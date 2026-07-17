@@ -20,6 +20,19 @@ Or bypass the title screen/main menu and load a specific save file:
 Move: wasd (also arrow keys / hjkl). Menu: Esc. Save/Quit are in the menu.
 (Needs a real terminal — curses won't run from an IDE output pane.)
 
+## Audio
+
+- On startup, the game now attempts to play the first supported file found in
+  `audio/music/` on loop (`.mp3`, `.ogg`, `.wav`, `.flac`, `.m4a`).
+- If no audio file is found, `pygame` is not installed, or audio init fails,
+  the game continues silently.
+- `audio_buffer` in `data/config/options.json` controls mixer buffer size
+  (default `16384` in this build). If audio is still choppy, increase it.
+
+Install `pygame` for music playback:
+
+  python3 -m pip install --user pygame
+
 ## Testing
 
 Tests are headless and do not require curses. They use a fake renderer test

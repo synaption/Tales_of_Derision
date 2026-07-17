@@ -5,7 +5,10 @@ The game logic never touches curses -- swap TerminalRenderer for a
 tcod/pygame/raylib renderer and nothing else changes.
 """
 import argparse
+import os
 from pathlib import Path
+import sys
+from typing import Any
 
 import esper
 
@@ -25,6 +28,115 @@ from systems import MovementProcessor, NpcAiProcessor, RenderProcessor
 
 MAP_WIDTH = 40
 MAP_HEIGHT = 20
+
+AUDIO_SAMPLE_RATE = 44100
+AUDIO_SAMPLE_SIZE = -16
+AUDIO_CHANNELS = 2
+AUDIO_BUFFER_SIZES = (16384, 8192, 4096, 2048)
+
+
+def _audio_driver_order() -> list[str | None]:
+    if os.environ.get("PULSE_SERVER"):
+        return ["pulseaudio", "pipewire", "alsa", None, "dsp"]
+    return [None, "pipewire", "pulseaudio", "alsa", "dsp"]
+
+
+def _audio_buffer_order(options: dict | None) -> list[int]:
+    configured = None
+    if isinstance(options, dict):
+        configured = options.get("audio_buffer")
+
+    if isinstance(configured, int) and configured > 0:
+        sizes = [configured, *AUDIO_BUFFER_SIZES]
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for size in sizes:
+            if size not in seen:
+                ordered.append(size)
+                seen.add(size)
+        return ordered
+
+    return list(AUDIO_BUFFER_SIZES)
+
+
+def _pick_music_track(music_dir: Path) -> Path | None:
+    if not music_dir.exists() or not music_dir.is_dir():
+        return None
+
+    supported_suffixes = {".mp3", ".ogg", ".wav", ".flac", ".m4a"}
+    candidates = sorted(
+        path
+        for path in music_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in supported_suffixes
+    )
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def _start_background_music(options: dict | None = None) -> Any | None:
+    music_dir = Path(__file__).resolve().parent.parent / "audio" / "music"
+    track = _pick_music_track(music_dir)
+    if track is None:
+        return None
+
+    try:
+        import pygame
+    except ModuleNotFoundError:
+        return None
+
+    original_driver = os.environ.get("SDL_AUDIODRIVER")
+    last_error: Exception | None = None
+    for driver in _audio_driver_order():
+        for buffer_size in _audio_buffer_order(options):
+            try:
+                if driver is None:
+                    if original_driver is None:
+                        os.environ.pop("SDL_AUDIODRIVER", None)
+                    else:
+                        os.environ["SDL_AUDIODRIVER"] = original_driver
+                else:
+                    os.environ["SDL_AUDIODRIVER"] = driver
+
+                pygame.mixer.quit()
+                pygame.mixer.init(
+                    frequency=AUDIO_SAMPLE_RATE,
+                    size=AUDIO_SAMPLE_SIZE,
+                    channels=AUDIO_CHANNELS,
+                    buffer=buffer_size,
+                    allowedchanges=0,
+                )
+                pygame.mixer.music.load(str(track))
+                pygame.mixer.music.play(-1)
+                return pygame
+            except Exception as exc:
+                last_error = exc
+                try:
+                    pygame.mixer.quit()
+                except Exception:
+                    pass
+
+    if original_driver is None:
+        os.environ.pop("SDL_AUDIODRIVER", None)
+    else:
+        os.environ["SDL_AUDIODRIVER"] = original_driver
+
+    if last_error is not None:
+        print(f"Audio disabled: {last_error}", file=sys.stderr)
+    return None
+
+
+def _stop_background_music(pygame_module: Any | None) -> None:
+    if pygame_module is None:
+        return
+    try:
+        pygame_module.mixer.music.stop()
+    except Exception:
+        pass
+    try:
+        pygame_module.mixer.quit()
+    except Exception:
+        pass
 
 
 def _parse_args() -> argparse.Namespace:
@@ -173,56 +285,59 @@ def _setup_world(game_map: GameMap, player_position: Position) -> None:
 def main() -> None:
     args = _parse_args()
     bootstrap_files(MAP_WIDTH, MAP_HEIGHT)
+    options = load_options()
+    pygame_module = _start_background_music(options)
 
     selected_save_file = args.save_file
 
     if selected_save_file is None:
         selected_save_file = DEFAULT_SAVE_FILE
 
-    options = load_options()
-
     game_map = GameMap(MAP_WIDTH, MAP_HEIGHT)
     player_position = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
 
-    with TerminalRenderer() as renderer:
-        if args.save_file is None:
-            if not _draw_title_screen(renderer):
-                return
+    try:
+        with TerminalRenderer() as renderer:
+            if args.save_file is None:
+                if not _draw_title_screen(renderer):
+                    return
 
-            menu_choice = _draw_main_menu(renderer)
-            if menu_choice == "quit":
-                return
-            if menu_choice == "continue":
+                menu_choice = _draw_main_menu(renderer)
+                if menu_choice == "quit":
+                    return
+                if menu_choice == "continue":
+                    game_map, player_position = load_game(
+                        DEFAULT_SAVE_FILE,
+                        MAP_WIDTH,
+                        MAP_HEIGHT,
+                    )
+                elif menu_choice == "new_game":
+                    save_game(game_map, DEFAULT_SAVE_FILE, player_position)
+            else:
                 game_map, player_position = load_game(
-                    DEFAULT_SAVE_FILE,
+                    selected_save_file,
                     MAP_WIDTH,
                     MAP_HEIGHT,
                 )
-            elif menu_choice == "new_game":
-                save_game(game_map, DEFAULT_SAVE_FILE, player_position)
-        else:
-            game_map, player_position = load_game(
-                selected_save_file,
-                MAP_WIDTH,
-                MAP_HEIGHT,
-            )
 
-        _setup_world(game_map, player_position)
-        esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+            _setup_world(game_map, player_position)
+            esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
-        esper.process()  # initial frame
-        while True:
-            action = renderer.poll_action()
-            if action == "open_pause_menu":
-                pause_choice = _draw_pause_menu(renderer, options)
-                if pause_choice == "save_game":
-                    player_pos = first_player_position() or player_position
-                    save_game(game_map, selected_save_file, player_pos)
-                elif pause_choice == "quit":
-                    break
-                esper.process(None)
-                continue
-            esper.process(action)
+            esper.process()  # initial frame
+            while True:
+                action = renderer.poll_action()
+                if action == "open_pause_menu":
+                    pause_choice = _draw_pause_menu(renderer, options)
+                    if pause_choice == "save_game":
+                        player_pos = first_player_position() or player_position
+                        save_game(game_map, selected_save_file, player_pos)
+                    elif pause_choice == "quit":
+                        break
+                    esper.process(None)
+                    continue
+                esper.process(action)
+    finally:
+        _stop_background_music(pygame_module)
 
 
 if __name__ == "__main__":

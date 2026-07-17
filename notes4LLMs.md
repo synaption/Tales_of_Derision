@@ -1,5 +1,6 @@
-reference this if you are an llm
-consider this the top authority, then readme.md, then the wiki
+Reference this if you are an llm
+Consider this the top authority, then readme.md, then the wiki
+LLMs should not edit this file, only humans.  
 
 use ECS
 document everything

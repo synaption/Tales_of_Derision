@@ -1,6 +1,7 @@
 {
   "fullscreen": false,
   "show_fps": false,
+  "audio_buffer": 16384,
   "keybinds": {
     "up": [
       "w",

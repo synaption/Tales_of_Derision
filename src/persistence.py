@@ -22,6 +22,7 @@ WORKING_OPTIONS_FILE = CONFIG_DIR / "options.json"
 _DEFAULT_OPTIONS = {
     "fullscreen": False,
     "show_fps": False,
+    "audio_buffer": 16384,
     "keybinds": {
         "up": ["w", "k", "up"],
         "down": ["s", "j", "down"],
