@@ -1,0 +1,33 @@
+{
+  "fullscreen": false,
+  "show_fps": false,
+  "keybinds": {
+    "up": [
+      "w",
+      "k",
+      "up"
+    ],
+    "down": [
+      "s",
+      "j",
+      "down"
+    ],
+    "left": [
+      "a",
+      "h",
+      "left"
+    ],
+    "right": [
+      "d",
+      "l",
+      "right"
+    ],
+    "save": [
+      "p"
+    ],
+    "quit": [
+      "q",
+      "esc"
+    ]
+  }
+}

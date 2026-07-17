@@ -1,0 +1,36 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE/editor noise
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime game data (keep defaults tracked)
+data/config/options.json
+data/saves/*.json
+!data/saves/default_save.json
+
+src/data/config/options.json
+src/data/saves/*.json
+!src/data/saves/default_save.json
