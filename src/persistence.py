@@ -23,6 +23,7 @@ _DEFAULT_OPTIONS = {
     "fullscreen": False,
     "show_fps": False,
     "audio_buffer": 16384,
+    "audio_separate_process": True,
     "keybinds": {
         "up": ["w", "k", "up"],
         "down": ["s", "j", "down"],

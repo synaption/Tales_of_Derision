@@ -5,6 +5,7 @@ The game logic never touches curses -- swap TerminalRenderer for a
 tcod/pygame/raylib renderer and nothing else changes.
 """
 import argparse
+import multiprocessing
 import os
 from pathlib import Path
 import sys
@@ -133,6 +134,47 @@ def _stop_background_music(pygame_module: Any | None) -> None:
         pygame_module.mixer.music.stop()
     except Exception:
         pass
+
+
+def _music_worker(stop_event: Any, options: dict | None) -> None:
+    pygame_module = _start_background_music(options)
+    if pygame_module is None:
+        return
+    try:
+        while not stop_event.wait(0.25):
+            pass
+    finally:
+        _stop_background_music(pygame_module)
+
+
+def _start_background_music_process(options: dict | None) -> tuple[multiprocessing.Process, Any] | None:
+    try:
+        stop_event = multiprocessing.Event()
+        process = multiprocessing.Process(
+            target=_music_worker,
+            args=(stop_event, options),
+            daemon=True,
+            name="music-worker",
+        )
+        process.start()
+        return process, stop_event
+    except Exception as exc:
+        print(f"Audio process disabled: {exc}", file=sys.stderr)
+        return None
+
+
+def _stop_background_music_process(handle: tuple[multiprocessing.Process, Any] | None) -> None:
+    if handle is None:
+        return
+    process, stop_event = handle
+    try:
+        stop_event.set()
+    except Exception:
+        pass
+    process.join(timeout=2.0)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1.0)
     try:
         pygame_module.mixer.quit()
     except Exception:
@@ -286,7 +328,15 @@ def main() -> None:
     args = _parse_args()
     bootstrap_files(MAP_WIDTH, MAP_HEIGHT)
     options = load_options()
-    pygame_module = _start_background_music(options)
+    use_audio_process = bool(options.get("audio_separate_process", True))
+    audio_process_handle: tuple[multiprocessing.Process, Any] | None = None
+    pygame_module: Any | None = None
+    if use_audio_process:
+        audio_process_handle = _start_background_music_process(options)
+        if audio_process_handle is None:
+            pygame_module = _start_background_music(options)
+    else:
+        pygame_module = _start_background_music(options)
 
     selected_save_file = args.save_file
 
@@ -337,6 +387,7 @@ def main() -> None:
                     continue
                 esper.process(action)
     finally:
+        _stop_background_music_process(audio_process_handle)
         _stop_background_music(pygame_module)
 
 

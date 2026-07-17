@@ -28,6 +28,8 @@ Move: wasd (also arrow keys / hjkl). Menu: Esc. Save/Quit are in the menu.
   the game continues silently.
 - `audio_buffer` in `data/config/options.json` controls mixer buffer size
   (default `16384` in this build). If audio is still choppy, increase it.
+- `audio_separate_process` in `data/config/options.json` runs music playback in
+  a background process (default `true`), which can reduce stutter in WSL.
 
 Install `pygame` for music playback:
 
