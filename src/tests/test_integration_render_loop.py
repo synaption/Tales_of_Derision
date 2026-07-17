@@ -23,7 +23,7 @@ def _setup_world(width: int = 10, height: int = 6) -> tuple[GameMap, FakeRendere
     player_pos = Position(width // 2, height // 2)
     esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
     esper.create_entity(
-        Position(player_pos.x + 2, player_pos.y),
+        Position(player_pos.x + 1, player_pos.y),
         Renderable("g"),
         Name("Goblin"),
         NPC(),
@@ -108,6 +108,25 @@ def test_player_does_not_move_through_wall() -> None:
     esper.process("move_left")
 
     assert (player_pos.x, player_pos.y) == start
+
+
+def test_visible_npc_sighting_logs_once_even_when_not_adjacent() -> None:
+    game_map = GameMap(12, 20)
+    renderer = FakeRenderer()
+
+    esper.add_processor(MovementProcessor(game_map), priority=1)
+    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+
+    player_pos = Position(5, 10)
+    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    esper.create_entity(Position(8, 10), Renderable("r"), Name("Rat"), NPC(), Enemy(), BlocksMovement())
+
+    esper.process(None)
+    esper.process("move_left")
+    esper.process("move_right")
+
+    notice_count = sum(1 for _x, _y, text in renderer.text if text == "You notice Rat to the east.")
+    assert notice_count == 1
 
 
 def test_npc_moves_toward_player_when_in_sight() -> None:

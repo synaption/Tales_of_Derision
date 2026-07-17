@@ -166,7 +166,7 @@ class RenderProcessor(esper.Processor):
         self._message_log: list[str] = ["You enter the area."]
         self._max_log_lines = 200
         self._last_player_pos: tuple[int, int] | None = None
-        self._visible_entity_keys: set[tuple[str, int, int]] = set()
+        self._seen_entity_ids: set[int] = set()
         self._visible_tiles: set[tuple[int, int]] = set()
 
     @staticmethod
@@ -209,9 +209,8 @@ class RenderProcessor(esper.Processor):
     def _collect_nearby_objects(
         self,
         player_pos: Position,
-    ) -> list[tuple[str, str, str, int, int, int, int]]:
-        nearby: list[tuple[str, str, str, int, int, int, int]] = []
-        radius = max(self.game_map.width // 2, self.game_map.height // 2)
+    ) -> list[tuple[int, str, str, str, int, int, int, int]]:
+        nearby: list[tuple[int, str, str, str, int, int, int, int]] = []
 
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
             if pos.x == player_pos.x and pos.y == player_pos.y:
@@ -221,16 +220,16 @@ class RenderProcessor(esper.Processor):
 
             dx = pos.x - player_pos.x
             dy = pos.y - player_pos.y
-            if max(abs(dx), abs(dy)) > radius:
+            if max(abs(dx), abs(dy)) != 1:
                 continue
 
             arrow = self._direction_arrow(player_pos, pos)
             name = "Unknown"
             if esper.has_component(ent, Name):
                 name = esper.component_for_entity(ent, Name).value
-            nearby.append((rend.glyph, arrow, name, abs(dx) + abs(dy), max(abs(dx), abs(dy),), pos.x, pos.y))
+            nearby.append((ent, rend.glyph, arrow, name, abs(dx) + abs(dy), max(abs(dx), abs(dy),), pos.x, pos.y))
 
-        nearby.sort(key=lambda item: (item[3], item[4], item[2]))
+        nearby.sort(key=lambda item: (item[4], item[5], item[3]))
         return nearby
 
     def _compute_visible_tiles(self, player_ent: int | None, player_pos: Position | None) -> set[tuple[int, int]]:
@@ -251,15 +250,37 @@ class RenderProcessor(esper.Processor):
                     visible.add((x, y))
         return visible
 
-    def _update_sighting_events(self, nearby: list[tuple[str, str, str, int, int, int, int]]) -> None:
-        current_keys = {(name, x, y) for _g, _a, name, _md, _cd, x, y in nearby}
-        newly_seen = [item for item in nearby if (item[2], item[5], item[6]) not in self._visible_entity_keys]
+    def _update_sighting_events(self, nearby: list[tuple[int, str, str, str, int, int, int, int]]) -> None:
+        newly_seen = [item for item in nearby if item[0] not in self._seen_entity_ids]
 
-        for _glyph, arrow, name, _md, _cd, _x, _y in newly_seen[:2]:
+        for ent_id, _glyph, arrow, name, _md, _cd, _x, _y in newly_seen[:2]:
             direction = _ARROW_TO_WORD.get(arrow, "nearby")
             self._append_message(f"You notice {name} to the {direction}.")
+            self._seen_entity_ids.add(ent_id)
 
-        self._visible_entity_keys = current_keys
+    def _collect_visible_npcs(
+        self,
+        player_pos: Position,
+    ) -> list[tuple[int, str, str, str, int, int, int, int]]:
+        visible: list[tuple[int, str, str, str, int, int, int, int]] = []
+
+        for ent, (pos, rend, _npc) in esper.get_components(Position, Renderable, NPC):
+            if (pos.x, pos.y) == (player_pos.x, player_pos.y):
+                continue
+            if (pos.x, pos.y) not in self._visible_tiles:
+                continue
+
+            dx = pos.x - player_pos.x
+            dy = pos.y - player_pos.y
+            arrow = self._direction_arrow(player_pos, pos)
+            name = "Unknown"
+            if esper.has_component(ent, Name):
+                name = esper.component_for_entity(ent, Name).value
+
+            visible.append((ent, rend.glyph, arrow, name, abs(dx) + abs(dy), max(abs(dx), abs(dy)), pos.x, pos.y))
+
+        visible.sort(key=lambda item: (item[4], item[5], item[3]))
+        return visible
 
     def _draw_sidebar(
         self,
@@ -270,10 +291,11 @@ class RenderProcessor(esper.Processor):
         x0 = self.sidebar_x
         y = 0
 
-        nearby_data: list[tuple[str, str, str, int, int, int, int]] = []
+        nearby_data: list[tuple[int, str, str, str, int, int, int, int]] = []
         if player_pos is not None:
+            visible_npcs = self._collect_visible_npcs(player_pos)
+            self._update_sighting_events(visible_npcs)
             nearby_data = self._collect_nearby_objects(player_pos)
-            self._update_sighting_events(nearby_data)
 
         r.draw_text(x0, y, "== NEARBY ==")
         y += 1
@@ -293,7 +315,7 @@ class RenderProcessor(esper.Processor):
                     y += 1
                     nearby_lines_drawn = 1
             else:
-                for glyph, arrow, name, _mdist, _cdist, _x, _y in nearby_data[:max_nearby_lines]:
+                for _ent_id, glyph, arrow, name, _mdist, _cdist, _x, _y in nearby_data[:max_nearby_lines]:
                     line = f"{glyph} {arrow} {name}"
                     r.draw_text(x0, y, line[: self.sidebar_width])
                     y += 1
