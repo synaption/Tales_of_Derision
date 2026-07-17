@@ -66,6 +66,24 @@ Run only totally unrendered logic/data tests:
 Full docs live in the [wiki/](wiki/Home.md) — architecture, ECS model, per-module
 reference, how to add a renderer backend, and the roadmap.
 
+## Commit-indexed browser play (minimum setup)
+
+Each pushed commit now builds an image tagged by full SHA in GHCR:
+
+`ghcr.io/<owner>/<repo>/game:<full-commit-sha>`
+
+On a Linux host with Docker, run any commit image:
+
+```bash
+docker run --rm -it -p 7681:7681 ghcr.io/<owner>/<repo>/game:<full-commit-sha>
+```
+
+Then open:
+
+`http://<host>:7681`
+
+The in-game HUD shows `build: <sha-prefix>` so you can confirm which commit is running.
+
 ## Layout
 
 | file                   | role                                                      |

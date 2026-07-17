@@ -3,6 +3,8 @@
 esper 3.x uses module-level state and esper.Processor subclasses whose
 process() receives whatever args are passed to esper.process().
 """
+import os
+
 import esper
 
 from components import Player, Position, Renderable
@@ -40,6 +42,8 @@ class RenderProcessor(esper.Processor):
     def __init__(self, renderer: Renderer, game_map: GameMap):
         self.renderer = renderer
         self.game_map = game_map
+        full_commit = os.environ.get("GAME_COMMIT", "dev")
+        self.build_label = f"build: {full_commit[:12]}"
 
     def process(self, action: str | None = None) -> None:
         r = self.renderer
@@ -53,4 +57,5 @@ class RenderProcessor(esper.Processor):
             r.draw_glyph(pos.x, pos.y, rend.glyph)
 
         r.draw_text(0, self.game_map.height, "move: arrows/hjkl/wasd   menu: esc")
+        r.draw_text(0, self.game_map.height + 1, self.build_label)
         r.present()

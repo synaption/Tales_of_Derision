@@ -1,0 +1,73 @@
+name: Build playable commit image
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/game
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: ./run_tests.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build commit image
+        run: |
+          docker build \
+            --build-arg GAME_COMMIT="${GITHUB_SHA}" \
+            --tag "${REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA}" \
+            .
+
+      - name: Smoke test terminal endpoint
+        run: |
+          cid="$(docker run -d -p 7681:7681 "${REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA}")"
+          trap 'docker rm -f "$cid"' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:7681" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$cid"
+          exit 1
+
+      - name: Push commit image
+        run: docker push "${REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA}"
+
+      - name: Record pushed digest
+        run: |
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA}")"
+          echo "Pushed image: $digest"
