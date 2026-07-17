@@ -37,6 +37,25 @@ class TerminalRenderer(Renderer):
         curses.curs_set(0)
         self.stdscr.keypad(True)
 
+        self._color_pairs: dict[str, int] = {}
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            self._color_pairs = {
+                "default": 1,
+                "wall": 2,
+                "stairs": 3,
+                "friendly": 4,
+                "enemy": 5,
+                "valuable": 6,
+            }
+            curses.init_pair(self._color_pairs["default"], -1, -1)
+            curses.init_pair(self._color_pairs["wall"], curses.COLOR_BLUE, -1)
+            curses.init_pair(self._color_pairs["stairs"], curses.COLOR_CYAN, -1)
+            curses.init_pair(self._color_pairs["friendly"], curses.COLOR_GREEN, -1)
+            curses.init_pair(self._color_pairs["enemy"], curses.COLOR_RED, -1)
+            curses.init_pair(self._color_pairs["valuable"], curses.COLOR_YELLOW, -1)
+
     def teardown(self) -> None:
         curses.curs_set(1)
         self.stdscr.keypad(False)
@@ -51,6 +70,17 @@ class TerminalRenderer(Renderer):
         # addstr raises at the bottom-right cell; swallow it.
         try:
             self.stdscr.addstr(y, x, glyph)
+        except curses.error:
+            pass
+
+    def draw_glyph_classified(self, x: int, y: int, glyph: str, classification: str) -> None:
+        if not self._color_pairs:
+            self.draw_glyph(x, y, glyph)
+            return
+
+        pair_id = self._color_pairs.get(classification, self._color_pairs["default"])
+        try:
+            self.stdscr.addstr(y, x, glyph, curses.color_pair(pair_id))
         except curses.error:
             pass
 

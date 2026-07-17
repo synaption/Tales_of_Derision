@@ -9,7 +9,7 @@ from pathlib import Path
 
 import esper
 
-from components import Player, Position, Renderable
+from components import Name, Player, Position, Renderable
 from game_map import GameMap
 from persistence import (
     DEFAULT_SAVE_FILE,
@@ -150,7 +150,7 @@ def _draw_pause_menu(renderer: TerminalRenderer, options: dict) -> str:
 
 def _setup_world(game_map: GameMap, player_position: Position) -> None:
     esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.create_entity(player_position, Renderable("@"), Player())
+    esper.create_entity(player_position, Renderable("@"), Name("You"), Player())
 
 
 def main() -> None:

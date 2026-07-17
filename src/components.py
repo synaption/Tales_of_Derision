@@ -20,3 +20,8 @@ class Renderable:
 @dataclass
 class Player:
     """Tag component: marks the entity the input controls."""
+
+
+@dataclass
+class Name:
+    value: str

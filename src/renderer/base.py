@@ -31,6 +31,14 @@ class Renderer(ABC):
     def draw_glyph(self, x: int, y: int, glyph: str) -> None:
         """Draw a single character at map cell (x, y)."""
 
+    def draw_glyph_classified(self, x: int, y: int, glyph: str, classification: str) -> None:
+        """Draw a glyph with semantic classification (wall, enemy, etc).
+
+        Renderers that do not support color/class styling can ignore
+        classification and fall back to plain glyph drawing.
+        """
+        self.draw_glyph(x, y, glyph)
+
     @abstractmethod
     def draw_text(self, x: int, y: int, text: str) -> None:
         """Draw a UI string (status line, messages)."""

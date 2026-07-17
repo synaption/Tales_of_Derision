@@ -8,6 +8,7 @@ class FakeRenderer(Renderer):
 
     def __init__(self):
         self.glyphs: dict[tuple[int, int], str] = {}
+        self.classified_glyphs: dict[tuple[int, int], tuple[str, str]] = {}
         self.text: list[tuple[int, int, str]] = []
         self.present_calls = 0
         self.setup_calls = 0
@@ -21,10 +22,15 @@ class FakeRenderer(Renderer):
 
     def clear(self) -> None:
         self.glyphs = {}
+        self.classified_glyphs = {}
         self.text = []
 
     def draw_glyph(self, x: int, y: int, glyph: str) -> None:
         self.glyphs[(x, y)] = glyph
+
+    def draw_glyph_classified(self, x: int, y: int, glyph: str, classification: str) -> None:
+        self.glyphs[(x, y)] = glyph
+        self.classified_glyphs[(x, y)] = (glyph, classification)
 
     def draw_text(self, x: int, y: int, text: str) -> None:
         self.text.append((x, y, text))
