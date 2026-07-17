@@ -88,23 +88,17 @@ already abstracted to action strings (`move_up`, `quit`, …), so nothing else
 changes.
 
 ## Inspiration
-Caves of Qud
-
-Lord of the Rings
-
-DaFluffyPotato
-
-Minecraft
-
-Rimworld
-
-Dwarf Fortress
-
-Song of Syx
-
-Infectionator World Dominator
-
-Earth Defense Force
+- Caves of Qud
+- Lord of the Rings
+- DaFluffyPotato
+- Minecraft
+- Rimworld
+- Dwarf Fortress
+- Song of Syx
+- Infectionator World Dominator
+- Earth Defense Force
+- chrono trigger
+- zelda
 
 
 ## Themes
@@ -140,11 +134,9 @@ Action Economy:
 
 Targets
 - terminal
-- desktop fully rendered
-- browser terminal emulator
-- browser fully rendered
-- commit indexed
-
+- desktop fully rendered on windows and linux with shadders
+- steam
+- itch.io
 
 ## Style
 Pixel Art
@@ -158,3 +150,5 @@ basic animations, or no animations at all
 characters face the direction the are going, either just left or right, or up, down, left, and right, or all 8 directions depending on the sprite.  
 
 Dialogue in a fake gibberish language "##!/$*~# GH01^@"  
+
+speach bubbles, and sims like symbol popups i.e. ++ 
