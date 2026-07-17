@@ -3,9 +3,9 @@ from __future__ import annotations
 import esper
 import pytest
 
-from components import Name, Player, Position, Renderable
+from components import BlocksMovement, Dialogue, Enemy, Friendly, NPC, Name, Player, Position, Renderable, Vision
 from game_map import GameMap
-from systems import MovementProcessor, RenderProcessor
+from systems import MovementProcessor, NpcAiProcessor, RenderProcessor
 from fakes import FakeRenderer
 
 
@@ -17,11 +17,20 @@ def _setup_world(width: int = 10, height: int = 6) -> tuple[GameMap, FakeRendere
     renderer = FakeRenderer()
 
     esper.add_processor(MovementProcessor(game_map), priority=1)
+    esper.add_processor(NpcAiProcessor(game_map), priority=0)
     esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
     player_pos = Position(width // 2, height // 2)
-    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player())
-    esper.create_entity(Position(player_pos.x + 2, player_pos.y), Renderable("g"), Name("Goblin"))
+    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    esper.create_entity(
+        Position(player_pos.x + 2, player_pos.y),
+        Renderable("g"),
+        Name("Goblin"),
+        NPC(),
+        Enemy(),
+        BlocksMovement(),
+        Vision(8),
+    )
 
     return game_map, renderer, player_pos
 
@@ -99,3 +108,83 @@ def test_player_does_not_move_through_wall() -> None:
     esper.process("move_left")
 
     assert (player_pos.x, player_pos.y) == start
+
+
+def test_npc_moves_toward_player_when_in_sight() -> None:
+    game_map = GameMap(16, 10)
+    renderer = FakeRenderer()
+
+    esper.add_processor(MovementProcessor(game_map), priority=1)
+    esper.add_processor(NpcAiProcessor(game_map), priority=0)
+    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+
+    player_pos = Position(10, 5)
+    npc_pos = Position(4, 5)
+
+    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    esper.create_entity(npc_pos, Renderable("g"), Name("Goblin"), NPC(), Enemy(), Vision(10), BlocksMovement())
+
+    start = (npc_pos.x, npc_pos.y)
+    esper.process("move_right")
+
+    assert (npc_pos.x, npc_pos.y) != start
+    assert npc_pos.x > start[0]
+
+
+def test_player_attacks_enemy_on_collision() -> None:
+    game_map = GameMap(12, 8)
+    renderer = FakeRenderer()
+
+    esper.add_processor(MovementProcessor(game_map), priority=1)
+    esper.add_processor(NpcAiProcessor(game_map), priority=0)
+    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+
+    player_pos = Position(5, 4)
+    enemy_pos = Position(6, 4)
+    enemy_ent = esper.create_entity(
+        enemy_pos,
+        Renderable("g"),
+        Name("Goblin"),
+        NPC(),
+        Enemy(),
+        BlocksMovement(),
+        Vision(8),
+    )
+    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+
+    esper.process("move_right")
+
+    assert (player_pos.x, player_pos.y) == (6, 4)
+    assert not esper.entity_exists(enemy_ent)
+    assert any(text == "You attack Goblin." for _x, _y, text in renderer.text)
+
+
+def test_player_bumps_friendly_and_gets_dialogue() -> None:
+    game_map = GameMap(12, 8)
+    renderer = FakeRenderer()
+
+    esper.add_processor(MovementProcessor(game_map), priority=1)
+    esper.add_processor(NpcAiProcessor(game_map), priority=0)
+    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+
+    player_pos = Position(5, 4)
+    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    esper.create_entity(
+        Position(6, 4),
+        Renderable("v"),
+        Name("Friendly Villager"),
+        NPC(),
+        Friendly(),
+        Dialogue("##!/$*~# GH01^@"),
+        BlocksMovement(),
+    )
+
+    esper.process(None)
+    esper.process("move_right")
+
+    assert (player_pos.x, player_pos.y) == (5, 4)
+    assert any(
+        text.startswith('Friendly Villager says: "##!')
+        for _x, _y, text in renderer.text
+    )
+    assert not any(text == "You bump into a wall." for _x, _y, text in renderer.text)

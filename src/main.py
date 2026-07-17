@@ -9,7 +9,7 @@ from pathlib import Path
 
 import esper
 
-from components import Name, Player, Position, Renderable
+from components import BlocksMovement, Dialogue, Enemy, Friendly, NPC, Name, Player, Position, Renderable, Vision
 from game_map import GameMap
 from persistence import (
     DEFAULT_SAVE_FILE,
@@ -21,7 +21,7 @@ from persistence import (
     save_options,
 )
 from renderer.terminal import TerminalRenderer
-from systems import MovementProcessor, RenderProcessor
+from systems import MovementProcessor, NpcAiProcessor, RenderProcessor
 
 MAP_WIDTH = 40
 MAP_HEIGHT = 20
@@ -150,7 +150,24 @@ def _draw_pause_menu(renderer: TerminalRenderer, options: dict) -> str:
 
 def _setup_world(game_map: GameMap, player_position: Position) -> None:
     esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.create_entity(player_position, Renderable("@"), Name("You"), Player())
+    esper.add_processor(NpcAiProcessor(game_map), priority=0)
+    esper.create_entity(player_position, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+
+    villager_pos = Position(max(2, player_position.x - 2), player_position.y + 1)
+    guard_pos = Position(max(2, player_position.x - 5), player_position.y)
+    rat_pos = Position(min(game_map.width - 3, player_position.x + 6), max(2, player_position.y - 2))
+
+    esper.create_entity(
+        villager_pos,
+        Renderable("v"),
+        Name("Friendly Villager"),
+        NPC(),
+        Friendly(),
+        Dialogue("##!/$*~# GH01^@"),
+        BlocksMovement(),
+    )
+    esper.create_entity(guard_pos, Renderable("g"), Name("Goblin Scout"), NPC(), Enemy(), Vision(8), BlocksMovement())
+    esper.create_entity(rat_pos, Renderable("r"), Name("Cave Rat"), NPC(), Enemy(), Vision(6), BlocksMovement())
 
 
 def main() -> None:

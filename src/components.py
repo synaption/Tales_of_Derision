@@ -25,3 +25,33 @@ class Player:
 @dataclass
 class Name:
     value: str
+
+
+@dataclass
+class NPC:
+    """Tag component: marks an entity controlled by AI."""
+
+
+@dataclass
+class Enemy:
+    """Tag component: marks an NPC as hostile to the player."""
+
+
+@dataclass
+class Friendly:
+    """Tag component: marks an NPC as non-hostile."""
+
+
+@dataclass
+class BlocksMovement:
+    """Tag component: entity occupies and blocks its current tile."""
+
+
+@dataclass
+class Vision:
+    radius: int = 8
+
+
+@dataclass
+class Dialogue:
+    line: str

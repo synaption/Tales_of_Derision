@@ -52,3 +52,33 @@ def test_save_and_load_roundtrip_without_renderer(tmp_path: Path) -> None:
 
     assert (loaded_map.width, loaded_map.height) == (12, 8)
     assert (loaded_pos.x, loaded_pos.y) == (5, 4)
+
+
+def test_line_of_sight_blocked_by_wall() -> None:
+    game_map = GameMap(12, 7)
+    game_map.tiles[3][5] = game_map.WALL
+
+    assert game_map.has_line_of_sight((3, 3), (9, 3)) is False
+
+
+def test_find_path_routes_around_obstacle() -> None:
+    game_map = GameMap(9, 7)
+    game_map.tiles[3][4] = game_map.WALL
+
+    path = game_map.find_path((2, 3), (6, 3))
+
+    assert path
+    assert path[-1] == (6, 3)
+    assert (4, 3) not in path
+
+
+def test_large_default_map_contains_buildings() -> None:
+    game_map = GameMap(40, 20)
+
+    assert game_map.tile_at(4, 3) == game_map.WALL
+    assert game_map.tile_at(12, 8) == game_map.WALL
+    assert game_map.tile_at(8, 8) == game_map.FLOOR
+
+    assert game_map.tile_at(26, 5) == game_map.WALL
+    assert game_map.tile_at(35, 11) == game_map.WALL
+    assert game_map.tile_at(30, 11) == game_map.FLOOR

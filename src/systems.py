@@ -5,7 +5,7 @@ process() receives whatever args are passed to esper.process().
 """
 import esper
 
-from components import Name, Player, Position, Renderable
+from components import BlocksMovement, Dialogue, Enemy, Friendly, Name, NPC, Player, Position, Renderable, Vision
 from game_map import GameMap
 from renderer.base import Renderer
 
@@ -40,6 +40,18 @@ _ARROW_TO_WORD = {
     "↘": "southeast",
 }
 
+_TURN_EVENTS: list[str] = []
+
+
+def _push_turn_event(text: str) -> None:
+    _TURN_EVENTS.append(text)
+
+
+def _pull_turn_events() -> list[str]:
+    events = list(_TURN_EVENTS)
+    _TURN_EVENTS.clear()
+    return events
+
 
 class MovementProcessor(esper.Processor):
     """Applies a movement action to every player-controlled entity."""
@@ -52,10 +64,95 @@ class MovementProcessor(esper.Processor):
         if delta is None:
             return
         dx, dy = delta
+
+        occupied = {
+            (pos.x, pos.y): ent
+            for ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
+        }
+
         for _ent, (pos, _player) in esper.get_components(Position, Player):
             nx, ny = pos.x + dx, pos.y + dy
+            target_occupied = (nx, ny) in occupied and occupied[(nx, ny)] != _ent
             if self.game_map.is_walkable(nx, ny):
-                pos.x, pos.y = nx, ny
+                if not target_occupied:
+                    pos.x, pos.y = nx, ny
+                    continue
+
+                target_ent = occupied[(nx, ny)]
+                target_name = "Unknown"
+                if esper.has_component(target_ent, Name):
+                    target_name = esper.component_for_entity(target_ent, Name).value
+
+                if esper.has_component(target_ent, Enemy):
+                    _push_turn_event(f"You attack {target_name}.")
+                    esper.delete_entity(target_ent, immediate=True)
+                    pos.x, pos.y = nx, ny
+                    continue
+
+                if esper.has_component(target_ent, Dialogue):
+                    line = esper.component_for_entity(target_ent, Dialogue).line
+                    _push_turn_event(f"{target_name} says: \"{line}\"")
+                    continue
+
+                _push_turn_event("Something blocks your way.")
+
+
+class NpcAiProcessor(esper.Processor):
+    """Makes NPCs chase the player when they have line of sight."""
+
+    def __init__(self, game_map: GameMap):
+        self.game_map = game_map
+
+    def _find_player_position(self) -> tuple[int, int] | None:
+        for _ent, (pos, _player) in esper.get_components(Position, Player):
+            return (pos.x, pos.y)
+        return None
+
+    def process(self, action: str | None = None) -> None:
+        if action not in _ACTION_DELTAS:
+            return
+
+        player_xy = self._find_player_position()
+        if player_xy is None:
+            return
+
+        occupied = {
+            (pos.x, pos.y): ent
+            for ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
+        }
+
+        for ent, (pos, _npc, _enemy) in esper.get_components(Position, NPC, Enemy):
+            vision_radius = 8
+            if esper.has_component(ent, Vision):
+                vision_radius = esper.component_for_entity(ent, Vision).radius
+
+            dx = player_xy[0] - pos.x
+            dy = player_xy[1] - pos.y
+            if max(abs(dx), abs(dy)) > vision_radius:
+                continue
+            if not self.game_map.has_line_of_sight((pos.x, pos.y), player_xy):
+                continue
+
+            blocked_tiles = {
+                tile_xy
+                for tile_xy, occ_ent in occupied.items()
+                if occ_ent not in {ent}
+            }
+            path = self.game_map.find_path((pos.x, pos.y), player_xy, blocked_tiles=blocked_tiles)
+            if not path:
+                continue
+
+            next_x, next_y = path[0]
+            if (next_x, next_y) == player_xy:
+                continue
+
+            if (next_x, next_y) in occupied and occupied[(next_x, next_y)] != ent:
+                continue
+
+            old_xy = (pos.x, pos.y)
+            pos.x, pos.y = next_x, next_y
+            occupied.pop(old_xy, None)
+            occupied[(next_x, next_y)] = ent
 
 
 class RenderProcessor(esper.Processor):
@@ -70,6 +167,7 @@ class RenderProcessor(esper.Processor):
         self._max_log_lines = 200
         self._last_player_pos: tuple[int, int] | None = None
         self._visible_entity_keys: set[tuple[str, int, int]] = set()
+        self._visible_tiles: set[tuple[int, int]] = set()
 
     @staticmethod
     def _clamp_sign(value: int) -> int:
@@ -89,7 +187,12 @@ class RenderProcessor(esper.Processor):
         if len(self._message_log) > self._max_log_lines:
             self._message_log = self._message_log[-self._max_log_lines :]
 
-    def _describe_movement(self, action: str | None, player_pos: Position | None) -> None:
+    def _describe_movement(
+        self,
+        action: str | None,
+        player_pos: Position | None,
+        suppress_wall_message: bool,
+    ) -> None:
         if action not in _ACTION_DELTAS or player_pos is None:
             return
 
@@ -98,7 +201,7 @@ class RenderProcessor(esper.Processor):
             return
 
         moved = self._last_player_pos != (player_pos.x, player_pos.y)
-        if not moved:
+        if not moved and not suppress_wall_message:
             self._append_message("You bump into a wall.")
 
         self._last_player_pos = (player_pos.x, player_pos.y)
@@ -112,6 +215,8 @@ class RenderProcessor(esper.Processor):
 
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
             if pos.x == player_pos.x and pos.y == player_pos.y:
+                continue
+            if (pos.x, pos.y) not in self._visible_tiles:
                 continue
 
             dx = pos.x - player_pos.x
@@ -127,6 +232,24 @@ class RenderProcessor(esper.Processor):
 
         nearby.sort(key=lambda item: (item[3], item[4], item[2]))
         return nearby
+
+    def _compute_visible_tiles(self, player_ent: int | None, player_pos: Position | None) -> set[tuple[int, int]]:
+        if player_pos is None:
+            return set()
+
+        radius = max(self.game_map.width // 2, self.game_map.height // 2)
+        if player_ent is not None and esper.has_component(player_ent, Vision):
+            radius = esper.component_for_entity(player_ent, Vision).radius
+
+        visible: set[tuple[int, int]] = set()
+        origin = (player_pos.x, player_pos.y)
+        for y in range(self.game_map.height):
+            for x in range(self.game_map.width):
+                if max(abs(x - player_pos.x), abs(y - player_pos.y)) > radius:
+                    continue
+                if self.game_map.has_line_of_sight(origin, (x, y)):
+                    visible.add((x, y))
+        return visible
 
     def _update_sighting_events(self, nearby: list[tuple[str, str, str, int, int, int, int]]) -> None:
         current_keys = {(name, x, y) for _g, _a, name, _md, _cd, x, y in nearby}
@@ -193,6 +316,7 @@ class RenderProcessor(esper.Processor):
 
         entity_lookup: dict[tuple[int, int], tuple[str, str]] = {}
         player_pos: Position | None = None
+        player_ent: int | None = None
 
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
             name = "Unknown"
@@ -201,18 +325,39 @@ class RenderProcessor(esper.Processor):
             entity_lookup[(pos.x, pos.y)] = (rend.glyph, name)
             if esper.has_component(ent, Player):
                 player_pos = pos
+                player_ent = ent
 
         if player_pos is not None and self._last_player_pos is None:
             self._last_player_pos = (player_pos.x, player_pos.y)
 
-        self._describe_movement(action, player_pos)
+        events = _pull_turn_events()
+        for event in events:
+            self._append_message(event)
+
+        self._describe_movement(action, player_pos, suppress_wall_message=bool(events))
+
+        self._visible_tiles = self._compute_visible_tiles(player_ent, player_pos)
 
         for y in range(self.game_map.height):
             for x in range(self.game_map.width):
-                r.draw_glyph(x, y, self.game_map.tile_at(x, y))
+                if (x, y) in self._visible_tiles:
+                    tile = self.game_map.tile_at(x, y)
+                    classification = "wall" if tile == self.game_map.WALL else "default"
+                    r.draw_glyph_classified(x, y, tile, classification)
+                else:
+                    r.draw_glyph(x, y, " ")
 
-        for _ent, (pos, rend) in esper.get_components(Position, Renderable):
-            r.draw_glyph(pos.x, pos.y, rend.glyph)
+        for ent, (pos, rend) in esper.get_components(Position, Renderable):
+            if (pos.x, pos.y) not in self._visible_tiles and not esper.has_component(ent, Player):
+                continue
+
+            classification = "default"
+            if esper.has_component(ent, Player) or esper.has_component(ent, Friendly):
+                classification = "friendly"
+            elif esper.has_component(ent, Enemy):
+                classification = "enemy"
+
+            r.draw_glyph_classified(pos.x, pos.y, rend.glyph, classification)
 
         self._draw_sidebar(player_pos, entity_lookup)
 
