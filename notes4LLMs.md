@@ -1,4 +1,5 @@
 reference this if you are an llm
+consider this the top authority, then readme.md, then the wiki
 
 use ECS
 document everything

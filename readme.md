@@ -138,6 +138,12 @@ Targets
 - steam
 - itch.io
 
+All NPCs are playable.
+
+Players and NPCs have the same needs as the player like food and water.
+
+When the player dies they become a random sentiaent NPC somewhere in the world.  
+
 ## Style
 Pixel Art
 
@@ -152,3 +158,9 @@ characters face the direction the are going, either just left or right, or up, d
 Dialogue in a fake gibberish language "##!/$*~# GH01^@"  
 
 speach bubbles, and sims like symbol popups i.e. ++ 
+
+## Characters
+Wizards
+Great Fairy
+NPCs
+Mostly Farmers
