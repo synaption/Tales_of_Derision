@@ -100,6 +100,20 @@ def test_action_from_held_keys_cancels_opposite_axis() -> None:
     assert action == "move_left"
 
 
+def test_action_from_held_keys_prefers_most_recent_opposite_key_when_provided() -> None:
+    # Simulates holding S+D, then pressing A before releasing D.
+    held = {"move_down", "move_right", "move_left"}
+    order = {
+        "move_up": -1,
+        "move_down": 1,
+        "move_right": 2,
+        "move_left": 3,
+    }
+
+    action = _action_from_held_keys(held, order)
+    assert action == "move_down_left"
+
+
 def test_load_game_returns_fallback_when_file_missing(tmp_path: Path) -> None:
     missing_file = tmp_path / "missing_save.json"
 

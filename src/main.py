@@ -459,18 +459,37 @@ def _direction_target_xy(direction_action: str | None, origin: Position) -> tupl
 
 def _action_from_held_keys(
     held_directions: set[str],
+    pressed_order: dict[str, int] | None = None,
 ) -> str | None:
+    if pressed_order is None:
+        pressed_order = {}
+
+    use_recent_preference = bool(pressed_order)
+
     dx = 0
     dy = 0
 
-    if "move_left" in held_directions and "move_right" not in held_directions:
+    left_held = "move_left" in held_directions
+    right_held = "move_right" in held_directions
+    up_held = "move_up" in held_directions
+    down_held = "move_down" in held_directions
+
+    if left_held and right_held and use_recent_preference:
+        left_order = pressed_order.get("move_left", -1)
+        right_order = pressed_order.get("move_right", -1)
+        dx = -1 if left_order >= right_order else 1
+    elif left_held and not right_held:
         dx = -1
-    elif "move_right" in held_directions and "move_left" not in held_directions:
+    elif right_held and not left_held:
         dx = 1
 
-    if "move_up" in held_directions and "move_down" not in held_directions:
+    if up_held and down_held and use_recent_preference:
+        up_order = pressed_order.get("move_up", -1)
+        down_order = pressed_order.get("move_down", -1)
+        dy = -1 if up_order >= down_order else 1
+    elif up_held and not down_held:
         dy = -1
-    elif "move_down" in held_directions and "move_up" not in held_directions:
+    elif down_held and not up_held:
         dy = 1
 
     if dx == 0 and dy == 0:
@@ -988,10 +1007,19 @@ def main() -> None:
 
             esper.process()  # initial frame
             held_directions: set[str] = set()
+            direction_pressed_order = {
+                "move_up": -1,
+                "move_down": -1,
+                "move_left": -1,
+                "move_right": -1,
+            }
+            press_order_counter = 0
             while True:
                 action = renderer.poll_action()
                 if action in _CARDINAL_ACTION_DELTAS:
                     held_directions.add(action)
+                    press_order_counter += 1
+                    direction_pressed_order[action] = press_order_counter
                     esper.process(None)
                     continue
                 if action in _RELEASE_TO_DIRECTION:
@@ -999,14 +1027,14 @@ def main() -> None:
                     esper.process(None)
                     continue
                 if action == "confirm_action":
-                    live_action = _action_from_held_keys(held_directions)
+                    live_action = _action_from_held_keys(held_directions, direction_pressed_order)
                     if live_action is not None:
                         esper.process(live_action)
                     else:
                         esper.process(None)
                     continue
                 if action == "menu_select":
-                    interact_action = _action_from_held_keys(held_directions)
+                    interact_action = _action_from_held_keys(held_directions, direction_pressed_order)
                     interact_npc = _find_interaction_npc(interact_action)
                     if interact_npc is not None:
                         dialogue_choice = _draw_dialogue_menu(renderer, interact_npc)

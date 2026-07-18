@@ -94,9 +94,9 @@ def test_move_action_updates_position_and_rendered_player_location() -> None:
     _game_map, renderer, player_pos = _setup_world()
 
     start = (player_pos.x, player_pos.y)
-    esper.process("move_right")
+    esper.process("move_left")
 
-    assert (player_pos.x, player_pos.y) == (start[0] + 1, start[1])
+    assert (player_pos.x, player_pos.y) == (start[0] - 1, start[1])
     assert renderer.glyphs[(player_pos.x, player_pos.y)] == "@"
 
 
@@ -189,7 +189,7 @@ def test_player_attacks_enemy_on_collision() -> None:
         for _ent, (pos, _corpse, name) in esper.get_components(Position, Corpse, Name)
     ]
 
-    assert (player_pos.x, player_pos.y) == (6, 4)
+    assert (player_pos.x, player_pos.y) == (5, 4)
     assert not esper.entity_exists(enemy_ent)
     assert len(corpses) == 1
     assert (corpses[0][0].x, corpses[0][0].y) == (6, 4)

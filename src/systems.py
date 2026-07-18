@@ -105,7 +105,6 @@ class MovementProcessor(esper.Processor):
                     esper.create_entity(Position(nx, ny), Renderable("%"), Name(corpse_name), Corpse())
                     if self.on_enemy_death is not None:
                         self.on_enemy_death()
-                    pos.x, pos.y = nx, ny
                     continue
 
                 if esper.has_component(target_ent, Friendly):

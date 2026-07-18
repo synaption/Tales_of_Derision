@@ -105,15 +105,11 @@ class PygameRenderer(Renderer):
             return None
 
         while True:
-            now = self._pygame.time.get_ticks()
-            if self._space_held and now >= self._next_space_repeat_ms:
-                self._next_space_repeat_ms = now + self._space_repeat_interval_ms
-                return "confirm_action"
-
             events = self._pygame.event.get()
-            if not events:
-                self._pygame.time.wait(8)
-                continue
+            now = self._pygame.time.get_ticks()
+
+            action_from_events: str | None = None
+            space_pressed_this_batch = False
 
             for event in events:
                 if event.type == self._pygame.QUIT:
@@ -124,10 +120,11 @@ class PygameRenderer(Renderer):
                         if not self._space_held:
                             self._space_held = True
                             self._next_space_repeat_ms = now + self._space_initial_delay_ms
-                        return "confirm_action"
+                        space_pressed_this_batch = True
+                        continue
 
                     if event.key in self._keydown_to_action:
-                        return self._keydown_to_action[event.key]
+                        action_from_events = self._keydown_to_action[event.key]
 
                 if event.type == self._pygame.KEYUP:
                     if event.key == self._pygame.K_SPACE:
@@ -135,4 +132,17 @@ class PygameRenderer(Renderer):
                         continue
 
                     if event.key in self._keyup_to_action:
-                        return self._keyup_to_action[event.key]
+                        action_from_events = self._keyup_to_action[event.key]
+
+            # Always consume direction transitions before emitting confirm.
+            if action_from_events is not None:
+                return action_from_events
+
+            if space_pressed_this_batch:
+                return "confirm_action"
+
+            if self._space_held and now >= self._next_space_repeat_ms:
+                self._next_space_repeat_ms = now + self._space_repeat_interval_ms
+                return "confirm_action"
+
+            self._pygame.time.wait(8)
