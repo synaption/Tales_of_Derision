@@ -5,6 +5,7 @@ process() receives whatever args are passed to esper.process().
 """
 import esper
 
+from audio_sfx import CombatSfxPlayer
 from components import BlocksMovement, Dialogue, Enemy, Friendly, Name, NPC, Player, Position, Renderable, Vision
 from game_map import GameMap
 from renderer.base import Renderer
@@ -56,8 +57,9 @@ def _pull_turn_events() -> list[str]:
 class MovementProcessor(esper.Processor):
     """Applies a movement action to every player-controlled entity."""
 
-    def __init__(self, game_map: GameMap):
+    def __init__(self, game_map: GameMap, combat_sfx: CombatSfxPlayer | None = None):
         self.game_map = game_map
+        self.combat_sfx = combat_sfx
 
     def process(self, action: str | None = None) -> None:
         delta = _ACTION_DELTAS.get(action)
@@ -84,8 +86,12 @@ class MovementProcessor(esper.Processor):
                     target_name = esper.component_for_entity(target_ent, Name).value
 
                 if esper.has_component(target_ent, Enemy):
+                    if self.combat_sfx is not None:
+                        self.combat_sfx.play_attack()
                     _push_turn_event(f"You attack {target_name}.")
                     esper.delete_entity(target_ent, immediate=True)
+                    if self.combat_sfx is not None:
+                        self.combat_sfx.play_death()
                     pos.x, pos.y = nx, ny
                     continue
 

@@ -3,6 +3,7 @@
   "show_fps": false,
   "audio_buffer": 16384,
   "audio_separate_process": true,
+  "combat_sfx": true,
   "keybinds": {
     "up": [
       "w",

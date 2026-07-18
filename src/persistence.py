@@ -24,6 +24,7 @@ _DEFAULT_OPTIONS = {
     "show_fps": False,
     "audio_buffer": 16384,
     "audio_separate_process": True,
+    "combat_sfx": True,
     "keybinds": {
         "up": ["w", "k", "up"],
         "down": ["s", "j", "down"],

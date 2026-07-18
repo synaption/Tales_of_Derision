@@ -30,6 +30,9 @@ Move: wasd (also arrow keys / hjkl). Menu: Esc. Save/Quit are in the menu.
   (default `16384` in this build). If audio is still choppy, increase it.
 - `audio_separate_process` in `data/config/options.json` runs music playback in
   a background process (default `true`), which can reduce stutter in WSL.
+- Combat defaults: attack uses `400 Sounds Pack/Combat and Gore/swipe.wav`,
+  death uses `400 Sounds Pack/Combat and Gore/splat_quick.wav`.
+- `combat_sfx` in `data/config/options.json` toggles combat SFX (default `true`).
 
 Install `pygame` for music playback:
 

@@ -13,6 +13,7 @@ from typing import Any
 
 import esper
 
+from audio_sfx import CombatSfxPlayer
 from components import BlocksMovement, Dialogue, Enemy, Friendly, NPC, Name, Player, Position, Renderable, Vision
 from game_map import GameMap
 from persistence import (
@@ -302,8 +303,8 @@ def _draw_pause_menu(renderer: TerminalRenderer, options: dict) -> str:
             return chosen
 
 
-def _setup_world(game_map: GameMap, player_position: Position) -> None:
-    esper.add_processor(MovementProcessor(game_map), priority=1)
+def _setup_world(game_map: GameMap, player_position: Position, options: dict) -> None:
+    esper.add_processor(MovementProcessor(game_map, combat_sfx=CombatSfxPlayer(options)), priority=1)
     esper.add_processor(NpcAiProcessor(game_map), priority=0)
     esper.create_entity(player_position, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
 
@@ -370,7 +371,7 @@ def main() -> None:
                     MAP_HEIGHT,
                 )
 
-            _setup_world(game_map, player_position)
+            _setup_world(game_map, player_position, options)
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame
