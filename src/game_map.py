@@ -74,6 +74,19 @@ class GameMap:
         candidates = [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
         return [(nx, ny) for nx, ny in candidates if self.in_bounds(nx, ny)]
 
+    def neighbors_8(self, x: int, y: int) -> list[tuple[int, int]]:
+        candidates = [
+            (x + 1, y),
+            (x - 1, y),
+            (x, y + 1),
+            (x, y - 1),
+            (x + 1, y + 1),
+            (x + 1, y - 1),
+            (x - 1, y + 1),
+            (x - 1, y - 1),
+        ]
+        return [(nx, ny) for nx, ny in candidates if self.in_bounds(nx, ny)]
+
     def line_points(self, start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
         """Return Bresenham line points from start to end, inclusive."""
         x0, y0 = start
@@ -118,7 +131,7 @@ class GameMap:
         goal: tuple[int, int],
         blocked_tiles: set[tuple[int, int]] | None = None,
     ) -> list[tuple[int, int]]:
-        """Find a shortest 4-way path from start to goal using BFS.
+        """Find a shortest 8-way path from start to goal using BFS.
 
         Returns a list of coordinates excluding start and including goal.
         Returns [] when no path exists.
@@ -137,7 +150,7 @@ class GameMap:
             if current == goal:
                 break
 
-            for nxt in self.neighbors_4(current[0], current[1]):
+            for nxt in self.neighbors_8(current[0], current[1]):
                 if nxt in came_from:
                     continue
                 if not self.is_walkable(nxt[0], nxt[1]):

@@ -55,7 +55,7 @@ def test_initial_tick_renders_map_player_and_status_line() -> None:
     assert renderer.glyphs[(0, 0)] == game_map.WALL
     assert renderer.glyphs[(1, 1)] == game_map.FLOOR
     assert renderer.glyphs[(player_pos.x, player_pos.y)] == "@"
-    assert (0, game_map.height, "move: arrows/hjkl/wasd   inventory: i   menu: esc") in renderer.text
+    assert (0, game_map.height, "WASD set axis (combine for diagonal)  Space confirm  Enter interact  I inventory  Esc") in renderer.text
     sidebar_x = game_map.width + 2
     assert (sidebar_x, 0, "== NEARBY ==") in renderer.text
     assert any(text.startswith("g → Goblin") for _x, _y, text in renderer.text)
@@ -197,7 +197,7 @@ def test_player_attacks_enemy_on_collision() -> None:
     assert any(text == "You attack Goblin." for _x, _y, text in renderer.text)
 
 
-def test_player_bumps_friendly_and_gets_dialogue() -> None:
+def test_player_bumps_friendly_and_gets_interaction_prompt() -> None:
     game_map = GameMap(12, 8)
     renderer = FakeRenderer()
 
@@ -221,10 +221,7 @@ def test_player_bumps_friendly_and_gets_dialogue() -> None:
     esper.process("move_right")
 
     assert (player_pos.x, player_pos.y) == (5, 4)
-    assert any(
-        text.startswith('Friendly Villager says: "##!')
-        for _x, _y, text in renderer.text
-    )
+    assert any(text.startswith("Friendly Villager blocks you") for _x, _y, text in renderer.text)
     assert not any(text == "You bump into a wall." for _x, _y, text in renderer.text)
 
 

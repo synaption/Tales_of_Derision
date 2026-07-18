@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 import esper
 
-from components import BlocksMovement, Corpse, Dialogue, Enemy, Friendly, Name, NPC, Player, Position, Renderable, Vision
+from components import BlocksMovement, Corpse, Enemy, Friendly, Name, NPC, Player, Position, Renderable, Vision
 from game_map import GameMap
 from renderer.base import Renderer
 
@@ -16,6 +16,10 @@ _ACTION_DELTAS = {
     "move_down": (0, 1),
     "move_left": (-1, 0),
     "move_right": (1, 0),
+    "move_up_left": (-1, -1),
+    "move_up_right": (1, -1),
+    "move_down_left": (-1, 1),
+    "move_down_right": (1, 1),
 }
 
 _DIR_TO_ARROW = {
@@ -104,9 +108,8 @@ class MovementProcessor(esper.Processor):
                     pos.x, pos.y = nx, ny
                     continue
 
-                if esper.has_component(target_ent, Dialogue):
-                    line = esper.component_for_entity(target_ent, Dialogue).line
-                    _push_turn_event(f"{target_name} says: \"{line}\"")
+                if esper.has_component(target_ent, Friendly):
+                    _push_turn_event(f"{target_name} blocks your way. Press Enter to interact.")
                     continue
 
                 _push_turn_event("Something blocks your way.")
@@ -407,5 +410,5 @@ class RenderProcessor(esper.Processor):
 
         self._draw_sidebar(player_pos, entity_lookup)
 
-        r.draw_text(0, self.game_map.height, "move: arrows/hjkl/wasd   inventory: i   menu: esc")
+        r.draw_text(0, self.game_map.height, "WASD set axis (combine for diagonal)  Space confirm  Enter interact  I inventory  Esc")
         r.present()

@@ -5,6 +5,7 @@ The game logic never touches curses -- swap TerminalRenderer for a
 tcod/pygame/raylib renderer and nothing else changes.
 """
 import argparse
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
@@ -23,11 +24,37 @@ from persistence import (
     save_game,
     save_options,
 )
-from renderer.terminal import TerminalRenderer
+from renderer.base import Renderer
+from renderer.pygame_renderer import PygameRenderer
 from systems import MovementProcessor, NpcAiProcessor, RenderProcessor
 
 MAP_WIDTH = 40
 MAP_HEIGHT = 20
+
+_CARDINAL_ACTION_DELTAS = {
+    "move_up": (0, -1),
+    "move_down": (0, 1),
+    "move_left": (-1, 0),
+    "move_right": (1, 0),
+}
+
+_VECTOR_TO_ACTION = {
+    (-1, -1): "move_up_left",
+    (0, -1): "move_up",
+    (1, -1): "move_up_right",
+    (-1, 0): "move_left",
+    (1, 0): "move_right",
+    (-1, 1): "move_down_left",
+    (0, 1): "move_down",
+    (1, 1): "move_down_right",
+}
+
+_RELEASE_TO_DIRECTION = {
+    "release_up": "move_up",
+    "release_down": "move_down",
+    "release_left": "move_left",
+    "release_right": "move_right",
+}
 
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_SAMPLE_SIZE = -16
@@ -231,7 +258,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _draw_title_screen(renderer: TerminalRenderer) -> bool:
+def _draw_title_screen(renderer: Renderer) -> bool:
     while True:
         renderer.clear()
         renderer.draw_text(12, 6, "PYRL2")
@@ -247,7 +274,7 @@ def _draw_title_screen(renderer: TerminalRenderer) -> bool:
             return True
 
 
-def _draw_main_menu(renderer: TerminalRenderer) -> str:
+def _draw_main_menu(renderer: Renderer) -> str:
     options = ["Continue", "New Game", "Quit"]
     selected = 0
 
@@ -257,7 +284,7 @@ def _draw_main_menu(renderer: TerminalRenderer) -> str:
         for idx, item in enumerate(options):
             prefix = "> " if idx == selected else "  "
             renderer.draw_text(10, 8 + idx, f"{prefix}{item}")
-        renderer.draw_text(3, 14, "Use arrows/WASD, Enter to select")
+        renderer.draw_text(3, 14, "Use W/S to move, Enter to select")
         renderer.present()
 
         action = renderer.poll_action()
@@ -272,7 +299,7 @@ def _draw_main_menu(renderer: TerminalRenderer) -> str:
             return lowered
 
 
-def _draw_options_menu(renderer: TerminalRenderer, options: dict) -> str:
+def _draw_options_menu(renderer: Renderer, options: dict) -> str:
     selected = 0
 
     while True:
@@ -289,7 +316,7 @@ def _draw_options_menu(renderer: TerminalRenderer, options: dict) -> str:
         for idx, item in enumerate(items):
             prefix = "> " if idx == selected else "  "
             renderer.draw_text(8, 8 + idx, f"{prefix}{item}")
-        renderer.draw_text(2, 14, "Use arrows/WASD, Enter to toggle/select")
+        renderer.draw_text(2, 14, "Use W/S to move, Enter to toggle/select")
         renderer.draw_text(2, 15, "Esc to return")
         renderer.present()
 
@@ -311,7 +338,7 @@ def _draw_options_menu(renderer: TerminalRenderer, options: dict) -> str:
                 return "back"
 
 
-def _draw_pause_menu(renderer: TerminalRenderer, options: dict) -> str:
+def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
     menu_items = ["Save Game", "Options", "Quit"]
     selected = 0
 
@@ -321,7 +348,7 @@ def _draw_pause_menu(renderer: TerminalRenderer, options: dict) -> str:
         for idx, item in enumerate(menu_items):
             prefix = "> " if idx == selected else "  "
             renderer.draw_text(10, 8 + idx, f"{prefix}{item}")
-        renderer.draw_text(3, 14, "Use arrows/WASD, Enter to select")
+        renderer.draw_text(3, 14, "Use W/S to move, Enter to select")
         renderer.draw_text(3, 15, "Esc to resume")
         renderer.present()
 
@@ -413,11 +440,339 @@ def _first_player_entity() -> int | None:
     return None
 
 
-def _draw_inventory_menu(renderer: TerminalRenderer) -> str:
+def _entity_name(entity_id: int, fallback: str = "Unknown") -> str:
+    if esper.has_component(entity_id, Name):
+        return esper.component_for_entity(entity_id, Name).value
+    return fallback
+
+
+def _direction_target_xy(direction_action: str | None, origin: Position) -> tuple[int, int] | None:
+    if direction_action in _CARDINAL_ACTION_DELTAS:
+        dx, dy = _CARDINAL_ACTION_DELTAS[direction_action]
+        return (origin.x + dx, origin.y + dy)
+    if direction_action in _VECTOR_TO_ACTION.values():
+        for (dx, dy), action in _VECTOR_TO_ACTION.items():
+            if action == direction_action:
+                return (origin.x + dx, origin.y + dy)
+        return None
+
+
+def _action_from_held_keys(
+    held_directions: set[str],
+) -> str | None:
+    dx = 0
+    dy = 0
+
+    if "move_left" in held_directions and "move_right" not in held_directions:
+        dx = -1
+    elif "move_right" in held_directions and "move_left" not in held_directions:
+        dx = 1
+
+    if "move_up" in held_directions and "move_down" not in held_directions:
+        dy = -1
+    elif "move_down" in held_directions and "move_up" not in held_directions:
+        dy = 1
+
+    if dx == 0 and dy == 0:
+        return None
+    return _VECTOR_TO_ACTION.get((dx, dy))
+
+
+def _find_interaction_npc(direction_action: str | None) -> int | None:
+    player_ent = _first_player_entity()
+    if player_ent is None or not esper.has_component(player_ent, Position):
+        return None
+
+    player_pos = esper.component_for_entity(player_ent, Position)
+    position_to_npc: dict[tuple[int, int], int] = {}
+    for ent, (pos, _npc) in esper.get_components(Position, NPC):
+        if esper.has_component(ent, Enemy):
+            continue
+        position_to_npc[(pos.x, pos.y)] = ent
+
+    preferred_xy = _direction_target_xy(direction_action, player_pos)
+    if preferred_xy is not None and preferred_xy in position_to_npc:
+        return position_to_npc[preferred_xy]
+
+    for action_name in ("move_up", "move_right", "move_down", "move_left"):
+        adjacent_xy = _direction_target_xy(action_name, player_pos)
+        if adjacent_xy is not None and adjacent_xy in position_to_npc:
+            return position_to_npc[adjacent_xy]
+    return None
+
+
+def _npc_info_lines(npc_ent: int) -> list[str]:
+    npc_name = _entity_name(npc_ent, fallback="Unknown NPC")
+    disposition = "Friendly"
+    if esper.has_component(npc_ent, Enemy):
+        disposition = "Hostile"
+
+    dialogue_line = "..."
+    if esper.has_component(npc_ent, Dialogue):
+        dialogue_line = esper.component_for_entity(npc_ent, Dialogue).line
+
+    inventory_count = 0
+    if esper.has_component(npc_ent, Inventory):
+        inventory_count = len(esper.component_for_entity(npc_ent, Inventory).items)
+
+    equipped_count = 0
+    if esper.has_component(npc_ent, Equipment):
+        slots = esper.component_for_entity(npc_ent, Equipment).slots
+        equipped_count = sum(1 for item in slots.values() if item)
+
+    return [
+        f"Name: {npc_name}",
+        f"Disposition: {disposition}",
+        f"Says: {dialogue_line}",
+        f"Stock: {inventory_count} carried, {equipped_count} equipped",
+    ]
+
+
+@dataclass
+class _TradeEntry:
+    kind: str
+    item_name: str
+    slot_name: str | None = None
+    item_index: int | None = None
+
+
+def _list_trade_entries(actor_ent: int) -> list[_TradeEntry]:
+    entries: list[_TradeEntry] = []
+
+    if esper.has_component(actor_ent, Inventory):
+        items = esper.component_for_entity(actor_ent, Inventory).items
+        for idx, item_name in enumerate(items):
+            entries.append(_TradeEntry(kind="inventory", item_name=item_name, item_index=idx))
+
+    if esper.has_component(actor_ent, Equipment):
+        slots = esper.component_for_entity(actor_ent, Equipment).slots
+        for slot_name in sorted(slots.keys()):
+            equipped_item = slots.get(slot_name)
+            if equipped_item:
+                entries.append(_TradeEntry(kind="equipment", item_name=equipped_item, slot_name=slot_name))
+
+    return entries
+
+
+def _remove_trade_entry(actor_ent: int, entry: _TradeEntry) -> str | None:
+    if entry.kind == "inventory":
+        if not esper.has_component(actor_ent, Inventory):
+            return None
+        inventory = esper.component_for_entity(actor_ent, Inventory)
+        if entry.item_index is None:
+            return None
+        if entry.item_index < 0 or entry.item_index >= len(inventory.items):
+            return None
+        return inventory.items.pop(entry.item_index)
+
+    if entry.kind == "equipment":
+        if not esper.has_component(actor_ent, Equipment) or not entry.slot_name:
+            return None
+        equipment = esper.component_for_entity(actor_ent, Equipment)
+        item = equipment.slots.get(entry.slot_name)
+        if not item:
+            return None
+        equipment.slots[entry.slot_name] = None
+        return item
+
+    return None
+
+
+def _ensure_inventory(actor_ent: int) -> Inventory:
+    if esper.has_component(actor_ent, Inventory):
+        return esper.component_for_entity(actor_ent, Inventory)
+
+    inventory = Inventory(items=[])
+    esper.add_component(actor_ent, inventory)
+    return inventory
+
+
+def _trade_item(source_ent: int, target_ent: int, entry: _TradeEntry) -> str:
+    source_name = _entity_name(source_ent)
+    target_name = _entity_name(target_ent)
+
+    item_name = _remove_trade_entry(source_ent, entry)
+    if item_name is None:
+        return "Trade failed. Item was no longer available."
+
+    target_inventory = _ensure_inventory(target_ent)
+    target_inventory.items.append(item_name)
+    return f"{source_name} traded {item_name} to {target_name}."
+
+
+def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
+    player_ent = _first_player_entity()
+    if player_ent is None:
+        return "close"
+
+    selected_panel = "left"
+    selected_npc_idx = 0
+    selected_player_idx = 0
+    message = "Enter: trade selected item  A/D: switch side  W/S: move"
+
+    while True:
+        npc_entries = _list_trade_entries(npc_ent)
+        player_entries = _list_trade_entries(player_ent)
+
+        if npc_entries:
+            selected_npc_idx = max(0, min(selected_npc_idx, len(npc_entries) - 1))
+        else:
+            selected_npc_idx = 0
+
+        if player_entries:
+            selected_player_idx = max(0, min(selected_player_idx, len(player_entries) - 1))
+        else:
+            selected_player_idx = 0
+
+        npc_name = _entity_name(npc_ent, fallback="NPC")
+        player_name = _entity_name(player_ent, fallback="You")
+
+        renderer.clear()
+        renderer.draw_text(2, 1, f"TRADE - {npc_name}")
+        renderer.draw_text(2, 2, "Esc or i to close")
+
+        left_x = 2
+        right_x = 40
+        top_y = 4
+
+        renderer.draw_text(left_x, top_y, f"== {npc_name} (LEFT) ==")
+        y = top_y + 2
+        if not npc_entries:
+            prefix = "> " if selected_panel == "left" else "  "
+            renderer.draw_text(left_x, y, f"{prefix}(empty)")
+        else:
+            for idx, entry in enumerate(npc_entries):
+                prefix = "> " if selected_panel == "left" and idx == selected_npc_idx else "  "
+                if entry.kind == "equipment":
+                    label = f"[E] {entry.slot_name}: {entry.item_name}"
+                else:
+                    label = entry.item_name
+                renderer.draw_text(left_x, y, f"{prefix}{label}"[:36])
+                y += 1
+
+        renderer.draw_text(right_x, top_y, f"== {player_name} (RIGHT) ==")
+        y = top_y + 2
+        if not player_entries:
+            prefix = "> " if selected_panel == "right" else "  "
+            renderer.draw_text(right_x, y, f"{prefix}(empty)")
+        else:
+            for idx, entry in enumerate(player_entries):
+                prefix = "> " if selected_panel == "right" and idx == selected_player_idx else "  "
+                if entry.kind == "equipment":
+                    label = f"[E] {entry.slot_name}: {entry.item_name}"
+                else:
+                    label = entry.item_name
+                renderer.draw_text(right_x, y, f"{prefix}{label}"[:36])
+                y += 1
+
+        renderer.draw_text(2, top_y + 14, message[:76])
+        renderer.present()
+
+        action = renderer.poll_action()
+        if action in {"open_pause_menu", "open_inventory"}:
+            return "close"
+        if action == "quit":
+            return "quit"
+        if action == "move_left":
+            selected_panel = "left"
+            continue
+        if action == "move_right":
+            selected_panel = "right"
+            continue
+        if action == "move_up":
+            if selected_panel == "left" and npc_entries:
+                selected_npc_idx = (selected_npc_idx - 1) % len(npc_entries)
+            elif selected_panel == "right" and player_entries:
+                selected_player_idx = (selected_player_idx - 1) % len(player_entries)
+            continue
+        if action == "move_down":
+            if selected_panel == "left" and npc_entries:
+                selected_npc_idx = (selected_npc_idx + 1) % len(npc_entries)
+            elif selected_panel == "right" and player_entries:
+                selected_player_idx = (selected_player_idx + 1) % len(player_entries)
+            continue
+
+        if action == "menu_select":
+            if selected_panel == "left":
+                if not npc_entries:
+                    message = f"{npc_name} has nothing to trade."
+                    continue
+                entry = npc_entries[selected_npc_idx]
+                message = _trade_item(npc_ent, player_ent, entry)
+            else:
+                if not player_entries:
+                    message = "You have nothing to trade."
+                    continue
+                entry = player_entries[selected_player_idx]
+                message = _trade_item(player_ent, npc_ent, entry)
+
+
+def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
+    selected = 0
+    options = ["Talk", "Trade", "Leave"]
+    info_lines = _npc_info_lines(npc_ent)
+    talk_line = ""
+
+    while True:
+        npc_name = _entity_name(npc_ent, fallback="Unknown NPC")
+
+        renderer.clear()
+        renderer.draw_text(2, 1, f"DIALOGUE - {npc_name}")
+        renderer.draw_text(2, 2, "Esc to close")
+
+        y = 4
+        for line in info_lines:
+            renderer.draw_text(2, y, line[:76])
+            y += 1
+
+        y += 1
+        renderer.draw_text(2, y, "== OPTIONS ==")
+        y += 1
+        for idx, option in enumerate(options):
+            prefix = "> " if idx == selected else "  "
+            renderer.draw_text(2, y + idx, f"{prefix}{option}")
+
+        if talk_line:
+            renderer.draw_text(2, y + 5, talk_line[:76])
+
+        renderer.present()
+        action = renderer.poll_action()
+
+        if action in {"open_pause_menu", "open_inventory"}:
+            return "close"
+        if action == "quit":
+            return "quit"
+        if action == "move_up":
+            selected = (selected - 1) % len(options)
+            continue
+        if action == "move_down":
+            selected = (selected + 1) % len(options)
+            continue
+
+        if action == "menu_select":
+            choice = options[selected]
+            if choice == "Leave":
+                return "close"
+            if choice == "Talk":
+                if esper.has_component(npc_ent, Dialogue):
+                    line = esper.component_for_entity(npc_ent, Dialogue).line
+                    talk_line = f"{npc_name}: \"{line}\""
+                else:
+                    talk_line = f"{npc_name} has nothing to say."
+                continue
+            if choice == "Trade":
+                trade_choice = _draw_trade_menu(renderer, npc_ent)
+                if trade_choice == "quit":
+                    return "quit"
+                info_lines = _npc_info_lines(npc_ent)
+                talk_line = ""
+
+
+def _draw_inventory_menu(renderer: Renderer) -> str:
     selected_panel = "left"
     selected_slot_idx = 0
     selected_item_idx = 0
-    message = "Enter: equip/unequip  A/D or arrows: switch side  W/S or arrows: move"
+    message = "Enter: equip/unequip  A/D: switch side  W/S: move"
 
     while True:
         player_ent = _first_player_entity()
@@ -596,7 +951,7 @@ def main() -> None:
     player_position = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
 
     try:
-        with TerminalRenderer() as renderer:
+        with PygameRenderer() as renderer:
             if args.save_file is None:
                 if not _draw_title_screen(renderer):
                     return
@@ -632,16 +987,45 @@ def main() -> None:
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame
+            held_directions: set[str] = set()
             while True:
                 action = renderer.poll_action()
+                if action in _CARDINAL_ACTION_DELTAS:
+                    held_directions.add(action)
+                    esper.process(None)
+                    continue
+                if action in _RELEASE_TO_DIRECTION:
+                    held_directions.discard(_RELEASE_TO_DIRECTION[action])
+                    esper.process(None)
+                    continue
+                if action == "confirm_action":
+                    live_action = _action_from_held_keys(held_directions)
+                    if live_action is not None:
+                        esper.process(live_action)
+                    else:
+                        esper.process(None)
+                    continue
+                if action == "menu_select":
+                    interact_action = _action_from_held_keys(held_directions)
+                    interact_npc = _find_interaction_npc(interact_action)
+                    if interact_npc is not None:
+                        dialogue_choice = _draw_dialogue_menu(renderer, interact_npc)
+                        held_directions.clear()
+                        if dialogue_choice == "quit":
+                            break
+                        esper.process(None)
+                        continue
+
                 if action == "open_inventory":
                     inventory_choice = _draw_inventory_menu(renderer)
+                    held_directions.clear()
                     if inventory_choice == "quit":
                         break
                     esper.process(None)
                     continue
                 if action == "open_pause_menu":
                     pause_choice = _draw_pause_menu(renderer, options)
+                    held_directions.clear()
                     if pause_choice == "save_game":
                         player_pos = first_player_position() or player_position
                         save_game(game_map, selected_save_file, player_pos)

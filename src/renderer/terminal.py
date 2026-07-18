@@ -7,20 +7,17 @@ import curses
 
 from .base import Renderer
 
-# Raw key -> abstract action. Supports arrows, vi keys (hjkl), and wasd.
+# Raw key -> abstract action. Movement uses WASD and confirms with Space.
 _KEY_TO_ACTION = {
-    curses.KEY_UP: "move_up",
-    curses.KEY_DOWN: "move_down",
-    curses.KEY_LEFT: "move_left",
-    curses.KEY_RIGHT: "move_right",
-    ord("k"): "move_up",
-    ord("j"): "move_down",
-    ord("h"): "move_left",
-    ord("l"): "move_right",
     ord("w"): "move_up",
     ord("s"): "move_down",
     ord("a"): "move_left",
     ord("d"): "move_right",
+    ord("W"): "move_up",
+    ord("S"): "move_down",
+    ord("A"): "move_left",
+    ord("D"): "move_right",
+    ord(" "): "confirm_action",
     ord("i"): "open_inventory",
     ord("I"): "open_inventory",
     curses.KEY_ENTER: "menu_select",
