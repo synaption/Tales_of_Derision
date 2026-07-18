@@ -74,16 +74,14 @@ def _pick_music_track(music_dir: Path) -> Path | None:
     return candidates[0]
 
 
-def _start_background_music(options: dict | None = None) -> Any | None:
-    music_dir = Path(__file__).resolve().parent.parent / "audio" / "music"
-    track = _pick_music_track(music_dir)
-    if track is None:
-        return None
-
+def _init_pygame_mixer(options: dict | None = None) -> Any | None:
     try:
         import pygame
     except ModuleNotFoundError:
         return None
+
+    if pygame.mixer.get_init() is not None:
+        return pygame
 
     original_driver = os.environ.get("SDL_AUDIODRIVER")
     last_error: Exception | None = None
@@ -106,8 +104,10 @@ def _start_background_music(options: dict | None = None) -> Any | None:
                     buffer=buffer_size,
                     allowedchanges=0,
                 )
-                pygame.mixer.music.load(str(track))
-                pygame.mixer.music.play(-1)
+                if original_driver is None:
+                    os.environ.pop("SDL_AUDIODRIVER", None)
+                else:
+                    os.environ["SDL_AUDIODRIVER"] = original_driver
                 return pygame
             except Exception as exc:
                 last_error = exc
@@ -124,6 +124,88 @@ def _start_background_music(options: dict | None = None) -> Any | None:
     if last_error is not None:
         print(f"Audio disabled: {last_error}", file=sys.stderr)
     return None
+
+
+def _start_background_music(options: dict | None = None) -> Any | None:
+    pygame = _init_pygame_mixer(options)
+    if pygame is None:
+        return None
+
+    music_dir = Path(__file__).resolve().parent.parent / "audio" / "music"
+    track = _pick_music_track(music_dir)
+    if track is None:
+        return pygame
+
+    try:
+        pygame.mixer.music.load(str(track))
+        pygame.mixer.music.play(-1)
+    except Exception as exc:
+        print(f"Music disabled: {exc}", file=sys.stderr)
+
+    return pygame
+
+
+class _CombatSfxPlayer:
+    def __init__(self, pygame_module: Any | None, options: dict | None = None):
+        self._pygame = pygame_module
+        self._channel: Any | None = None
+        self._enabled = True
+        if isinstance(options, dict):
+            self._enabled = bool(options.get("combat_sfx", True))
+
+        self._melee_sound: Any | None = None
+        self._death_sound: Any | None = None
+        if not self._enabled or self._pygame is None:
+            return
+
+        try:
+            self._channel = self._pygame.mixer.find_channel()
+        except Exception:
+            self._channel = None
+
+        self._melee_sound = self._load_sound(options, "melee_attack_sfx", "audio/sfx/swipe.wav")
+        self._death_sound = self._load_sound(options, "death_sfx", "audio/sfx/splat_quick.wav")
+
+    @staticmethod
+    def _resolve_sound_path(path_value: str) -> Path:
+        candidate = Path(path_value)
+        if candidate.is_absolute():
+            return candidate
+        return Path(__file__).resolve().parent.parent / candidate
+
+    def _load_sound(self, options: dict | None, key: str, fallback: str) -> Any | None:
+        configured = fallback
+        if isinstance(options, dict) and isinstance(options.get(key), str):
+            configured = options[key]
+
+        try:
+            sound_path = self._resolve_sound_path(configured)
+            if not sound_path.exists():
+                return None
+            return self._pygame.mixer.Sound(str(sound_path))
+        except Exception:
+            return None
+
+    def _play(self, sound: Any | None, queue_if_busy: bool = False) -> None:
+        if sound is None:
+            return
+        try:
+            if self._channel is not None:
+                if queue_if_busy and self._channel.get_busy():
+                    self._channel.queue(sound)
+                else:
+                    self._channel.play(sound)
+                return
+            sound.play()
+        except Exception:
+            return
+
+    def play_melee_attack(self) -> None:
+        self._play(self._melee_sound)
+
+    def play_death(self) -> None:
+        # When called immediately after melee, queue death so it plays next.
+        self._play(self._death_sound, queue_if_busy=True)
 
 
 def _stop_background_music(pygame_module: Any | None) -> None:
@@ -261,8 +343,6 @@ def _draw_pause_menu(renderer: TerminalRenderer, options: dict) -> str:
 
 
 def _setup_world(game_map: GameMap, player_position: Position) -> None:
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(NpcAiProcessor(game_map), priority=0)
     esper.create_entity(player_position, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
 
     villager_pos = Position(max(2, player_position.x - 2), player_position.y + 1)
@@ -287,6 +367,7 @@ def main() -> None:
     bootstrap_files(MAP_WIDTH, MAP_HEIGHT)
     options = load_options()
     pygame_module = _start_background_music(options)
+    combat_sfx = _CombatSfxPlayer(pygame_module, options)
 
     selected_save_file = args.save_file
 
@@ -321,6 +402,15 @@ def main() -> None:
                 )
 
             _setup_world(game_map, player_position)
+            esper.add_processor(
+                MovementProcessor(
+                    game_map,
+                    on_melee_attack=combat_sfx.play_melee_attack,
+                    on_enemy_death=combat_sfx.play_death,
+                ),
+                priority=1,
+            )
+            esper.add_processor(NpcAiProcessor(game_map), priority=0)
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame

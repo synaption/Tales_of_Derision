@@ -23,6 +23,9 @@ _DEFAULT_OPTIONS = {
     "fullscreen": False,
     "show_fps": False,
     "audio_buffer": 16384,
+    "combat_sfx": True,
+    "melee_attack_sfx": "audio/sfx/swipe.wav",
+    "death_sfx": "audio/sfx/splat_quick.wav",
     "keybinds": {
         "up": ["w", "k", "up"],
         "down": ["s", "j", "down"],

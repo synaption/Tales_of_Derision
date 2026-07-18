@@ -3,6 +3,8 @@
 esper 3.x uses module-level state and esper.Processor subclasses whose
 process() receives whatever args are passed to esper.process().
 """
+from collections.abc import Callable
+
 import esper
 
 from components import BlocksMovement, Dialogue, Enemy, Friendly, Name, NPC, Player, Position, Renderable, Vision
@@ -56,8 +58,15 @@ def _pull_turn_events() -> list[str]:
 class MovementProcessor(esper.Processor):
     """Applies a movement action to every player-controlled entity."""
 
-    def __init__(self, game_map: GameMap):
+    def __init__(
+        self,
+        game_map: GameMap,
+        on_melee_attack: Callable[[], None] | None = None,
+        on_enemy_death: Callable[[], None] | None = None,
+    ):
         self.game_map = game_map
+        self.on_melee_attack = on_melee_attack
+        self.on_enemy_death = on_enemy_death
 
     def process(self, action: str | None = None) -> None:
         delta = _ACTION_DELTAS.get(action)
@@ -85,7 +94,11 @@ class MovementProcessor(esper.Processor):
 
                 if esper.has_component(target_ent, Enemy):
                     _push_turn_event(f"You attack {target_name}.")
+                    if self.on_melee_attack is not None:
+                        self.on_melee_attack()
                     esper.delete_entity(target_ent, immediate=True)
+                    if self.on_enemy_death is not None:
+                        self.on_enemy_death()
                     pos.x, pos.y = nx, ny
                     continue
 

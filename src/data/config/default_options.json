@@ -2,6 +2,9 @@
   "fullscreen": false,
   "show_fps": false,
   "audio_buffer": 16384,
+  "combat_sfx": true,
+  "melee_attack_sfx": "audio/sfx/swipe.wav",
+  "death_sfx": "audio/sfx/splat_quick.wav",
   "keybinds": {
     "up": [
       "w",
