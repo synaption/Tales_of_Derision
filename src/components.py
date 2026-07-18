@@ -55,3 +55,8 @@ class Vision:
 @dataclass
 class Dialogue:
     line: str
+
+
+@dataclass
+class Corpse:
+    """Tag component: marks an entity as a dead body."""

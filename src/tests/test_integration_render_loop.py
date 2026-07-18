@@ -3,7 +3,7 @@ from __future__ import annotations
 import esper
 import pytest
 
-from components import BlocksMovement, Dialogue, Enemy, Friendly, NPC, Name, Player, Position, Renderable, Vision
+from components import BlocksMovement, Corpse, Dialogue, Enemy, Friendly, NPC, Name, Player, Position, Renderable, Vision
 from game_map import GameMap
 from systems import MovementProcessor, NpcAiProcessor, RenderProcessor
 from fakes import FakeRenderer
@@ -173,8 +173,16 @@ def test_player_attacks_enemy_on_collision() -> None:
 
     esper.process("move_right")
 
+    corpses = [
+        (pos, name)
+        for _ent, (pos, _corpse, name) in esper.get_components(Position, Corpse, Name)
+    ]
+
     assert (player_pos.x, player_pos.y) == (6, 4)
     assert not esper.entity_exists(enemy_ent)
+    assert len(corpses) == 1
+    assert (corpses[0][0].x, corpses[0][0].y) == (6, 4)
+    assert corpses[0][1].value == "Corpse of Goblin"
     assert any(text == "You attack Goblin." for _x, _y, text in renderer.text)
 
 

@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 import esper
 
-from components import BlocksMovement, Dialogue, Enemy, Friendly, Name, NPC, Player, Position, Renderable, Vision
+from components import BlocksMovement, Corpse, Dialogue, Enemy, Friendly, Name, NPC, Player, Position, Renderable, Vision
 from game_map import GameMap
 from renderer.base import Renderer
 
@@ -96,7 +96,9 @@ class MovementProcessor(esper.Processor):
                     _push_turn_event(f"You attack {target_name}.")
                     if self.on_melee_attack is not None:
                         self.on_melee_attack()
+                    corpse_name = f"Corpse of {target_name}"
                     esper.delete_entity(target_ent, immediate=True)
+                    esper.create_entity(Position(nx, ny), Renderable("%"), Name(corpse_name), Corpse())
                     if self.on_enemy_death is not None:
                         self.on_enemy_death()
                     pos.x, pos.y = nx, ny
@@ -382,17 +384,26 @@ class RenderProcessor(esper.Processor):
                 else:
                     r.draw_glyph(x, y, " ")
 
+        player_draw: tuple[int, int, str, str] | None = None
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
-            if (pos.x, pos.y) not in self._visible_tiles and not esper.has_component(ent, Player):
+            is_player = esper.has_component(ent, Player)
+            if (pos.x, pos.y) not in self._visible_tiles and not is_player:
                 continue
 
             classification = "default"
-            if esper.has_component(ent, Player) or esper.has_component(ent, Friendly):
+            if is_player or esper.has_component(ent, Friendly):
                 classification = "friendly"
             elif esper.has_component(ent, Enemy):
                 classification = "enemy"
 
+            if is_player:
+                player_draw = (pos.x, pos.y, rend.glyph, classification)
+                continue
+
             r.draw_glyph_classified(pos.x, pos.y, rend.glyph, classification)
+
+        if player_draw is not None:
+            r.draw_glyph_classified(player_draw[0], player_draw[1], player_draw[2], player_draw[3])
 
         self._draw_sidebar(player_pos, entity_lookup)
 
