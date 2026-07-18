@@ -12,7 +12,7 @@ from typing import Any
 
 import esper
 
-from components import BlocksMovement, Dialogue, Enemy, Friendly, NPC, Name, Player, Position, Renderable, Vision
+from components import BlocksMovement, Dialogue, Enemy, Equipment, Friendly, Inventory, NPC, Name, Player, Position, Renderable, Vision
 from game_map import GameMap
 from persistence import (
     DEFAULT_SAVE_FILE,
@@ -342,8 +342,202 @@ def _draw_pause_menu(renderer: TerminalRenderer, options: dict) -> str:
             return chosen
 
 
+def _default_equipment_slots() -> dict[str, str | None]:
+    return {
+        "head": None,
+        "chest": None,
+        "hands": None,
+        "legs": None,
+        "feet": None,
+        "main hand": None,
+        "off hand": None,
+        "ring": None,
+    }
+
+
+def _infer_slot_for_item(item_name: str) -> str | None:
+    lowered = item_name.lower()
+    if any(token in lowered for token in ("helm", "hood", "hat", "crown")):
+        return "head"
+    if any(token in lowered for token in ("chest", "tunic", "armor", "robe", "coat")):
+        return "chest"
+    if any(token in lowered for token in ("glove", "gauntlet")):
+        return "hands"
+    if any(token in lowered for token in ("pants", "greave", "leggings", "trousers")):
+        return "legs"
+    if any(token in lowered for token in ("boot", "shoe", "sandal")):
+        return "feet"
+    if any(token in lowered for token in ("shield", "buckler", "offhand", "off-hand")):
+        return "off hand"
+    if any(token in lowered for token in ("ring",)):
+        return "ring"
+    if any(token in lowered for token in ("sword", "dagger", "axe", "mace", "club", "staff", "spear", "bow")):
+        return "main hand"
+    return None
+
+
+def _equip_inventory_item(inventory: Inventory, equipment: Equipment, item_index: int) -> str:
+    if item_index < 0 or item_index >= len(inventory.items):
+        return "No item selected."
+
+    item_name = inventory.items[item_index]
+    slot_name = _infer_slot_for_item(item_name)
+    if slot_name is None:
+        return f"Cannot equip {item_name}."
+
+    if slot_name not in equipment.slots:
+        equipment.slots[slot_name] = None
+
+    replaced = equipment.slots.get(slot_name)
+    equipment.slots[slot_name] = item_name
+    inventory.items.pop(item_index)
+    if replaced:
+        inventory.items.append(replaced)
+        return f"Equipped {item_name} to {slot_name}; unequipped {replaced}."
+    return f"Equipped {item_name} to {slot_name}."
+
+
+def _unequip_slot(inventory: Inventory, equipment: Equipment, slot_name: str) -> str:
+    current = equipment.slots.get(slot_name)
+    if not current:
+        return f"Nothing equipped in {slot_name}."
+
+    equipment.slots[slot_name] = None
+    inventory.items.append(current)
+    return f"Unequipped {current} from {slot_name}."
+
+
+def _first_player_entity() -> int | None:
+    for ent, (_pos, _player) in esper.get_components(Position, Player):
+        return ent
+    return None
+
+
+def _draw_inventory_menu(renderer: TerminalRenderer) -> str:
+    selected_panel = "left"
+    selected_slot_idx = 0
+    selected_item_idx = 0
+    message = "Enter: equip/unequip  A/D or arrows: switch side  W/S or arrows: move"
+
+    while True:
+        player_ent = _first_player_entity()
+
+        inventory_items: list[str] = []
+        equipment_slots = _default_equipment_slots()
+        player_name = "You"
+
+        if player_ent is not None:
+            if esper.has_component(player_ent, Name):
+                player_name = esper.component_for_entity(player_ent, Name).value
+
+            if esper.has_component(player_ent, Inventory):
+                inventory_items = list(esper.component_for_entity(player_ent, Inventory).items)
+
+            if esper.has_component(player_ent, Equipment):
+                configured = esper.component_for_entity(player_ent, Equipment).slots
+                for slot_name in equipment_slots:
+                    equipment_slots[slot_name] = configured.get(slot_name)
+
+        renderer.clear()
+        renderer.draw_text(2, 1, f"INVENTORY - {player_name}")
+        renderer.draw_text(2, 2, "Esc or i to close")
+
+        left_x = 2
+        right_x = 40
+        top_y = 4
+
+        renderer.draw_text(left_x, top_y, "== EQUIPPED ==")
+        slot_names = list(equipment_slots.keys())
+        slot_y = top_y + 2
+        for idx, slot_name in enumerate(slot_names):
+            equipped_item = equipment_slots[slot_name]
+            display = equipped_item if equipped_item else "(empty)"
+            prefix = "> " if selected_panel == "left" and idx == selected_slot_idx else "  "
+            renderer.draw_text(left_x, slot_y, f"{prefix}{slot_name:10}: {display}")
+            slot_y += 1
+
+        renderer.draw_text(right_x, top_y, "== ITEMS ==")
+        item_y = top_y + 2
+        if not inventory_items:
+            prefix = "> " if selected_panel == "right" else "  "
+            renderer.draw_text(right_x, item_y, f"{prefix}(empty)")
+        else:
+            for idx, item in enumerate(inventory_items):
+                label = chr(ord("a") + idx) if idx < 26 else "*"
+                prefix = "> " if selected_panel == "right" and idx == selected_item_idx else "  "
+                renderer.draw_text(right_x, item_y, f"{prefix}{label}) {item}")
+                item_y += 1
+
+        renderer.draw_text(2, top_y + 13, message[:76])
+
+        renderer.present()
+
+        action = renderer.poll_action()
+        if action in {"open_pause_menu", "open_inventory"}:
+            return "close"
+        if action == "quit":
+            return "quit"
+
+        if action in {"move_left"}:
+            selected_panel = "left"
+            continue
+        if action in {"move_right"}:
+            selected_panel = "right"
+            continue
+
+        if action == "move_up":
+            if selected_panel == "left" and slot_names:
+                selected_slot_idx = (selected_slot_idx - 1) % len(slot_names)
+            elif selected_panel == "right" and inventory_items:
+                selected_item_idx = (selected_item_idx - 1) % len(inventory_items)
+            continue
+
+        if action == "move_down":
+            if selected_panel == "left" and slot_names:
+                selected_slot_idx = (selected_slot_idx + 1) % len(slot_names)
+            elif selected_panel == "right" and inventory_items:
+                selected_item_idx = (selected_item_idx + 1) % len(inventory_items)
+            continue
+
+        if action == "menu_select" and player_ent is not None:
+            if not esper.has_component(player_ent, Inventory):
+                continue
+            if not esper.has_component(player_ent, Equipment):
+                continue
+
+            inventory = esper.component_for_entity(player_ent, Inventory)
+            equipment = esper.component_for_entity(player_ent, Equipment)
+
+            if selected_panel == "right":
+                if not inventory.items:
+                    message = "No items to equip."
+                else:
+                    clamped_idx = max(0, min(selected_item_idx, len(inventory.items) - 1))
+                    message = _equip_inventory_item(inventory, equipment, clamped_idx)
+                    if inventory.items:
+                        selected_item_idx = min(selected_item_idx, len(inventory.items) - 1)
+                    else:
+                        selected_item_idx = 0
+            else:
+                if slot_names:
+                    slot_name = slot_names[max(0, min(selected_slot_idx, len(slot_names) - 1))]
+                    message = _unequip_slot(inventory, equipment, slot_name)
+
+
 def _setup_world(game_map: GameMap, player_position: Position) -> None:
-    esper.create_entity(player_position, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    player_equipment = _default_equipment_slots()
+    player_equipment["main hand"] = "Rusty Sword"
+    player_equipment["chest"] = "Traveler Tunic"
+    esper.create_entity(
+        player_position,
+        Renderable("@"),
+        Name("You"),
+        Player(),
+        Vision(10),
+        BlocksMovement(),
+        Inventory(items=["Bandage", "Torch", "Apple"]),
+        Equipment(slots=player_equipment),
+    )
 
     villager_pos = Position(max(2, player_position.x - 2), player_position.y + 1)
     guard_pos = Position(max(2, player_position.x - 5), player_position.y)
@@ -357,9 +551,33 @@ def _setup_world(game_map: GameMap, player_position: Position) -> None:
         Friendly(),
         Dialogue("##!/$*~# GH01^@"),
         BlocksMovement(),
+        Inventory(items=["Bread", "Waterskin"]),
+        Equipment(slots=_default_equipment_slots()),
     )
-    esper.create_entity(guard_pos, Renderable("g"), Name("Goblin Scout"), NPC(), Enemy(), Vision(8), BlocksMovement())
-    esper.create_entity(rat_pos, Renderable("r"), Name("Cave Rat"), NPC(), Enemy(), Vision(6), BlocksMovement())
+    goblin_equipment = _default_equipment_slots()
+    goblin_equipment["main hand"] = "Jagged Dagger"
+    esper.create_entity(
+        guard_pos,
+        Renderable("g"),
+        Name("Goblin Scout"),
+        NPC(),
+        Enemy(),
+        Vision(8),
+        BlocksMovement(),
+        Inventory(items=["Copper Coin", "Bone Charm"]),
+        Equipment(slots=goblin_equipment),
+    )
+    esper.create_entity(
+        rat_pos,
+        Renderable("r"),
+        Name("Cave Rat"),
+        NPC(),
+        Enemy(),
+        Vision(6),
+        BlocksMovement(),
+        Inventory(items=["String", "Pebble"]),
+        Equipment(slots=_default_equipment_slots()),
+    )
 
 
 def main() -> None:
@@ -416,6 +634,12 @@ def main() -> None:
             esper.process()  # initial frame
             while True:
                 action = renderer.poll_action()
+                if action == "open_inventory":
+                    inventory_choice = _draw_inventory_menu(renderer)
+                    if inventory_choice == "quit":
+                        break
+                    esper.process(None)
+                    continue
                 if action == "open_pause_menu":
                     pause_choice = _draw_pause_menu(renderer, options)
                     if pause_choice == "save_game":

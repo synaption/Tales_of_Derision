@@ -407,5 +407,5 @@ class RenderProcessor(esper.Processor):
 
         self._draw_sidebar(player_pos, entity_lookup)
 
-        r.draw_text(0, self.game_map.height, "move: arrows/hjkl/wasd   menu: esc")
+        r.draw_text(0, self.game_map.height, "move: arrows/hjkl/wasd   inventory: i   menu: esc")
         r.present()

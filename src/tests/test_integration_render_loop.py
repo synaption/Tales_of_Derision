@@ -3,7 +3,7 @@ from __future__ import annotations
 import esper
 import pytest
 
-from components import BlocksMovement, Corpse, Dialogue, Enemy, Friendly, NPC, Name, Player, Position, Renderable, Vision
+from components import BlocksMovement, Corpse, Dialogue, Enemy, Equipment, Friendly, Inventory, NPC, Name, Player, Position, Renderable, Vision
 from game_map import GameMap
 from systems import MovementProcessor, NpcAiProcessor, RenderProcessor
 from fakes import FakeRenderer
@@ -21,7 +21,16 @@ def _setup_world(width: int = 10, height: int = 6) -> tuple[GameMap, FakeRendere
     esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
     player_pos = Position(width // 2, height // 2)
-    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    esper.create_entity(
+        player_pos,
+        Renderable("@"),
+        Name("You"),
+        Player(),
+        Vision(10),
+        BlocksMovement(),
+        Inventory(items=["Bandage"]),
+        Equipment(slots={"main hand": "Rusty Sword"}),
+    )
     esper.create_entity(
         Position(player_pos.x + 1, player_pos.y),
         Renderable("g"),
@@ -30,6 +39,8 @@ def _setup_world(width: int = 10, height: int = 6) -> tuple[GameMap, FakeRendere
         Enemy(),
         BlocksMovement(),
         Vision(8),
+        Inventory(items=["Copper Coin"]),
+        Equipment(slots={"main hand": "Jagged Dagger"}),
     )
 
     return game_map, renderer, player_pos
@@ -44,7 +55,7 @@ def test_initial_tick_renders_map_player_and_status_line() -> None:
     assert renderer.glyphs[(0, 0)] == game_map.WALL
     assert renderer.glyphs[(1, 1)] == game_map.FLOOR
     assert renderer.glyphs[(player_pos.x, player_pos.y)] == "@"
-    assert (0, game_map.height, "move: arrows/hjkl/wasd   menu: esc") in renderer.text
+    assert (0, game_map.height, "move: arrows/hjkl/wasd   inventory: i   menu: esc") in renderer.text
     sidebar_x = game_map.width + 2
     assert (sidebar_x, 0, "== NEARBY ==") in renderer.text
     assert any(text.startswith("g → Goblin") for _x, _y, text in renderer.text)
@@ -215,3 +226,20 @@ def test_player_bumps_friendly_and_gets_dialogue() -> None:
         for _x, _y, text in renderer.text
     )
     assert not any(text == "You bump into a wall." for _x, _y, text in renderer.text)
+
+
+def test_all_characters_have_inventory_and_equipment_components() -> None:
+    _game_map, _renderer, _player_pos = _setup_world(width=12, height=8)
+
+    actor_ents = {
+        ent
+        for ent, (_pos, _name) in esper.get_components(Position, Name)
+        if esper.has_component(ent, Player) or esper.has_component(ent, NPC)
+    }
+
+    with_inventory = {ent for ent, (_inv,) in esper.get_components(Inventory)}
+    with_equipment = {ent for ent, (_equip,) in esper.get_components(Equipment)}
+
+    assert actor_ents
+    assert actor_ents.issubset(with_inventory)
+    assert actor_ents.issubset(with_equipment)

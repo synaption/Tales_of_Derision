@@ -21,6 +21,8 @@ _KEY_TO_ACTION = {
     ord("s"): "move_down",
     ord("a"): "move_left",
     ord("d"): "move_right",
+    ord("i"): "open_inventory",
+    ord("I"): "open_inventory",
     curses.KEY_ENTER: "menu_select",
     10: "menu_select",  # Enter (LF)
     13: "menu_select",  # Enter (CR)

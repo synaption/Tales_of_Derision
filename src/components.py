@@ -4,6 +4,7 @@ Components stay renderer-agnostic: a Renderable holds a glyph, not a
 curses/pygame handle. Systems and renderers translate these into pixels.
 """
 from dataclasses import dataclass
+from dataclasses import field
 
 
 @dataclass
@@ -60,3 +61,13 @@ class Dialogue:
 @dataclass
 class Corpse:
     """Tag component: marks an entity as a dead body."""
+
+
+@dataclass
+class Inventory:
+    items: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Equipment:
+    slots: dict[str, str | None] = field(default_factory=dict)
