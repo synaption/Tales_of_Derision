@@ -4,6 +4,7 @@ esper 3.x uses module-level state and esper.Processor subclasses whose
 process() receives whatever args are passed to esper.process().
 """
 from collections.abc import Callable
+import textwrap
 
 import esper
 
@@ -179,7 +180,12 @@ class RenderProcessor(esper.Processor):
         self.renderer = renderer
         self.game_map = game_map
         self.sidebar_x = game_map.width + 2
-        self.sidebar_width = 28
+        self.sidebar_width = 22
+        self._view_origin_x = 0
+        self._view_origin_y = 0
+        self._view_width = game_map.width
+        self._view_height = game_map.height
+        self._status_y = game_map.height
         self._message_log: list[str] = ["You enter the area."]
         self._max_log_lines = 200
         self._last_player_pos: tuple[int, int] | None = None
@@ -219,7 +225,11 @@ class RenderProcessor(esper.Processor):
 
         moved = self._last_player_pos != (player_pos.x, player_pos.y)
         if not moved and not suppress_wall_message:
-            self._append_message("You bump into a wall.")
+            dx, dy = _ACTION_DELTAS[action]
+            target_x = player_pos.x + dx
+            target_y = player_pos.y + dy
+            if not self.game_map.is_walkable(target_x, target_y):
+                self._append_message("You bump into a wall.")
 
         self._last_player_pos = (player_pos.x, player_pos.y)
 
@@ -305,8 +315,27 @@ class RenderProcessor(esper.Processor):
         _entity_lookup: dict[tuple[int, int], tuple[str, str]],
     ) -> None:
         r = self.renderer
-        x0 = self.sidebar_x
-        y = 0
+        draw_text_clipped = getattr(r, "draw_text_clipped", None)
+
+        def draw_line(x: int, y: int, text: str, width_cells: int) -> None:
+            if callable(draw_text_clipped):
+                draw_text_clipped(x, y, text, width_cells)
+                return
+            r.draw_text(x, y, text[: max(0, width_cells)])
+
+        panel_x = max(0, self.sidebar_x)
+        panel_y = 0
+        panel_w = max(14, self.sidebar_width)
+        panel_h = max(12, self._grid_h)
+
+        x0 = panel_x + 1
+        content_width = max(8, panel_w - 2)
+        wrap_width = content_width
+        get_text_cols = getattr(r, "text_columns_for_cells", None)
+        if callable(get_text_cols):
+            cols = get_text_cols(content_width)
+            if isinstance(cols, int):
+                wrap_width = max(1, cols)
 
         nearby_data: list[tuple[int, str, str, str, int, int, int, int]] = []
         if player_pos is not None:
@@ -314,40 +343,127 @@ class RenderProcessor(esper.Processor):
             self._update_sighting_events(visible_npcs)
             nearby_data = self._collect_nearby_objects(player_pos)
 
-        r.draw_text(x0, y, "== NEARBY ==")
-        y += 1
-
-        max_nearby_lines = max(0, self.game_map.height - y - 2)
-        nearby_lines_drawn = 0
+        nearby_lines: list[str] = []
 
         if player_pos is None:
-            if max_nearby_lines > 0:
-                r.draw_text(x0, y, "none")
-                y += 1
-                nearby_lines_drawn = 1
+            nearby_lines.append("none")
         else:
             if not nearby_data:
-                if max_nearby_lines > 0:
-                    r.draw_text(x0, y, "none")
-                    y += 1
-                    nearby_lines_drawn = 1
+                nearby_lines.append("none")
             else:
-                for _ent_id, glyph, arrow, name, _mdist, _cdist, _x, _y in nearby_data[:max_nearby_lines]:
+                for _ent_id, glyph, arrow, name, _mdist, _cdist, _x, _y in nearby_data:
                     line = f"{glyph} {arrow} {name}"
-                    r.draw_text(x0, y, line[: self.sidebar_width])
-                    y += 1
-                    nearby_lines_drawn += 1
+                    nearby_lines.append(line)
 
-        if nearby_lines_drawn > 0:
-            y += 1
+        wrapped_nearby: list[str] = []
+        for line in nearby_lines:
+            wrapped = textwrap.wrap(line, width=wrap_width, break_long_words=True, break_on_hyphens=False)
+            if wrapped:
+                wrapped_nearby.extend(wrapped)
+            else:
+                wrapped_nearby.append("")
 
-        r.draw_text(x0, y, "== LOG ==")
-        y += 1
+        panel_gap = 0
+        min_box_h = 5
+        nearby_content_needed = max(1, len(wrapped_nearby))
+        nearby_h_needed = nearby_content_needed + 3  # inner header + borders
+        max_nearby_h = max(min_box_h, panel_h - min_box_h - panel_gap)
+        nearby_h = max(min_box_h, min(max_nearby_h, nearby_h_needed))
+        log_h = panel_h - nearby_h - panel_gap
+        if log_h < min_box_h:
+            log_h = min_box_h
+            nearby_h = max(min_box_h, panel_h - log_h - panel_gap)
 
-        log_height = max(1, self.game_map.height - y)
-        messages = self._message_log[-log_height:]
-        for idx, message in enumerate(messages):
-            r.draw_text(x0, y + idx, message[: self.sidebar_width])
+        nearby_y = panel_y
+        log_y = nearby_y + nearby_h + panel_gap
+
+        nearby_content_y = nearby_y + 1
+        nearby_content_h = max(1, nearby_h - 2)
+        draw_line(x0, nearby_content_y, "== NEARBY ==", content_width)
+        nearby_content_y += 1
+        nearby_content_h = max(0, nearby_content_h - 1)
+
+        draw_panel = getattr(r, "draw_panel", None)
+        if callable(draw_panel):
+            draw_panel(panel_x, nearby_y, panel_w, nearby_h, title="NEARBY")
+            draw_panel(panel_x, log_y, panel_w, log_h, title="LOG")
+        else:
+            def draw_ascii_panel(px: int, py: int, pw: int, ph: int, title: str) -> None:
+                top = "+" + ("-" * max(0, pw - 2)) + "+"
+                r.draw_text(px, py, top)
+                for row in range(1, max(1, ph - 1)):
+                    r.draw_text(px, py + row, "|" + (" " * max(0, pw - 2)) + "|")
+                if ph > 1:
+                    r.draw_text(px, py + ph - 1, top)
+                r.draw_text(px + 2, py, title)
+
+            draw_ascii_panel(panel_x, nearby_y, panel_w, nearby_h, "NEARBY")
+            draw_ascii_panel(panel_x, log_y, panel_w, log_h, "LOG")
+
+        for idx, line in enumerate(wrapped_nearby[:nearby_content_h]):
+            draw_line(x0, nearby_content_y + idx, line, content_width)
+
+        log_content_y = log_y + 1
+        log_content_h = max(1, log_h - 2)
+        draw_line(x0, log_content_y, "== LOG ==", content_width)
+        log_content_y += 1
+        log_content_h = max(0, log_content_h - 1)
+
+        log_messages: list[str] = []
+        for message in self._message_log:
+            wrapped = textwrap.wrap(message, width=wrap_width, break_long_words=True, break_on_hyphens=False)
+            if wrapped:
+                log_messages.extend(wrapped)
+            else:
+                log_messages.append("")
+
+        if not log_messages:
+            log_messages = ["none"]
+
+        visible_log = log_messages[-log_content_h:]
+        for idx, line in enumerate(visible_log):
+            draw_line(x0, log_content_y + idx, line, content_width)
+
+    def _compute_layout(self, player_pos: Position | None) -> None:
+        grid_w = self.game_map.width + self.sidebar_width + 3
+        grid_h = self.game_map.height + 1
+        get_grid = getattr(self.renderer, "get_grid_size", None)
+        if callable(get_grid):
+            w, h = get_grid()
+            if isinstance(w, int) and isinstance(h, int):
+                grid_w = max(20, w)
+                grid_h = max(8, h)
+
+        get_sidebar_w = getattr(self.renderer, "get_sidebar_width_cells", None)
+        if callable(get_sidebar_w):
+            w = get_sidebar_w(self.sidebar_width)
+            if isinstance(w, int):
+                self.sidebar_width = max(12, min(w, max(12, grid_w - 8)))
+
+        self._grid_w = grid_w
+        self._grid_h = grid_h
+
+        self.sidebar_x = max(0, grid_w - self.sidebar_width)
+        self._view_width = min(self.game_map.width, max(8, self.sidebar_x))
+        self._view_height = min(self.game_map.height, max(5, grid_h - 1))
+        self._status_y = max(0, grid_h - 1)
+
+        max_ox = max(0, self.game_map.width - self._view_width)
+        max_oy = max(0, self.game_map.height - self._view_height)
+        if player_pos is None:
+            self._view_origin_x = 0
+            self._view_origin_y = 0
+            return
+
+        self._view_origin_x = min(max_ox, max(0, player_pos.x - self._view_width // 2))
+        self._view_origin_y = min(max_oy, max(0, player_pos.y - self._view_height // 2))
+
+    def _world_to_view(self, wx: int, wy: int) -> tuple[int, int] | None:
+        vx = wx - self._view_origin_x
+        vy = wy - self._view_origin_y
+        if vx < 0 or vy < 0 or vx >= self._view_width or vy >= self._view_height:
+            return None
+        return (vx, vy)
 
     def process(self, action: str | None = None) -> None:
         r = self.renderer
@@ -374,22 +490,29 @@ class RenderProcessor(esper.Processor):
             self._append_message(event)
 
         self._describe_movement(action, player_pos, suppress_wall_message=bool(events))
+        self._compute_layout(player_pos)
 
         self._visible_tiles = self._compute_visible_tiles(player_ent, player_pos)
 
-        for y in range(self.game_map.height):
-            for x in range(self.game_map.width):
-                if (x, y) in self._visible_tiles:
-                    tile = self.game_map.tile_at(x, y)
+        for vy in range(self._view_height):
+            wy = self._view_origin_y + vy
+            for vx in range(self._view_width):
+                wx = self._view_origin_x + vx
+                if (wx, wy) in self._visible_tiles:
+                    tile = self.game_map.tile_at(wx, wy)
                     classification = "wall" if tile == self.game_map.WALL else "default"
-                    r.draw_glyph_classified(x, y, tile, classification)
+                    r.draw_glyph_classified(vx, vy, tile, classification)
                 else:
-                    r.draw_glyph(x, y, " ")
+                    r.draw_glyph(vx, vy, " ")
 
         player_draw: tuple[int, int, str, str] | None = None
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
             is_player = esper.has_component(ent, Player)
             if (pos.x, pos.y) not in self._visible_tiles and not is_player:
+                continue
+
+            view_xy = self._world_to_view(pos.x, pos.y)
+            if view_xy is None and not is_player:
                 continue
 
             classification = "default"
@@ -399,15 +522,22 @@ class RenderProcessor(esper.Processor):
                 classification = "enemy"
 
             if is_player:
-                player_draw = (pos.x, pos.y, rend.glyph, classification)
+                if view_xy is not None:
+                    player_draw = (view_xy[0], view_xy[1], rend.glyph, classification)
                 continue
 
-            r.draw_glyph_classified(pos.x, pos.y, rend.glyph, classification)
+            if view_xy is not None:
+                r.draw_glyph_classified(view_xy[0], view_xy[1], rend.glyph, classification)
 
         if player_draw is not None:
             r.draw_glyph_classified(player_draw[0], player_draw[1], player_draw[2], player_draw[3])
 
         self._draw_sidebar(player_pos, entity_lookup)
 
-        r.draw_text(0, self.game_map.height, "WASD set axis (combine for diagonal)  Space confirm  Enter interact  I inventory  Esc")
+        draw_text_clipped = getattr(r, "draw_text_clipped", None)
+        status_line = "I inventory  Esc menu  +/- tile scale"
+        if callable(draw_text_clipped):
+            draw_text_clipped(0, self._status_y, status_line, self._grid_w)
+        else:
+            r.draw_text(0, self._status_y, status_line)
         r.present()

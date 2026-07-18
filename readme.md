@@ -2,8 +2,7 @@
 
 GOALS:
 - use ecs, esper
-- make a roguelike game in python that runs in the terminal and later can be
-  rendered with tcod, pygame, raylib, moderngl, or something else.
+- make a roguelike game in pygame-ce.
 - start with very basic and go from there
 - wasd movement, fully configurable configurable controls, controller support eventually
 - lot's of simulation, testing, and prcedural generation
@@ -146,8 +145,7 @@ Action Economy:
 - animations happen either in order, or multiple at the same time, depending on what they are.  
 
 Targets
-- terminal
-- desktop fully rendered on windows and linux with shadders
+- desktop fully rendered on windows and linux
 - steam
 - itch.io
 

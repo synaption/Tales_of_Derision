@@ -22,8 +22,9 @@ WORKING_OPTIONS_FILE = CONFIG_DIR / "options.json"
 _DEFAULT_OPTIONS = {
     "fullscreen": False,
     "show_fps": False,
-    "tile_scale": 2.0,
+    "tile_scale": 1.5,
     "ui_scale": 1.0,
+    "sidebar_width_ratio": 0.22,
     "audio_buffer": 16384,
     "combat_sfx": True,
     "melee_attack_sfx": "audio/sfx/swipe.wav",

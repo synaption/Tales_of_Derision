@@ -70,6 +70,27 @@ def _audio_driver_order() -> list[str | None]:
     return [None, "pipewire", "pulseaudio", "alsa", "dsp"]
 
 
+def _coerce_scale(value: object) -> float:
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if scale < 0.5:
+        return 0.5
+    if scale > 3.0:
+        return 3.0
+    return scale
+
+
+def _next_scale(current: float, direction: int = 1) -> float:
+    current = _coerce_scale(current)
+    if current not in _SCALE_STEPS:
+        nearest = min(range(len(_SCALE_STEPS)), key=lambda idx: abs(_SCALE_STEPS[idx] - current))
+        return _SCALE_STEPS[nearest]
+    idx = _SCALE_STEPS.index(current)
+    return _SCALE_STEPS[(idx + direction) % len(_SCALE_STEPS)]
+
+
 def _audio_buffer_order(options: dict | None) -> list[int]:
     configured = None
     if isinstance(options, dict):
@@ -307,32 +328,13 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
         if callable(apply_fn):
             apply_fn(options)
 
-    def coerce_scale(value: object) -> float:
-        try:
-            scale = float(value)
-        except (TypeError, ValueError):
-            return 1.0
-        if scale < 0.5:
-            return 0.5
-        if scale > 3.0:
-            return 3.0
-        return scale
-
-    def next_scale(current: float, direction: int = 1) -> float:
-        current = coerce_scale(current)
-        if current not in _SCALE_STEPS:
-            nearest = min(range(len(_SCALE_STEPS)), key=lambda idx: abs(_SCALE_STEPS[idx] - current))
-            return _SCALE_STEPS[nearest]
-        idx = _SCALE_STEPS.index(current)
-        return _SCALE_STEPS[(idx + direction) % len(_SCALE_STEPS)]
-
     selected = 0
 
     while True:
         fullscreen = bool(options.get("fullscreen", False))
         show_fps = bool(options.get("show_fps", False))
-        tile_scale = coerce_scale(options.get("tile_scale", 1.0))
-        ui_scale = coerce_scale(options.get("ui_scale", 1.0))
+        tile_scale = _coerce_scale(options.get("tile_scale", 1.0))
+        ui_scale = _coerce_scale(options.get("ui_scale", 1.0))
         items = [
             f"Fullscreen: {'ON' if fullscreen else 'OFF'}",
             f"Show FPS: {'ON' if show_fps else 'OFF'}",
@@ -359,20 +361,20 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
             selected = (selected + 1) % len(items)
         elif action == "move_left":
             if selected == 2:
-                options["tile_scale"] = next_scale(tile_scale, direction=-1)
+                options["tile_scale"] = _next_scale(tile_scale, direction=-1)
                 save_options(options)
                 apply_renderer_options()
             elif selected == 3:
-                options["ui_scale"] = next_scale(ui_scale, direction=-1)
+                options["ui_scale"] = _next_scale(ui_scale, direction=-1)
                 save_options(options)
                 apply_renderer_options()
         elif action == "move_right":
             if selected == 2:
-                options["tile_scale"] = next_scale(tile_scale, direction=1)
+                options["tile_scale"] = _next_scale(tile_scale, direction=1)
                 save_options(options)
                 apply_renderer_options()
             elif selected == 3:
-                options["ui_scale"] = next_scale(ui_scale, direction=1)
+                options["ui_scale"] = _next_scale(ui_scale, direction=1)
                 save_options(options)
                 apply_renderer_options()
         elif action == "menu_select":
@@ -384,11 +386,11 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
                 options["show_fps"] = not show_fps
                 save_options(options)
             elif selected == 2:
-                options["tile_scale"] = next_scale(tile_scale, direction=1)
+                options["tile_scale"] = _next_scale(tile_scale, direction=1)
                 save_options(options)
                 apply_renderer_options()
             elif selected == 3:
-                options["ui_scale"] = next_scale(ui_scale, direction=1)
+                options["ui_scale"] = _next_scale(ui_scale, direction=1)
                 save_options(options)
                 apply_renderer_options()
             else:
@@ -1073,6 +1075,26 @@ def main() -> None:
             press_order_counter = 0
             while True:
                 action = renderer.poll_action()
+                if action == "tile_scale_up":
+                    options["tile_scale"] = _next_scale(_coerce_scale(options.get("tile_scale", 1.0)), direction=1)
+                    save_options(options)
+                    apply_fn = getattr(renderer, "apply_options", None)
+                    if callable(apply_fn):
+                        apply_fn(options)
+                    esper.process(None)
+                    continue
+                if action == "tile_scale_down":
+                    options["tile_scale"] = _next_scale(_coerce_scale(options.get("tile_scale", 1.0)), direction=-1)
+                    save_options(options)
+                    apply_fn = getattr(renderer, "apply_options", None)
+                    if callable(apply_fn):
+                        apply_fn(options)
+                    esper.process(None)
+                    continue
+                if action == "ui_layout_changed":
+                    save_options(options)
+                    esper.process(None)
+                    continue
                 if action in _CARDINAL_ACTION_DELTAS:
                     held_directions.add(action)
                     press_order_counter += 1

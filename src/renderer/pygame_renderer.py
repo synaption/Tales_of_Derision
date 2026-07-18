@@ -36,6 +36,9 @@ class PygameRenderer(Renderer):
 
         self._bg = (14, 16, 20)
         self._default_fg = (230, 230, 230)
+        self._panel_bg = (24, 28, 36)
+        self._panel_border = (88, 108, 132)
+        self._splitter = (130, 160, 190)
         self._class_colors = {
             "default": (230, 230, 230),
             "wall": (90, 140, 230),
@@ -58,13 +61,23 @@ class PygameRenderer(Renderer):
         self._sheet_cache: dict[str, object] = {}
         self._glyph_tiles: dict[str, object] = {}
         self._class_tiles: dict[str, object] = {}
+        self._grid_cols = self._cols
+        self._grid_rows = self._rows
+        self._sidebar_width_px: int | None = None
+        self._sidebar_width_ratio = 0.22
+        self._dragging_sidebar = False
+        self._splitter_hit_slop_px = 8
+        self._cursor_kind = "arrow"
+        self._mouse_visible = True
+        self._last_mouse_activity_ms = 0
+        self._mouse_hide_delay_ms = 2400
 
     def apply_options(self, options: dict) -> None:
         self._options = dict(options)
         if self._pygame is None:
             return
 
-        self._tile_scale = self._coerce_scale(self._options.get("tile_scale", 2.0))
+        self._tile_scale = self._coerce_scale(self._options.get("tile_scale", 1.5))
         self._ui_scale = self._coerce_scale(self._options.get("ui_scale", 1.0))
 
         self._cell_w = max(1, int(round(self._tile_size * self._tile_scale)))
@@ -72,6 +85,11 @@ class PygameRenderer(Renderer):
 
         self._ui_font_size = max(8, int(round(16 * self._ui_scale)))
         self._font = self._pygame.font.SysFont("DejaVu Sans Mono", self._ui_font_size)
+        try:
+            ratio = float(self._options.get("sidebar_width_ratio", 0.22))
+        except (TypeError, ValueError):
+            ratio = 0.22
+        self._sidebar_width_ratio = min(0.5, max(0.14, ratio))
 
         fullscreen = bool(self._options.get("fullscreen", False))
         if fullscreen:
@@ -81,10 +99,26 @@ class PygameRenderer(Renderer):
             window_h = max(480, self._rows * self._cell_h)
             self._screen = self._pygame.display.set_mode((window_w, window_h))
 
+        if self._screen is not None:
+            screen_w = self._screen.get_width()
+            if self._sidebar_width_px is None:
+                self._sidebar_width_px = int(round(screen_w * self._sidebar_width_ratio))
+            self._sidebar_width_px = max(180, min(int(screen_w * 0.6), self._sidebar_width_px))
+            self._grid_cols = max(1, screen_w // self._cell_w)
+            self._grid_rows = max(1, self._screen.get_height() // self._cell_h)
+
         self._sheet_cache = {}
         self._glyph_tiles = {}
         self._class_tiles = {}
         self._load_tileset_config()
+
+    def get_grid_size(self) -> tuple[int, int]:
+        return (self._grid_cols, self._grid_rows)
+
+    def get_sidebar_width_cells(self, default: int = 28) -> int:
+        if self._sidebar_width_px is None:
+            return default
+        return max(14, int(round(self._sidebar_width_px / max(1, self._cell_w))))
 
     @staticmethod
     def _coerce_scale(value: object) -> float:
@@ -226,10 +260,23 @@ class PygameRenderer(Renderer):
         if self._screen is not None:
             self._screen.fill(self._bg)
 
-    def _blit_text(self, x: int, y: int, text: str, color: tuple[int, int, int]) -> None:
+    def _blit_text(
+        self,
+        x: int,
+        y: int,
+        text: str,
+        color: tuple[int, int, int],
+        max_width_px: int | None = None,
+    ) -> None:
         if self._screen is None or self._font is None:
             return
         surface = self._font.render(text, True, color)
+        if max_width_px is not None:
+            if max_width_px <= 0:
+                return
+            if surface.get_width() > max_width_px:
+                clip = self._pygame.Rect(0, 0, max_width_px, surface.get_height())
+                surface = surface.subsurface(clip)
         self._screen.blit(surface, (x * self._cell_w, y * self._cell_h))
 
     def draw_glyph(self, x: int, y: int, glyph: str) -> None:
@@ -252,9 +299,102 @@ class PygameRenderer(Renderer):
     def draw_text(self, x: int, y: int, text: str) -> None:
         self._blit_text(x, y, text, self._default_fg)
 
+    def draw_text_clipped(self, x: int, y: int, text: str, max_cells: int) -> None:
+        if max_cells <= 0:
+            return
+        max_width_px = max(1, max_cells * self._cell_w - 4)
+        self._blit_text(x, y, text, self._default_fg, max_width_px=max_width_px)
+
+    def text_columns_for_cells(self, width_cells: int, padding_px: int = 4) -> int:
+        if width_cells <= 0:
+            return 1
+        usable_px = max(1, width_cells * self._cell_w - max(0, padding_px))
+        if self._font is None:
+            return max(1, usable_px // max(1, self._cell_w))
+        char_w, _char_h = self._font.size("M")
+        return max(1, usable_px // max(1, char_w))
+
+    def draw_panel(self, x: int, y: int, width: int, height: int, title: str | None = None) -> None:
+        if self._pygame is None or self._screen is None:
+            return
+        if width <= 0 or height <= 0:
+            return
+
+        px = x * self._cell_w
+        py = y * self._cell_h
+        pw = width * self._cell_w
+        ph = height * self._cell_h
+
+        panel_rect = self._pygame.Rect(px, py, pw, ph)
+        self._pygame.draw.rect(self._screen, self._panel_bg, panel_rect)
+        self._pygame.draw.rect(self._screen, self._panel_border, panel_rect, width=2)
+
+        if title:
+            # Draw title text slightly inset so it does not collide with border corners.
+            self._blit_text(x + 1, y, f"[{title}]", self._panel_border)
+
     def present(self) -> None:
         if self._pygame is not None:
             self._pygame.display.flip()
+
+    def _ensure_mouse_visible(self, now_ms: int) -> None:
+        if self._pygame is None:
+            return
+        self._last_mouse_activity_ms = now_ms
+        if not self._mouse_visible:
+            self._pygame.mouse.set_visible(True)
+            self._mouse_visible = True
+
+    def _hide_mouse_if_idle(self, now_ms: int) -> None:
+        if self._pygame is None:
+            return
+        if self._dragging_sidebar:
+            return
+        if not self._mouse_visible:
+            return
+        if now_ms - self._last_mouse_activity_ms >= self._mouse_hide_delay_ms:
+            self._pygame.mouse.set_visible(False)
+            self._mouse_visible = False
+
+    def _sidebar_geometry_px(self) -> tuple[int, int, int, int]:
+        if self._screen is None:
+            return (0, 0, 0, 0)
+        screen_w = self._screen.get_width()
+        screen_h = self._screen.get_height()
+        sidebar_px = self._sidebar_width_px
+        if sidebar_px is None:
+            sidebar_px = int(round(screen_w * self._sidebar_width_ratio))
+        sidebar_cells = max(16, int(round(sidebar_px / max(1, self._cell_w))))
+        snapped_width_px = sidebar_cells * self._cell_w
+        left_px = max(0, screen_w - snapped_width_px)
+        return (left_px, 0, snapped_width_px, screen_h)
+
+    def _set_cursor(self, kind: str) -> None:
+        if self._pygame is None:
+            return
+        if kind == self._cursor_kind:
+            return
+        if kind == "resize":
+            self._pygame.mouse.set_cursor(self._pygame.SYSTEM_CURSOR_SIZEWE)
+            self._cursor_kind = "resize"
+            return
+        self._pygame.mouse.set_cursor(self._pygame.SYSTEM_CURSOR_ARROW)
+        self._cursor_kind = "arrow"
+
+    def _update_cursor_for_splitter(self) -> None:
+        if self._screen is None or self._pygame is None:
+            return
+        if self._dragging_sidebar:
+            self._set_cursor("resize")
+            return
+
+        left_px, _top_px, _width_px, _height_px = self._sidebar_geometry_px()
+        splitter_x = left_px
+        mouse_x, _mouse_y = self._pygame.mouse.get_pos()
+        if abs(mouse_x - splitter_x) <= self._splitter_hit_slop_px:
+            self._set_cursor("resize")
+        else:
+            self._set_cursor("arrow")
 
     def poll_action(self) -> str | None:
         if self._pygame is None:
@@ -271,6 +411,38 @@ class PygameRenderer(Renderer):
                 if event.type == self._pygame.QUIT:
                     return "quit"
 
+                if event.type in {self._pygame.MOUSEMOTION, self._pygame.MOUSEBUTTONDOWN, self._pygame.MOUSEBUTTONUP}:
+                    self._ensure_mouse_visible(now)
+
+                if event.type == self._pygame.MOUSEBUTTONDOWN and event.button == 1 and self._screen is not None:
+                    left_px, _top_px, _width_px, _height_px = self._sidebar_geometry_px()
+                    splitter_x = left_px
+                    if abs(event.pos[0] - splitter_x) <= self._splitter_hit_slop_px:
+                        self._dragging_sidebar = True
+                        self._set_cursor("resize")
+                        continue
+
+                if event.type == self._pygame.MOUSEBUTTONUP and event.button == 1:
+                    self._dragging_sidebar = False
+                    self._update_cursor_for_splitter()
+                    continue
+
+                if event.type == self._pygame.MOUSEMOTION and self._dragging_sidebar and self._screen is not None:
+                    screen_w = self._screen.get_width()
+                    new_sidebar_px = screen_w - event.pos[0]
+                    min_px = max(14 * self._cell_w, int(screen_w * 0.14))
+                    max_px = int(screen_w * 0.6)
+                    self._sidebar_width_px = max(min_px, min(max_px, new_sidebar_px))
+                    self._sidebar_width_ratio = self._sidebar_width_px / max(1, screen_w)
+                    self._options["sidebar_width_ratio"] = self._sidebar_width_ratio
+                    self._pending_actions.append("ui_layout_changed")
+                    self._set_cursor("resize")
+                    continue
+
+                if event.type == self._pygame.MOUSEMOTION:
+                    self._update_cursor_for_splitter()
+                    continue
+
                 if event.type == self._pygame.KEYDOWN:
                     if event.key == self._pygame.K_SPACE:
                         if not self._space_held:
@@ -279,8 +451,16 @@ class PygameRenderer(Renderer):
                         self._pending_actions.append("confirm_action")
                         continue
 
+                    if event.key in {self._pygame.K_EQUALS, self._pygame.K_KP_PLUS}:
+                        self._pending_actions.append("tile_scale_up")
+                        continue
+                    if event.key in {self._pygame.K_MINUS, self._pygame.K_KP_MINUS}:
+                        self._pending_actions.append("tile_scale_down")
+                        continue
+
                     if event.key in self._keydown_to_action:
                         self._pending_actions.append(self._keydown_to_action[event.key])
+                    self._ensure_mouse_visible(now)
 
                 if event.type == self._pygame.KEYUP:
                     if event.key == self._pygame.K_SPACE:
@@ -296,5 +476,8 @@ class PygameRenderer(Renderer):
             if self._space_held and now >= self._next_space_repeat_ms:
                 self._next_space_repeat_ms = now + self._space_repeat_interval_ms
                 return "confirm_action"
+
+            self._update_cursor_for_splitter()
+            self._hide_mouse_if_idle(now)
 
             self._pygame.time.wait(8)
