@@ -22,6 +22,8 @@ WORKING_OPTIONS_FILE = CONFIG_DIR / "options.json"
 _DEFAULT_OPTIONS = {
     "fullscreen": False,
     "show_fps": False,
+    "tile_scale": 2.0,
+    "ui_scale": 1.0,
     "audio_buffer": 16384,
     "combat_sfx": True,
     "melee_attack_sfx": "audio/sfx/swipe.wav",
@@ -79,7 +81,15 @@ def load_options() -> dict:
         payload = json.load(file)
     if not isinstance(payload, dict):
         return dict(_DEFAULT_OPTIONS)
-    return payload
+
+    merged = dict(_DEFAULT_OPTIONS)
+    merged.update(payload)
+    if isinstance(_DEFAULT_OPTIONS.get("keybinds"), dict):
+        merged_keybinds = dict(_DEFAULT_OPTIONS["keybinds"])
+        if isinstance(payload.get("keybinds"), dict):
+            merged_keybinds.update(payload["keybinds"])
+        merged["keybinds"] = merged_keybinds
+    return merged
 
 
 def save_options(options: dict) -> None:

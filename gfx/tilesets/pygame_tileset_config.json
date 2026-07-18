@@ -1,0 +1,19 @@
+{
+  "tile_size": 16,
+  "default_sheet": "gfx/tilesets/Hexany/general_transparent.png",
+  "glyphs": {
+    ".": { "sheet": "gfx/tilesets/Hexany/autotile_transparent.png", "x": 0, "y": 0 },
+    "#": { "sheet": "gfx/tilesets/Hexany/autotile_transparent.png", "x": 1, "y": 0 },
+    "@": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 0, "y": 0 },
+    "v": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 1, "y": 0 },
+    "g": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 2, "y": 0 },
+    "r": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 3, "y": 0 },
+    "%": { "sheet": "gfx/tilesets/Hexany/items_transparent.png", "x": 0, "y": 0 }
+  },
+  "classifications": {
+    "friendly": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 1, "y": 0 },
+    "enemy": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 2, "y": 0 },
+    "wall": { "sheet": "gfx/tilesets/Hexany/autotile_transparent.png", "x": 1, "y": 0 },
+    "default": { "sheet": "gfx/tilesets/Hexany/autotile_transparent.png", "x": 0, "y": 0 }
+  }
+}

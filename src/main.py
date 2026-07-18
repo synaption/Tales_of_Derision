@@ -56,6 +56,8 @@ _RELEASE_TO_DIRECTION = {
     "release_right": "move_right",
 }
 
+_SCALE_STEPS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
+
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_SAMPLE_SIZE = -16
 AUDIO_CHANNELS = 2
@@ -300,14 +302,42 @@ def _draw_main_menu(renderer: Renderer) -> str:
 
 
 def _draw_options_menu(renderer: Renderer, options: dict) -> str:
+    def apply_renderer_options() -> None:
+        apply_fn = getattr(renderer, "apply_options", None)
+        if callable(apply_fn):
+            apply_fn(options)
+
+    def coerce_scale(value: object) -> float:
+        try:
+            scale = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        if scale < 0.5:
+            return 0.5
+        if scale > 3.0:
+            return 3.0
+        return scale
+
+    def next_scale(current: float, direction: int = 1) -> float:
+        current = coerce_scale(current)
+        if current not in _SCALE_STEPS:
+            nearest = min(range(len(_SCALE_STEPS)), key=lambda idx: abs(_SCALE_STEPS[idx] - current))
+            return _SCALE_STEPS[nearest]
+        idx = _SCALE_STEPS.index(current)
+        return _SCALE_STEPS[(idx + direction) % len(_SCALE_STEPS)]
+
     selected = 0
 
     while True:
         fullscreen = bool(options.get("fullscreen", False))
         show_fps = bool(options.get("show_fps", False))
+        tile_scale = coerce_scale(options.get("tile_scale", 1.0))
+        ui_scale = coerce_scale(options.get("ui_scale", 1.0))
         items = [
             f"Fullscreen: {'ON' if fullscreen else 'OFF'}",
             f"Show FPS: {'ON' if show_fps else 'OFF'}",
+            f"Tile Scale: {tile_scale:.2f}x",
+            f"UI Scale: {ui_scale:.2f}x",
             "Back",
         ]
 
@@ -316,7 +346,7 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
         for idx, item in enumerate(items):
             prefix = "> " if idx == selected else "  "
             renderer.draw_text(8, 8 + idx, f"{prefix}{item}")
-        renderer.draw_text(2, 14, "Use W/S to move, Enter to toggle/select")
+        renderer.draw_text(2, 14, "Use W/S to move, A/D to change scale, Enter to toggle/select")
         renderer.draw_text(2, 15, "Esc to return")
         renderer.present()
 
@@ -327,13 +357,40 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
             selected = (selected - 1) % len(items)
         elif action == "move_down":
             selected = (selected + 1) % len(items)
+        elif action == "move_left":
+            if selected == 2:
+                options["tile_scale"] = next_scale(tile_scale, direction=-1)
+                save_options(options)
+                apply_renderer_options()
+            elif selected == 3:
+                options["ui_scale"] = next_scale(ui_scale, direction=-1)
+                save_options(options)
+                apply_renderer_options()
+        elif action == "move_right":
+            if selected == 2:
+                options["tile_scale"] = next_scale(tile_scale, direction=1)
+                save_options(options)
+                apply_renderer_options()
+            elif selected == 3:
+                options["ui_scale"] = next_scale(ui_scale, direction=1)
+                save_options(options)
+                apply_renderer_options()
         elif action == "menu_select":
             if selected == 0:
                 options["fullscreen"] = not fullscreen
                 save_options(options)
+                apply_renderer_options()
             elif selected == 1:
                 options["show_fps"] = not show_fps
                 save_options(options)
+            elif selected == 2:
+                options["tile_scale"] = next_scale(tile_scale, direction=1)
+                save_options(options)
+                apply_renderer_options()
+            elif selected == 3:
+                options["ui_scale"] = next_scale(ui_scale, direction=1)
+                save_options(options)
+                apply_renderer_options()
             else:
                 return "back"
 
@@ -970,7 +1027,7 @@ def main() -> None:
     player_position = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
 
     try:
-        with PygameRenderer() as renderer:
+        with PygameRenderer(options=options) as renderer:
             if args.save_file is None:
                 if not _draw_title_screen(renderer):
                     return
