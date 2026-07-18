@@ -6,6 +6,8 @@ to the game loop.
 
 from __future__ import annotations
 
+from collections import deque
+
 from .base import Renderer
 
 
@@ -38,6 +40,7 @@ class PygameRenderer(Renderer):
         self._space_initial_delay_ms = 180
         self._space_repeat_interval_ms = 70
         self._next_space_repeat_ms = 0
+        self._pending_actions: deque[str] = deque()
 
     def setup(self) -> None:
         import pygame
@@ -105,11 +108,11 @@ class PygameRenderer(Renderer):
             return None
 
         while True:
+            if self._pending_actions:
+                return self._pending_actions.popleft()
+
             events = self._pygame.event.get()
             now = self._pygame.time.get_ticks()
-
-            action_from_events: str | None = None
-            space_pressed_this_batch = False
 
             for event in events:
                 if event.type == self._pygame.QUIT:
@@ -120,11 +123,11 @@ class PygameRenderer(Renderer):
                         if not self._space_held:
                             self._space_held = True
                             self._next_space_repeat_ms = now + self._space_initial_delay_ms
-                        space_pressed_this_batch = True
+                        self._pending_actions.append("confirm_action")
                         continue
 
                     if event.key in self._keydown_to_action:
-                        action_from_events = self._keydown_to_action[event.key]
+                        self._pending_actions.append(self._keydown_to_action[event.key])
 
                 if event.type == self._pygame.KEYUP:
                     if event.key == self._pygame.K_SPACE:
@@ -132,14 +135,10 @@ class PygameRenderer(Renderer):
                         continue
 
                     if event.key in self._keyup_to_action:
-                        action_from_events = self._keyup_to_action[event.key]
+                        self._pending_actions.append(self._keyup_to_action[event.key])
 
-            # Always consume direction transitions before emitting confirm.
-            if action_from_events is not None:
-                return action_from_events
-
-            if space_pressed_this_batch:
-                return "confirm_action"
+            if self._pending_actions:
+                return self._pending_actions.popleft()
 
             if self._space_held and now >= self._next_space_repeat_ms:
                 self._next_space_repeat_ms = now + self._space_repeat_interval_ms
