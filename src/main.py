@@ -366,12 +366,23 @@ def _draw_menu_shell(
     footer: str | None = None,
     width: int = 76,
     height: int = 24,
+    overlay_game: bool = False,
 ) -> tuple[int, int, int, int]:
-    draw_menu_backdrop = getattr(renderer, "draw_menu_backdrop", None)
-    if callable(draw_menu_backdrop):
-        draw_menu_backdrop()
+    drew_game_background = False
+    if overlay_game and esper.get_processor(RenderProcessor) is not None:
+        esper.process(None)
+        drew_game_background = True
+
+    if drew_game_background:
+        draw_overlay = getattr(renderer, "draw_overlay", None)
+        if callable(draw_overlay):
+            draw_overlay((0, 0, 0), 144)
     else:
-        renderer.clear()
+        draw_menu_backdrop = getattr(renderer, "draw_menu_backdrop", None)
+        if callable(draw_menu_backdrop):
+            draw_menu_backdrop()
+        else:
+            renderer.clear()
 
     cols, rows = _ui_grid_size(renderer)
     width = max(30, min(width, cols - 2))
@@ -522,6 +533,7 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
             footer="[W/S] move   [A/D] adjust   [Enter/Space] toggle/select   [Esc] back",
             width=78,
             height=24,
+            overlay_game=True,
         )
         _draw_menu_options(renderer, x + 4, y + 7, width - 8, items, selected)
         renderer.present()
@@ -583,6 +595,7 @@ def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
             footer="[W/S] move   [Enter/Space] select   [Esc] resume",
             width=68,
             height=22,
+            overlay_game=True,
         )
         _draw_menu_options(renderer, x + 4, y + 7, width - 8, menu_items, selected)
         renderer.present()
@@ -931,6 +944,7 @@ def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
             footer=message,
             width=98,
             height=30,
+            overlay_game=True,
         )
 
         content_y = y + 4
@@ -1056,6 +1070,7 @@ def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
             footer=footer,
             width=82,
             height=24,
+            overlay_game=True,
         )
 
         info_y = y + 5
@@ -1131,6 +1146,7 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
             footer=message,
             width=98,
             height=32,
+            overlay_game=True,
         )
 
         content_y = y + 4

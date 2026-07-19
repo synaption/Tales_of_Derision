@@ -765,6 +765,18 @@ class PygameRenderer(Renderer):
                 width=1,
             )
 
+    def draw_overlay(self, color: tuple[int, int, int], alpha: int = 144) -> None:
+        if self._pygame is None or self._screen is None:
+            return
+
+        clamped_alpha = max(0, min(255, int(alpha)))
+        overlay = self._pygame.Surface(
+            (self._screen.get_width(), self._screen.get_height()),
+            self._pygame.SRCALPHA,
+        )
+        overlay.fill((color[0], color[1], color[2], clamped_alpha))
+        self._screen.blit(overlay, (0, 0))
+
     def draw_text_clipped(self, x: int, y: int, text: str, max_cells: int) -> None:
         if max_cells <= 0:
             return
