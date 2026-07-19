@@ -49,6 +49,18 @@ _ARROW_TO_WORD = {
 
 _TURN_EVENTS: list[str] = []
 
+_NearbyEntry = tuple[
+    int,
+    str,
+    str,
+    str,
+    int,
+    int,
+    str,
+    tuple[int, int, int] | None,
+    tuple[int, int, int] | None,
+]
+
 
 def _push_turn_event(text: str) -> None:
     _TURN_EVENTS.append(text)
@@ -236,8 +248,8 @@ class RenderProcessor(esper.Processor):
     def _collect_nearby_objects(
         self,
         player_pos: Position,
-    ) -> list[tuple[int, str, str, str, int, int, int, int]]:
-        nearby: list[tuple[int, str, str, str, int, int, int, int]] = []
+    ) -> list[_NearbyEntry]:
+        nearby: list[_NearbyEntry] = []
 
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
             if pos.x == player_pos.x and pos.y == player_pos.y:
@@ -254,7 +266,26 @@ class RenderProcessor(esper.Processor):
             name = "Unknown"
             if esper.has_component(ent, Name):
                 name = esper.component_for_entity(ent, Name).value
-            nearby.append((ent, rend.glyph, arrow, name, abs(dx) + abs(dy), max(abs(dx), abs(dy),), pos.x, pos.y))
+
+            classification = "default"
+            if esper.has_component(ent, Friendly):
+                classification = "friendly"
+            elif esper.has_component(ent, Enemy):
+                classification = "enemy"
+
+            nearby.append(
+                (
+                    ent,
+                    rend.glyph,
+                    arrow,
+                    name,
+                    abs(dx) + abs(dy),
+                    max(abs(dx), abs(dy)),
+                    classification,
+                    rend.fg,
+                    rend.bg,
+                )
+            )
 
         nearby.sort(key=lambda item: (item[4], item[5], item[3]))
         return nearby
@@ -318,6 +349,7 @@ class RenderProcessor(esper.Processor):
         draw_text_clipped = getattr(r, "draw_text_clipped", None)
         draw_text_tinted = getattr(r, "draw_text_tinted", None)
         fill_cells = getattr(r, "fill_cells", None)
+        draw_ui_glyph = getattr(r, "draw_ui_glyph", None)
 
         def draw_line(
             x: int,
@@ -349,7 +381,7 @@ class RenderProcessor(esper.Processor):
             if isinstance(cols, int):
                 wrap_width = max(1, cols)
 
-        nearby_data: list[tuple[int, str, str, str, int, int, int, int]] = []
+        nearby_data: list[_NearbyEntry] = []
         if player_pos is not None:
             visible_npcs = self._collect_visible_npcs(player_pos)
             self._update_sighting_events(visible_npcs)
@@ -363,7 +395,7 @@ class RenderProcessor(esper.Processor):
             if not nearby_data:
                 nearby_lines.append("none")
             else:
-                for _ent_id, glyph, arrow, name, _mdist, _cdist, _x, _y in nearby_data:
+                for _ent_id, glyph, arrow, name, _mdist, _cdist, _classification, _fg, _bg in nearby_data:
                     line = f"{glyph} {arrow} {name}"
                     nearby_lines.append(line)
 
@@ -423,8 +455,31 @@ class RenderProcessor(esper.Processor):
         else:
             nearby_content_y = nearby_y + 2
             nearby_content_h = max(1, nearby_h - 3)
-        for idx, line in enumerate(wrapped_nearby[:nearby_content_h]):
-            draw_line(x0, nearby_content_y + idx, line, content_width, color=text_color)
+
+        if callable(draw_ui_glyph) and nearby_data:
+            icon_cells = 2
+            text_x = x0 + icon_cells + 1
+            text_width = max(1, content_width - icon_cells - 1)
+            for idx, entry in enumerate(nearby_data[:nearby_content_h]):
+                _ent_id, glyph, arrow, name, _mdist, _cdist, classification, fg, bg = entry
+                row_y = nearby_content_y + idx
+                icon_drawn = bool(draw_ui_glyph(
+                    x0,
+                    row_y,
+                    glyph,
+                    classification=classification,
+                    fg=fg,
+                    bg=bg,
+                    cell_span=icon_cells,
+                ))
+                if icon_drawn:
+                    line_text = f"{arrow} {name}"
+                else:
+                    line_text = f"{glyph} {arrow} {name}"
+                draw_line(text_x, row_y, line_text, text_width, color=text_color)
+        else:
+            for idx, line in enumerate(wrapped_nearby[:nearby_content_h]):
+                draw_line(x0, nearby_content_y + idx, line, content_width, color=text_color)
 
         if not has_custom_panels:
             draw_line(x0, log_y + 1, "[LOG]", content_width, color=header_color)

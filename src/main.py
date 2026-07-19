@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import esper
@@ -290,6 +291,7 @@ _MENU_TEXT_COLOR = (210, 210, 210)
 _MENU_MUTED_COLOR = (156, 156, 156)
 _MENU_SELECTED_BG = (44, 44, 44)
 _MENU_SELECTED_TEXT = (252, 252, 252)
+_TITLE_SPLASH_SECONDS = 3.0
 
 
 def _capture_frame_screenshot(renderer: Renderer, output_path: Path) -> None:
@@ -446,31 +448,45 @@ def _scroll_start(selected_index: int, total_items: int, visible_rows: int) -> i
 
 
 def _draw_title_screen(renderer: Renderer) -> bool:
-    options = ["Continue", "Quit"]
-    selected = 0
+    poll_action_nonblocking = getattr(renderer, "poll_action_nonblocking", None)
+    splash_seconds = max(0.5, _TITLE_SPLASH_SECONDS)
+    end_time = time.monotonic() + splash_seconds
 
     while True:
-        x, y, width, _height = _draw_menu_shell(
-            renderer,
-            title="TALES OF DERISION",
-            subtitle="A pygame ECS roguelike prototype",
-            footer="[W/S] navigate   [Enter/Space] select   [Esc] quit",
-            width=72,
-            height=20,
-        )
-        _draw_ui_text(renderer, x + 2, y + 5, "Main Menu", _MENU_MUTED_COLOR, width - 4)
-        _draw_menu_options(renderer, x + 4, y + 7, width - 8, options, selected)
+        draw_menu_backdrop = getattr(renderer, "draw_menu_backdrop", None)
+        if callable(draw_menu_backdrop):
+            draw_menu_backdrop()
+        else:
+            renderer.clear()
+
+        cols, rows = _ui_grid_size(renderer)
+        title = "TALES OF DERISION"
+        subtitle = "A pygame ECS roguelike prototype"
+
+        text_block_height = 3  # title row + spacer row + subtitle row
+        title_y = max(1, (rows - text_block_height) // 2)
+        subtitle_y = title_y + 2
+
+        _draw_ui_text(renderer, max(0, (cols - len(title)) // 2), title_y, title, _MENU_TITLE_COLOR)
+        _draw_ui_text(renderer, max(0, (cols - len(subtitle)) // 2), subtitle_y, subtitle, _MENU_TEXT_COLOR)
         renderer.present()
 
-        action = renderer.poll_action()
-        if action in {"quit", "open_pause_menu"}:
+        if callable(poll_action_nonblocking):
+            action = poll_action_nonblocking()
+        else:
+            action = renderer.poll_action()
+
+        if action == "quit":
             return False
-        if action == "move_up":
-            selected = (selected - 1) % len(options)
-        elif action == "move_down":
-            selected = (selected + 1) % len(options)
-        elif action in {"menu_select", "confirm_action"}:
-            return selected == 0
+
+        if action in {"menu_select", "confirm_action", "open_pause_menu"}:
+            return True
+
+        if time.monotonic() >= end_time:
+            return True
+
+        if callable(poll_action_nonblocking):
+            time.sleep(0.016)
 
 
 def _draw_main_menu(renderer: Renderer) -> str:
@@ -624,40 +640,32 @@ def _run_startup_flow(
     player_position: Position,
 ) -> tuple[bool, GameMap, Position, Path]:
     selected_save_file = requested_save_file or DEFAULT_SAVE_FILE
-    state = "load_requested_save" if requested_save_file is not None else "title"
-
-    while True:
-        if state == "title":
-            if _draw_title_screen(renderer):
-                state = "main_menu"
-            else:
-                return (False, game_map, player_position, selected_save_file)
-            continue
-
-        if state == "main_menu":
-            menu_choice = _draw_main_menu(renderer)
-            if menu_choice == "quit":
-                return (False, game_map, player_position, selected_save_file)
-            if menu_choice == "continue":
-                loaded_map, loaded_player_position = load_game(
-                    DEFAULT_SAVE_FILE,
-                    MAP_WIDTH,
-                    MAP_HEIGHT,
-                )
-                return (True, loaded_map, loaded_player_position, selected_save_file)
-            if menu_choice == "new_game":
-                save_game(game_map, DEFAULT_SAVE_FILE, player_position)
-                return (True, game_map, player_position, selected_save_file)
-
-            state = "title"
-            continue
-
+    if requested_save_file is not None:
         loaded_map, loaded_player_position = load_game(
             selected_save_file,
             MAP_WIDTH,
             MAP_HEIGHT,
         )
         return (True, loaded_map, loaded_player_position, selected_save_file)
+
+    if not _draw_title_screen(renderer):
+        return (False, game_map, player_position, selected_save_file)
+
+    menu_choice = _draw_main_menu(renderer)
+    if menu_choice == "quit":
+        return (False, game_map, player_position, selected_save_file)
+    if menu_choice == "continue":
+        loaded_map, loaded_player_position = load_game(
+            DEFAULT_SAVE_FILE,
+            MAP_WIDTH,
+            MAP_HEIGHT,
+        )
+        return (True, loaded_map, loaded_player_position, selected_save_file)
+    if menu_choice == "new_game":
+        save_game(game_map, DEFAULT_SAVE_FILE, player_position)
+        return (True, game_map, player_position, selected_save_file)
+
+    return (False, game_map, player_position, selected_save_file)
 
 
 def _default_equipment_slots() -> dict[str, str | None]:
@@ -723,6 +731,30 @@ def _unequip_slot(inventory: Inventory, equipment: Equipment, slot_name: str) ->
     equipment.slots[slot_name] = None
     inventory.items.append(current)
     return f"Unequipped {current} from {slot_name}."
+
+
+def _item_visual(item_name: str) -> tuple[str, str, tuple[int, int, int] | None, tuple[int, int, int] | None]:
+    lowered = item_name.lower()
+
+    if any(token in lowered for token in ("sword", "dagger", "knife", "rapier", "spear", "javelin", "halberd", "axe", "mace", "club", "staff", "bow", "crossbow")):
+        return (")", "valuable", (220, 220, 220), None)
+
+    if any(token in lowered for token in ("helm", "hood", "hat", "crown", "chest", "tunic", "armor", "robe", "coat", "shield", "buckler", "pants", "greave", "leggings", "trousers", "boot", "shoe", "sandal", "glove", "gauntlet")):
+        return ("[", "valuable", (176, 188, 214), None)
+
+    if any(token in lowered for token in ("potion", "flask", "waterskin")):
+        return ("!", "valuable", (120, 196, 255), None)
+
+    if any(token in lowered for token in ("bandage", "scroll", "map", "book", "torch")):
+        return ("?", "valuable", (236, 210, 150), None)
+
+    if any(token in lowered for token in ("apple", "bread", "meat", "food")):
+        return ("%", "valuable", (222, 142, 106), None)
+
+    if any(token in lowered for token in ("coin", "gem", "charm", "ring")):
+        return ("$", "valuable", (245, 216, 118), None)
+
+    return ("*", "valuable", None, None)
 
 
 def _first_player_entity() -> int | None:
@@ -1157,6 +1189,9 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
         right_x = left_x + left_w + 2
 
         draw_panel = getattr(renderer, "draw_panel", None)
+        draw_ui_glyph = getattr(renderer, "draw_ui_glyph", None)
+        icon_cells = 2 if callable(draw_ui_glyph) else 0
+        text_offset = icon_cells + 1 if icon_cells > 0 else 0
         if callable(draw_panel):
             draw_panel(left_x, content_y, left_w, content_h, title="EQUIPPED")
             draw_panel(right_x, content_y, right_w, content_h, title="ITEMS")
@@ -1179,13 +1214,35 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
 
                 prefix = ">" if is_selected else " "
                 color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+                text_x = left_x + 2 + text_offset
+                text_width = max(1, left_w - 4 - text_offset)
+                glyph_prefix = ""
+
+                if equipped_item:
+                    glyph, classification, fg, bg = _item_visual(equipped_item)
+                    icon_drawn = False
+                    if callable(draw_ui_glyph):
+                        icon_drawn = bool(
+                            draw_ui_glyph(
+                                left_x + 2,
+                                row_y,
+                                glyph,
+                                classification=classification,
+                                fg=fg,
+                                bg=bg,
+                                cell_span=icon_cells,
+                            )
+                        )
+                    if not icon_drawn:
+                        glyph_prefix = f"{glyph} "
+
                 _draw_ui_text(
                     renderer,
-                    left_x + 2,
+                    text_x,
                     row_y,
-                    f"{prefix} {slot_name:10}: {display}",
+                    f"{prefix} {slot_name:10}: {glyph_prefix}{display}",
                     color,
-                    left_w - 4,
+                    text_width,
                 )
 
         if inventory_items:
@@ -1201,13 +1258,35 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
 
                 prefix = ">" if is_selected else " "
                 color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+                text_x = right_x + 2 + text_offset
+                text_width = max(1, right_w - 4 - text_offset)
+                glyph, classification, fg, bg = _item_visual(item_name)
+                icon_drawn = False
+
+                if callable(draw_ui_glyph):
+                    icon_drawn = bool(
+                        draw_ui_glyph(
+                            right_x + 2,
+                            row_y,
+                            glyph,
+                            classification=classification,
+                            fg=fg,
+                            bg=bg,
+                            cell_span=icon_cells,
+                        )
+                    )
+
+                label_text = f"{prefix} {label}) {item_name}"
+                if not icon_drawn:
+                    label_text = f"{prefix} {label}) {glyph} {item_name}"
+
                 _draw_ui_text(
                     renderer,
-                    right_x + 2,
+                    text_x,
                     row_y,
-                    f"{prefix} {label}) {item_name}",
+                    label_text,
                     color,
-                    right_w - 4,
+                    text_width,
                 )
         else:
             is_selected = selected_panel == "right"
@@ -1215,7 +1294,14 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
                 _fill_ui_cells(renderer, right_x + 1, list_start_y, right_w - 2, 1, _MENU_SELECTED_BG)
             color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
             prefix = ">" if is_selected else " "
-            _draw_ui_text(renderer, right_x + 2, list_start_y, f"{prefix} (empty)", color, right_w - 4)
+            _draw_ui_text(
+                renderer,
+                right_x + 2 + text_offset,
+                list_start_y,
+                f"{prefix} (empty)",
+                color,
+                max(1, right_w - 4 - text_offset),
+            )
 
         renderer.present()
 
@@ -1338,8 +1424,8 @@ def main() -> None:
         # Force windowed capture for deterministic screenshot dimensions.
         options["fullscreen"] = False
 
-    pygame_module = None if args.screenshot is not None else _start_background_music(options)
-    combat_sfx = _CombatSfxPlayer(pygame_module, options)
+    pygame_module = None
+    combat_sfx = _CombatSfxPlayer(None, options)
 
     game_map = GameMap(MAP_WIDTH, MAP_HEIGHT)
     player_position = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
@@ -1357,6 +1443,10 @@ def main() -> None:
             )
             if not startup_ok:
                 return
+
+            if args.screenshot is None:
+                pygame_module = _start_background_music(options)
+                combat_sfx = _CombatSfxPlayer(pygame_module, options)
 
             _setup_world(game_map, player_position)
             esper.add_processor(

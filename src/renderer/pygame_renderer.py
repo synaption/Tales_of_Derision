@@ -731,6 +731,49 @@ class PygameRenderer(Renderer):
 
         self._blit_text(x, y, glyph, resolved_fg)
 
+    def draw_ui_glyph(
+        self,
+        x: int,
+        y: int,
+        glyph: str,
+        classification: str = "default",
+        fg: tuple[int, int, int] | None = None,
+        bg: tuple[int, int, int] | None = None,
+        cell_span: int = 2,
+    ) -> bool:
+        if self._pygame is None or self._screen is None:
+            return False
+
+        if fg is None:
+            resolved_fg = self._class_colors.get(classification, self._default_fg)
+        else:
+            resolved_fg = _coerce_rgb(fg, self._default_fg)
+        resolved_bg = _coerce_rgb(bg, self._bg)
+
+        span = max(1, int(cell_span))
+        slot_x = x * self._ui_cell_w
+        slot_y = y * self._ui_cell_h
+        slot_w = max(1, span * self._ui_cell_w)
+        slot_h = max(1, self._ui_cell_h)
+
+        if bg is not None:
+            bg_rect = self._pygame.Rect(slot_x, slot_y, slot_w, slot_h)
+            self._pygame.draw.rect(self._screen, resolved_bg, bg_rect)
+
+        tile = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
+        if tile is None:
+            return False
+
+        icon_size = max(1, min(slot_w, slot_h))
+        icon = tile
+        if tile.get_width() != icon_size or tile.get_height() != icon_size:
+            icon = self._pygame.transform.scale(tile, (icon_size, icon_size))
+
+        icon_x = slot_x + max(0, (slot_w - icon_size) // 2)
+        icon_y = slot_y + max(0, (slot_h - icon_size) // 2)
+        self._screen.blit(icon, (icon_x, icon_y))
+        return True
+
     def draw_text(self, x: int, y: int, text: str) -> None:
         self._blit_text(x, y, text, self._default_fg)
 
@@ -919,81 +962,93 @@ class PygameRenderer(Renderer):
         else:
             self._set_cursor("arrow")
 
+    def _poll_action_once(self) -> str | None:
+        if self._pygame is None:
+            return None
+
+        if self._pending_actions:
+            return self._pending_actions.popleft()
+
+        events = self._pygame.event.get()
+        now = self._pygame.time.get_ticks()
+
+        for event in events:
+            if event.type == self._pygame.QUIT:
+                return "quit"
+
+            if event.type in {self._pygame.MOUSEMOTION, self._pygame.MOUSEBUTTONDOWN, self._pygame.MOUSEBUTTONUP}:
+                self._ensure_mouse_visible(now)
+
+            if event.type == self._pygame.MOUSEBUTTONDOWN and event.button == 1 and self._screen is not None:
+                left_px, _top_px, _width_px, _height_px = self._sidebar_geometry_px()
+                splitter_x = left_px
+                if abs(event.pos[0] - splitter_x) <= self._splitter_hit_slop_px:
+                    self._dragging_sidebar = True
+                    self._set_cursor("resize")
+                    continue
+
+            if event.type == self._pygame.MOUSEBUTTONUP and event.button == 1:
+                self._dragging_sidebar = False
+                self._update_cursor_for_splitter()
+                continue
+
+            if event.type == self._pygame.MOUSEMOTION and self._dragging_sidebar and self._screen is not None:
+                screen_w = self._screen.get_width()
+                new_sidebar_px = screen_w - event.pos[0]
+                min_px = max(14 * self._ui_cell_w, int(screen_w * 0.14))
+                max_px = int(screen_w * 0.6)
+                self._sidebar_width_px = max(min_px, min(max_px, new_sidebar_px))
+                self._sidebar_width_ratio = self._sidebar_width_px / max(1, screen_w)
+                self._options["sidebar_width_ratio"] = self._sidebar_width_ratio
+                self._pending_actions.append("ui_layout_changed")
+                self._set_cursor("resize")
+                continue
+
+            if event.type == self._pygame.MOUSEMOTION:
+                self._update_cursor_for_splitter()
+                continue
+
+            if event.type == self._pygame.KEYDOWN:
+                if event.key in self._confirm_keys:
+                    if self._confirm_held_key != event.key:
+                        self._confirm_held_key = event.key
+                        self._next_confirm_repeat_ms = now + self._confirm_initial_delay_ms
+                    self._pending_actions.append("confirm_action")
+                    continue
+
+                if event.key in self._keydown_to_action:
+                    self._pending_actions.append(self._keydown_to_action[event.key])
+                self._ensure_mouse_visible(now)
+
+            if event.type == self._pygame.KEYUP:
+                if self._confirm_held_key == event.key:
+                    self._confirm_held_key = None
+                    continue
+
+                if event.key in self._keyup_to_action:
+                    self._pending_actions.append(self._keyup_to_action[event.key])
+
+        if self._pending_actions:
+            return self._pending_actions.popleft()
+
+        if self._confirm_held_key is not None and now >= self._next_confirm_repeat_ms:
+            self._next_confirm_repeat_ms = now + self._confirm_repeat_interval_ms
+            return "confirm_action"
+
+        self._update_cursor_for_splitter()
+        self._hide_mouse_if_idle(now)
+        return None
+
     def poll_action(self) -> str | None:
         if self._pygame is None:
             return None
 
         while True:
-            if self._pending_actions:
-                return self._pending_actions.popleft()
-
-            events = self._pygame.event.get()
-            now = self._pygame.time.get_ticks()
-
-            for event in events:
-                if event.type == self._pygame.QUIT:
-                    return "quit"
-
-                if event.type in {self._pygame.MOUSEMOTION, self._pygame.MOUSEBUTTONDOWN, self._pygame.MOUSEBUTTONUP}:
-                    self._ensure_mouse_visible(now)
-
-                if event.type == self._pygame.MOUSEBUTTONDOWN and event.button == 1 and self._screen is not None:
-                    left_px, _top_px, _width_px, _height_px = self._sidebar_geometry_px()
-                    splitter_x = left_px
-                    if abs(event.pos[0] - splitter_x) <= self._splitter_hit_slop_px:
-                        self._dragging_sidebar = True
-                        self._set_cursor("resize")
-                        continue
-
-                if event.type == self._pygame.MOUSEBUTTONUP and event.button == 1:
-                    self._dragging_sidebar = False
-                    self._update_cursor_for_splitter()
-                    continue
-
-                if event.type == self._pygame.MOUSEMOTION and self._dragging_sidebar and self._screen is not None:
-                    screen_w = self._screen.get_width()
-                    new_sidebar_px = screen_w - event.pos[0]
-                    min_px = max(14 * self._ui_cell_w, int(screen_w * 0.14))
-                    max_px = int(screen_w * 0.6)
-                    self._sidebar_width_px = max(min_px, min(max_px, new_sidebar_px))
-                    self._sidebar_width_ratio = self._sidebar_width_px / max(1, screen_w)
-                    self._options["sidebar_width_ratio"] = self._sidebar_width_ratio
-                    self._pending_actions.append("ui_layout_changed")
-                    self._set_cursor("resize")
-                    continue
-
-                if event.type == self._pygame.MOUSEMOTION:
-                    self._update_cursor_for_splitter()
-                    continue
-
-                if event.type == self._pygame.KEYDOWN:
-                    if event.key in self._confirm_keys:
-                        if self._confirm_held_key != event.key:
-                            self._confirm_held_key = event.key
-                            self._next_confirm_repeat_ms = now + self._confirm_initial_delay_ms
-                        self._pending_actions.append("confirm_action")
-                        continue
-
-                    if event.key in self._keydown_to_action:
-                        self._pending_actions.append(self._keydown_to_action[event.key])
-                    self._ensure_mouse_visible(now)
-
-                if event.type == self._pygame.KEYUP:
-                    if self._confirm_held_key == event.key:
-                        self._confirm_held_key = None
-                        continue
-
-                    if event.key in self._keyup_to_action:
-                        self._pending_actions.append(self._keyup_to_action[event.key])
-
-            if self._pending_actions:
-                return self._pending_actions.popleft()
-
-            if self._confirm_held_key is not None and now >= self._next_confirm_repeat_ms:
-                self._next_confirm_repeat_ms = now + self._confirm_repeat_interval_ms
-                return "confirm_action"
-
-            self._update_cursor_for_splitter()
-            self._hide_mouse_if_idle(now)
+            action = self._poll_action_once()
+            if action is not None:
+                return action
 
             self._pygame.time.wait(8)
+
+    def poll_action_nonblocking(self) -> str | None:
+        return self._poll_action_once()
