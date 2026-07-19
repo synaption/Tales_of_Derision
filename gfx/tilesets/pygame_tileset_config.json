@@ -1,19 +1,32 @@
 {
   "tile_size": 16,
   "default_sheet": "gfx/tilesets/Hexany/general_transparent.png",
+  "tile_index_csv": "gfx/tilesets/Hexany/tile_index.csv",
+  "sheet_paths": {
+    "general": "gfx/tilesets/Hexany/general_transparent.png",
+    "items": "gfx/tilesets/Hexany/items_transparent.png",
+    "creatures": "gfx/tilesets/Hexany/creatures_transparent.png"
+  },
+  "fallback": {
+    "sheet": "gfx/tilesets/Bisasam_16x16.png",
+    "tile_size": 16,
+    "columns": 16,
+    "rows": 16,
+    "tint_with_fg": true,
+    "use_bg_fill": true
+  },
   "glyphs": {
-    ".": { "sheet": "gfx/tilesets/Hexany/autotile_transparent.png", "x": 0, "y": 0 },
-    "#": { "sheet": "gfx/tilesets/Hexany/autotile_transparent.png", "x": 1, "y": 0 },
-    "@": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 0, "y": 0 },
-    "v": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 1, "y": 0 },
-    "g": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 2, "y": 0 },
-    "r": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 3, "y": 0 },
-    "%": { "sheet": "gfx/tilesets/Hexany/items_transparent.png", "x": 0, "y": 0 }
+    ".": { "tile_id": "general_00_01" },
+    "#": { "tile_id": "general_01_24" },
+    "@": { "tile_id": "creatures_00_00" },
+    "v": { "tile_id": "creatures_00_01" },
+    "g": { "tile_id": "creatures_03_00" },
+    "r": { "tile_id": "creatures_03_12" },
+    "%": { "tile_id": "items_03_20" }
   },
   "classifications": {
-    "friendly": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 1, "y": 0 },
-    "enemy": { "sheet": "gfx/tilesets/Hexany/creatures_transparent.png", "x": 2, "y": 0 },
-    "wall": { "sheet": "gfx/tilesets/Hexany/autotile_transparent.png", "x": 1, "y": 0 },
-    "default": { "sheet": "gfx/tilesets/Hexany/autotile_transparent.png", "x": 0, "y": 0 }
+    "friendly": { "tile_id": "creatures_00_01" },
+    "enemy": { "tile_id": "creatures_03_00" },
+    "wall": { "tile_id": "general_01_24" }
   }
 }

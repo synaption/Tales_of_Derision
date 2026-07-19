@@ -27,16 +27,31 @@ class Renderer(ABC):
         """Erase the frame before drawing."""
 
     @abstractmethod
-    def draw_glyph(self, x: int, y: int, glyph: str) -> None:
+    def draw_glyph(
+        self,
+        x: int,
+        y: int,
+        glyph: str,
+        fg: tuple[int, int, int] | None = None,
+        bg: tuple[int, int, int] | None = None,
+    ) -> None:
         """Draw a single character at map cell (x, y)."""
 
-    def draw_glyph_classified(self, x: int, y: int, glyph: str, classification: str) -> None:
+    def draw_glyph_classified(
+        self,
+        x: int,
+        y: int,
+        glyph: str,
+        classification: str,
+        fg: tuple[int, int, int] | None = None,
+        bg: tuple[int, int, int] | None = None,
+    ) -> None:
         """Draw a glyph with semantic classification (wall, enemy, etc).
 
         Renderers that do not support color/class styling can ignore
         classification and fall back to plain glyph drawing.
         """
-        self.draw_glyph(x, y, glyph)
+        self.draw_glyph(x, y, glyph, fg=fg, bg=bg)
 
     @abstractmethod
     def draw_text(self, x: int, y: int, text: str) -> None:

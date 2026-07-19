@@ -32,6 +32,18 @@ Move: hold WASD, press Space to take a step. Menu: Esc. Inventory: I.
 - `audio_buffer` in `src/data/config/options.json` controls mixer buffer size
   (default `16384` in this build). If audio is still choppy, increase it.
 
+## Tilesets
+
+- Render flow now follows:
+  `Game object -> glyph + fg + bg -> tileset lookup -> PNG tile blit`.
+- `Renderable` supports optional `fg` and `bg` values.
+- `gfx/tilesets/pygame_tileset_config.json` now supports `tile_id` entries
+  from `gfx/tilesets/Hexany/tile_index.csv`.
+- If a glyph is not found in configured lookup tables, renderer falls back to
+  `gfx/tilesets/Bisasam_16x16.png` by default.
+- The fallback sheet is configurable and can be replaced with another
+  dwarf-fortress style CP437 tilesheet via the config `fallback` section.
+
 ## Testing
 
 Tests are headless and do not require a live game window. They use a fake

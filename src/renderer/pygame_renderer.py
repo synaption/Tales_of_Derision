@@ -6,6 +6,7 @@ separate high-resolution font scale.
 
 from __future__ import annotations
 
+import csv
 from collections import deque
 import json
 from pathlib import Path
@@ -144,6 +145,20 @@ def _build_key_mappings(
     return keydown_to_action, keyup_to_action
 
 
+def _coerce_rgb(value: object, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+    if (
+        isinstance(value, tuple)
+        and len(value) == 3
+        and all(isinstance(channel, int) for channel in value)
+    ):
+        return tuple(max(0, min(255, int(channel))) for channel in value)
+    return fallback
+
+
+def _rgb_to_hex(color: tuple[int, int, int]) -> str:
+    return f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+
+
 class PygameRenderer(Renderer):
     def __init__(self, options: dict | None = None) -> None:
         self._options = options or {}
@@ -195,9 +210,19 @@ class PygameRenderer(Renderer):
 
         project_root = Path(__file__).resolve().parents[2]
         self._tile_config_path = project_root / "gfx" / "tilesets" / "pygame_tileset_config.json"
+        self._fallback_sheet_path = str(project_root / "gfx" / "tilesets" / "Bisasam_16x16.png")
+        self._fallback_tile_size = 16
+        self._fallback_sheet_columns = 16
+        self._fallback_sheet_rows = 16
+        self._fallback_tint_with_fg = True
+        self._fallback_fill_bg = True
         self._sheet_cache: dict[str, object] = {}
         self._glyph_tiles: dict[str, object] = {}
         self._class_tiles: dict[str, object] = {}
+        self._fallback_tiles: dict[
+            tuple[str, str, tuple[int, int, int], tuple[int, int, int], int, int],
+            object,
+        ] = {}
         self._grid_cols = self._cols
         self._grid_rows = self._rows
         self._ui_cols = self._cols
@@ -255,6 +280,7 @@ class PygameRenderer(Renderer):
         self._sheet_cache = {}
         self._glyph_tiles = {}
         self._class_tiles = {}
+        self._fallback_tiles = {}
         self._load_tileset_config()
 
         self._keydown_to_action, self._keyup_to_action = _build_key_mappings(self._pygame, self._options)
@@ -308,9 +334,17 @@ class PygameRenderer(Renderer):
             return 4.0
         return scale
 
-    def _load_tile(self, sheet_path: str, tile_x: int, tile_y: int):
+    def _load_tile(
+        self,
+        sheet_path: str,
+        tile_x: int,
+        tile_y: int,
+        tile_size: int | None = None,
+    ):
         if self._pygame is None:
             return None
+
+        sample_size = tile_size if isinstance(tile_size, int) and tile_size > 0 else self._tile_size
 
         sheet = self._sheet_cache.get(sheet_path)
         if sheet is None:
@@ -321,18 +355,18 @@ class PygameRenderer(Renderer):
                 return None
 
         rect = self._pygame.Rect(
-            tile_x * self._tile_size,
-            tile_y * self._tile_size,
-            self._tile_size,
-            self._tile_size,
+            tile_x * sample_size,
+            tile_y * sample_size,
+            sample_size,
+            sample_size,
         )
         if rect.right > sheet.get_width() or rect.bottom > sheet.get_height():
             return None
 
-        tile = self._pygame.Surface((self._tile_size, self._tile_size), self._pygame.SRCALPHA)
+        tile = self._pygame.Surface((sample_size, sample_size), self._pygame.SRCALPHA)
         tile.blit(sheet, (0, 0), rect)
 
-        if self._cell_w != self._tile_size or self._cell_h != self._tile_size:
+        if self._cell_w != sample_size or self._cell_h != sample_size:
             tile = self._pygame.transform.scale(tile, (self._cell_w, self._cell_h))
 
         return tile
@@ -370,18 +404,118 @@ class PygameRenderer(Renderer):
                 sheet_path = Path(__file__).resolve().parents[2] / sheet_path
             return str(sheet_path)
 
+        sheet_aliases: dict[str, str] = {}
+        raw_sheet_aliases = payload.get("sheet_paths")
+        if isinstance(raw_sheet_aliases, dict):
+            for alias_name, alias_value in raw_sheet_aliases.items():
+                if not isinstance(alias_name, str) or not isinstance(alias_value, str):
+                    continue
+                resolved = resolve_sheet(alias_value)
+                if resolved:
+                    sheet_aliases[alias_name] = resolved
+
+        tile_index_path: Path | None = None
+        raw_tile_index = payload.get("tile_index_csv")
+        if isinstance(raw_tile_index, str) and raw_tile_index.strip():
+            candidate = Path(raw_tile_index.strip())
+            if not candidate.is_absolute():
+                candidate = Path(__file__).resolve().parents[2] / candidate
+            tile_index_path = candidate
+        elif default_sheet:
+            default_sheet_path = Path(resolve_sheet(default_sheet))
+            inferred = default_sheet_path.parent / "tile_index.csv"
+            if inferred.exists():
+                tile_index_path = inferred
+
+        tile_index: dict[str, tuple[str, int, int, int | None]] = {}
+        if tile_index_path is not None and tile_index_path.exists():
+            try:
+                with tile_index_path.open("r", encoding="utf-8", newline="") as index_file:
+                    for row in csv.DictReader(index_file):
+                        if not isinstance(row, dict):
+                            continue
+
+                        tile_id = str(row.get("tile_id", "")).strip()
+                        sheet_name = str(row.get("sheet", "")).strip()
+                        if not tile_id:
+                            continue
+
+                        try:
+                            tile_x = int(row.get("col", ""))
+                            tile_y = int(row.get("row", ""))
+                        except (TypeError, ValueError):
+                            continue
+
+                        sample_size: int | None = None
+                        width_raw = row.get("w")
+                        try:
+                            if width_raw is not None and str(width_raw).strip():
+                                parsed = int(width_raw)
+                                if parsed > 0:
+                                    sample_size = parsed
+                        except (TypeError, ValueError):
+                            sample_size = None
+
+                        tile_index[tile_id] = (sheet_name, tile_x, tile_y, sample_size)
+            except Exception:
+                tile_index = {}
+
+        def resolve_sheet_alias(sheet_value: str) -> str:
+            sheet_value = (sheet_value or "").strip()
+            if not sheet_value:
+                return resolve_sheet(sheet_value)
+
+            if sheet_value in sheet_aliases:
+                return sheet_aliases[sheet_value]
+
+            if tile_index_path is not None:
+                index_dir = tile_index_path.parent
+                for suffix in ("_transparent.png", ".png"):
+                    candidate = index_dir / f"{sheet_value}{suffix}"
+                    if candidate.exists():
+                        return str(candidate)
+
+            return resolve_sheet(sheet_value)
+
+        def load_tile_from_spec(spec: dict) -> object | None:
+            tile_id = spec.get("tile_id")
+            if isinstance(tile_id, str):
+                indexed = tile_index.get(tile_id.strip())
+                if indexed is not None:
+                    sheet_name, tile_x, tile_y, sample_size = indexed
+                    sheet_path = resolve_sheet_alias(sheet_name)
+                    if sheet_path:
+                        tile = self._load_tile(sheet_path, tile_x, tile_y, sample_size)
+                        if tile is not None:
+                            return tile
+
+            sheet_path = ""
+            raw_sheet = spec.get("sheet")
+            if isinstance(raw_sheet, str):
+                sheet_path = resolve_sheet_alias(raw_sheet)
+            elif default_sheet:
+                sheet_path = resolve_sheet(default_sheet)
+
+            tile_x = spec.get("x")
+            tile_y = spec.get("y")
+            if not isinstance(tile_x, int) or not isinstance(tile_y, int):
+                tile_x = spec.get("col")
+                tile_y = spec.get("row")
+
+            sample_size = spec.get("tile_size")
+            sample_size_value = sample_size if isinstance(sample_size, int) and sample_size > 0 else None
+
+            if not sheet_path or not isinstance(tile_x, int) or not isinstance(tile_y, int):
+                return None
+            return self._load_tile(sheet_path, tile_x, tile_y, sample_size_value)
+
         self._glyph_tiles = {}
         glyph_payload = payload.get("glyphs", {})
         if isinstance(glyph_payload, dict):
             for glyph, spec in glyph_payload.items():
                 if not isinstance(glyph, str) or not isinstance(spec, dict):
                     continue
-                sheet_path = resolve_sheet(str(spec.get("sheet", "")))
-                tx = spec.get("x")
-                ty = spec.get("y")
-                if not sheet_path or not isinstance(tx, int) or not isinstance(ty, int):
-                    continue
-                tile = self._load_tile(sheet_path, tx, ty)
+                tile = load_tile_from_spec(spec)
                 if tile is not None:
                     self._glyph_tiles[glyph] = tile
 
@@ -391,14 +525,35 @@ class PygameRenderer(Renderer):
             for classification, spec in class_payload.items():
                 if not isinstance(classification, str) or not isinstance(spec, dict):
                     continue
-                sheet_path = resolve_sheet(str(spec.get("sheet", "")))
-                tx = spec.get("x")
-                ty = spec.get("y")
-                if not sheet_path or not isinstance(tx, int) or not isinstance(ty, int):
-                    continue
-                tile = self._load_tile(sheet_path, tx, ty)
+                tile = load_tile_from_spec(spec)
                 if tile is not None:
                     self._class_tiles[classification] = tile
+
+        fallback_payload = payload.get("fallback")
+        if isinstance(fallback_payload, dict):
+            fallback_sheet = fallback_payload.get("sheet")
+            if isinstance(fallback_sheet, str) and fallback_sheet.strip():
+                resolved = resolve_sheet(fallback_sheet.strip())
+                if resolved:
+                    self._fallback_sheet_path = resolved
+
+            tile_size_value = fallback_payload.get("tile_size")
+            if isinstance(tile_size_value, int) and tile_size_value > 0:
+                self._fallback_tile_size = tile_size_value
+
+            col_value = fallback_payload.get("columns")
+            if isinstance(col_value, int) and col_value > 0:
+                self._fallback_sheet_columns = col_value
+
+            row_value = fallback_payload.get("rows")
+            if isinstance(row_value, int) and row_value > 0:
+                self._fallback_sheet_rows = row_value
+
+            if "tint_with_fg" in fallback_payload:
+                self._fallback_tint_with_fg = bool(fallback_payload.get("tint_with_fg"))
+
+            if "use_bg_fill" in fallback_payload:
+                self._fallback_fill_bg = bool(fallback_payload.get("use_bg_fill"))
 
     def setup(self) -> None:
         import pygame
@@ -437,22 +592,144 @@ class PygameRenderer(Renderer):
                 surface = surface.subsurface(clip)
         self._screen.blit(surface, (x * self._ui_cell_w, y * self._ui_cell_h))
 
-    def draw_glyph(self, x: int, y: int, glyph: str) -> None:
-        if self._screen is not None and glyph in self._glyph_tiles:
-            self._screen.blit(self._glyph_tiles[glyph], (x * self._cell_w, y * self._cell_h))
-            return
-        self._blit_text(x, y, glyph, self._default_fg)
+    @staticmethod
+    def _style_lookup_key(token: str, fg: tuple[int, int, int], bg: tuple[int, int, int]) -> str:
+        return f"{token}|{_rgb_to_hex(fg)}|{_rgb_to_hex(bg)}"
 
-    def draw_glyph_classified(self, x: int, y: int, glyph: str, classification: str) -> None:
-        if self._screen is not None:
-            if glyph in self._glyph_tiles:
-                self._screen.blit(self._glyph_tiles[glyph], (x * self._cell_w, y * self._cell_h))
-                return
-            if classification in self._class_tiles:
-                self._screen.blit(self._class_tiles[classification], (x * self._cell_w, y * self._cell_h))
-                return
-        color = self._class_colors.get(classification, self._default_fg)
-        self._blit_text(x, y, glyph, color)
+    def _fill_glyph_background(self, x: int, y: int, bg: tuple[int, int, int]) -> None:
+        if self._pygame is None or self._screen is None:
+            return
+        rect = self._pygame.Rect(x * self._cell_w, y * self._cell_h, self._cell_w, self._cell_h)
+        self._pygame.draw.rect(self._screen, bg, rect)
+
+    def _load_fallback_tile(
+        self,
+        glyph: str,
+        fg: tuple[int, int, int],
+        bg: tuple[int, int, int],
+    ):
+        if self._pygame is None:
+            return None
+        if not self._fallback_sheet_path:
+            return None
+
+        glyph_char = glyph[0] if glyph else " "
+        cache_key = (self._fallback_sheet_path, glyph_char, fg, bg, self._cell_w, self._cell_h)
+        cached = self._fallback_tiles.get(cache_key)
+        if cached is not None:
+            return cached
+
+        columns = max(1, self._fallback_sheet_columns)
+        rows = max(1, self._fallback_sheet_rows)
+        max_glyphs = columns * rows
+
+        codepoint = ord(glyph_char)
+        if codepoint < 0 or codepoint >= max_glyphs:
+            codepoint = ord("?") % max_glyphs
+
+        tile_x = codepoint % columns
+        tile_y = (codepoint // columns) % rows
+
+        tile = self._load_tile(
+            self._fallback_sheet_path,
+            tile_x,
+            tile_y,
+            self._fallback_tile_size,
+        )
+        if tile is None:
+            return None
+
+        tile = tile.copy()
+        if self._fallback_tint_with_fg:
+            tint = self._pygame.Surface((tile.get_width(), tile.get_height()), self._pygame.SRCALPHA)
+            tint.fill((fg[0], fg[1], fg[2], 255))
+            tile.blit(tint, (0, 0), special_flags=self._pygame.BLEND_RGBA_MULT)
+
+        if self._fallback_fill_bg:
+            with_bg = self._pygame.Surface((tile.get_width(), tile.get_height()), self._pygame.SRCALPHA)
+            with_bg.fill((bg[0], bg[1], bg[2], 255))
+            with_bg.blit(tile, (0, 0))
+            tile = with_bg
+
+        self._fallback_tiles[cache_key] = tile
+        return tile
+
+    def _resolve_tile_surface(
+        self,
+        glyph: str,
+        classification: str | None,
+        fg: tuple[int, int, int],
+        bg: tuple[int, int, int],
+    ):
+        style_key = self._style_lookup_key(glyph, fg, bg)
+        tile = self._glyph_tiles.get(style_key)
+        if tile is None:
+            tile = self._glyph_tiles.get(glyph)
+        if tile is not None:
+            return tile
+
+        if classification is not None:
+            class_style_key = self._style_lookup_key(classification, fg, bg)
+            tile = self._class_tiles.get(class_style_key)
+            if tile is None:
+                tile = self._class_tiles.get(classification)
+            if tile is not None:
+                return tile
+
+            default_style_key = self._style_lookup_key("default", fg, bg)
+            tile = self._class_tiles.get(default_style_key)
+            if tile is None:
+                tile = self._class_tiles.get("default")
+            if tile is not None:
+                return tile
+
+        return self._load_fallback_tile(glyph, fg, bg)
+
+    def draw_glyph(
+        self,
+        x: int,
+        y: int,
+        glyph: str,
+        fg: tuple[int, int, int] | None = None,
+        bg: tuple[int, int, int] | None = None,
+    ) -> None:
+        resolved_fg = _coerce_rgb(fg, self._default_fg)
+        resolved_bg = _coerce_rgb(bg, self._bg)
+
+        if bg is not None:
+            self._fill_glyph_background(x, y, resolved_bg)
+
+        tile = self._resolve_tile_surface(glyph, None, resolved_fg, resolved_bg)
+        if self._screen is not None and tile is not None:
+            self._screen.blit(tile, (x * self._cell_w, y * self._cell_h))
+            return
+
+        self._blit_text(x, y, glyph, resolved_fg)
+
+    def draw_glyph_classified(
+        self,
+        x: int,
+        y: int,
+        glyph: str,
+        classification: str,
+        fg: tuple[int, int, int] | None = None,
+        bg: tuple[int, int, int] | None = None,
+    ) -> None:
+        if fg is None:
+            resolved_fg = self._class_colors.get(classification, self._default_fg)
+        else:
+            resolved_fg = _coerce_rgb(fg, self._default_fg)
+        resolved_bg = _coerce_rgb(bg, self._bg)
+
+        if bg is not None:
+            self._fill_glyph_background(x, y, resolved_bg)
+
+        tile = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
+        if self._screen is not None and tile is not None:
+            self._screen.blit(tile, (x * self._cell_w, y * self._cell_h))
+            return
+
+        self._blit_text(x, y, glyph, resolved_fg)
 
     def draw_text(self, x: int, y: int, text: str) -> None:
         self._blit_text(x, y, text, self._default_fg)

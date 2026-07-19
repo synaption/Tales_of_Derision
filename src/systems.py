@@ -577,11 +577,11 @@ class RenderProcessor(esper.Processor):
                 if (wx, wy) in self._visible_tiles:
                     tile = self.game_map.tile_at(wx, wy)
                     classification = "wall" if tile == self.game_map.WALL else "default"
-                    r.draw_glyph_classified(vx, vy, tile, classification)
+                    r.draw_glyph_classified(vx, vy, tile, classification, fg=None, bg=None)
                 else:
                     r.draw_glyph(vx, vy, " ")
 
-        player_draw: tuple[int, int, str, str] | None = None
+        player_draw: tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None] | None = None
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
             is_player = esper.has_component(ent, Player)
             if (pos.x, pos.y) not in self._visible_tiles and not is_player:
@@ -599,14 +599,21 @@ class RenderProcessor(esper.Processor):
 
             if is_player:
                 if view_xy is not None:
-                    player_draw = (view_xy[0], view_xy[1], rend.glyph, classification)
+                    player_draw = (view_xy[0], view_xy[1], rend.glyph, classification, rend.fg, rend.bg)
                 continue
 
             if view_xy is not None:
-                r.draw_glyph_classified(view_xy[0], view_xy[1], rend.glyph, classification)
+                r.draw_glyph_classified(view_xy[0], view_xy[1], rend.glyph, classification, fg=rend.fg, bg=rend.bg)
 
         if player_draw is not None:
-            r.draw_glyph_classified(player_draw[0], player_draw[1], player_draw[2], player_draw[3])
+            r.draw_glyph_classified(
+                player_draw[0],
+                player_draw[1],
+                player_draw[2],
+                player_draw[3],
+                fg=player_draw[4],
+                bg=player_draw[5],
+            )
 
         self._draw_sidebar(player_pos, entity_lookup)
 

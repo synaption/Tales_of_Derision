@@ -16,6 +16,8 @@ class Position:
 @dataclass
 class Renderable:
     glyph: str
+    fg: tuple[int, int, int] | None = None
+    bg: tuple[int, int, int] | None = None
 
 
 @dataclass
