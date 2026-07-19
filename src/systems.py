@@ -425,6 +425,56 @@ class RenderProcessor(esper.Processor):
             draw_line(x0, log_content_y + idx, line, content_width)
 
     def _compute_layout(self, player_pos: Position | None) -> None:
+        get_screen_px = getattr(self.renderer, "get_screen_size_px", None)
+        get_tile_cell_px = getattr(self.renderer, "get_tile_cell_size_px", None)
+        get_ui_grid = getattr(self.renderer, "get_ui_grid_size", None)
+        get_ui_cell_px = getattr(self.renderer, "get_ui_cell_size_px", None)
+        get_sidebar_px = getattr(self.renderer, "get_sidebar_width_px", None)
+
+        if (
+            callable(get_screen_px)
+            and callable(get_tile_cell_px)
+            and callable(get_ui_grid)
+            and callable(get_ui_cell_px)
+            and callable(get_sidebar_px)
+        ):
+            screen_w, screen_h = get_screen_px()
+            tile_w, tile_h = get_tile_cell_px()
+            ui_cols, ui_rows = get_ui_grid()
+            ui_cell_w, ui_cell_h = get_ui_cell_px()
+
+            tile_w = max(1, tile_w)
+            tile_h = max(1, tile_h)
+            ui_cell_w = max(1, ui_cell_w)
+            ui_cell_h = max(1, ui_cell_h)
+
+            status_px = ui_cell_h
+            sidebar_px = max(14 * ui_cell_w, int(get_sidebar_px(22 * ui_cell_w)))
+            sidebar_px = min(max(sidebar_px, 14 * ui_cell_w), max(14 * ui_cell_w, screen_w - 8 * tile_w))
+
+            map_px_w = max(8 * tile_w, screen_w - sidebar_px)
+            map_px_h = max(5 * tile_h, screen_h - status_px)
+
+            self._view_width = min(self.game_map.width, max(8, map_px_w // tile_w))
+            self._view_height = min(self.game_map.height, max(5, map_px_h // tile_h))
+
+            self._grid_w = max(1, ui_cols)
+            self._grid_h = max(1, ui_rows)
+            self.sidebar_width = max(14, sidebar_px // ui_cell_w)
+            self.sidebar_x = max(0, self._grid_w - self.sidebar_width)
+            self._status_y = max(0, self._grid_h - 1)
+
+            max_ox = max(0, self.game_map.width - self._view_width)
+            max_oy = max(0, self.game_map.height - self._view_height)
+            if player_pos is None:
+                self._view_origin_x = 0
+                self._view_origin_y = 0
+                return
+
+            self._view_origin_x = min(max_ox, max(0, player_pos.x - self._view_width // 2))
+            self._view_origin_y = min(max_oy, max(0, player_pos.y - self._view_height // 2))
+            return
+
         grid_w = self.game_map.width + self.sidebar_width + 3
         grid_h = self.game_map.height + 1
         get_grid = getattr(self.renderer, "get_grid_size", None)

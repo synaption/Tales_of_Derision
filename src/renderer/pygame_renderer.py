@@ -29,6 +29,8 @@ class PygameRenderer(Renderer):
         # Render-cell size used by map and glyph positioning.
         self._cell_w = 16
         self._cell_h = 16
+        self._ui_cell_w = 8
+        self._ui_cell_h = 16
 
         # Screen size in text cells; roomy enough for map + sidebar + menus.
         self._cols = 120
@@ -63,6 +65,8 @@ class PygameRenderer(Renderer):
         self._class_tiles: dict[str, object] = {}
         self._grid_cols = self._cols
         self._grid_rows = self._rows
+        self._ui_cols = self._cols
+        self._ui_rows = self._rows
         self._sidebar_width_px: int | None = None
         self._sidebar_width_ratio = 0.22
         self._dragging_sidebar = False
@@ -85,6 +89,9 @@ class PygameRenderer(Renderer):
 
         self._ui_font_size = max(8, int(round(16 * self._ui_scale)))
         self._font = self._pygame.font.SysFont("DejaVu Sans Mono", self._ui_font_size)
+        self._ui_cell_w, self._ui_cell_h = self._font.size("M")
+        self._ui_cell_w = max(1, self._ui_cell_w)
+        self._ui_cell_h = max(1, self._ui_cell_h)
         try:
             ratio = float(self._options.get("sidebar_width_ratio", 0.22))
         except (TypeError, ValueError):
@@ -101,11 +108,14 @@ class PygameRenderer(Renderer):
 
         if self._screen is not None:
             screen_w = self._screen.get_width()
+            screen_h = self._screen.get_height()
             if self._sidebar_width_px is None:
                 self._sidebar_width_px = int(round(screen_w * self._sidebar_width_ratio))
             self._sidebar_width_px = max(180, min(int(screen_w * 0.6), self._sidebar_width_px))
             self._grid_cols = max(1, screen_w // self._cell_w)
-            self._grid_rows = max(1, self._screen.get_height() // self._cell_h)
+            self._grid_rows = max(1, screen_h // self._cell_h)
+            self._ui_cols = max(1, screen_w // self._ui_cell_w)
+            self._ui_rows = max(1, screen_h // self._ui_cell_h)
 
         self._sheet_cache = {}
         self._glyph_tiles = {}
@@ -114,6 +124,25 @@ class PygameRenderer(Renderer):
 
     def get_grid_size(self) -> tuple[int, int]:
         return (self._grid_cols, self._grid_rows)
+
+    def get_ui_grid_size(self) -> tuple[int, int]:
+        return (self._ui_cols, self._ui_rows)
+
+    def get_screen_size_px(self) -> tuple[int, int]:
+        if self._screen is None:
+            return (self._cols * self._cell_w, self._rows * self._cell_h)
+        return (self._screen.get_width(), self._screen.get_height())
+
+    def get_tile_cell_size_px(self) -> tuple[int, int]:
+        return (self._cell_w, self._cell_h)
+
+    def get_ui_cell_size_px(self) -> tuple[int, int]:
+        return (self._ui_cell_w, self._ui_cell_h)
+
+    def get_sidebar_width_px(self, default: int = 320) -> int:
+        if self._sidebar_width_px is None:
+            return default
+        return self._sidebar_width_px
 
     def get_sidebar_width_cells(self, default: int = 28) -> int:
         if self._sidebar_width_px is None:
@@ -277,7 +306,7 @@ class PygameRenderer(Renderer):
             if surface.get_width() > max_width_px:
                 clip = self._pygame.Rect(0, 0, max_width_px, surface.get_height())
                 surface = surface.subsurface(clip)
-        self._screen.blit(surface, (x * self._cell_w, y * self._cell_h))
+        self._screen.blit(surface, (x * self._ui_cell_w, y * self._ui_cell_h))
 
     def draw_glyph(self, x: int, y: int, glyph: str) -> None:
         if self._screen is not None and glyph in self._glyph_tiles:
@@ -302,15 +331,15 @@ class PygameRenderer(Renderer):
     def draw_text_clipped(self, x: int, y: int, text: str, max_cells: int) -> None:
         if max_cells <= 0:
             return
-        max_width_px = max(1, max_cells * self._cell_w - 4)
+        max_width_px = max(1, max_cells * self._ui_cell_w - 4)
         self._blit_text(x, y, text, self._default_fg, max_width_px=max_width_px)
 
     def text_columns_for_cells(self, width_cells: int, padding_px: int = 4) -> int:
         if width_cells <= 0:
             return 1
-        usable_px = max(1, width_cells * self._cell_w - max(0, padding_px))
+        usable_px = max(1, width_cells * self._ui_cell_w - max(0, padding_px))
         if self._font is None:
-            return max(1, usable_px // max(1, self._cell_w))
+            return max(1, usable_px // max(1, self._ui_cell_w))
         char_w, _char_h = self._font.size("M")
         return max(1, usable_px // max(1, char_w))
 
@@ -320,10 +349,10 @@ class PygameRenderer(Renderer):
         if width <= 0 or height <= 0:
             return
 
-        px = x * self._cell_w
-        py = y * self._cell_h
-        pw = width * self._cell_w
-        ph = height * self._cell_h
+        px = x * self._ui_cell_w
+        py = y * self._ui_cell_h
+        pw = width * self._ui_cell_w
+        ph = height * self._ui_cell_h
 
         panel_rect = self._pygame.Rect(px, py, pw, ph)
         self._pygame.draw.rect(self._screen, self._panel_bg, panel_rect)
@@ -364,8 +393,8 @@ class PygameRenderer(Renderer):
         sidebar_px = self._sidebar_width_px
         if sidebar_px is None:
             sidebar_px = int(round(screen_w * self._sidebar_width_ratio))
-        sidebar_cells = max(16, int(round(sidebar_px / max(1, self._cell_w))))
-        snapped_width_px = sidebar_cells * self._cell_w
+        sidebar_cells = max(14, int(round(sidebar_px / max(1, self._ui_cell_w))))
+        snapped_width_px = sidebar_cells * self._ui_cell_w
         left_px = max(0, screen_w - snapped_width_px)
         return (left_px, 0, snapped_width_px, screen_h)
 
@@ -430,7 +459,7 @@ class PygameRenderer(Renderer):
                 if event.type == self._pygame.MOUSEMOTION and self._dragging_sidebar and self._screen is not None:
                     screen_w = self._screen.get_width()
                     new_sidebar_px = screen_w - event.pos[0]
-                    min_px = max(14 * self._cell_w, int(screen_w * 0.14))
+                    min_px = max(14 * self._ui_cell_w, int(screen_w * 0.14))
                     max_px = int(screen_w * 0.6)
                     self._sidebar_width_px = max(min_px, min(max_px, new_sidebar_px))
                     self._sidebar_width_ratio = self._sidebar_width_px / max(1, screen_w)

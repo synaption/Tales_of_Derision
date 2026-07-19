@@ -118,8 +118,6 @@ Fantasy
 
 Time Travel
 
-Knowledge and Teaching
-
 Zombie
 
 MacGuffins/Plot Coupons
@@ -127,7 +125,13 @@ MacGuffins/Plot Coupons
 - the infinity stones
 - dragon balls
 
+Knowledge and Teaching
+
 Music, and Comrodery
+
+Ballence and Equilibrium
+
+Karma and Reincarnation
 
 
 ## Design Goals Big Picture
@@ -153,7 +157,7 @@ All NPCs are playable.
 
 Players and NPCs have the same needs as the player like food and water.
 
-When the player dies they become a random sentiaent NPC somewhere in the world.  
+When the player dies they become a random sentiaent NPC somewhere in the world.  It's like "Roy" from Rick and Morty.  
 
 ## Style
 Pixel Art
