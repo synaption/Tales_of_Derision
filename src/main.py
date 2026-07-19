@@ -292,6 +292,26 @@ _MENU_MUTED_COLOR = (156, 156, 156)
 _MENU_SELECTED_BG = (44, 44, 44)
 _MENU_SELECTED_TEXT = (252, 252, 252)
 _TITLE_SPLASH_SECONDS = 3.0
+_GOBLIN_GREEN = (82, 166, 74)
+_RAT_BROWN = (128, 92, 60)
+_HUMAN_SKIN_TONES: list[tuple[int, int, int]] = [
+    (255, 238, 220),
+    (248, 227, 208),
+    (241, 216, 196),
+    (234, 205, 184),
+    (227, 194, 172),
+    (220, 183, 160),
+    (213, 172, 148),
+    (206, 161, 136),
+    (194, 149, 123),
+    (182, 137, 110),
+    (170, 125, 98),
+    (158, 113, 86),
+    (146, 101, 74),
+    (134, 89, 62),
+    (122, 77, 50),
+    (110, 65, 38),
+]
 
 
 def _capture_frame_screenshot(renderer: Renderer, output_path: Path) -> None:
@@ -755,6 +775,13 @@ def _item_visual(item_name: str) -> tuple[str, str, tuple[int, int, int] | None,
         return ("$", "valuable", (245, 216, 118), None)
 
     return ("*", "valuable", None, None)
+
+
+def _human_skin_tone(seed_text: str, offset: int = 0) -> tuple[int, int, int]:
+    seed = 0
+    for index, char in enumerate(seed_text):
+        seed += (index + 1) * ord(char)
+    return _HUMAN_SKIN_TONES[(seed + offset) % len(_HUMAN_SKIN_TONES)]
 
 
 def _first_player_entity() -> int | None:
@@ -1358,13 +1385,18 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
 
 
 def _setup_world(game_map: GameMap, player_position: Position) -> None:
+    player_name = "You"
+    villager_name = "Friendly Villager"
+    player_skin = _human_skin_tone(player_name)
+    villager_skin = _human_skin_tone(villager_name, offset=7)
+
     player_equipment = _default_equipment_slots()
     player_equipment["main hand"] = "Rusty Sword"
     player_equipment["chest"] = "Traveler Tunic"
     esper.create_entity(
         player_position,
-        Renderable("@"),
-        Name("You"),
+        Renderable("@", fg=player_skin),
+        Name(player_name),
         Player(),
         Vision(10),
         BlocksMovement(),
@@ -1378,8 +1410,8 @@ def _setup_world(game_map: GameMap, player_position: Position) -> None:
 
     esper.create_entity(
         villager_pos,
-        Renderable("v"),
-        Name("Friendly Villager"),
+        Renderable("v", fg=villager_skin),
+        Name(villager_name),
         NPC(),
         Friendly(),
         Dialogue("##!/$*~# GH01^@"),
@@ -1391,7 +1423,7 @@ def _setup_world(game_map: GameMap, player_position: Position) -> None:
     goblin_equipment["main hand"] = "Jagged Dagger"
     esper.create_entity(
         guard_pos,
-        Renderable("g"),
+        Renderable("g", fg=_GOBLIN_GREEN),
         Name("Goblin Scout"),
         NPC(),
         Enemy(),
@@ -1402,7 +1434,7 @@ def _setup_world(game_map: GameMap, player_position: Position) -> None:
     )
     esper.create_entity(
         rat_pos,
-        Renderable("r"),
+        Renderable("r", fg=_RAT_BROWN),
         Name("Cave Rat"),
         NPC(),
         Enemy(),

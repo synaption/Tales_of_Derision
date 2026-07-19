@@ -17,16 +17,16 @@
   },
   "glyphs": {
     ".": { "tile_id": "general_00_01" },
-    "#": { "tile_id": "general_01_24" },
+    "#": { "tile_id": "general_00_20" },
     "@": { "tile_id": "creatures_00_00" },
     "v": { "tile_id": "creatures_00_01" },
-    "g": { "tile_id": "creatures_03_00" },
-    "r": { "tile_id": "creatures_03_12" },
+    "g": { "tile_id": "creatures_03_06" },
+    "r": { "tile_id": "creatures_09_08" },
     "%": { "tile_id": "items_03_20" }
   },
   "classifications": {
     "friendly": { "tile_id": "creatures_00_01" },
-    "enemy": { "tile_id": "creatures_03_00" },
-    "wall": { "tile_id": "general_01_24" }
+    "enemy": { "tile_id": "creatures_03_06" },
+    "wall": { "tile_id": "general_00_20" }
   }
 }

@@ -223,6 +223,7 @@ class PygameRenderer(Renderer):
             tuple[str, str, tuple[int, int, int], tuple[int, int, int], int, int],
             object,
         ] = {}
+        self._tinted_tiles: dict[tuple[int, tuple[int, int, int]], object] = {}
         self._grid_cols = self._cols
         self._grid_rows = self._rows
         self._ui_cols = self._cols
@@ -281,6 +282,7 @@ class PygameRenderer(Renderer):
         self._glyph_tiles = {}
         self._class_tiles = {}
         self._fallback_tiles = {}
+        self._tinted_tiles = {}
         self._load_tileset_config()
 
         self._keydown_to_action, self._keyup_to_action = _build_key_mappings(self._pygame, self._options)
@@ -602,6 +604,21 @@ class PygameRenderer(Renderer):
         rect = self._pygame.Rect(x * self._cell_w, y * self._cell_h, self._cell_w, self._cell_h)
         self._pygame.draw.rect(self._screen, bg, rect)
 
+    def _blit_world_tile(
+        self,
+        x: int,
+        y: int,
+        tile: object,
+        bg: tuple[int, int, int] | None = None,
+    ) -> None:
+        if self._pygame is None or self._screen is None:
+            return
+
+        fill_color = _coerce_rgb(bg, self._bg) if bg is not None else self._bg
+        rect = self._pygame.Rect(x * self._cell_w, y * self._cell_h, self._cell_w, self._cell_h)
+        self._pygame.draw.rect(self._screen, fill_color, rect)
+        self._screen.blit(tile, (x * self._cell_w, y * self._cell_h))
+
     def _load_fallback_tile(
         self,
         glyph: str,
@@ -654,36 +671,67 @@ class PygameRenderer(Renderer):
         self._fallback_tiles[cache_key] = tile
         return tile
 
+    def _tint_tile(self, tile: object, fg: tuple[int, int, int]):
+        if self._pygame is None:
+            return tile
+
+        tint_key = (id(tile), fg)
+        cached = self._tinted_tiles.get(tint_key)
+        if cached is not None:
+            return cached
+
+        tinted = tile.copy()
+        tint_surface = self._pygame.Surface((tile.get_width(), tile.get_height()), self._pygame.SRCALPHA)
+        tint_surface.fill((fg[0], fg[1], fg[2], 255))
+        tinted.blit(tint_surface, (0, 0), special_flags=self._pygame.BLEND_RGBA_MULT)
+        self._tinted_tiles[tint_key] = tinted
+        return tinted
+
     def _resolve_tile_surface(
         self,
         glyph: str,
         classification: str | None,
         fg: tuple[int, int, int],
         bg: tuple[int, int, int],
-    ):
+    ) -> tuple[object | None, str]:
         style_key = self._style_lookup_key(glyph, fg, bg)
         tile = self._glyph_tiles.get(style_key)
-        if tile is None:
-            tile = self._glyph_tiles.get(glyph)
         if tile is not None:
-            return tile
+            return (tile, "styled")
+
+        tile = self._glyph_tiles.get(glyph)
+        if tile is None:
+            tile = None
+        else:
+            return (tile, "glyph")
 
         if classification is not None:
             class_style_key = self._style_lookup_key(classification, fg, bg)
             tile = self._class_tiles.get(class_style_key)
-            if tile is None:
-                tile = self._class_tiles.get(classification)
             if tile is not None:
-                return tile
+                return (tile, "styled")
+
+            tile = self._class_tiles.get(classification)
+            if tile is None:
+                tile = None
+            else:
+                return (tile, "class")
 
             default_style_key = self._style_lookup_key("default", fg, bg)
             tile = self._class_tiles.get(default_style_key)
-            if tile is None:
-                tile = self._class_tiles.get("default")
             if tile is not None:
-                return tile
+                return (tile, "styled")
 
-        return self._load_fallback_tile(glyph, fg, bg)
+            tile = self._class_tiles.get("default")
+            if tile is None:
+                tile = None
+            else:
+                return (tile, "class")
+
+        fallback_tile = self._load_fallback_tile(glyph, fg, bg)
+        if fallback_tile is not None:
+            return (fallback_tile, "fallback")
+        return (None, "none")
 
     def draw_glyph(
         self,
@@ -693,15 +741,20 @@ class PygameRenderer(Renderer):
         fg: tuple[int, int, int] | None = None,
         bg: tuple[int, int, int] | None = None,
     ) -> None:
+        explicit_fg = fg is not None
         resolved_fg = _coerce_rgb(fg, self._default_fg)
         resolved_bg = _coerce_rgb(bg, self._bg)
 
         if bg is not None:
             self._fill_glyph_background(x, y, resolved_bg)
 
-        tile = self._resolve_tile_surface(glyph, None, resolved_fg, resolved_bg)
+        tile, source = self._resolve_tile_surface(glyph, None, resolved_fg, resolved_bg)
         if self._screen is not None and tile is not None:
-            self._screen.blit(tile, (x * self._cell_w, y * self._cell_h))
+            draw_tile = tile
+            if explicit_fg and source in {"glyph", "class"}:
+                draw_tile = self._tint_tile(tile, resolved_fg)
+            tile_bg = resolved_bg if bg is not None else None
+            self._blit_world_tile(x, y, draw_tile, tile_bg)
             return
 
         self._blit_text(x, y, glyph, resolved_fg)
@@ -715,6 +768,7 @@ class PygameRenderer(Renderer):
         fg: tuple[int, int, int] | None = None,
         bg: tuple[int, int, int] | None = None,
     ) -> None:
+        explicit_fg = fg is not None
         if fg is None:
             resolved_fg = self._class_colors.get(classification, self._default_fg)
         else:
@@ -724,9 +778,13 @@ class PygameRenderer(Renderer):
         if bg is not None:
             self._fill_glyph_background(x, y, resolved_bg)
 
-        tile = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
+        tile, source = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
         if self._screen is not None and tile is not None:
-            self._screen.blit(tile, (x * self._cell_w, y * self._cell_h))
+            draw_tile = tile
+            if explicit_fg and source in {"glyph", "class"}:
+                draw_tile = self._tint_tile(tile, resolved_fg)
+            tile_bg = resolved_bg if bg is not None else None
+            self._blit_world_tile(x, y, draw_tile, tile_bg)
             return
 
         self._blit_text(x, y, glyph, resolved_fg)
@@ -744,6 +802,7 @@ class PygameRenderer(Renderer):
         if self._pygame is None or self._screen is None:
             return False
 
+        explicit_fg = fg is not None
         if fg is None:
             resolved_fg = self._class_colors.get(classification, self._default_fg)
         else:
@@ -760,9 +819,12 @@ class PygameRenderer(Renderer):
             bg_rect = self._pygame.Rect(slot_x, slot_y, slot_w, slot_h)
             self._pygame.draw.rect(self._screen, resolved_bg, bg_rect)
 
-        tile = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
+        tile, source = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
         if tile is None:
             return False
+
+        if explicit_fg and source in {"glyph", "class"}:
+            tile = self._tint_tile(tile, resolved_fg)
 
         icon_size = max(1, min(slot_w, slot_h))
         icon = tile

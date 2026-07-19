@@ -47,6 +47,8 @@ _ARROW_TO_WORD = {
     "↘": "southeast",
 }
 
+_WALL_BROWN = (124, 88, 56)
+
 _TURN_EVENTS: list[str] = []
 
 _NearbyEntry = tuple[
@@ -632,13 +634,18 @@ class RenderProcessor(esper.Processor):
                 if (wx, wy) in self._visible_tiles:
                     tile = self.game_map.tile_at(wx, wy)
                     classification = "wall" if tile == self.game_map.WALL else "default"
-                    r.draw_glyph_classified(vx, vy, tile, classification, fg=None, bg=None)
+                    tile_fg = _WALL_BROWN if classification == "wall" else None
+                    r.draw_glyph_classified(vx, vy, tile, classification, fg=tile_fg, bg=None)
                 else:
                     r.draw_glyph(vx, vy, " ")
 
         player_draw: tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None] | None = None
+        character_draws: list[
+            tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None]
+        ] = []
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
             is_player = esper.has_component(ent, Player)
+            is_character = is_player or esper.has_component(ent, NPC)
             if (pos.x, pos.y) not in self._visible_tiles and not is_player:
                 continue
 
@@ -658,7 +665,28 @@ class RenderProcessor(esper.Processor):
                 continue
 
             if view_xy is not None:
-                r.draw_glyph_classified(view_xy[0], view_xy[1], rend.glyph, classification, fg=rend.fg, bg=rend.bg)
+                draw_data = (view_xy[0], view_xy[1], rend.glyph, classification, rend.fg, rend.bg)
+                if is_character:
+                    character_draws.append(draw_data)
+                else:
+                    r.draw_glyph_classified(
+                        draw_data[0],
+                        draw_data[1],
+                        draw_data[2],
+                        draw_data[3],
+                        fg=draw_data[4],
+                        bg=draw_data[5],
+                    )
+
+        for draw_data in character_draws:
+            r.draw_glyph_classified(
+                draw_data[0],
+                draw_data[1],
+                draw_data[2],
+                draw_data[3],
+                fg=draw_data[4],
+                bg=draw_data[5],
+            )
 
         if player_draw is not None:
             r.draw_glyph_classified(
