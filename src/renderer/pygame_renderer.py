@@ -13,6 +13,27 @@ from pathlib import Path
 from .base import Renderer
 
 
+def _build_default_key_mappings(pygame_module: object) -> tuple[dict[int, str], dict[int, str]]:
+    keydown_to_action = {
+        pygame_module.K_w: "move_up",
+        pygame_module.K_s: "move_down",
+        pygame_module.K_a: "move_left",
+        pygame_module.K_d: "move_right",
+        pygame_module.K_i: "open_inventory",
+        pygame_module.K_ESCAPE: "open_pause_menu",
+        pygame_module.K_RETURN: "menu_select",
+        pygame_module.K_KP_ENTER: "menu_select",
+        pygame_module.K_SPACE: "confirm_action",
+    }
+    keyup_to_action = {
+        pygame_module.K_w: "release_up",
+        pygame_module.K_s: "release_down",
+        pygame_module.K_a: "release_left",
+        pygame_module.K_d: "release_right",
+    }
+    return keydown_to_action, keyup_to_action
+
+
 class PygameRenderer(Renderer):
     def __init__(self, options: dict | None = None) -> None:
         self._options = options or {}
@@ -261,24 +282,7 @@ class PygameRenderer(Renderer):
 
         self._pygame = pygame
         self.apply_options(self._options)
-
-        self._keydown_to_action = {
-            pygame.K_w: "move_up",
-            pygame.K_s: "move_down",
-            pygame.K_a: "move_left",
-            pygame.K_d: "move_right",
-            pygame.K_i: "open_inventory",
-            pygame.K_ESCAPE: "open_pause_menu",
-            pygame.K_RETURN: "menu_select",
-            pygame.K_KP_ENTER: "menu_select",
-            pygame.K_SPACE: "confirm_action",
-        }
-        self._keyup_to_action = {
-            pygame.K_w: "release_up",
-            pygame.K_s: "release_down",
-            pygame.K_a: "release_left",
-            pygame.K_d: "release_right",
-        }
+        self._keydown_to_action, self._keyup_to_action = _build_default_key_mappings(pygame)
 
     def teardown(self) -> None:
         if self._pygame is None:

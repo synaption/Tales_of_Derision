@@ -37,21 +37,21 @@ flowchart TD
     end
     subgraph Display["Display seam"]
         R[Renderer interface]
-        T[TerminalRenderer curses]
+        P[PygameRenderer]
     end
     MP --> C
     MP --> M
     RP --> C
     RP --> M
     RP --> R
-    R -.implemented by.-> T
+    R -.implemented by.-> P
     main[main.py<br/>turn loop] --> MP
     main --> RP
-    main --> T
+    main --> P
 ```
 
 The arrows only ever point *toward* data and the `Renderer` interface. Nothing in
-Data or Systems imports curses.
+Data or Systems imports pygame.
 
 ## The turn loop
 
@@ -61,15 +61,13 @@ The game is turn-based: it blocks for input, runs the systems once, and repeats.
 sequenceDiagram
     participant U as Player
     participant Main as main.py
-    participant Ren as TerminalRenderer
+    participant Ren as PygameRenderer
     participant Move as MovementProcessor
     participant Draw as RenderProcessor
     Main->>Draw: esper.process()  (initial frame)
     loop each turn
         Main->>Ren: poll_action()
-        Ren->>U: block on getch()
-        U-->>Ren: key press
-        Ren-->>Main: "move_up" | "open_pause_menu" | None
+        Ren-->>Main: action string
         alt open pause menu
             Main->>Main: show pause menu
             alt pause choice is quit
@@ -77,6 +75,10 @@ sequenceDiagram
             else pause choice is save/resume/options
                 Main->>Draw: redraw frame
             end
+        else confirm_action
+            Main->>Main: resolve held directions
+            Main->>Move: esper.process(live_action)
+            Main->>Draw: (same process call)
         else action
             Main->>Move: esper.process(action)
             Move->>Move: move player if walkable
@@ -93,10 +95,11 @@ guarantees movement is applied *before* the frame is drawn.
 
 ## Data flow of a keypress
 
-1. `TerminalRenderer.poll_action()` reads a raw key and maps it to an action
-    string (`move_left`, `menu_select`, `open_pause_menu`, ...).
-2. `main.py` passes it to `esper.process("move_left")`.
-3. `MovementProcessor` looks up the delta, finds every `Position` + `Player`
+1. `PygameRenderer.poll_action()` reads pygame events and emits an abstract
+    action string (`move_left`, `menu_select`, `confirm_action`, ...).
+2. `main.py` handles UI-state actions (inventory/pause/options/dialogue) and
+    routes gameplay actions into `esper.process(...)`.
+3. `MovementProcessor` looks up deltas, finds every `Position` + `Player`
    entity, and moves it if `GameMap.is_walkable`.
 4. `RenderProcessor` clears the frame, draws the map, draws every `Renderable`,
    draws the status line, and presents.
@@ -120,7 +123,7 @@ class FakeRenderer(Renderer):
 ```
 
 Register it with `RenderProcessor`, call `esper.process("move_up")`, and assert on
-`buf` / the player's `Position`. No terminal required.
+`buf` / the player's `Position`. No live window required.
 
 ## Related pages
 

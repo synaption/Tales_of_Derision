@@ -1,8 +1,8 @@
 # Components
 
 Components are **plain data** attached to entities. They contain no behaviour and
-no renderer handles — a `Renderable` stores a glyph character, not a curses/pygame
-object. Defined in [`components.py`](../components.py) as `@dataclass`es.
+no renderer handles — a `Renderable` stores a glyph character, not a renderer
+object. Defined in [src/components.py](../src/components.py) as `@dataclass`es.
 
 ## Current components
 
@@ -36,7 +36,7 @@ query `Position, Player` to act on "the things the human drives".
 
 ## Adding a component
 
-1. Add a `@dataclass` to [`components.py`](../components.py).
+1. Add a `@dataclass` to [src/components.py](../src/components.py).
 2. Attach it when creating an entity, or later with
    `esper.add_component(ent, MyComponent(...))`.
 3. Query it from a system via `esper.get_components(MyComponent, ...)`.

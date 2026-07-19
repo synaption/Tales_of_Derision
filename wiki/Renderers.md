@@ -1,12 +1,11 @@
 # Renderers
 
-This is the seam that makes "later render with tcod / pygame / raylib / OpenGL"
-cheap. Everything the game needs from a display backend is captured by one
-interface; the game never imports a specific backend.
+Rendering is isolated behind a small interface so game/systems code stays
+backend-agnostic. The shipped runtime is pygame.
 
 ## The `Renderer` interface
 
-Defined in [`renderer/base.py`](../renderer/base.py) as an ABC:
+Defined in [src/renderer/base.py](../src/renderer/base.py) as an ABC:
 
 | Method | Responsibility |
 |--------|----------------|
@@ -17,8 +16,8 @@ Defined in [`renderer/base.py`](../renderer/base.py) as an ABC:
 | `present()` | Flush the frame to screen |
 | `poll_action()` | Block for input, return an **abstract action string** |
 
-It's a context manager: `with TerminalRenderer() as renderer:` calls `setup()` on
-enter and `teardown()` on exit, so the terminal is always restored even on error.
+It is a context manager: `with PygameRenderer(...) as renderer:` calls `setup()`
+on enter and `teardown()` on exit.
 
 ## Abstract actions
 
@@ -26,46 +25,42 @@ enter and `teardown()` on exit, so the terminal is always restored even on error
 
 ```
 "move_up"  "move_down"  "move_left"  "move_right"
-"menu_select"  "open_pause_menu"  None
+"move_up_left" "move_down_right"
+"menu_select" "confirm_action" "open_inventory" "open_pause_menu" "quit" None
 ```
 
 `None` means "key not recognised". This is why swapping backends doesn't touch
 [movement](Systems.md) — every backend speaks the same action vocabulary.
 
-## `TerminalRenderer` (curses)
+## `PygameRenderer`
 
-[`renderer/terminal.py`](../renderer/terminal.py) implements the interface with
-curses and owns the key map:
+[src/renderer/pygame_renderer.py](../src/renderer/pygame_renderer.py) implements
+the interface with pygame and owns the key map:
 
 | Raw key | Action |
 |---------|--------|
-| ↑ / `k` / `w` | `move_up` |
-| ↓ / `j` / `s` | `move_down` |
-| ← / `h` / `a` | `move_left` |
-| → / `l` / `d` | `move_right` |
+| `W` / `A` / `S` / `D` | Direction actions |
+| `Space` | `confirm_action` |
 | `Enter` | `menu_select` |
-| `Esc` (27) | `open_pause_menu` |
+| `I` | `open_inventory` |
+| `Esc` | `open_pause_menu` |
+| Window close | `quit` |
 
 Notes:
-- `setup()` sets `curses.set_escdelay(25)` so Escape opens menus quickly.
-- `setup()` calls `initscr`, `noecho`, `cbreak`, hides the cursor, enables
-  `keypad` (so arrow keys arrive as `KEY_UP` etc.).
-- `draw_glyph`/`draw_text` swallow the `curses.error` raised when writing the
-  bottom-right cell.
-- `teardown()` reverses all of it and calls `endwin()`.
+- Supports configurable fullscreen and tile/UI scaling.
+- Supports sprite tiles via optional tileset config.
+- Supports draggable sidebar width and panel-style UI drawing helpers.
 
-## Adding a backend (e.g. raylib)
+## Adding a backend (future)
 
 1. Create `renderer/raylib.py` with `class RaylibRenderer(Renderer)`.
 2. Implement the seven methods:
    - `setup`/`teardown` → open/close the window.
    - `draw_glyph(x, y, g)` → draw `g` at `(x*cell, y*cell)` in pixels; pick a
      monospace font.
-   - `poll_action()` → read keys and return the same action strings. If your
-     backend is frame-driven rather than blocking, either block until a key is
-     down or restructure `main.py` into a real-time loop (see below).
-3. In [`main.py`](../main.py), construct your renderer instead of
-   `TerminalRenderer`. Nothing else changes.
+  - `poll_action()` → read input and return the same action strings.
+3. In [src/main.py](../src/main.py), construct your renderer instead of
+  `PygameRenderer`. Systems and map code stay unchanged.
 
 ```python
 # main.py — the only line that names a backend
@@ -74,10 +69,9 @@ with RaylibRenderer() as renderer:
     ...
 ```
 
-## Terminal vs. real-time backends
+## Turn loop note
 
-The current [turn loop](Architecture.md#the-turn-loop) *blocks* on
-`poll_action()` — perfect for a terminal roguelike. A graphical backend that
-wants continuous animation would instead run a fixed-timestep loop that polls
-input non-blocking each frame and calls `esper.process(...)` every tick. That's a
-`main.py` change; the `Renderer` interface and all systems stay the same.
+The current [turn loop](Architecture.md#the-turn-loop) is turn-driven and waits
+for actionable input. A future animation-heavy backend could shift to a fixed
+timestep frame loop while preserving the action vocabulary and ECS processor
+contracts.

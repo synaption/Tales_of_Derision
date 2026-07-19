@@ -1,7 +1,7 @@
 """ECS components. Pure data, no behaviour.
 
 Components stay renderer-agnostic: a Renderable holds a glyph, not a
-curses/pygame handle. Systems and renderers translate these into pixels.
+renderer handle. Systems and renderers translate these into pixels.
 """
 from dataclasses import dataclass
 from dataclasses import field

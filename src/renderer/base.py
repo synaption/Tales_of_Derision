@@ -1,8 +1,7 @@
 """Renderer interface.
 
-Everything the game needs from a display backend lives here. Implement this
-for curses today, and for tcod / pygame / raylib / opengl later without
-changing any game or system code.
+Everything the game needs from a display backend lives here. The shipped
+runtime uses pygame, and this seam keeps systems/test code backend-agnostic.
 """
 from abc import ABC, abstractmethod
 

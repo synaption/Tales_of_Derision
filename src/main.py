@@ -1,8 +1,7 @@
 """pyRL2 entry point.
 
 Turn loop: show title/menu, then block for an action, run the systems, repeat.
-The game logic never touches curses -- swap TerminalRenderer for a
-tcod/pygame/raylib renderer and nothing else changes.
+The game logic stays renderer-agnostic while the default runtime uses pygame.
 """
 import argparse
 from dataclasses import dataclass
