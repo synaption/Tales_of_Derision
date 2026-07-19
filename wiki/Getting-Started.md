@@ -60,6 +60,9 @@ see [Renderers](Renderers.md) for backend details.
 - Working options: `src/data/config/options.json`
 - On startup, missing `options.json` is auto-copied from `default_options.json`.
 
+Keybinds live under `keybinds` in `options.json` using action names (for example
+`move_up`, `confirm_action`, `open_pause_menu`).
+
 ## Verifying headlessly
 
 Because the renderer is decoupled, you can drive the whole game headless with a

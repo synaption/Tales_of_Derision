@@ -56,9 +56,9 @@ def test_initial_tick_renders_map_player_and_status_line() -> None:
     assert renderer.glyphs[(1, 1)] == game_map.FLOOR
     assert renderer.glyphs[(player_pos.x, player_pos.y)] == "@"
     assert (0, game_map.height, "I inventory  Esc menu  +/- tile scale") in renderer.text
-    assert any(text == "== NEARBY ==" for _x, _y, text in renderer.text)
+    assert any(text == "[NEARBY]" for _x, _y, text in renderer.text)
     assert any(text.startswith("g → Goblin") or text.startswith("You notice Goblin") for _x, _y, text in renderer.text)
-    assert any(text == "== LOG ==" for _x, _y, text in renderer.text)
+    assert any(text == "[LOG]" for _x, _y, text in renderer.text)
 
 
 def test_nearby_section_is_dynamic_and_log_starts_after_items() -> None:
@@ -76,13 +76,13 @@ def test_nearby_section_is_dynamic_and_log_starts_after_items() -> None:
 
     esper.process(None)
 
-    sidebar_x = next(x for x, _y, text in renderer.text if text == "== NEARBY ==")
-    nearby_header_y = next(y for x, y, text in renderer.text if x == sidebar_x and text == "== NEARBY ==")
-    log_header_y = next(y for x, y, text in renderer.text if x == sidebar_x and text == "== LOG ==")
+    sidebar_x = next(x for x, _y, text in renderer.text if text == "[NEARBY]")
+    nearby_header_y = next(y for x, y, text in renderer.text if x == sidebar_x and text == "[NEARBY]")
+    log_header_y = next(y for x, y, text in renderer.text if x == sidebar_x and text == "[LOG]")
     nearby_rows = [
         y
         for x, y, text in renderer.text
-        if x == sidebar_x and nearby_header_y < y < log_header_y and text and "==" not in text
+        if x == sidebar_x and nearby_header_y < y < log_header_y and text and text not in {"[NEARBY]", "[LOG]"}
     ]
 
     assert len(nearby_rows) >= 1

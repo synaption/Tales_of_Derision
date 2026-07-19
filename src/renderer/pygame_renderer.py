@@ -13,24 +13,134 @@ from pathlib import Path
 from .base import Renderer
 
 
-def _build_default_key_mappings(pygame_module: object) -> tuple[dict[int, str], dict[int, str]]:
-    keydown_to_action = {
-        pygame_module.K_w: "move_up",
-        pygame_module.K_s: "move_down",
-        pygame_module.K_a: "move_left",
-        pygame_module.K_d: "move_right",
-        pygame_module.K_i: "open_inventory",
-        pygame_module.K_ESCAPE: "open_pause_menu",
-        pygame_module.K_RETURN: "menu_select",
-        pygame_module.K_KP_ENTER: "menu_select",
-        pygame_module.K_SPACE: "confirm_action",
+_DEFAULT_ACTION_KEYBINDS: dict[str, list[str]] = {
+    "move_up": ["w"],
+    "move_down": ["s"],
+    "move_left": ["a"],
+    "move_right": ["d"],
+    "confirm_action": ["space"],
+    "menu_select": ["enter", "kp_enter"],
+    "open_inventory": ["i"],
+    "open_pause_menu": ["esc"],
+    "tile_scale_up": ["equals", "kp_plus"],
+    "tile_scale_down": ["minus", "kp_minus"],
+}
+
+_LEGACY_KEYBIND_ALIASES = {
+    "up": "move_up",
+    "down": "move_down",
+    "left": "move_left",
+    "right": "move_right",
+}
+
+_KEY_NAME_ALIASES = {
+    "esc": "escape",
+    "enter": "return",
+    "plus": "equals",
+    "+": "equals",
+    "-": "minus",
+    "numpad_enter": "kp_enter",
+    "numpad_plus": "kp_plus",
+    "numpad_minus": "kp_minus",
+}
+
+_MOVE_TO_RELEASE_ACTION = {
+    "move_up": "release_up",
+    "move_down": "release_down",
+    "move_left": "release_left",
+    "move_right": "release_right",
+}
+
+
+def _normalise_keybind_values(raw_value: object) -> list[str | int]:
+    if isinstance(raw_value, (str, int)):
+        return [raw_value]
+    if isinstance(raw_value, list):
+        values: list[str | int] = []
+        for item in raw_value:
+            if isinstance(item, (str, int)):
+                values.append(item)
+        return values
+    return []
+
+
+def _key_code_from_binding(pygame_module: object, binding: str | int) -> int | None:
+    if isinstance(binding, int):
+        return binding
+
+    key_name = binding.strip().lower()
+    if not key_name:
+        return None
+
+    key_name = _KEY_NAME_ALIASES.get(key_name, key_name)
+
+    for attr_name in (f"K_{key_name}", f"K_{key_name.upper()}"):
+        key_code = getattr(pygame_module, attr_name, None)
+        if isinstance(key_code, int):
+            return key_code
+
+    pygame_key_module = getattr(pygame_module, "key", None)
+    key_code_func = getattr(pygame_key_module, "key_code", None)
+    if callable(key_code_func):
+        try:
+            return int(key_code_func(key_name))
+        except Exception:
+            return None
+
+    return None
+
+
+def _build_key_mappings(
+    pygame_module: object,
+    options: dict | None = None,
+) -> tuple[dict[int, str], dict[int, str]]:
+    resolved_action_bindings: dict[str, list[str | int]] = {
+        action: list(bindings)
+        for action, bindings in _DEFAULT_ACTION_KEYBINDS.items()
     }
-    keyup_to_action = {
-        pygame_module.K_w: "release_up",
-        pygame_module.K_s: "release_down",
-        pygame_module.K_a: "release_left",
-        pygame_module.K_d: "release_right",
-    }
+    customised_actions: set[str] = set()
+
+    raw_keybinds = None
+    if isinstance(options, dict):
+        raw_keybinds = options.get("keybinds")
+
+    if isinstance(raw_keybinds, dict):
+        for raw_action, raw_bindings in raw_keybinds.items():
+            if not isinstance(raw_action, str):
+                continue
+
+            canonical_action = raw_action.strip().lower()
+            canonical_action = _LEGACY_KEYBIND_ALIASES.get(canonical_action, canonical_action)
+            if canonical_action not in resolved_action_bindings:
+                continue
+
+            normalised_bindings = _normalise_keybind_values(raw_bindings)
+            if normalised_bindings:
+                resolved_action_bindings[canonical_action] = normalised_bindings
+                customised_actions.add(canonical_action)
+
+    keydown_to_action: dict[int, str] = {}
+    keyup_to_action: dict[int, str] = {}
+    for action_name in _DEFAULT_ACTION_KEYBINDS:
+        for binding in resolved_action_bindings[action_name]:
+            key_code = _key_code_from_binding(pygame_module, binding)
+            if key_code is None:
+                continue
+
+            if key_code in keydown_to_action:
+                previous_action = keydown_to_action[key_code]
+                previous_is_custom = previous_action in customised_actions
+                current_is_custom = action_name in customised_actions
+                if previous_is_custom and not current_is_custom:
+                    continue
+
+            keydown_to_action[key_code] = action_name
+            release_action = _MOVE_TO_RELEASE_ACTION.get(action_name)
+            if release_action is not None:
+                keyup_to_action[key_code] = release_action
+            else:
+                keyup_to_action.pop(key_code, None)
+
     return keydown_to_action, keyup_to_action
 
 
@@ -57,26 +167,30 @@ class PygameRenderer(Renderer):
         self._cols = 120
         self._rows = 40
 
-        self._bg = (14, 16, 20)
-        self._default_fg = (230, 230, 230)
-        self._panel_bg = (24, 28, 36)
-        self._panel_border = (88, 108, 132)
-        self._splitter = (130, 160, 190)
+        self._bg = (0, 0, 0)
+        self._default_fg = (224, 224, 224)
+        self._panel_bg = (0, 0, 0)
+        self._panel_border = (118, 118, 118)
+        self._panel_header = (22, 22, 22)
+        self._menu_backdrop = (0, 0, 0)
+        self._menu_scanline = (10, 10, 10)
+        self._splitter = (96, 96, 96)
         self._class_colors = {
-            "default": (230, 230, 230),
-            "wall": (90, 140, 230),
-            "stairs": (120, 220, 240),
-            "friendly": (120, 220, 120),
-            "enemy": (230, 110, 110),
-            "valuable": (245, 215, 110),
+            "default": (224, 224, 224),
+            "wall": (122, 122, 122),
+            "stairs": (186, 186, 186),
+            "friendly": (240, 240, 240),
+            "enemy": (202, 202, 202),
+            "valuable": (214, 214, 214),
         }
 
         self._keydown_to_action = {}
         self._keyup_to_action = {}
-        self._space_held = False
-        self._space_initial_delay_ms = 180
-        self._space_repeat_interval_ms = 70
-        self._next_space_repeat_ms = 0
+        self._confirm_keys: set[int] = set()
+        self._confirm_held_key: int | None = None
+        self._confirm_initial_delay_ms = 180
+        self._confirm_repeat_interval_ms = 70
+        self._next_confirm_repeat_ms = 0
         self._pending_actions: deque[str] = deque()
 
         project_root = Path(__file__).resolve().parents[2]
@@ -142,6 +256,18 @@ class PygameRenderer(Renderer):
         self._glyph_tiles = {}
         self._class_tiles = {}
         self._load_tileset_config()
+
+        self._keydown_to_action, self._keyup_to_action = _build_key_mappings(self._pygame, self._options)
+        self._confirm_keys = {
+            key_code
+            for key_code, action_name in self._keydown_to_action.items()
+            if action_name == "confirm_action"
+        }
+        if not self._confirm_keys and hasattr(self._pygame, "K_SPACE"):
+            self._confirm_keys = {self._pygame.K_SPACE}
+
+        if self._confirm_held_key is not None and self._confirm_held_key not in self._confirm_keys:
+            self._confirm_held_key = None
 
     def get_grid_size(self) -> tuple[int, int]:
         return (self._grid_cols, self._grid_rows)
@@ -282,7 +408,6 @@ class PygameRenderer(Renderer):
 
         self._pygame = pygame
         self.apply_options(self._options)
-        self._keydown_to_action, self._keyup_to_action = _build_default_key_mappings(pygame)
 
     def teardown(self) -> None:
         if self._pygame is None:
@@ -332,6 +457,37 @@ class PygameRenderer(Renderer):
     def draw_text(self, x: int, y: int, text: str) -> None:
         self._blit_text(x, y, text, self._default_fg)
 
+    def draw_text_tinted(self, x: int, y: int, text: str, color: tuple[int, int, int]) -> None:
+        self._blit_text(x, y, text, color)
+
+    def fill_cells(self, x: int, y: int, width: int, height: int, color: tuple[int, int, int]) -> None:
+        if self._pygame is None or self._screen is None:
+            return
+        if width <= 0 or height <= 0:
+            return
+
+        px = x * self._ui_cell_w
+        py = y * self._ui_cell_h
+        pw = width * self._ui_cell_w
+        ph = height * self._ui_cell_h
+        rect = self._pygame.Rect(px, py, pw, ph)
+        self._pygame.draw.rect(self._screen, color, rect)
+
+    def draw_menu_backdrop(self) -> None:
+        if self._pygame is None or self._screen is None:
+            return
+
+        self._screen.fill(self._menu_backdrop)
+        step = max(2, self._ui_cell_h // 2)
+        for py in range(0, self._screen.get_height(), step):
+            self._pygame.draw.line(
+                self._screen,
+                self._menu_scanline,
+                (0, py),
+                (self._screen.get_width(), py),
+                width=1,
+            )
+
     def draw_text_clipped(self, x: int, y: int, text: str, max_cells: int) -> None:
         if max_cells <= 0:
             return
@@ -360,15 +516,60 @@ class PygameRenderer(Renderer):
 
         panel_rect = self._pygame.Rect(px, py, pw, ph)
         self._pygame.draw.rect(self._screen, self._panel_bg, panel_rect)
+
+        title_surface = None
+        if title and self._font is not None:
+            title_surface = self._font.render(f"[{title}]", True, (236, 236, 236))
+
+        header_rect = None
+        if ph > 6:
+            header_padding_y = max(3, self._ui_cell_h // 4)
+            if title_surface is not None:
+                desired_header_h = title_surface.get_height() + (header_padding_y * 2)
+            else:
+                desired_header_h = self._ui_cell_h + (header_padding_y * 2)
+            header_h = max(4, min(ph - 4, desired_header_h))
+            header_rect = self._pygame.Rect(px + 2, py + 2, max(1, pw - 4), header_h)
+            self._pygame.draw.rect(self._screen, self._panel_header, header_rect)
+
         self._pygame.draw.rect(self._screen, self._panel_border, panel_rect, width=2)
 
-        if title:
-            # Draw title text slightly inset so it does not collide with border corners.
-            self._blit_text(x + 1, y, f"[{title}]", self._panel_border)
+        inner_top = py + 4
+        if header_rect is not None:
+            inner_top = max(inner_top, header_rect.bottom + 2)
+        inner_rect = self._pygame.Rect(
+            px + 4,
+            inner_top,
+            max(0, pw - 8),
+            max(0, ph - (inner_top - py) - 4),
+        )
+        if inner_rect.width > 2 and inner_rect.height > 2:
+            self._pygame.draw.rect(self._screen, self._panel_border, inner_rect, width=1)
+
+        if title_surface is not None:
+            if header_rect is not None:
+                text_x = header_rect.x + 8
+                text_ink_rect = title_surface.get_bounding_rect()
+                if text_ink_rect.width <= 0 or text_ink_rect.height <= 0:
+                    text_ink_rect = title_surface.get_rect()
+                available_h = max(0, header_rect.height - text_ink_rect.height)
+                text_y = header_rect.y + ((available_h + 1) // 2) - text_ink_rect.y
+            else:
+                text_x = px + 8
+                text_y = py + 2
+            self._screen.blit(title_surface, (text_x, text_y))
 
     def present(self) -> None:
         if self._pygame is not None:
             self._pygame.display.flip()
+
+    def save_screenshot(self, output_path: str | Path) -> None:
+        if self._pygame is None or self._screen is None:
+            raise RuntimeError("renderer not initialized")
+
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._pygame.image.save(self._screen, str(target))
 
     def _ensure_mouse_visible(self, now_ms: int) -> None:
         if self._pygame is None:
@@ -477,18 +678,11 @@ class PygameRenderer(Renderer):
                     continue
 
                 if event.type == self._pygame.KEYDOWN:
-                    if event.key == self._pygame.K_SPACE:
-                        if not self._space_held:
-                            self._space_held = True
-                            self._next_space_repeat_ms = now + self._space_initial_delay_ms
+                    if event.key in self._confirm_keys:
+                        if self._confirm_held_key != event.key:
+                            self._confirm_held_key = event.key
+                            self._next_confirm_repeat_ms = now + self._confirm_initial_delay_ms
                         self._pending_actions.append("confirm_action")
-                        continue
-
-                    if event.key in {self._pygame.K_EQUALS, self._pygame.K_KP_PLUS}:
-                        self._pending_actions.append("tile_scale_up")
-                        continue
-                    if event.key in {self._pygame.K_MINUS, self._pygame.K_KP_MINUS}:
-                        self._pending_actions.append("tile_scale_down")
                         continue
 
                     if event.key in self._keydown_to_action:
@@ -496,8 +690,8 @@ class PygameRenderer(Renderer):
                     self._ensure_mouse_visible(now)
 
                 if event.type == self._pygame.KEYUP:
-                    if event.key == self._pygame.K_SPACE:
-                        self._space_held = False
+                    if self._confirm_held_key == event.key:
+                        self._confirm_held_key = None
                         continue
 
                     if event.key in self._keyup_to_action:
@@ -506,8 +700,8 @@ class PygameRenderer(Renderer):
             if self._pending_actions:
                 return self._pending_actions.popleft()
 
-            if self._space_held and now >= self._next_space_repeat_ms:
-                self._next_space_repeat_ms = now + self._space_repeat_interval_ms
+            if self._confirm_held_key is not None and now >= self._next_confirm_repeat_ms:
+                self._next_confirm_repeat_ms = now + self._confirm_repeat_interval_ms
                 return "confirm_action"
 
             self._update_cursor_for_splitter()

@@ -277,36 +277,210 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help="load/save this file and bypass title screen + main menu",
     )
+    parser.add_argument(
+        "--screenshot",
+        type=Path,
+        help="render a single gameplay frame, save it to this path, and exit",
+    )
     return parser.parse_args()
 
 
-def _draw_title_screen(renderer: Renderer) -> bool:
-    while True:
+_MENU_TITLE_COLOR = (236, 236, 236)
+_MENU_TEXT_COLOR = (210, 210, 210)
+_MENU_MUTED_COLOR = (156, 156, 156)
+_MENU_SELECTED_BG = (44, 44, 44)
+_MENU_SELECTED_TEXT = (252, 252, 252)
+
+
+def _capture_frame_screenshot(renderer: Renderer, output_path: Path) -> None:
+    save_fn = getattr(renderer, "save_screenshot", None)
+    if not callable(save_fn):
+        print("Screenshot capture not supported by active renderer.", file=sys.stderr)
+        return
+
+    try:
+        save_fn(output_path)
+        print(f"Screenshot saved to {output_path}")
+    except Exception as exc:
+        print(f"Failed to save screenshot: {exc}", file=sys.stderr)
+
+
+def _ui_grid_size(renderer: Renderer) -> tuple[int, int]:
+    get_ui_grid = getattr(renderer, "get_ui_grid_size", None)
+    if callable(get_ui_grid):
+        cols, rows = get_ui_grid()
+        if isinstance(cols, int) and isinstance(rows, int):
+            return (max(20, cols), max(12, rows))
+
+    get_grid = getattr(renderer, "get_grid_size", None)
+    if callable(get_grid):
+        cols, rows = get_grid()
+        if isinstance(cols, int) and isinstance(rows, int):
+            return (max(20, cols), max(12, rows))
+
+    return (100, 40)
+
+
+def _draw_ui_text(
+    renderer: Renderer,
+    x: int,
+    y: int,
+    text: str,
+    color: tuple[int, int, int] | None = None,
+    max_cells: int | None = None,
+) -> None:
+    clipped_text = text
+    if max_cells is not None:
+        clipped_text = clipped_text[: max(0, max_cells)]
+
+    draw_text_tinted = getattr(renderer, "draw_text_tinted", None)
+    if color is not None and callable(draw_text_tinted):
+        draw_text_tinted(x, y, clipped_text, color)
+        return
+
+    draw_text_clipped = getattr(renderer, "draw_text_clipped", None)
+    if max_cells is not None and callable(draw_text_clipped):
+        draw_text_clipped(x, y, text, max_cells)
+        return
+
+    renderer.draw_text(x, y, clipped_text)
+
+
+def _fill_ui_cells(
+    renderer: Renderer,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    color: tuple[int, int, int],
+) -> None:
+    fill_cells = getattr(renderer, "fill_cells", None)
+    if callable(fill_cells):
+        fill_cells(x, y, width, height, color)
+
+
+def _draw_menu_shell(
+    renderer: Renderer,
+    title: str,
+    subtitle: str | None = None,
+    footer: str | None = None,
+    width: int = 76,
+    height: int = 24,
+) -> tuple[int, int, int, int]:
+    draw_menu_backdrop = getattr(renderer, "draw_menu_backdrop", None)
+    if callable(draw_menu_backdrop):
+        draw_menu_backdrop()
+    else:
         renderer.clear()
-        renderer.draw_text(12, 6, "PYRL2")
-        renderer.draw_text(7, 8, "A tiny ECS roguelike prototype")
-        renderer.draw_text(6, 11, "Press Enter to continue")
-        renderer.draw_text(8, 12, "Press Esc to quit")
+
+    cols, rows = _ui_grid_size(renderer)
+    width = max(30, min(width, cols - 2))
+    height = max(12, min(height, rows - 2))
+    x = max(1, (cols - width) // 2)
+    y = max(1, (rows - height) // 2)
+
+    draw_panel = getattr(renderer, "draw_panel", None)
+    if callable(draw_panel):
+        draw_panel(x, y, width, height, title=title)
+    else:
+        top = "+" + ("-" * max(0, width - 2)) + "+"
+        renderer.draw_text(x, y, top)
+        for row in range(1, max(1, height - 1)):
+            renderer.draw_text(x, y + row, "|" + (" " * max(0, width - 2)) + "|")
+        if height > 1:
+            renderer.draw_text(x, y + height - 1, top)
+        renderer.draw_text(x + 2, y, title)
+
+    if subtitle:
+        _draw_ui_text(renderer, x + 2, y + 2, subtitle, _MENU_TEXT_COLOR, width - 4)
+    if footer:
+        _draw_ui_text(renderer, x + 2, y + height - 2, footer, _MENU_MUTED_COLOR, width - 4)
+
+    return (x, y, width, height)
+
+
+def _draw_menu_options(
+    renderer: Renderer,
+    x: int,
+    y: int,
+    width: int,
+    options: list[str],
+    selected: int,
+) -> None:
+    for idx, option_text in enumerate(options):
+        row_y = y + idx
+        is_selected = idx == selected
+        if is_selected:
+            _fill_ui_cells(renderer, x, row_y, width, 1, _MENU_SELECTED_BG)
+
+        prefix = ">" if is_selected else " "
+        color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+        _draw_ui_text(
+            renderer,
+            x + 1,
+            row_y,
+            f"{prefix} {option_text}",
+            color,
+            max_cells=max(1, width - 2),
+        )
+
+
+def _scroll_start(selected_index: int, total_items: int, visible_rows: int) -> int:
+    if total_items <= visible_rows:
+        return 0
+
+    candidate = selected_index - (visible_rows // 2)
+    candidate = max(0, candidate)
+    return min(candidate, total_items - visible_rows)
+
+
+def _draw_title_screen(renderer: Renderer) -> bool:
+    options = ["Continue", "Quit"]
+    selected = 0
+
+    while True:
+        x, y, width, _height = _draw_menu_shell(
+            renderer,
+            title="TALES OF DERISION",
+            subtitle="A pygame ECS roguelike prototype",
+            footer="[W/S] navigate   [Enter/Space] select   [Esc] quit",
+            width=72,
+            height=20,
+        )
+        _draw_ui_text(renderer, x + 2, y + 5, "Main Menu", _MENU_MUTED_COLOR, width - 4)
+        _draw_menu_options(renderer, x + 4, y + 7, width - 8, options, selected)
         renderer.present()
 
         action = renderer.poll_action()
         if action in {"quit", "open_pause_menu"}:
             return False
-        if action == "menu_select":
-            return True
+        if action == "move_up":
+            selected = (selected - 1) % len(options)
+        elif action == "move_down":
+            selected = (selected + 1) % len(options)
+        elif action in {"menu_select", "confirm_action"}:
+            return selected == 0
 
 
 def _draw_main_menu(renderer: Renderer) -> str:
-    options = ["Continue", "New Game", "Quit"]
+    options: list[tuple[str, str]] = [
+        ("continue", "Continue"),
+        ("new_game", "New Game"),
+        ("quit", "Quit"),
+    ]
     selected = 0
 
     while True:
-        renderer.clear()
-        renderer.draw_text(12, 5, "MAIN MENU")
-        for idx, item in enumerate(options):
-            prefix = "> " if idx == selected else "  "
-            renderer.draw_text(10, 8 + idx, f"{prefix}{item}")
-        renderer.draw_text(3, 14, "Use W/S to move, Enter to select")
+        x, y, width, _height = _draw_menu_shell(
+            renderer,
+            title="MAIN MENU",
+            subtitle="Choose your path",
+            footer="[W/S] move   [Enter/Space] select   [Esc] quit",
+            width=72,
+            height=22,
+        )
+        labels = [label for _value, label in options]
+        _draw_menu_options(renderer, x + 4, y + 7, width - 8, labels, selected)
         renderer.present()
 
         action = renderer.poll_action()
@@ -316,9 +490,8 @@ def _draw_main_menu(renderer: Renderer) -> str:
             selected = (selected - 1) % len(options)
         elif action == "move_down":
             selected = (selected + 1) % len(options)
-        elif action == "menu_select":
-            lowered = options[selected].lower().replace(" ", "_")
-            return lowered
+        elif action in {"menu_select", "confirm_action"}:
+            return options[selected][0]
 
 
 def _draw_options_menu(renderer: Renderer, options: dict) -> str:
@@ -337,18 +510,20 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
         items = [
             f"Fullscreen: {'ON' if fullscreen else 'OFF'}",
             f"Show FPS: {'ON' if show_fps else 'OFF'}",
-            f"Tile Scale: {tile_scale:.2f}x",
-            f"UI Scale: {ui_scale:.2f}x",
+            f"Tile Scale: < {tile_scale:.2f}x >",
+            f"UI Scale: < {ui_scale:.2f}x >",
             "Back",
         ]
 
-        renderer.clear()
-        renderer.draw_text(12, 5, "OPTIONS")
-        for idx, item in enumerate(items):
-            prefix = "> " if idx == selected else "  "
-            renderer.draw_text(8, 8 + idx, f"{prefix}{item}")
-        renderer.draw_text(2, 14, "Use W/S to move, A/D to change scale, Enter to toggle/select")
-        renderer.draw_text(2, 15, "Esc to return")
+        x, y, width, _height = _draw_menu_shell(
+            renderer,
+            title="OPTIONS",
+            subtitle="Display and interface",
+            footer="[W/S] move   [A/D] adjust   [Enter/Space] toggle/select   [Esc] back",
+            width=78,
+            height=24,
+        )
+        _draw_menu_options(renderer, x + 4, y + 7, width - 8, items, selected)
         renderer.present()
 
         action = renderer.poll_action()
@@ -376,7 +551,7 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
                 options["ui_scale"] = _next_scale(ui_scale, direction=1)
                 save_options(options)
                 apply_renderer_options()
-        elif action == "menu_select":
+        elif action in {"menu_select", "confirm_action"}:
             if selected == 0:
                 options["fullscreen"] = not fullscreen
                 save_options(options)
@@ -401,13 +576,15 @@ def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
     selected = 0
 
     while True:
-        renderer.clear()
-        renderer.draw_text(12, 5, "PAUSE MENU")
-        for idx, item in enumerate(menu_items):
-            prefix = "> " if idx == selected else "  "
-            renderer.draw_text(10, 8 + idx, f"{prefix}{item}")
-        renderer.draw_text(3, 14, "Use W/S to move, Enter to select")
-        renderer.draw_text(3, 15, "Esc to resume")
+        x, y, width, _height = _draw_menu_shell(
+            renderer,
+            title="PAUSE",
+            subtitle="Session controls",
+            footer="[W/S] move   [Enter/Space] select   [Esc] resume",
+            width=68,
+            height=22,
+        )
+        _draw_menu_options(renderer, x + 4, y + 7, width - 8, menu_items, selected)
         renderer.present()
 
         action = renderer.poll_action()
@@ -419,12 +596,55 @@ def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
             selected = (selected - 1) % len(menu_items)
         elif action == "move_down":
             selected = (selected + 1) % len(menu_items)
-        elif action == "menu_select":
+        elif action in {"menu_select", "confirm_action"}:
             chosen = menu_items[selected].lower().replace(" ", "_")
             if chosen == "options":
                 _draw_options_menu(renderer, options)
                 continue
             return chosen
+
+
+def _run_startup_flow(
+    renderer: Renderer,
+    requested_save_file: Path | None,
+    game_map: GameMap,
+    player_position: Position,
+) -> tuple[bool, GameMap, Position, Path]:
+    selected_save_file = requested_save_file or DEFAULT_SAVE_FILE
+    state = "load_requested_save" if requested_save_file is not None else "title"
+
+    while True:
+        if state == "title":
+            if _draw_title_screen(renderer):
+                state = "main_menu"
+            else:
+                return (False, game_map, player_position, selected_save_file)
+            continue
+
+        if state == "main_menu":
+            menu_choice = _draw_main_menu(renderer)
+            if menu_choice == "quit":
+                return (False, game_map, player_position, selected_save_file)
+            if menu_choice == "continue":
+                loaded_map, loaded_player_position = load_game(
+                    DEFAULT_SAVE_FILE,
+                    MAP_WIDTH,
+                    MAP_HEIGHT,
+                )
+                return (True, loaded_map, loaded_player_position, selected_save_file)
+            if menu_choice == "new_game":
+                save_game(game_map, DEFAULT_SAVE_FILE, player_position)
+                return (True, game_map, player_position, selected_save_file)
+
+            state = "title"
+            continue
+
+        loaded_map, loaded_player_position = load_game(
+            selected_save_file,
+            MAP_WIDTH,
+            MAP_HEIGHT,
+        )
+        return (True, loaded_map, loaded_player_position, selected_save_file)
 
 
 def _default_equipment_slots() -> dict[str, str | None]:
@@ -704,45 +924,80 @@ def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
         npc_name = _entity_name(npc_ent, fallback="NPC")
         player_name = _entity_name(player_ent, fallback="You")
 
-        renderer.clear()
-        renderer.draw_text(2, 1, f"TRADE - {npc_name}")
-        renderer.draw_text(2, 2, "Esc or i to close")
+        x, y, width, height = _draw_menu_shell(
+            renderer,
+            title=f"TRADE - {npc_name}",
+            subtitle="Esc/I closes   A/D switches side",
+            footer=message,
+            width=98,
+            height=30,
+        )
 
-        left_x = 2
-        right_x = 40
-        top_y = 4
+        content_y = y + 4
+        content_h = max(10, height - 7)
+        left_w = max(18, (width - 6) // 2)
+        right_w = max(18, width - left_w - 6)
+        left_x = x + 2
+        right_x = left_x + left_w + 2
 
-        renderer.draw_text(left_x, top_y, f"== {npc_name} (LEFT) ==")
-        y = top_y + 2
-        if not npc_entries:
-            prefix = "> " if selected_panel == "left" else "  "
-            renderer.draw_text(left_x, y, f"{prefix}(empty)")
-        else:
-            for idx, entry in enumerate(npc_entries):
-                prefix = "> " if selected_panel == "left" and idx == selected_npc_idx else "  "
+        draw_panel = getattr(renderer, "draw_panel", None)
+        if callable(draw_panel):
+            draw_panel(left_x, content_y, left_w, content_h, title=f"{npc_name} STOCK")
+            draw_panel(right_x, content_y, right_w, content_h, title=f"{player_name} STOCK")
+
+        list_start_y = content_y + 3
+        visible_rows = max(1, content_h - 5)
+
+        if npc_entries:
+            npc_start = _scroll_start(selected_npc_idx, len(npc_entries), visible_rows)
+            npc_end = min(len(npc_entries), npc_start + visible_rows)
+            for row_offset, entry_idx in enumerate(range(npc_start, npc_end)):
+                entry = npc_entries[entry_idx]
+                row_y = list_start_y + row_offset
+                is_selected = selected_panel == "left" and entry_idx == selected_npc_idx
+                if is_selected:
+                    _fill_ui_cells(renderer, left_x + 1, row_y, left_w - 2, 1, _MENU_SELECTED_BG)
+
                 if entry.kind == "equipment":
                     label = f"[E] {entry.slot_name}: {entry.item_name}"
                 else:
                     label = entry.item_name
-                renderer.draw_text(left_x, y, f"{prefix}{label}"[:36])
-                y += 1
-
-        renderer.draw_text(right_x, top_y, f"== {player_name} (RIGHT) ==")
-        y = top_y + 2
-        if not player_entries:
-            prefix = "> " if selected_panel == "right" else "  "
-            renderer.draw_text(right_x, y, f"{prefix}(empty)")
+                prefix = ">" if is_selected else " "
+                color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+                _draw_ui_text(renderer, left_x + 2, row_y, f"{prefix} {label}", color, left_w - 4)
         else:
-            for idx, entry in enumerate(player_entries):
-                prefix = "> " if selected_panel == "right" and idx == selected_player_idx else "  "
+            is_selected = selected_panel == "left"
+            if is_selected:
+                _fill_ui_cells(renderer, left_x + 1, list_start_y, left_w - 2, 1, _MENU_SELECTED_BG)
+            color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+            prefix = ">" if is_selected else " "
+            _draw_ui_text(renderer, left_x + 2, list_start_y, f"{prefix} (empty)", color, left_w - 4)
+
+        if player_entries:
+            player_start = _scroll_start(selected_player_idx, len(player_entries), visible_rows)
+            player_end = min(len(player_entries), player_start + visible_rows)
+            for row_offset, entry_idx in enumerate(range(player_start, player_end)):
+                entry = player_entries[entry_idx]
+                row_y = list_start_y + row_offset
+                is_selected = selected_panel == "right" and entry_idx == selected_player_idx
+                if is_selected:
+                    _fill_ui_cells(renderer, right_x + 1, row_y, right_w - 2, 1, _MENU_SELECTED_BG)
+
                 if entry.kind == "equipment":
                     label = f"[E] {entry.slot_name}: {entry.item_name}"
                 else:
                     label = entry.item_name
-                renderer.draw_text(right_x, y, f"{prefix}{label}"[:36])
-                y += 1
+                prefix = ">" if is_selected else " "
+                color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+                _draw_ui_text(renderer, right_x + 2, row_y, f"{prefix} {label}", color, right_w - 4)
+        else:
+            is_selected = selected_panel == "right"
+            if is_selected:
+                _fill_ui_cells(renderer, right_x + 1, list_start_y, right_w - 2, 1, _MENU_SELECTED_BG)
+            color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+            prefix = ">" if is_selected else " "
+            _draw_ui_text(renderer, right_x + 2, list_start_y, f"{prefix} (empty)", color, right_w - 4)
 
-        renderer.draw_text(2, top_y + 14, message[:76])
         renderer.present()
 
         action = renderer.poll_action()
@@ -769,7 +1024,7 @@ def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
                 selected_player_idx = (selected_player_idx + 1) % len(player_entries)
             continue
 
-        if action == "menu_select":
+        if action in {"menu_select", "confirm_action"}:
             if selected_panel == "left":
                 if not npc_entries:
                     message = f"{npc_name} has nothing to trade."
@@ -793,24 +1048,23 @@ def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
     while True:
         npc_name = _entity_name(npc_ent, fallback="Unknown NPC")
 
-        renderer.clear()
-        renderer.draw_text(2, 1, f"DIALOGUE - {npc_name}")
-        renderer.draw_text(2, 2, "Esc to close")
+        footer = talk_line if talk_line else "[W/S] move   [Enter/Space] select   [Esc] close"
+        x, y, width, _height = _draw_menu_shell(
+            renderer,
+            title=f"DIALOGUE - {npc_name}",
+            subtitle="Interaction menu",
+            footer=footer,
+            width=82,
+            height=24,
+        )
 
-        y = 4
-        for line in info_lines:
-            renderer.draw_text(2, y, line[:76])
-            y += 1
+        info_y = y + 5
+        for idx, line in enumerate(info_lines):
+            _draw_ui_text(renderer, x + 3, info_y + idx, line, _MENU_TEXT_COLOR, width - 6)
 
-        y += 1
-        renderer.draw_text(2, y, "== OPTIONS ==")
-        y += 1
-        for idx, option in enumerate(options):
-            prefix = "> " if idx == selected else "  "
-            renderer.draw_text(2, y + idx, f"{prefix}{option}")
-
-        if talk_line:
-            renderer.draw_text(2, y + 5, talk_line[:76])
+        option_y = info_y + len(info_lines) + 2
+        _draw_ui_text(renderer, x + 3, option_y - 1, "OPTIONS", _MENU_MUTED_COLOR, width - 6)
+        _draw_menu_options(renderer, x + 3, option_y, width - 6, options, selected)
 
         renderer.present()
         action = renderer.poll_action()
@@ -826,7 +1080,7 @@ def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
             selected = (selected + 1) % len(options)
             continue
 
-        if action == "menu_select":
+        if action in {"menu_select", "confirm_action"}:
             choice = options[selected]
             if choice == "Leave":
                 return "close"
@@ -870,37 +1124,82 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
                 for slot_name in equipment_slots:
                     equipment_slots[slot_name] = configured.get(slot_name)
 
-        renderer.clear()
-        renderer.draw_text(2, 1, f"INVENTORY - {player_name}")
-        renderer.draw_text(2, 2, "Esc or i to close")
+        x, y, width, height = _draw_menu_shell(
+            renderer,
+            title=f"INVENTORY - {player_name}",
+            subtitle="Esc/I closes   A/D switches side",
+            footer=message,
+            width=98,
+            height=32,
+        )
 
-        left_x = 2
-        right_x = 40
-        top_y = 4
+        content_y = y + 4
+        content_h = max(10, height - 7)
+        left_w = max(20, (width - 6) // 2)
+        right_w = max(20, width - left_w - 6)
+        left_x = x + 2
+        right_x = left_x + left_w + 2
 
-        renderer.draw_text(left_x, top_y, "== EQUIPPED ==")
+        draw_panel = getattr(renderer, "draw_panel", None)
+        if callable(draw_panel):
+            draw_panel(left_x, content_y, left_w, content_h, title="EQUIPPED")
+            draw_panel(right_x, content_y, right_w, content_h, title="ITEMS")
+
         slot_names = list(equipment_slots.keys())
-        slot_y = top_y + 2
-        for idx, slot_name in enumerate(slot_names):
-            equipped_item = equipment_slots[slot_name]
-            display = equipped_item if equipped_item else "(empty)"
-            prefix = "> " if selected_panel == "left" and idx == selected_slot_idx else "  "
-            renderer.draw_text(left_x, slot_y, f"{prefix}{slot_name:10}: {display}")
-            slot_y += 1
+        list_start_y = content_y + 3
+        visible_rows = max(1, content_h - 5)
 
-        renderer.draw_text(right_x, top_y, "== ITEMS ==")
-        item_y = top_y + 2
-        if not inventory_items:
-            prefix = "> " if selected_panel == "right" else "  "
-            renderer.draw_text(right_x, item_y, f"{prefix}(empty)")
+        if slot_names:
+            slot_start = _scroll_start(selected_slot_idx, len(slot_names), visible_rows)
+            slot_end = min(len(slot_names), slot_start + visible_rows)
+            for row_offset, slot_idx in enumerate(range(slot_start, slot_end)):
+                slot_name = slot_names[slot_idx]
+                equipped_item = equipment_slots[slot_name]
+                display = equipped_item if equipped_item else "(empty)"
+                row_y = list_start_y + row_offset
+                is_selected = selected_panel == "left" and slot_idx == selected_slot_idx
+                if is_selected:
+                    _fill_ui_cells(renderer, left_x + 1, row_y, left_w - 2, 1, _MENU_SELECTED_BG)
+
+                prefix = ">" if is_selected else " "
+                color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+                _draw_ui_text(
+                    renderer,
+                    left_x + 2,
+                    row_y,
+                    f"{prefix} {slot_name:10}: {display}",
+                    color,
+                    left_w - 4,
+                )
+
+        if inventory_items:
+            item_start = _scroll_start(selected_item_idx, len(inventory_items), visible_rows)
+            item_end = min(len(inventory_items), item_start + visible_rows)
+            for row_offset, item_idx in enumerate(range(item_start, item_end)):
+                item_name = inventory_items[item_idx]
+                row_y = list_start_y + row_offset
+                label = chr(ord("a") + item_idx) if item_idx < 26 else "*"
+                is_selected = selected_panel == "right" and item_idx == selected_item_idx
+                if is_selected:
+                    _fill_ui_cells(renderer, right_x + 1, row_y, right_w - 2, 1, _MENU_SELECTED_BG)
+
+                prefix = ">" if is_selected else " "
+                color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+                _draw_ui_text(
+                    renderer,
+                    right_x + 2,
+                    row_y,
+                    f"{prefix} {label}) {item_name}",
+                    color,
+                    right_w - 4,
+                )
         else:
-            for idx, item in enumerate(inventory_items):
-                label = chr(ord("a") + idx) if idx < 26 else "*"
-                prefix = "> " if selected_panel == "right" and idx == selected_item_idx else "  "
-                renderer.draw_text(right_x, item_y, f"{prefix}{label}) {item}")
-                item_y += 1
-
-        renderer.draw_text(2, top_y + 13, message[:76])
+            is_selected = selected_panel == "right"
+            if is_selected:
+                _fill_ui_cells(renderer, right_x + 1, list_start_y, right_w - 2, 1, _MENU_SELECTED_BG)
+            color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+            prefix = ">" if is_selected else " "
+            _draw_ui_text(renderer, right_x + 2, list_start_y, f"{prefix} (empty)", color, right_w - 4)
 
         renderer.present()
 
@@ -931,7 +1230,7 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
                 selected_item_idx = (selected_item_idx + 1) % len(inventory_items)
             continue
 
-        if action == "menu_select" and player_ent is not None:
+        if action in {"menu_select", "confirm_action"} and player_ent is not None:
             if not esper.has_component(player_ent, Inventory):
                 continue
             if not esper.has_component(player_ent, Equipment):
@@ -1016,40 +1315,32 @@ def main() -> None:
     args = _parse_args()
     bootstrap_files(MAP_WIDTH, MAP_HEIGHT)
     options = load_options()
-    pygame_module = _start_background_music(options)
+    if args.screenshot is not None:
+        # Run screenshot capture off-screen.
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+        os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+        # Force windowed capture for deterministic screenshot dimensions.
+        options["fullscreen"] = False
+
+    pygame_module = None if args.screenshot is not None else _start_background_music(options)
     combat_sfx = _CombatSfxPlayer(pygame_module, options)
-
-    selected_save_file = args.save_file
-
-    if selected_save_file is None:
-        selected_save_file = DEFAULT_SAVE_FILE
 
     game_map = GameMap(MAP_WIDTH, MAP_HEIGHT)
     player_position = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
+    startup_save_file = args.save_file
+    if args.screenshot is not None and startup_save_file is None:
+        startup_save_file = DEFAULT_SAVE_FILE
 
     try:
         with PygameRenderer(options=options) as renderer:
-            if args.save_file is None:
-                if not _draw_title_screen(renderer):
-                    return
-
-                menu_choice = _draw_main_menu(renderer)
-                if menu_choice == "quit":
-                    return
-                if menu_choice == "continue":
-                    game_map, player_position = load_game(
-                        DEFAULT_SAVE_FILE,
-                        MAP_WIDTH,
-                        MAP_HEIGHT,
-                    )
-                elif menu_choice == "new_game":
-                    save_game(game_map, DEFAULT_SAVE_FILE, player_position)
-            else:
-                game_map, player_position = load_game(
-                    selected_save_file,
-                    MAP_WIDTH,
-                    MAP_HEIGHT,
-                )
+            startup_ok, game_map, player_position, selected_save_file = _run_startup_flow(
+                renderer,
+                startup_save_file,
+                game_map,
+                player_position,
+            )
+            if not startup_ok:
+                return
 
             _setup_world(game_map, player_position)
             esper.add_processor(
@@ -1064,6 +1355,10 @@ def main() -> None:
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame
+            if args.screenshot is not None:
+                _capture_frame_screenshot(renderer, args.screenshot)
+                return
+
             held_directions: set[str] = set()
             direction_pressed_order = {
                 "move_up": -1,
@@ -1074,6 +1369,8 @@ def main() -> None:
             press_order_counter = 0
             while True:
                 action = renderer.poll_action()
+                if action == "quit":
+                    break
                 if action == "tile_scale_up":
                     options["tile_scale"] = _next_scale(_coerce_scale(options.get("tile_scale", 1.0)), direction=1)
                     save_options(options)

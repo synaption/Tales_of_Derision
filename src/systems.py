@@ -316,20 +316,32 @@ class RenderProcessor(esper.Processor):
     ) -> None:
         r = self.renderer
         draw_text_clipped = getattr(r, "draw_text_clipped", None)
+        draw_text_tinted = getattr(r, "draw_text_tinted", None)
+        fill_cells = getattr(r, "fill_cells", None)
 
-        def draw_line(x: int, y: int, text: str, width_cells: int) -> None:
+        def draw_line(
+            x: int,
+            y: int,
+            text: str,
+            width_cells: int,
+            color: tuple[int, int, int] | None = None,
+        ) -> None:
+            clipped_text = text[: max(0, width_cells)]
+            if color is not None and callable(draw_text_tinted):
+                draw_text_tinted(x, y, clipped_text, color)
+                return
             if callable(draw_text_clipped):
                 draw_text_clipped(x, y, text, width_cells)
                 return
-            r.draw_text(x, y, text[: max(0, width_cells)])
+            r.draw_text(x, y, clipped_text)
 
         panel_x = max(0, self.sidebar_x)
         panel_y = 0
         panel_w = max(14, self.sidebar_width)
-        panel_h = max(12, self._grid_h)
+        panel_h = max(14, self._grid_h)
 
-        x0 = panel_x + 1
-        content_width = max(8, panel_w - 2)
+        x0 = panel_x + 2
+        content_width = max(6, panel_w - 4)
         wrap_width = content_width
         get_text_cols = getattr(r, "text_columns_for_cells", None)
         if callable(get_text_cols):
@@ -363,10 +375,10 @@ class RenderProcessor(esper.Processor):
             else:
                 wrapped_nearby.append("")
 
-        panel_gap = 0
-        min_box_h = 5
+        panel_gap = 1
+        min_box_h = 6
         nearby_content_needed = max(1, len(wrapped_nearby))
-        nearby_h_needed = nearby_content_needed + 3  # inner header + borders
+        nearby_h_needed = nearby_content_needed + 4
         max_nearby_h = max(min_box_h, panel_h - min_box_h - panel_gap)
         nearby_h = max(min_box_h, min(max_nearby_h, nearby_h_needed))
         log_h = panel_h - nearby_h - panel_gap
@@ -377,14 +389,9 @@ class RenderProcessor(esper.Processor):
         nearby_y = panel_y
         log_y = nearby_y + nearby_h + panel_gap
 
-        nearby_content_y = nearby_y + 1
-        nearby_content_h = max(1, nearby_h - 2)
-        draw_line(x0, nearby_content_y, "== NEARBY ==", content_width)
-        nearby_content_y += 1
-        nearby_content_h = max(0, nearby_content_h - 1)
-
         draw_panel = getattr(r, "draw_panel", None)
-        if callable(draw_panel):
+        has_custom_panels = callable(draw_panel)
+        if has_custom_panels:
             draw_panel(panel_x, nearby_y, panel_w, nearby_h, title="NEARBY")
             draw_panel(panel_x, log_y, panel_w, log_h, title="LOG")
         else:
@@ -400,14 +407,32 @@ class RenderProcessor(esper.Processor):
             draw_ascii_panel(panel_x, nearby_y, panel_w, nearby_h, "NEARBY")
             draw_ascii_panel(panel_x, log_y, panel_w, log_h, "LOG")
 
-        for idx, line in enumerate(wrapped_nearby[:nearby_content_h]):
-            draw_line(x0, nearby_content_y + idx, line, content_width)
+        if callable(fill_cells) and not has_custom_panels:
+            header_bg = (18, 18, 18)
+            fill_cells(panel_x + 1, nearby_y + 1, max(1, panel_w - 2), 1, header_bg)
+            fill_cells(panel_x + 1, log_y + 1, max(1, panel_w - 2), 1, header_bg)
 
-        log_content_y = log_y + 1
-        log_content_h = max(1, log_h - 2)
-        draw_line(x0, log_content_y, "== LOG ==", content_width)
-        log_content_y += 1
-        log_content_h = max(0, log_content_h - 1)
+        header_color = (236, 236, 236)
+        text_color = (214, 214, 214)
+        muted_color = (168, 168, 168)
+
+        if not has_custom_panels:
+            draw_line(x0, nearby_y + 1, "[NEARBY]", content_width, color=header_color)
+            nearby_content_y = nearby_y + 3
+            nearby_content_h = max(1, nearby_h - 4)
+        else:
+            nearby_content_y = nearby_y + 2
+            nearby_content_h = max(1, nearby_h - 3)
+        for idx, line in enumerate(wrapped_nearby[:nearby_content_h]):
+            draw_line(x0, nearby_content_y + idx, line, content_width, color=text_color)
+
+        if not has_custom_panels:
+            draw_line(x0, log_y + 1, "[LOG]", content_width, color=header_color)
+            log_content_y = log_y + 3
+            log_content_h = max(1, log_h - 4)
+        else:
+            log_content_y = log_y + 2
+            log_content_h = max(1, log_h - 3)
 
         log_messages: list[str] = []
         for message in self._message_log:
@@ -422,7 +447,8 @@ class RenderProcessor(esper.Processor):
 
         visible_log = log_messages[-log_content_h:]
         for idx, line in enumerate(visible_log):
-            draw_line(x0, log_content_y + idx, line, content_width)
+            color = muted_color if line == "none" else text_color
+            draw_line(x0, log_content_y + idx, line, content_width, color=color)
 
     def _compute_layout(self, player_pos: Position | None) -> None:
         get_screen_px = getattr(self.renderer, "get_screen_size_px", None)

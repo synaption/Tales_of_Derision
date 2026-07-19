@@ -73,6 +73,8 @@ Run only totally unrendered logic/data tests:
 - User save files can live in `src/data/saves/*.json` and can be loaded directly
   with `--save_file`.
 - `--save_file` also bypasses title screen and main menu.
+- Keybinds are action-based in `src/data/config/options.json` (`move_up`,
+  `confirm_action`, `open_pause_menu`, etc.).
 
 ## Documentation
 
@@ -117,6 +119,7 @@ poll_action`) and be passed to `RenderProcessor`.
 Fantasy
 
 Time Travel
+- [BRAINSTORM] Time is cyclical.  Hyper advanced civilization makes floating islands, destroys the planet, and then inteligently redesigns new planets from their floating society.  These floating societies tend to be sparcely populated by a few super adept NPCs.  These "gods" die and inhabit the same reincarnation loop as you.  i.e. you are a reincanant.  You have of course forgotten this.  
 
 Zombie
 
@@ -159,6 +162,8 @@ Players and NPCs have the same needs as the player like food and water.
 
 When the player dies they become a random sentiaent NPC somewhere in the world.  It's like "Roy" from Rick and Morty.  
 
+Morrorwind style leveling.  You level up individual skills, when you level up those skills you gain a character level and can upgrade attributes str, dex, con, int, wis, char.  You also get more health and magic if you have magic.  
+
 ## Style
 Pixel Art
 
@@ -168,7 +173,7 @@ shader effects, lighting
 
 basic animations, or no animations at all
 
-characters face the direction the are going, either just left or right, or up, down, left, and right, or all 8 directions depending on the sprite.  
+characters face the direction they are going, either just left or right, or up, down, left, and right, or all 8 directions depending on the sprite.  
 
 Dialogue in a fake gibberish language "##!/$*~# GH01^@"  
 

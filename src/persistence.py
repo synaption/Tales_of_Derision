@@ -30,12 +30,16 @@ _DEFAULT_OPTIONS = {
     "melee_attack_sfx": "audio/sfx/swipe.wav",
     "death_sfx": "audio/sfx/splat_quick.wav",
     "keybinds": {
-        "up": ["w", "k", "up"],
-        "down": ["s", "j", "down"],
-        "left": ["a", "h", "left"],
-        "right": ["d", "l", "right"],
-        "save": ["p"],
-        "quit": ["q", "esc"],
+        "move_up": ["w"],
+        "move_down": ["s"],
+        "move_left": ["a"],
+        "move_right": ["d"],
+        "confirm_action": ["space"],
+        "menu_select": ["enter", "kp_enter"],
+        "open_inventory": ["i"],
+        "open_pause_menu": ["esc"],
+        "tile_scale_up": ["equals", "kp_plus"],
+        "tile_scale_down": ["minus", "kp_minus"],
     },
 }
 
