@@ -283,6 +283,11 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help="render a single gameplay frame, save it to this path, and exit",
     )
+    parser.add_argument(
+        "--rat-flood",
+        action="store_true",
+        help="spawn cave rats on every walkable tile for stress testing",
+    )
     return parser.parse_args()
 
 
@@ -1384,7 +1389,33 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
                     message = _unequip_slot(inventory, equipment, slot_name)
 
 
-def _setup_world(game_map: GameMap, player_position: Position) -> None:
+def _spawn_cave_rat(
+    x: int,
+    y: int,
+    *,
+    include_loot: bool,
+) -> None:
+    components: list[object] = [
+        Position(x, y),
+        Renderable("r", fg=_RAT_BROWN),
+        Name("Cave Rat"),
+        NPC(),
+        Enemy(),
+        Vision(6),
+        BlocksMovement(),
+    ]
+    if include_loot:
+        components.extend(
+            [
+                Inventory(items=["String", "Pebble"]),
+                Equipment(slots=_default_equipment_slots()),
+            ]
+        )
+
+    esper.create_entity(*components)
+
+
+def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool = False) -> int:
     player_name = "You"
     villager_name = "Friendly Villager"
     player_skin = _human_skin_tone(player_name)
@@ -1403,6 +1434,19 @@ def _setup_world(game_map: GameMap, player_position: Position) -> None:
         Inventory(items=["Bandage", "Torch", "Apple"]),
         Equipment(slots=player_equipment),
     )
+
+    if rat_flood:
+        rats_spawned = 0
+        player_xy = (player_position.x, player_position.y)
+        for y in range(game_map.height):
+            for x in range(game_map.width):
+                if not game_map.is_walkable(x, y):
+                    continue
+                if (x, y) == player_xy:
+                    continue
+                _spawn_cave_rat(x, y, include_loot=False)
+                rats_spawned += 1
+        return rats_spawned
 
     villager_pos = Position(max(2, player_position.x - 2), player_position.y + 1)
     guard_pos = Position(max(2, player_position.x - 5), player_position.y)
@@ -1443,6 +1487,7 @@ def _setup_world(game_map: GameMap, player_position: Position) -> None:
         Inventory(items=["String", "Pebble"]),
         Equipment(slots=_default_equipment_slots()),
     )
+    return 1
 
 
 def main() -> None:
@@ -1480,7 +1525,9 @@ def main() -> None:
                 pygame_module = _start_background_music(options)
                 combat_sfx = _CombatSfxPlayer(pygame_module, options)
 
-            _setup_world(game_map, player_position)
+            rat_count = _setup_world(game_map, player_position, rat_flood=args.rat_flood)
+            if args.rat_flood:
+                print(f"Rat flood mode enabled: spawned {rat_count} cave rats.", file=sys.stderr)
             esper.add_processor(
                 MovementProcessor(
                     game_map,

@@ -5,9 +5,9 @@ from pathlib import Path
 import esper
 import pytest
 
-from components import Player, Position
+from components import Enemy, NPC, Player, Position
 from game_map import GameMap
-from main import _action_from_held_keys
+from main import _action_from_held_keys, _setup_world
 from persistence import load_game, save_game
 from systems import MovementProcessor
 
@@ -163,3 +163,26 @@ def test_large_default_map_contains_buildings() -> None:
     assert game_map.tile_at(26, 5) == game_map.WALL
     assert game_map.tile_at(35, 11) == game_map.WALL
     assert game_map.tile_at(30, 11) == game_map.FLOOR
+
+
+def test_setup_world_rat_flood_spawns_rat_on_every_walkable_tile() -> None:
+    game_map = GameMap(12, 8)
+    player_pos = Position(6, 4)
+
+    rats_spawned = _setup_world(game_map, player_pos, rat_flood=True)
+
+    expected_rat_positions = {
+        (x, y)
+        for y in range(game_map.height)
+        for x in range(game_map.width)
+        if game_map.is_walkable(x, y) and (x, y) != (player_pos.x, player_pos.y)
+    }
+
+    rat_positions = {
+        (pos.x, pos.y)
+        for _ent, (pos, _npc, _enemy) in esper.get_components(Position, NPC, Enemy)
+        if (pos.x, pos.y) != (player_pos.x, player_pos.y)
+    }
+
+    assert rats_spawned == len(expected_rat_positions)
+    assert rat_positions == expected_rat_positions

@@ -20,6 +20,10 @@ Or bypass the title screen/main menu and load a specific save file:
 
   python3 src/main.py --save_file src/data/saves/my_run.json
 
+Stress test with cave rats on every walkable map square:
+
+  python3 src/main.py --rat-flood
+
 Move: hold WASD, press Space to take a step. Menu: Esc. Inventory: I.
 
 ## Audio
