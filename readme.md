@@ -30,7 +30,7 @@ Move: hold WASD, press Space to take a step. Menu: Esc. Inventory: I.
 
 Install pygbag (once):
 
-  python3 -m pip install --user pygbag
+  python3 -m pip install --user pygbag esper
 
 Build the web bundle:
 
@@ -45,6 +45,29 @@ Preview locally:
   python3 -m http.server --directory build/web 8000
 
 Then open `http://localhost:8000` in your browser.
+
+Use port `8000` for local preview. This pygbag runtime rewrites package fetches
+to `http://localhost:8000/cdn/...` while booting; serving on other ports can
+leave the page stuck at `Loading, please wait ...`.
+
+If you still see an old `Ready to start` screen that does not advance, do a hard refresh
+(`Ctrl+Shift+R`) to clear cached web assets.
+
+Use the static server command above for local preview of the built site. Running
+`python3 -m pygbag ...` directly from repo root can regenerate `build/web` with a
+different layout while debugging.
+
+### Web build architecture (important)
+
+Pygbag runs the whole game on the browser's **single** thread. The entry point
+(`main.py` -> `src/main.py:main`) is an `async` coroutine, and every input wait
+goes through `_await_action`, which does `await asyncio.sleep(0)` on the web
+build so the browser can pump events and repaint.
+
+Do **not** add blocking input loops (`while True: renderer.poll_action()` or
+`pygame.time.wait`/`time.sleep` in the input path). On desktop they are fine, but
+on pygbag they never yield and freeze the page at `Loading, please wait ...`.
+New menus/loops must be `async def` and use `await _await_action(renderer)`.
 
 ## GitHub Pages deployment
 

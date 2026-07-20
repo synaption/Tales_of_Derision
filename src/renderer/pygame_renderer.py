@@ -712,7 +712,7 @@ class PygameRenderer(Renderer):
                 self._fallback_fill_bg = bool(fallback_payload.get("use_bg_fill"))
 
     def setup(self) -> None:
-        import pygame
+        pygame = __import__("pygame")
 
         pygame.init()
         pygame.display.set_caption("Tales of Derision")

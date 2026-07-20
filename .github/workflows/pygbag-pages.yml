@@ -28,10 +28,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pygbag
+      - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pygbag
+          python -m pip install pygbag esper
 
       - name: Build web bundle
         run: bash scripts/build_pygbag.sh
