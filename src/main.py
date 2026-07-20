@@ -66,9 +66,14 @@ AUDIO_BUFFER_SIZES = (16384, 8192, 4096, 2048)
 
 # Pygbag runs the whole program on the browser's single main thread. Any loop
 # that would block (spin on input) must hand control back to the browser with
-# ``await asyncio.sleep(0)`` or the tab freezes, and web audio/display need
+# ``await asyncio.sleep(...)`` or the tab freezes, and web audio/display need
 # their own handling. On desktop these paths keep the original behavior.
 IS_WEB = sys.platform == "emscripten"
+
+# Idle input polling cadence on web. A zero-delay spin (asyncio.sleep(0)) pegs
+# the browser's single main thread and starves the audio mixer -> clicks/pops.
+# ~60Hz frees the thread for audio while keeping input latency imperceptible.
+_WEB_IDLE_POLL_SECONDS = 1 / 60
 
 
 def _audio_driver_order() -> list[str | None]:
@@ -530,8 +535,8 @@ async def _await_action(renderer: Renderer) -> str | None:
     """Return the next input action, yielding to the browser event loop on web.
 
     Desktop keeps the renderer's blocking poll (unchanged idle behavior). Under
-    pygbag we poll without blocking and ``await asyncio.sleep(0)`` on every empty
-    poll so the browser can pump events and repaint between frames.
+    pygbag we poll without blocking and sleep a real frame on every empty poll so
+    the browser can pump events, repaint, and service audio between frames.
     """
     if not IS_WEB:
         return renderer.poll_action()
@@ -541,10 +546,10 @@ async def _await_action(renderer: Renderer) -> str | None:
         if callable(poll_nonblocking):
             action = poll_nonblocking()
         else:
-            action = await _await_action(renderer)
+            action = renderer.poll_action()
         if action is not None:
             return action
-        await asyncio.sleep(0)
+        await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
 
 
 async def _draw_title_screen(renderer: Renderer) -> bool:
