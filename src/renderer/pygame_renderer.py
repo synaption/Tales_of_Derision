@@ -21,6 +21,20 @@ from .base import Renderer
 IS_WEB = sys.platform == "emscripten"
 
 
+def _apply_web_canvas_style() -> None:
+    """Tell the browser to scale the canvas with nearest-neighbor sampling.
+
+    The canvas is CSS-scaled to fit the page; the browser's default smoothing
+    blurs upscaled pixels and text. `image-rendering: pixelated` keeps them crisp.
+    """
+    try:
+        import platform as _platform  # pygbag-injected; has .window.canvas on web
+
+        _platform.window.canvas.style.imageRendering = "pixelated"
+    except Exception:
+        pass
+
+
 def _web_display_size(default: tuple[int, int] = (1280, 720)) -> tuple[int, int]:
     """Visible browser canvas size (CSS pixels) for the pygbag build.
 
@@ -262,6 +276,12 @@ class PygameRenderer(Renderer):
         self._mouse_visible = True
         self._last_mouse_activity_ms = 0
         self._mouse_hide_delay_ms = 2400
+        # Cached game-scene snapshot reused as a static menu backdrop (see
+        # capture_backdrop). Avoids a full esper.process() render per menu frame.
+        self._backdrop_snapshot = None
+        # Cached fully-drawn map; walking blits regions of it instead of
+        # re-drawing every visible tile (see capture_map_surface).
+        self._map_surface = None
 
     def apply_options(self, options: dict) -> None:
         self._options = dict(options)
@@ -292,6 +312,7 @@ class PygameRenderer(Renderer):
             # rescales an oversized surface and the whole game looks tiny.
             window_w, window_h = _web_display_size()
             self._screen = self._pygame.display.set_mode((window_w, window_h))
+            _apply_web_canvas_style()
         elif fullscreen:
             self._screen = self._pygame.display.set_mode((0, 0), self._pygame.FULLSCREEN)
         else:
@@ -317,6 +338,10 @@ class PygameRenderer(Renderer):
         self._autotile_tiles = {"wall": {}, "water": {}, "ledges": {}}
         self._fallback_tiles = {}
         self._tinted_tiles = {}
+        # Screen was just re-created (set_mode); cached surfaces are now the
+        # wrong size / cell scale.
+        self._backdrop_snapshot = None
+        self._map_surface = None
         self._load_tileset_config()
 
         self._keydown_to_action, self._keyup_to_action = _build_key_mappings(self._pygame, self._options)
@@ -1107,6 +1132,93 @@ class PygameRenderer(Renderer):
         )
         overlay.fill((color[0], color[1], color[2], clamped_alpha))
         self._screen.blit(overlay, (0, 0))
+
+    def capture_backdrop(self) -> None:
+        """Snapshot the current screen so menus can reuse it as a static
+        backdrop instead of re-rendering the whole game every keypress."""
+        if self._screen is not None:
+            self._backdrop_snapshot = self._screen.copy()
+
+    def has_backdrop(self) -> bool:
+        return self._backdrop_snapshot is not None
+
+    def blit_backdrop(self) -> bool:
+        if self._screen is None or self._backdrop_snapshot is None:
+            return False
+        self._screen.blit(self._backdrop_snapshot, (0, 0))
+        return True
+
+    def invalidate_backdrop(self) -> None:
+        self._backdrop_snapshot = None
+
+    def build_map_surface(self, cols: int, rows: int, draw_callback) -> None:
+        """Render the whole map once to an off-screen, world-sized surface.
+
+        ``draw_callback`` draws every tile at its WORLD cell position (vx==wx,
+        vy==wy). Caching in world coordinates (not view coordinates) keeps the
+        cache valid when the camera scrolls at higher zoom -- later frames blit
+        the visible region with the scroll offset applied (see blit_map_region).
+        """
+        if self._pygame is None:
+            return
+        surface = self._pygame.Surface((max(1, cols) * self._cell_w, max(1, rows) * self._cell_h))
+        surface.fill(self._bg)
+        saved_screen = self._screen
+        self._screen = surface
+        try:
+            draw_callback()
+        finally:
+            self._screen = saved_screen
+        self._map_surface = surface
+
+    def has_map_surface(self) -> bool:
+        return self._map_surface is not None
+
+    def invalidate_map_surface(self) -> None:
+        self._map_surface = None
+
+    def blit_map_region(
+        self,
+        world_x: int,
+        world_y: int,
+        w_cells: int,
+        h_cells: int,
+        origin_x: int = 0,
+        origin_y: int = 0,
+    ) -> bool:
+        """Blit a world-cell block of the cached map to the screen, offset by the
+        current view origin (camera scroll). pygame clips a negative/overflowing
+        destination automatically."""
+        if self._screen is None or self._map_surface is None:
+            return False
+        src = self._pygame.Rect(
+            world_x * self._cell_w,
+            world_y * self._cell_h,
+            max(0, w_cells) * self._cell_w,
+            max(0, h_cells) * self._cell_h,
+        )
+        dest = ((world_x - origin_x) * self._cell_w, (world_y - origin_y) * self._cell_h)
+        self._screen.blit(self._map_surface, dest, src)
+        return True
+
+    def fill_cell_bg(self, vx: int, vy: int) -> None:
+        """Paint a single map cell with the background (used to hide FOV shadows)."""
+        if self._screen is None:
+            return
+        rect = self._pygame.Rect(vx * self._cell_w, vy * self._cell_h, self._cell_w, self._cell_h)
+        self._screen.fill(self._bg, rect)
+
+    def set_map_clip(self, w_cells: int, h_cells: int) -> None:
+        """Restrict drawing to the map viewport (top-left w_cells x h_cells) so a
+        composite map blit can't spill past the viewport into the sidebar."""
+        if self._screen is not None:
+            self._screen.set_clip(
+                self._pygame.Rect(0, 0, max(0, w_cells) * self._cell_w, max(0, h_cells) * self._cell_h)
+            )
+
+    def clear_clip(self) -> None:
+        if self._screen is not None:
+            self._screen.set_clip(None)
 
     def draw_text_clipped(self, x: int, y: int, text: str, max_cells: int) -> None:
         if max_cells <= 0:
