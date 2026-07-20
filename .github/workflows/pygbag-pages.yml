@@ -42,14 +42,16 @@ jobs:
         uses: actions/configure-pages@v6
 
       - name: Configure Pages (auto-enable)
-        if: ${{ steps.configure_pages.outcome == 'failure' && secrets.PAGES_ADMIN_TOKEN != '' }}
+        id: configure_pages_enable
+        if: ${{ steps.configure_pages.outcome == 'failure' }}
+        continue-on-error: true
         uses: actions/configure-pages@v6
         with:
           token: ${{ secrets.PAGES_ADMIN_TOKEN }}
           enablement: true
 
       - name: Fail with setup guidance
-        if: ${{ steps.configure_pages.outcome == 'failure' && secrets.PAGES_ADMIN_TOKEN == '' }}
+        if: ${{ steps.configure_pages.outcome == 'failure' && steps.configure_pages_enable.outcome != 'success' }}
         run: |
           echo "GitHub Pages is not enabled for this repository."
           echo "Enable it in Settings > Pages and set Source to GitHub Actions,"
