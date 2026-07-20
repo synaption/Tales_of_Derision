@@ -4,6 +4,7 @@ Turn loop: show title/menu, then block for an action, run the systems, repeat.
 The game logic stays renderer-agnostic while the default runtime uses pygame.
 """
 import argparse
+import asyncio
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -126,7 +127,7 @@ def _pick_music_track(music_dir: Path) -> Path | None:
 
 def _init_pygame_mixer(options: dict | None = None) -> Any | None:
     try:
-        import pygame
+        pygame = __import__("pygame")
     except ModuleNotFoundError:
         return None
 
@@ -472,7 +473,35 @@ def _scroll_start(selected_index: int, total_items: int, visible_rows: int) -> i
     return min(candidate, total_items - visible_rows)
 
 
-def _draw_title_screen(renderer: Renderer) -> bool:
+# Pygbag runs the whole program on the browser's single main thread. Any loop
+# that would block (spin on input) must hand control back to the browser with
+# ``await asyncio.sleep(0)`` or the tab freezes. On desktop we keep the original
+# blocking poll so idle turns stay at ~0% CPU.
+IS_WEB = sys.platform == "emscripten"
+
+
+async def _await_action(renderer: Renderer) -> str | None:
+    """Return the next input action, yielding to the browser event loop on web.
+
+    Desktop keeps the renderer's blocking poll (unchanged idle behavior). Under
+    pygbag we poll without blocking and ``await asyncio.sleep(0)`` on every empty
+    poll so the browser can pump events and repaint between frames.
+    """
+    if not IS_WEB:
+        return renderer.poll_action()
+
+    poll_nonblocking = getattr(renderer, "poll_action_nonblocking", None)
+    while True:
+        if callable(poll_nonblocking):
+            action = poll_nonblocking()
+        else:
+            action = await _await_action(renderer)
+        if action is not None:
+            return action
+        await asyncio.sleep(0)
+
+
+async def _draw_title_screen(renderer: Renderer) -> bool:
     poll_action_nonblocking = getattr(renderer, "poll_action_nonblocking", None)
     splash_seconds = max(0.5, _TITLE_SPLASH_SECONDS)
     end_time = time.monotonic() + splash_seconds
@@ -499,7 +528,7 @@ def _draw_title_screen(renderer: Renderer) -> bool:
         if callable(poll_action_nonblocking):
             action = poll_action_nonblocking()
         else:
-            action = renderer.poll_action()
+            action = await _await_action(renderer)
 
         if action == "quit":
             return False
@@ -511,10 +540,13 @@ def _draw_title_screen(renderer: Renderer) -> bool:
             return True
 
         if callable(poll_action_nonblocking):
-            time.sleep(0.016)
+            # ~60fps splash tick. asyncio.sleep yields to the browser on web and
+            # keeps CPU low on desktop (unlike time.sleep, which would block the
+            # WASM thread and freeze the page).
+            await asyncio.sleep(0.016)
 
 
-def _draw_main_menu(renderer: Renderer) -> str:
+async def _draw_main_menu(renderer: Renderer) -> str:
     options: list[tuple[str, str]] = [
         ("continue", "Continue"),
         ("new_game", "New Game"),
@@ -535,7 +567,7 @@ def _draw_main_menu(renderer: Renderer) -> str:
         _draw_menu_options(renderer, x + 4, y + 7, width - 8, labels, selected)
         renderer.present()
 
-        action = renderer.poll_action()
+        action = await _await_action(renderer)
         if action in {"quit", "open_pause_menu"}:
             return "quit"
         if action == "move_up":
@@ -546,7 +578,7 @@ def _draw_main_menu(renderer: Renderer) -> str:
             return options[selected][0]
 
 
-def _draw_options_menu(renderer: Renderer, options: dict) -> str:
+async def _draw_options_menu(renderer: Renderer, options: dict) -> str:
     def apply_renderer_options() -> None:
         apply_fn = getattr(renderer, "apply_options", None)
         if callable(apply_fn):
@@ -579,7 +611,7 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
         _draw_menu_options(renderer, x + 4, y + 7, width - 8, items, selected)
         renderer.present()
 
-        action = renderer.poll_action()
+        action = await _await_action(renderer)
         if action in {"open_pause_menu", "quit"}:
             return "back"
         if action == "move_up":
@@ -624,7 +656,7 @@ def _draw_options_menu(renderer: Renderer, options: dict) -> str:
                 return "back"
 
 
-def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
+async def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
     menu_items = ["Save Game", "Options", "Quit"]
     selected = 0
 
@@ -641,7 +673,7 @@ def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
         _draw_menu_options(renderer, x + 4, y + 7, width - 8, menu_items, selected)
         renderer.present()
 
-        action = renderer.poll_action()
+        action = await _await_action(renderer)
         if action == "open_pause_menu":
             return "resume"
         if action == "quit":
@@ -653,12 +685,12 @@ def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
         elif action in {"menu_select", "confirm_action"}:
             chosen = menu_items[selected].lower().replace(" ", "_")
             if chosen == "options":
-                _draw_options_menu(renderer, options)
+                await _draw_options_menu(renderer, options)
                 continue
             return chosen
 
 
-def _run_startup_flow(
+async def _run_startup_flow(
     renderer: Renderer,
     requested_save_file: Path | None,
     game_map: GameMap,
@@ -673,10 +705,10 @@ def _run_startup_flow(
         )
         return (True, loaded_map, loaded_player_position, selected_save_file)
 
-    if not _draw_title_screen(renderer):
+    if not await _draw_title_screen(renderer):
         return (False, game_map, player_position, selected_save_file)
 
-    menu_choice = _draw_main_menu(renderer)
+    menu_choice = await _draw_main_menu(renderer)
     if menu_choice == "quit":
         return (False, game_map, player_position, selected_save_file)
     if menu_choice == "continue":
@@ -1020,7 +1052,7 @@ def _loot_item_from_corpse(corpse_ent: int, player_ent: int, entry: _TradeEntry)
     return f"You looted {item_name} from {corpse_name}."
 
 
-def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
+async def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
     player_ent = _first_player_entity()
     if player_ent is None:
         return "close"
@@ -1124,7 +1156,7 @@ def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
 
         renderer.present()
 
-        action = renderer.poll_action()
+        action = await _await_action(renderer)
         if action in {"open_pause_menu", "open_inventory"}:
             return "close"
         if action == "quit":
@@ -1163,7 +1195,7 @@ def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
                 message = _trade_item(player_ent, npc_ent, entry)
 
 
-def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
+async def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
     player_ent = _first_player_entity()
     if player_ent is None:
         return "close"
@@ -1288,7 +1320,7 @@ def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
 
         renderer.present()
 
-        action = renderer.poll_action()
+        action = await _await_action(renderer)
         if action in {"open_pause_menu", "open_inventory"}:
             return "close"
         if action == "quit":
@@ -1329,7 +1361,7 @@ def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
                 continue
 
 
-def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
+async def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
     selected = 0
     options = ["Talk", "Trade", "Leave"]
     info_lines = _npc_info_lines(npc_ent)
@@ -1358,7 +1390,7 @@ def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
         _draw_menu_options(renderer, x + 3, option_y, width - 6, options, selected)
 
         renderer.present()
-        action = renderer.poll_action()
+        action = await _await_action(renderer)
 
         if action in {"open_pause_menu", "open_inventory"}:
             return "close"
@@ -1383,14 +1415,14 @@ def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
                     talk_line = f"{npc_name} has nothing to say."
                 continue
             if choice == "Trade":
-                trade_choice = _draw_trade_menu(renderer, npc_ent)
+                trade_choice = await _draw_trade_menu(renderer, npc_ent)
                 if trade_choice == "quit":
                     return "quit"
                 info_lines = _npc_info_lines(npc_ent)
                 talk_line = ""
 
 
-def _draw_inventory_menu(renderer: Renderer) -> str:
+async def _draw_inventory_menu(renderer: Renderer) -> str:
     selected_panel = "left"
     selected_slot_idx = 0
     selected_item_idx = 0
@@ -1549,7 +1581,7 @@ def _draw_inventory_menu(renderer: Renderer) -> str:
 
         renderer.present()
 
-        action = renderer.poll_action()
+        action = await _await_action(renderer)
         if action in {"open_pause_menu", "open_inventory"}:
             return "close"
         if action == "quit":
@@ -1702,7 +1734,7 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     return 1
 
 
-def main() -> None:
+async def main() -> None:
     args = _parse_args()
     bootstrap_files(MAP_WIDTH, MAP_HEIGHT)
     options = load_options()
@@ -1724,7 +1756,7 @@ def main() -> None:
 
     try:
         with PygameRenderer(options=options) as renderer:
-            startup_ok, game_map, player_position, selected_save_file = _run_startup_flow(
+            startup_ok, game_map, player_position, selected_save_file = await _run_startup_flow(
                 renderer,
                 startup_save_file,
                 game_map,
@@ -1765,7 +1797,7 @@ def main() -> None:
             }
             press_order_counter = 0
             while True:
-                action = renderer.poll_action()
+                action = await _await_action(renderer)
                 if action == "quit":
                     break
                 if action == "tile_scale_up":
@@ -1809,7 +1841,7 @@ def main() -> None:
                     interact_action = _action_from_held_keys(held_directions, direction_pressed_order)
                     interact_npc = _find_interaction_npc(interact_action)
                     if interact_npc is not None:
-                        dialogue_choice = _draw_dialogue_menu(renderer, interact_npc)
+                        dialogue_choice = await _draw_dialogue_menu(renderer, interact_npc)
                         held_directions.clear()
                         if dialogue_choice == "quit":
                             break
@@ -1818,7 +1850,7 @@ def main() -> None:
 
                     interact_corpse = _find_interaction_corpse(interact_action)
                     if interact_corpse is not None:
-                        loot_choice = _draw_loot_menu(renderer, interact_corpse)
+                        loot_choice = await _draw_loot_menu(renderer, interact_corpse)
                         held_directions.clear()
                         if loot_choice == "quit":
                             break
@@ -1826,14 +1858,14 @@ def main() -> None:
                         continue
 
                 if action == "open_inventory":
-                    inventory_choice = _draw_inventory_menu(renderer)
+                    inventory_choice = await _draw_inventory_menu(renderer)
                     held_directions.clear()
                     if inventory_choice == "quit":
                         break
                     esper.process(None)
                     continue
                 if action == "open_pause_menu":
-                    pause_choice = _draw_pause_menu(renderer, options)
+                    pause_choice = await _draw_pause_menu(renderer, options)
                     held_directions.clear()
                     if pause_choice == "save_game":
                         player_pos = first_player_position() or player_position
@@ -1847,5 +1879,10 @@ def main() -> None:
         _stop_background_music(pygame_module)
 
 
+def run() -> None:
+    """Synchronous entry point for desktop runs (`python3 src/main.py`)."""
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
-    main()
+    run()
