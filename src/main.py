@@ -64,6 +64,12 @@ AUDIO_SAMPLE_SIZE = -16
 AUDIO_CHANNELS = 2
 AUDIO_BUFFER_SIZES = (16384, 8192, 4096, 2048)
 
+# Pygbag runs the whole program on the browser's single main thread. Any loop
+# that would block (spin on input) must hand control back to the browser with
+# ``await asyncio.sleep(0)`` or the tab freezes, and web audio/display need
+# their own handling. On desktop these paths keep the original behavior.
+IS_WEB = sys.platform == "emscripten"
+
 
 def _audio_driver_order() -> list[str | None]:
     if os.environ.get("PULSE_SERVER"):
@@ -110,7 +116,10 @@ def _audio_buffer_order(options: dict | None) -> list[int]:
     return list(AUDIO_BUFFER_SIZES)
 
 
-def _pick_music_track(music_dir: Path) -> Path | None:
+def _pick_music_track(
+    music_dir: Path,
+    preferred_suffixes: tuple[str, ...] | None = None,
+) -> Path | None:
     if not music_dir.exists() or not music_dir.is_dir():
         return None
 
@@ -122,6 +131,18 @@ def _pick_music_track(music_dir: Path) -> Path | None:
     )
     if not candidates:
         return None
+
+    if preferred_suffixes:
+        # Prefer formats the target runtime can actually decode (e.g. the web
+        # build can't rely on mp3), then fall back to name order.
+        def _rank(path: Path) -> int:
+            suffix = path.suffix.lower()
+            if suffix in preferred_suffixes:
+                return preferred_suffixes.index(suffix)
+            return len(preferred_suffixes)
+
+        candidates.sort(key=lambda path: (_rank(path), path.name))
+
     return candidates[0]
 
 
@@ -177,12 +198,37 @@ def _init_pygame_mixer(options: dict | None = None) -> Any | None:
     return None
 
 
+# Keeps the web music Sound + channel alive (Sound is garbage-collected
+# otherwise) and lets teardown stop the loop.
+_web_music_state: dict[str, Any] = {}
+
+
 def _start_background_music(options: dict | None = None) -> Any | None:
     pygame = _init_pygame_mixer(options)
     if pygame is None:
         return None
 
     music_dir = Path(__file__).resolve().parent.parent / "audio" / "music"
+
+    if IS_WEB:
+        # pygbag's SDL_mixer streaming (mixer.music) is unreliable and mp3 often
+        # won't decode, so play music as an in-memory Sound loop -- the same path
+        # the working SFX use. Reserve channel 0 for it so SFX (find_channel)
+        # never steals the music channel.
+        track = _pick_music_track(music_dir, preferred_suffixes=(".ogg", ".wav", ".mp3"))
+        if track is None:
+            return pygame
+        try:
+            pygame.mixer.set_reserved(1)
+            channel = pygame.mixer.Channel(0)
+            sound = pygame.mixer.Sound(str(track))
+            channel.play(sound, loops=-1)
+            _web_music_state["sound"] = sound
+            _web_music_state["channel"] = channel
+        except Exception as exc:
+            print(f"Music disabled: {exc}", file=sys.stderr)
+        return pygame
+
     track = _pick_music_track(music_dir)
     if track is None:
         return pygame
@@ -262,6 +308,13 @@ class _CombatSfxPlayer:
 def _stop_background_music(pygame_module: Any | None) -> None:
     if pygame_module is None:
         return
+    channel = _web_music_state.get("channel")
+    if channel is not None:
+        try:
+            channel.stop()
+        except Exception:
+            pass
+        _web_music_state.clear()
     try:
         pygame_module.mixer.music.stop()
     except Exception:
@@ -471,13 +524,6 @@ def _scroll_start(selected_index: int, total_items: int, visible_rows: int) -> i
     candidate = selected_index - (visible_rows // 2)
     candidate = max(0, candidate)
     return min(candidate, total_items - visible_rows)
-
-
-# Pygbag runs the whole program on the browser's single main thread. Any loop
-# that would block (spin on input) must hand control back to the browser with
-# ``await asyncio.sleep(0)`` or the tab freezes. On desktop we keep the original
-# blocking poll so idle turns stay at ~0% CPU.
-IS_WEB = sys.platform == "emscripten"
 
 
 async def _await_action(renderer: Renderer) -> str | None:

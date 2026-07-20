@@ -20,6 +20,28 @@ cp -R "${ROOT_DIR}/gfx" "${STAGE_DIR}/gfx"
 # Tests are not needed in the web runtime bundle.
 rm -rf "${STAGE_DIR}/src/tests"
 
+# Trim redundant music sources from the web bundle. The web runtime prefers
+# .ogg (44.1kHz, small, no pygbag resampling), so when a track has an .ogg we
+# drop its larger .wav/.mp3 siblings to keep the download small. Tracks without
+# an .ogg keep whatever formats exist as a fallback.
+python3 - "${STAGE_DIR}/audio/music" <<'PY'
+from pathlib import Path
+import sys
+
+music_dir = Path(sys.argv[1])
+if music_dir.is_dir():
+	redundant_suffixes = {".wav", ".mp3", ".flac", ".m4a"}
+	stems_with_ogg = {path.stem for path in music_dir.glob("*.ogg")}
+	for path in sorted(music_dir.iterdir()):
+		if (
+			path.is_file()
+			and path.suffix.lower() in redundant_suffixes
+			and path.stem in stems_with_ogg
+		):
+			path.unlink()
+			print(f"web bundle: dropped redundant music source {path.name}")
+PY
+
 # Bundle esper directly into the web app so browser runtime can import it.
 python3 - "${STAGE_DIR}" <<'PY'
 from pathlib import Path
