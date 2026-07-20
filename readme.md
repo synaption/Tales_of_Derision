@@ -40,34 +40,85 @@ Output is written to:
 
   build/web
 
-Preview locally:
+Preview locally (build + serve + open, frees the port and cleans up on exit):
+
+  ./online.sh
+
+Then open `http://localhost:8000` in your browser. `online.sh` serves via
+`scripts/serve_coi.py`, which sets cross-origin isolation headers (COOP/COEP); a
+plain server also works:
 
   python3 -m http.server --directory build/web 8000
-
-Then open `http://localhost:8000` in your browser.
 
 Use port `8000` for local preview. This pygbag runtime rewrites package fetches
 to `http://localhost:8000/cdn/...` while booting; serving on other ports can
 leave the page stuck at `Loading, please wait ...`.
 
-If you still see an old `Ready to start` screen that does not advance, do a hard refresh
+If you still see an old screen that does not advance, do a hard refresh
 (`Ctrl+Shift+R`) to clear cached web assets.
 
-Use the static server command above for local preview of the built site. Running
-`python3 -m pygbag ...` directly from repo root can regenerate `build/web` with a
-different layout while debugging.
+Running `python3 -m pygbag ...` directly from repo root can regenerate
+`build/web` with a different layout while debugging — prefer `./online.sh` or the
+static server above.
 
-### Web build architecture (important)
+### Web build architecture (emscripten / pygbag)
 
-Pygbag runs the whole game on the browser's **single** thread. The entry point
-(`main.py` -> `src/main.py:main`) is an `async` coroutine, and every input wait
-goes through `_await_action`, which does `await asyncio.sleep(0)` on the web
-build so the browser can pump events and repaint.
+Pygbag runs the **entire** game on the browser's single main thread, and audio is
+mixed on that same thread (no SharedArrayBuffer / worker threads in this runtime).
+Every decision below exists to keep that one thread responsive. Desktop is
+unaffected — these paths are gated on `IS_WEB` (`sys.platform == "emscripten"`),
+so the native build keeps its original blocking/threaded behavior.
 
-Do **not** add blocking input loops (`while True: renderer.poll_action()` or
-`pygame.time.wait`/`time.sleep` in the input path). On desktop they are fine, but
-on pygbag they never yield and freeze the page at `Loading, please wait ...`.
-New menus/loops must be `async def` and use `await _await_action(renderer)`.
+**Cooperative async loop (or the tab freezes).**
+- Entry is async: `main.py` -> `src/main.py:main`, run via `asyncio.run`.
+- All input waits go through `_await_action`. On web it polls non-blocking and
+  `await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)` (~1/60 s, a *real* frame) between
+  polls, and yields once before returning each action.
+- **Never** add blocking loops (`while True: renderer.poll_action()`,
+  `pygame.time.wait`, `time.sleep`) in the input path — on pygbag they never
+  yield and freeze the page at `Loading, please wait ...`. New menus/loops must
+  be `async def` and use `await _await_action(renderer)`.
+- Why a real frame and not `asyncio.sleep(0)`: a zero-delay spin pegs the single
+  thread and starves the audio mixer, causing clicks/pops.
+
+**Display sizing & crispness.**
+- Browser "fullscreen" isn't a real mode. On web the surface is sized to the
+  visible canvas (`window.innerWidth/innerHeight`) so 1 surface px ~= 1 CSS px;
+  an oversized surface gets scaled down and everything looks tiny.
+- The canvas gets `image-rendering: pixelated` after each `set_mode` so text and
+  tiles stay crisp instead of blurred by the browser's default smoothing.
+
+**Audio.**
+- Music is a **44.1 kHz OGG** played as a looped in-memory `Sound` on a reserved
+  channel — *not* `pygame.mixer.music` (streaming is unreliable in pygbag) and
+  *not* mp3 (often won't decode). The OGG matches the mixer rate (44100) so there
+  is no resampling crackle. Desktop still streams `mixer.music`.
+- The web mixer uses a moderate/large buffer (`WEB_AUDIO_BUFFER`, overridable via
+  `web_audio_buffer` in `options.json`) and opens with
+  `AUDIO_ALLOW_FREQUENCY_CHANGE` so SDL matches the browser's device sample rate
+  instead of resampling every callback.
+- Any residual occasional pop is pygbag's main-thread audio jitter. True threaded
+  audio needs cross-origin isolation (COOP/COEP), which did not engage in pygbag
+  0.9.3; `scripts/serve_coi.py` serves those headers locally and is kept for a
+  future runtime that supports it.
+
+**Render cost (keep per-turn work small so it can't starve audio).**
+- Field-of-view is memoized per player position; wall autotile masks are cached
+  (static map); non-visible cells are skipped (`clear()` already blacks them).
+- The map is composited from a cached **world-coordinate** surface: a walking
+  step blits the visible FOV box (offset by the camera scroll) plus a few shadow
+  fills, instead of re-drawing hundreds of tiles. The blit is **clipped to the
+  viewport** so it can't bleed into the sidebar when zoomed/scrolled.
+- Menus with a game backdrop snapshot the scene once (`capture_backdrop`) and
+  reuse it, instead of re-rendering the whole game every keypress.
+- Invariant: keep the caches invalidated correctly if you touch tiles, scale, or
+  camera — `invalidate_map_surface` / `invalidate_backdrop` run on `set_mode`,
+  and the FOV/map caches assume a static map (walls don't change mid-session).
+
+**Build.**
+- `scripts/build_pygbag.sh` bundles the pygame-ce wasm wheel + esper, vendors
+  `browserfs.min.js`, and prunes redundant music sources from the web bundle
+  (drops `.wav`/`.mp3` when an `.ogg` sibling exists) to shrink the download.
 
 ## GitHub Pages deployment
 
