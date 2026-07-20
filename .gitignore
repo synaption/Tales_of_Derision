@@ -26,6 +26,13 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Web build artifacts
+build/
+pygbag-stage/
+*-pygbag.py
+*-pygbag.png
+*-pygbag.ogg
+
 # Runtime game data (keep defaults tracked)
 data/config/options.json
 data/saves/*.json

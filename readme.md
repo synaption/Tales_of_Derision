@@ -26,6 +26,34 @@ Stress test with cave rats on every walkable map square:
 
 Move: hold WASD, press Space to take a step. Menu: Esc. Inventory: I.
 
+## Web build (pygbag)
+
+Install pygbag (once):
+
+  python3 -m pip install --user pygbag
+
+Build the web bundle:
+
+  bash scripts/build_pygbag.sh
+
+Output is written to:
+
+  build/web
+
+Preview locally:
+
+  python3 -m http.server --directory build/web 8000
+
+Then open `http://localhost:8000` in your browser.
+
+## GitHub Pages deployment
+
+- Workflow file: `.github/workflows/pygbag-pages.yml`
+- Trigger: push to `main` (or run manually from Actions)
+- Publish source: GitHub Actions (repo Settings -> Pages)
+
+After the workflow finishes, the deploy job prints the final Pages URL.
+
 ## Audio
 
 - On startup, the game now attempts to play the first supported file found in
@@ -171,6 +199,7 @@ Targets
 - desktop fully rendered on windows and linux
 - steam
 - itch.io via Pygbag
+- github pages via Pygbag
 
 All NPCs are playable.
 
