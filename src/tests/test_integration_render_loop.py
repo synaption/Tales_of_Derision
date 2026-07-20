@@ -55,7 +55,7 @@ def test_initial_tick_renders_map_player_and_status_line() -> None:
     assert renderer.glyphs[(0, 0)] == game_map.WALL
     assert renderer.glyphs[(1, 1)] == game_map.FLOOR
     assert renderer.glyphs[(player_pos.x, player_pos.y)] == "@"
-    assert (0, game_map.height, "I inventory  Esc menu  +/- tile scale") in renderer.text
+    assert (0, game_map.height, "I inventory  C status  Esc menu  +/- tile scale") in renderer.text
     assert any(text == "[NEARBY]" for _x, _y, text in renderer.text)
     assert any(text.startswith("g → Goblin") or text.startswith("You notice Goblin") for _x, _y, text in renderer.text)
     assert any(text == "[LOG]" for _x, _y, text in renderer.text)

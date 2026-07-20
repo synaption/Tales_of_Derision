@@ -29,18 +29,33 @@ class MovementProcessor(esper.Processor):
 - Movement is gated by [`GameMap.is_walkable`](Game-Map.md) — walls block.
 - Unknown actions (e.g. the render-only frame) are ignored.
 
+## Turns and waiting
+
+Time-advancing systems (`NpcAiProcessor`, `NeedsProcessor`) tick on any action in
+`_TURN_ACTIONS` — the movement actions **plus `WAIT_ACTION`** (`"wait"`). The turn
+loop sends `esper.process(WAIT_ACTION)` when the player presses the confirm key
+(Space) with no direction held, so the player can pass time in place; menu
+refreshes still use `esper.process(None)`, which advances nothing.
+
 ## `NpcAiProcessor` (priority 0)
 
 The single per-turn brain for every `NPC`. For each creature, in order:
 
 1. **Satisfy an urgent need** (need ≥ `_FORAGE_THRESHOLD`). Thirst wins ties:
    - drink at adjacent water, else path to the nearest **shore** tile;
+   - when hungry, first **eat a prepared item it's carrying** (cooked meat,
+     bread, ...) via `_eat_from_inventory`; **raw meat is skipped — it must be
+     cooked**;
    - **herbivores** (`Diet("herbivore")`, e.g. deer) graze the nearest tree —
      eating restores hunger and depletes the tree's `wood` (it vanishes when
      grazed bare);
-   - **carnivores** (`Diet("carnivore")`, e.g. goblins/rats) hunt the nearest
-     `Deer` — reaching it kills the prey (via `slay_entity`, leaving a
-     butcherable corpse) and feeds the predator.
+   - **carnivores** (`Diet("carnivore")`, e.g. goblins/rats) are predators:
+     `_seek_food` heads to the nearest corpse-with-meat or live `Deer` and eats
+     raw on the spot (a deer kill goes via `slay_entity`, leaving a corpse);
+   - **cooks** (`Diet("cook")`, e.g. villagers) run the full loop in `_feed_cook`,
+     one step per turn: `_forage_meat` (scavenge/kill for raw meat into the pack)
+     → `_gather_wood` (chop a tree) → `_cook_at_stove` (raw meat + wood →
+     `Cooked … Meat`) → eat the cooked meat next turn via `_eat_from_inventory`.
 2. Otherwise, hostiles (`Enemy`) chase the player when in vision + line of sight.
 
 Water tiles and the walkable shore beside them are precomputed once (the map is

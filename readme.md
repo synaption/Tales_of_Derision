@@ -7,7 +7,7 @@ GOALS:
 - wasd movement, fully configurable configurable controls, controller support eventually
 - lot's of simulation, testing, and prcedural generation
 - mods are a first class priority.  anybody should easily be able to add there own files to add or change content.
-- seed based
+- seed based determinism
 ## Run
 
 Install dependencies:
@@ -24,7 +24,9 @@ Stress test with cave rats on every walkable map square:
 
   python3 src/main.py --rat-flood
 
-Move: hold WASD, press Space to take a step. Menu: Esc. Inventory: I.
+Move: hold WASD, press Space to take a step — or press Space with no direction
+held to **wait in place and pass a turn**. Player menu: Tab (Inventory/Status/
+…). Inventory: I. Status: C. Pause menu: Esc.
 
 ## Web build (pygbag)
 
@@ -176,9 +178,9 @@ Run only totally unrendered logic/data tests:
 
 ## Survival (food, water, wood)
 
-The player has **hunger** and **thirst** that rise every turn you take a step
-(shown on the bottom status line). Keep them down or you'll get escalating
-warnings:
+The player has **hunger** and **thirst** that rise every turn (a step, or a
+`Space` wait; shown on the bottom status line). Keep them down or you'll get
+escalating warnings:
 
 - **Water** — face the stone **well** (`O`) and press the interact key (Enter) to
   drink and quench your thirst. A `Waterskin` in your inventory can also be drunk
@@ -211,9 +213,23 @@ keeps living while you're elsewhere.
 
 Two lakes and a river (`~` water) run through it. Wild **deer** (`d`) roam:
 when hungry they graze trees, when thirsty they drink from lakes and rivers.
-**Carnivores** (goblins, cave rats) hunt deer when hungry — a kill leaves a
-corpse you can loot. You can hunt deer too: walk into one to take it down for
-`Deer Meat`.
+
+When hungry, **villagers cook**, just like you: they scavenge meat from a corpse
+(or hunt a deer), chop a tree for **wood**, carry both to a **stove**, cook the
+raw meat into a meal, and then eat it — meat is never eaten raw. Predator
+monsters (**goblins**, **cave rats**) are less civilised and eat raw meat on the
+spot. You can hunt deer too: walk into one to take it down for `Deer Meat`.
+
+**Player menu.** Press `Tab` to open the player menu — a tabbed screen with
+**Inventory** and **Status** (with **Map**, **Journal**, and **Skills** stubbed
+for later). `Tab` reopens on whichever tab you last used; inside the menu, `Tab`
+cycles tabs. Direct keys still jump straight to a tab: `I` opens Inventory, `C`
+opens Status (pressing the same key again closes). `Esc` closes.
+
+To read another creature, face it and press the interact key (Enter): friendlies
+open a dialogue with a **Status** option (like Trade), while wild or hostile
+creatures show a read-only **examine** panel with their disposition, hunger,
+thirst, and statuses.
 
 **Swimming.** Water blocks NPCs and line of sight, but *you* can wade in and
 swim across lakes and rivers (walls still block).
@@ -233,7 +249,10 @@ regenerates each session (only map size + player position are persisted).
 ## Menus
 
 - Startup flow: Title Screen -> Main Menu (`Continue`, `New Game`, `Quit`)
-- In-game menu: press `Esc` to open Pause Menu (`Options`, `Quit`)
+- Player menu: press `Tab` to open the tabbed player menu (`Inventory`, `Status`,
+  and stubbed `Map`/`Journal`/`Skills`). `Tab` reopens on the last tab and cycles
+  tabs from inside; `I`/`C` jump straight to Inventory/Status (and toggle closed).
+- In-game pause menu: press `Esc` to open Pause Menu (`Save Game`, `Options`, `Quit`)
 - Pause menu navigation: WASD to move selection, Enter to select, `Esc` to resume game
 - Options menu: toggle `Fullscreen` and `Show FPS`; changes are written to working options file
 

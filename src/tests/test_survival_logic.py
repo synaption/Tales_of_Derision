@@ -36,11 +36,13 @@ from main import (
     _apply_consumable,
     _chop_tree,
     _cook_at_stove,
+    _creature_status_lines,
     _drink_from_well,
     _find_adjacent_feature,
+    _find_interaction_creature,
 )
-from components import Deer, Diet
-from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, _pull_turn_events
+from components import Deer, Diet, Friendly, OnFire
+from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, WAIT_ACTION, _pull_turn_events
 
 pytestmark = pytest.mark.unrendered
 
@@ -69,6 +71,33 @@ def test_needs_processor_ticks_only_on_movement_turns() -> None:
     processor.process("open_inventory")
     assert needs.hunger == pytest.approx(1.0)
     assert needs.thirst == pytest.approx(1.4)
+
+
+def test_wait_action_passes_a_turn_but_none_does_not() -> None:
+    player = esper.create_entity(Player(), Needs(hunger=0.0, thirst=0.0))
+    processor = NeedsProcessor()
+
+    processor.process(None)  # a menu refresh -- no time passes
+    needs = esper.component_for_entity(player, Needs)
+    assert needs.hunger == 0.0 and needs.thirst == 0.0
+
+    processor.process(WAIT_ACTION)  # waiting in place passes a turn
+    assert needs.hunger == pytest.approx(1.0)
+    assert needs.thirst == pytest.approx(1.4)
+
+
+def test_hungry_npc_eats_food_it_is_carrying() -> None:
+    game_map = GameMap(24, 14)
+    processor = NpcAiProcessor(game_map)
+    npc = esper.create_entity(
+        Position(10, 6), NPC(), Diet("carnivore"),
+        Inventory(items=["Bread", "Waterskin"]),
+        Needs(hunger=90.0, thirst=10.0), BlocksMovement(), Name("Villager"),
+    )
+
+    processor.process(WAIT_ACTION)
+    assert esper.component_for_entity(npc, Needs).hunger < 90.0
+    assert esper.component_for_entity(npc, Inventory).items == ["Waterskin"]
 
 
 def test_needs_are_clamped_to_max() -> None:
@@ -316,6 +345,107 @@ def test_player_can_swim_into_water_but_walls_still_block() -> None:
     game_map.tiles[5][7] = GameMap.WALL
     esper.process("move_right")
     assert (player_pos.x, player_pos.y) == (6, 5)
+
+
+def test_hungry_carnivore_scavenges_meat_from_a_corpse() -> None:
+    game_map = GameMap(24, 14)
+    processor = NpcAiProcessor(game_map)
+    corpse = esper.create_entity(
+        Position(11, 6), Corpse(), Name("Corpse of Deer"),
+        Inventory(items=["Deer Meat", "Copper Coin"]),
+    )
+    scavenger = esper.create_entity(
+        Position(10, 6), NPC(), Diet("carnivore"),
+        Needs(hunger=90.0, thirst=10.0), BlocksMovement(), Name("Villager"),
+    )
+
+    processor.process("move_up")
+
+    # Ate the meat (hunger dropped); non-meat loot stays on the corpse.
+    assert esper.component_for_entity(scavenger, Needs).hunger < 90.0
+    assert esper.component_for_entity(corpse, Inventory).items == ["Copper Coin"]
+
+
+def test_hungry_carnivore_steps_toward_a_distant_corpse() -> None:
+    game_map = GameMap(24, 14)
+    processor = NpcAiProcessor(game_map)
+    esper.create_entity(Position(18, 6), Corpse(), Name("Corpse"), Inventory(items=["Rat Meat"]))
+    scavenger = esper.create_entity(
+        Position(10, 6), NPC(), Diet("carnivore"),
+        Needs(hunger=90.0, thirst=10.0), BlocksMovement(),
+    )
+
+    processor.process("move_up")
+    pos = esper.component_for_entity(scavenger, Position)
+    assert pos.x == 11 and pos.y == 6
+
+
+def test_creature_status_lines_report_needs_and_active_statuses() -> None:
+    game_map = _map_with_water(11, 6)
+    ent = esper.create_entity(
+        Position(10, 6), NPC(), Enemy(), Name("Goblin Scout"),
+        Needs(hunger=42.0, thirst=8.0), OnFire(),
+    )
+    lines = _creature_status_lines(game_map, ent)
+    joined = "\n".join(lines)
+    assert "Name: Goblin Scout" in joined
+    assert "Disposition: Hostile" in joined
+    assert "Hunger: 42%" in joined
+    assert "Thirst: 8%" in joined
+    assert "On fire" in joined  # active status surfaced
+
+
+def test_creature_status_lines_show_normal_when_no_statuses() -> None:
+    game_map = GameMap(24, 14)
+    ent = esper.create_entity(Position(10, 6), NPC(), Friendly(), Name("Villager"), Needs())
+    lines = _creature_status_lines(game_map, ent)
+    assert "Disposition: Friendly" in lines
+    assert "Status: Normal" in lines
+
+
+def test_find_interaction_creature_targets_any_faced_creature() -> None:
+    esper.create_entity(Position(5, 5), Player())
+    enemy = esper.create_entity(Position(5, 4), NPC(), Enemy(), Name("Goblin"))
+    # Unlike _find_interaction_npc, this finds hostiles too (for examine).
+    assert _find_interaction_creature("move_up") == enemy
+    assert _find_interaction_creature("move_down") is None
+
+
+def test_cook_villager_gathers_cooks_then_eats_cooked_meat() -> None:
+    game_map = GameMap(24, 14)
+    processor = NpcAiProcessor(game_map)
+    esper.create_entity(Position(11, 6), Corpse(), Name("Corpse"), Inventory(items=["Deer Meat"]))
+    esper.create_entity(Position(9, 6), Tree(wood=3), BlocksMovement())
+    esper.create_entity(Position(10, 5), Stove(), BlocksMovement())
+    villager = esper.create_entity(
+        Position(10, 6), NPC(), Diet("cook"), Inventory(items=[]),
+        Needs(hunger=90.0, thirst=10.0), BlocksMovement(), Name("Villager"),
+    )
+
+    # Loop: take meat -> gather wood -> cook -> eat cooked meat.
+    saw_cooked = False
+    for _ in range(6):
+        processor.process(WAIT_ACTION)
+        if "Cooked Deer Meat" in esper.component_for_entity(villager, Inventory).items:
+            saw_cooked = True
+
+    assert saw_cooked  # it actually cooked the meat
+    assert esper.component_for_entity(villager, Needs).hunger < 90.0  # then ate it
+
+
+def test_cook_villager_will_not_eat_raw_meat_from_its_pack() -> None:
+    # No stove/tree/corpse: the villager can't cook, and must NOT eat the raw
+    # meat it is carrying -- meat has to be cooked.
+    game_map = GameMap(24, 14)
+    processor = NpcAiProcessor(game_map)
+    villager = esper.create_entity(
+        Position(10, 6), NPC(), Diet("cook"), Inventory(items=["Deer Meat"]),
+        Needs(hunger=90.0, thirst=10.0), BlocksMovement(), Name("Villager"),
+    )
+
+    processor.process(WAIT_ACTION)
+    assert esper.component_for_entity(villager, Needs).hunger == 90.0
+    assert esper.component_for_entity(villager, Inventory).items == ["Deer Meat"]
 
 
 def test_hungry_deer_steps_toward_distant_tree() -> None:

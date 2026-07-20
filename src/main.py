@@ -28,7 +28,7 @@ from persistence import (
 )
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, player_is_animated, queue_message
+from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, WAIT_ACTION, active_statuses, player_is_animated, queue_message, status_label
 
 # The world is a 3x3 expansion of the original 40x20 room, giving room for
 # lakes, rivers, and roaming wildlife.
@@ -1074,6 +1074,53 @@ def _find_interaction_npc(direction_action: str | None) -> int | None:
     return position_to_npc.get(target_xy)
 
 
+def _find_interaction_creature(direction_action: str | None) -> int | None:
+    """Any creature (friendly, wild, or hostile) on the faced tile. Used so the
+    player can examine/interact with anything adjacent, not just friendlies."""
+    player_ent = _first_player_entity()
+    if player_ent is None or not esper.has_component(player_ent, Position):
+        return None
+
+    player_pos = esper.component_for_entity(player_ent, Position)
+    target_xy = _interaction_target_xy(direction_action, player_pos)
+    for ent, (pos, _npc) in esper.get_components(Position, NPC):
+        if (pos.x, pos.y) == target_xy:
+            return ent
+    return None
+
+
+def _disposition_of(ent: int) -> str:
+    if esper.has_component(ent, Player):
+        return "You"
+    if esper.has_component(ent, Enemy):
+        return "Hostile"
+    if esper.has_component(ent, Friendly):
+        return "Friendly"
+    if esper.has_component(ent, Deer):
+        return "Wild animal"
+    return "Neutral"
+
+
+def _creature_status_lines(game_map: GameMap, ent: int) -> list[str]:
+    """Human-readable status block for any creature (the player, an NPC, a mob):
+    name, disposition, needs, and active statuses."""
+    lines = [
+        f"Name: {_entity_name(ent, fallback='Unknown')}",
+        f"Disposition: {_disposition_of(ent)}",
+    ]
+    if esper.has_component(ent, Needs):
+        needs = esper.component_for_entity(ent, Needs)
+        lines.append(f"Hunger: {int(needs.hunger)}%")
+        lines.append(f"Thirst: {int(needs.thirst)}%")
+
+    statuses: list[str] = []
+    if esper.has_component(ent, Position):
+        pos = esper.component_for_entity(ent, Position)
+        statuses = [status_label(name) for name in active_statuses(game_map, ent, pos)]
+    lines.append("Status: " + (", ".join(statuses) if statuses else "Normal"))
+    return lines
+
+
 def _find_interaction_corpse(direction_action: str | None) -> int | None:
     player_ent = _first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
@@ -1090,12 +1137,7 @@ def _find_interaction_corpse(direction_action: str | None) -> int | None:
     return position_to_corpse.get(target_xy)
 
 
-def _npc_info_lines(npc_ent: int) -> list[str]:
-    npc_name = _entity_name(npc_ent, fallback="Unknown NPC")
-    disposition = "Friendly"
-    if esper.has_component(npc_ent, Enemy):
-        disposition = "Hostile"
-
+def _npc_info_lines(game_map: GameMap, npc_ent: int) -> list[str]:
     dialogue_line = "..."
     if esper.has_component(npc_ent, Dialogue):
         dialogue_line = esper.component_for_entity(npc_ent, Dialogue).line
@@ -1109,9 +1151,8 @@ def _npc_info_lines(npc_ent: int) -> list[str]:
         slots = esper.component_for_entity(npc_ent, Equipment).slots
         equipped_count = sum(1 for item in slots.values() if item)
 
-    return [
-        f"Name: {npc_name}",
-        f"Disposition: {disposition}",
+    # Name / Disposition / Needs / Status, then dialogue-specific detail.
+    return _creature_status_lines(game_map, npc_ent) + [
         f"Says: {dialogue_line}",
         f"Stock: {inventory_count} carried, {equipped_count} equipped",
     ]
@@ -1619,10 +1660,39 @@ async def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
                 continue
 
 
-async def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
+async def _draw_info_screen(
+    renderer: Renderer,
+    title: str,
+    lines: list[str],
+    subtitle: str = "",
+) -> str:
+    """A read-only panel of text lines; any menu/confirm key closes it. Used for
+    the player's status screen and for examining NPCs/mobs."""
+    while True:
+        x, y, width, _height = _draw_menu_shell(
+            renderer,
+            title=title,
+            subtitle=subtitle,
+            footer="[Esc] close",
+            width=64,
+            height=22,
+            overlay_game=True,
+        )
+        for idx, line in enumerate(lines):
+            _draw_ui_text(renderer, x + 3, y + 5 + idx, line, _MENU_TEXT_COLOR, width - 6)
+        renderer.present()
+
+        action = await _await_action(renderer)
+        if action == "quit":
+            return "quit"
+        if action in {"open_pause_menu", "open_inventory", "open_status", "menu_select", "confirm_action"}:
+            return "close"
+
+
+async def _draw_dialogue_menu(renderer: Renderer, game_map: GameMap, npc_ent: int) -> str:
     selected = 0
-    options = ["Talk", "Trade", "Leave"]
-    info_lines = _npc_info_lines(npc_ent)
+    options = ["Talk", "Trade", "Status", "Leave"]
+    info_lines = _npc_info_lines(game_map, npc_ent)
     talk_line = ""
 
     while True:
@@ -1676,224 +1746,274 @@ async def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
                 trade_choice = await _draw_trade_menu(renderer, npc_ent)
                 if trade_choice == "quit":
                     return "quit"
-                info_lines = _npc_info_lines(npc_ent)
+                info_lines = _npc_info_lines(game_map, npc_ent)
+                talk_line = ""
+            if choice == "Status":
+                status_choice = await _draw_info_screen(
+                    renderer,
+                    title=f"STATUS - {npc_name}",
+                    lines=_creature_status_lines(game_map, npc_ent),
+                    subtitle="What you can tell about them",
+                )
+                if status_choice == "quit":
+                    return "quit"
+                info_lines = _npc_info_lines(game_map, npc_ent)
                 talk_line = ""
 
 
-async def _draw_inventory_menu(renderer: Renderer) -> str:
-    selected_panel = "left"
-    selected_slot_idx = 0
-    selected_item_idx = 0
-    message = "Enter: equip/unequip  A/D: switch side  W/S: move"
+@dataclass
+class _InventoryState:
+    """Cursor/message state for the Inventory tab, held across frames by the
+    player menu so the tab can be re-entered without losing the selection."""
+    selected_panel: str = "left"
+    selected_slot_idx: int = 0
+    selected_item_idx: int = 0
+    message: str = "Enter: equip/use   A/D: switch side   W/S: move"
 
-    while True:
-        player_ent = _first_player_entity()
 
-        inventory_items: list[str] = []
-        equipment_slots = _default_equipment_slots()
-        player_name = "You"
+def _render_inventory_body(
+    renderer: Renderer,
+    x: int,
+    content_y: int,
+    width: int,
+    content_h: int,
+    state: _InventoryState,
+) -> None:
+    """Draw the Inventory tab body (a message line + EQUIPPED and ITEMS panels)
+    inside the given content region."""
+    player_ent = _first_player_entity()
+    inventory_items: list[str] = []
+    equipment_slots = _default_equipment_slots()
+    if player_ent is not None:
+        if esper.has_component(player_ent, Inventory):
+            inventory_items = list(esper.component_for_entity(player_ent, Inventory).items)
+        if esper.has_component(player_ent, Equipment):
+            configured = esper.component_for_entity(player_ent, Equipment).slots
+            for slot_name in equipment_slots:
+                equipment_slots[slot_name] = configured.get(slot_name)
 
-        if player_ent is not None:
-            if esper.has_component(player_ent, Name):
-                player_name = esper.component_for_entity(player_ent, Name).value
+    _draw_ui_text(renderer, x + 3, content_y, state.message, _MENU_MUTED_COLOR, width - 6)
+    panels_y = content_y + 1
+    panels_h = max(6, content_h - 1)
 
-            if esper.has_component(player_ent, Inventory):
-                inventory_items = list(esper.component_for_entity(player_ent, Inventory).items)
+    left_w = max(20, (width - 6) // 2)
+    right_w = max(20, width - left_w - 6)
+    left_x = x + 2
+    right_x = left_x + left_w + 2
 
-            if esper.has_component(player_ent, Equipment):
-                configured = esper.component_for_entity(player_ent, Equipment).slots
-                for slot_name in equipment_slots:
-                    equipment_slots[slot_name] = configured.get(slot_name)
+    draw_panel = getattr(renderer, "draw_panel", None)
+    draw_ui_glyph = getattr(renderer, "draw_ui_glyph", None)
+    icon_cells = 2 if callable(draw_ui_glyph) else 0
+    text_offset = icon_cells + 1 if icon_cells > 0 else 0
+    if callable(draw_panel):
+        draw_panel(left_x, panels_y, left_w, panels_h, title="EQUIPPED")
+        draw_panel(right_x, panels_y, right_w, panels_h, title="ITEMS")
 
-        x, y, width, height = _draw_menu_shell(
-            renderer,
-            title=f"INVENTORY - {player_name}",
-            subtitle="Esc/I closes   A/D switches side",
-            footer=message,
-            width=98,
-            height=32,
-            overlay_game=True,
-        )
+    slot_names = list(equipment_slots.keys())
+    list_start_y = panels_y + 3
+    visible_rows = max(1, panels_h - 5)
 
-        content_y = y + 4
-        content_h = max(10, height - 7)
-        left_w = max(20, (width - 6) // 2)
-        right_w = max(20, width - left_w - 6)
-        left_x = x + 2
-        right_x = left_x + left_w + 2
+    if slot_names:
+        slot_start = _scroll_start(state.selected_slot_idx, len(slot_names), visible_rows)
+        slot_end = min(len(slot_names), slot_start + visible_rows)
+        for row_offset, slot_idx in enumerate(range(slot_start, slot_end)):
+            slot_name = slot_names[slot_idx]
+            equipped_item = equipment_slots[slot_name]
+            display = equipped_item if equipped_item else "(empty)"
+            row_y = list_start_y + row_offset
+            is_selected = state.selected_panel == "left" and slot_idx == state.selected_slot_idx
+            if is_selected:
+                _fill_ui_cells(renderer, left_x + 1, row_y, left_w - 2, 1, _MENU_SELECTED_BG)
 
-        draw_panel = getattr(renderer, "draw_panel", None)
-        draw_ui_glyph = getattr(renderer, "draw_ui_glyph", None)
-        icon_cells = 2 if callable(draw_ui_glyph) else 0
-        text_offset = icon_cells + 1 if icon_cells > 0 else 0
-        if callable(draw_panel):
-            draw_panel(left_x, content_y, left_w, content_h, title="EQUIPPED")
-            draw_panel(right_x, content_y, right_w, content_h, title="ITEMS")
+            prefix = ">" if is_selected else " "
+            color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+            text_x = left_x + 2 + text_offset
+            text_width = max(1, left_w - 4 - text_offset)
+            glyph_prefix = ""
 
-        slot_names = list(equipment_slots.keys())
-        list_start_y = content_y + 3
-        visible_rows = max(1, content_h - 5)
-
-        if slot_names:
-            slot_start = _scroll_start(selected_slot_idx, len(slot_names), visible_rows)
-            slot_end = min(len(slot_names), slot_start + visible_rows)
-            for row_offset, slot_idx in enumerate(range(slot_start, slot_end)):
-                slot_name = slot_names[slot_idx]
-                equipped_item = equipment_slots[slot_name]
-                display = equipped_item if equipped_item else "(empty)"
-                row_y = list_start_y + row_offset
-                is_selected = selected_panel == "left" and slot_idx == selected_slot_idx
-                if is_selected:
-                    _fill_ui_cells(renderer, left_x + 1, row_y, left_w - 2, 1, _MENU_SELECTED_BG)
-
-                prefix = ">" if is_selected else " "
-                color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
-                text_x = left_x + 2 + text_offset
-                text_width = max(1, left_w - 4 - text_offset)
-                glyph_prefix = ""
-
-                if equipped_item:
-                    glyph, classification, fg, bg = _item_visual(equipped_item)
-                    icon_drawn = False
-                    if callable(draw_ui_glyph):
-                        icon_drawn = bool(
-                            draw_ui_glyph(
-                                left_x + 2,
-                                row_y,
-                                glyph,
-                                classification=classification,
-                                fg=fg,
-                                bg=bg,
-                                cell_span=icon_cells,
-                            )
-                        )
-                    if not icon_drawn:
-                        glyph_prefix = f"{glyph} "
-
-                _draw_ui_text(
-                    renderer,
-                    text_x,
-                    row_y,
-                    f"{prefix} {slot_name:10}: {glyph_prefix}{display}",
-                    color,
-                    text_width,
-                )
-
-        if inventory_items:
-            item_start = _scroll_start(selected_item_idx, len(inventory_items), visible_rows)
-            item_end = min(len(inventory_items), item_start + visible_rows)
-            for row_offset, item_idx in enumerate(range(item_start, item_end)):
-                item_name = inventory_items[item_idx]
-                row_y = list_start_y + row_offset
-                label = chr(ord("a") + item_idx) if item_idx < 26 else "*"
-                is_selected = selected_panel == "right" and item_idx == selected_item_idx
-                if is_selected:
-                    _fill_ui_cells(renderer, right_x + 1, row_y, right_w - 2, 1, _MENU_SELECTED_BG)
-
-                prefix = ">" if is_selected else " "
-                color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
-                text_x = right_x + 2 + text_offset
-                text_width = max(1, right_w - 4 - text_offset)
-                glyph, classification, fg, bg = _item_visual(item_name)
+            if equipped_item:
+                glyph, classification, fg, bg = _item_visual(equipped_item)
                 icon_drawn = False
-
                 if callable(draw_ui_glyph):
                     icon_drawn = bool(
-                        draw_ui_glyph(
-                            right_x + 2,
-                            row_y,
-                            glyph,
-                            classification=classification,
-                            fg=fg,
-                            bg=bg,
-                            cell_span=icon_cells,
-                        )
+                        draw_ui_glyph(left_x + 2, row_y, glyph, classification=classification, fg=fg, bg=bg, cell_span=icon_cells)
                     )
-
-                label_text = f"{prefix} {label}) {item_name}"
                 if not icon_drawn:
-                    label_text = f"{prefix} {label}) {glyph} {item_name}"
+                    glyph_prefix = f"{glyph} "
 
-                _draw_ui_text(
-                    renderer,
-                    text_x,
-                    row_y,
-                    label_text,
-                    color,
-                    text_width,
-                )
-        else:
-            is_selected = selected_panel == "right"
+            _draw_ui_text(renderer, text_x, row_y, f"{prefix} {slot_name:10}: {glyph_prefix}{display}", color, text_width)
+
+    if inventory_items:
+        item_start = _scroll_start(state.selected_item_idx, len(inventory_items), visible_rows)
+        item_end = min(len(inventory_items), item_start + visible_rows)
+        for row_offset, item_idx in enumerate(range(item_start, item_end)):
+            item_name = inventory_items[item_idx]
+            row_y = list_start_y + row_offset
+            label = chr(ord("a") + item_idx) if item_idx < 26 else "*"
+            is_selected = state.selected_panel == "right" and item_idx == state.selected_item_idx
             if is_selected:
-                _fill_ui_cells(renderer, right_x + 1, list_start_y, right_w - 2, 1, _MENU_SELECTED_BG)
-            color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+                _fill_ui_cells(renderer, right_x + 1, row_y, right_w - 2, 1, _MENU_SELECTED_BG)
+
             prefix = ">" if is_selected else " "
-            _draw_ui_text(
-                renderer,
-                right_x + 2 + text_offset,
-                list_start_y,
-                f"{prefix} (empty)",
-                color,
-                max(1, right_w - 4 - text_offset),
-            )
+            color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+            text_x = right_x + 2 + text_offset
+            text_width = max(1, right_w - 4 - text_offset)
+            glyph, classification, fg, bg = _item_visual(item_name)
+            icon_drawn = False
+            if callable(draw_ui_glyph):
+                icon_drawn = bool(
+                    draw_ui_glyph(right_x + 2, row_y, glyph, classification=classification, fg=fg, bg=bg, cell_span=icon_cells)
+                )
+
+            label_text = f"{prefix} {label}) {item_name}"
+            if not icon_drawn:
+                label_text = f"{prefix} {label}) {glyph} {item_name}"
+            _draw_ui_text(renderer, text_x, row_y, label_text, color, text_width)
+    else:
+        is_selected = state.selected_panel == "right"
+        if is_selected:
+            _fill_ui_cells(renderer, right_x + 1, list_start_y, right_w - 2, 1, _MENU_SELECTED_BG)
+        color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+        prefix = ">" if is_selected else " "
+        _draw_ui_text(renderer, right_x + 2 + text_offset, list_start_y, f"{prefix} (empty)", color, max(1, right_w - 4 - text_offset))
+
+
+def _handle_inventory_input(action: str, state: _InventoryState) -> None:
+    """Apply one input action to the Inventory tab (navigation + equip/use).
+    Tab switching and closing are handled by the enclosing player menu."""
+    player_ent = _first_player_entity()
+
+    slot_count = 0
+    item_count = 0
+    if player_ent is not None:
+        if esper.has_component(player_ent, Equipment):
+            slot_count = len(_default_equipment_slots())
+        if esper.has_component(player_ent, Inventory):
+            item_count = len(esper.component_for_entity(player_ent, Inventory).items)
+
+    if action == "move_left":
+        state.selected_panel = "left"
+        return
+    if action == "move_right":
+        state.selected_panel = "right"
+        return
+    if action == "move_up":
+        if state.selected_panel == "left" and slot_count:
+            state.selected_slot_idx = (state.selected_slot_idx - 1) % slot_count
+        elif state.selected_panel == "right" and item_count:
+            state.selected_item_idx = (state.selected_item_idx - 1) % item_count
+        return
+    if action == "move_down":
+        if state.selected_panel == "left" and slot_count:
+            state.selected_slot_idx = (state.selected_slot_idx + 1) % slot_count
+        elif state.selected_panel == "right" and item_count:
+            state.selected_item_idx = (state.selected_item_idx + 1) % item_count
+        return
+
+    if action in {"menu_select", "confirm_action"} and player_ent is not None:
+        if not esper.has_component(player_ent, Inventory) or not esper.has_component(player_ent, Equipment):
+            return
+        inventory = esper.component_for_entity(player_ent, Inventory)
+        equipment = esper.component_for_entity(player_ent, Equipment)
+
+        if state.selected_panel == "right":
+            if not inventory.items:
+                state.message = "No items to use."
+            else:
+                clamped_idx = max(0, min(state.selected_item_idx, len(inventory.items) - 1))
+                # Food/drink is eaten/drunk; everything else is equipped.
+                consume_message = _apply_consumable(player_ent, clamped_idx)
+                if consume_message is not None:
+                    state.message = consume_message
+                else:
+                    state.message = _equip_inventory_item(inventory, equipment, clamped_idx)
+                state.selected_item_idx = min(state.selected_item_idx, len(inventory.items) - 1) if inventory.items else 0
+        else:
+            slot_names = list(_default_equipment_slots().keys())
+            if slot_names:
+                slot_name = slot_names[max(0, min(state.selected_slot_idx, len(slot_names) - 1))]
+                state.message = _unequip_slot(inventory, equipment, slot_name)
+
+
+# The player menu tabs. Inventory and Status are live; the rest are placeholders
+# for planned screens so the tab framework is already in place.
+_PLAYER_MENU_TABS: list[tuple[str, str]] = [
+    ("inventory", "Inventory"),
+    ("status", "Status"),
+    ("map", "Map"),
+    ("journal", "Journal"),
+    ("skills", "Skills"),
+]
+_PLAYER_MENU_KEYS = [key for key, _label in _PLAYER_MENU_TABS]
+
+
+def _draw_tab_bar(renderer: Renderer, x: int, y: int, width: int, active_index: int) -> None:
+    cursor = x
+    for idx, (_key, label) in enumerate(_PLAYER_MENU_TABS):
+        text = f" {label} "
+        if idx == active_index:
+            _fill_ui_cells(renderer, cursor, y, len(text), 1, _MENU_SELECTED_BG)
+        color = _MENU_SELECTED_TEXT if idx == active_index else _MENU_MUTED_COLOR
+        _draw_ui_text(renderer, cursor, y, text, color, max(1, x + width - cursor))
+        cursor += len(text) + 1
+
+
+async def _draw_player_menu(renderer: Renderer, game_map: GameMap, start_tab: str = "inventory") -> tuple[str, str]:
+    """Tabbed player menu (Tab cycles tabs; I/C jump to Inventory/Status and
+    toggle-close if already there; Esc closes). Returns (result, last_tab) so the
+    caller can reopen on the tab you left on."""
+    tab = _PLAYER_MENU_KEYS.index(start_tab) if start_tab in _PLAYER_MENU_KEYS else 0
+    inv_state = _InventoryState()
+
+    while True:
+        current_key = _PLAYER_MENU_KEYS[tab]
+        x, y, width, height = _draw_menu_shell(
+            renderer,
+            title="MENU",
+            subtitle=None,
+            footer="[Tab] switch tab   [I] items   [C] status   [Esc] close",
+            width=100,
+            height=34,
+            overlay_game=True,
+        )
+        _draw_tab_bar(renderer, x + 2, y + 2, width - 4, tab)
+        content_y = y + 4
+        content_h = max(8, height - 7)
+
+        if current_key == "inventory":
+            _render_inventory_body(renderer, x, content_y, width, content_h, inv_state)
+        elif current_key == "status":
+            player_ent = _first_player_entity()
+            lines = _creature_status_lines(game_map, player_ent) if player_ent is not None else ["No player."]
+            for idx, line in enumerate(lines):
+                _draw_ui_text(renderer, x + 3, content_y + 1 + idx, line, _MENU_TEXT_COLOR, width - 6)
+        else:
+            label = _PLAYER_MENU_TABS[tab][1]
+            _draw_ui_text(renderer, x + 3, content_y + 1, f"{label} - coming soon.", _MENU_MUTED_COLOR, width - 6)
 
         renderer.present()
 
         action = await _await_action(renderer)
-        if action in {"open_pause_menu", "open_inventory"}:
-            return "close"
         if action == "quit":
-            return "quit"
-
-        if action in {"move_left"}:
-            selected_panel = "left"
+            return "quit", current_key
+        if action == "open_pause_menu":
+            return "close", current_key
+        if action == "open_menu":  # Tab cycles to the next tab
+            tab = (tab + 1) % len(_PLAYER_MENU_KEYS)
             continue
-        if action in {"move_right"}:
-            selected_panel = "right"
+        if action == "open_inventory":
+            if current_key == "inventory":
+                return "close", current_key
+            tab = _PLAYER_MENU_KEYS.index("inventory")
             continue
-
-        if action == "move_up":
-            if selected_panel == "left" and slot_names:
-                selected_slot_idx = (selected_slot_idx - 1) % len(slot_names)
-            elif selected_panel == "right" and inventory_items:
-                selected_item_idx = (selected_item_idx - 1) % len(inventory_items)
-            continue
-
-        if action == "move_down":
-            if selected_panel == "left" and slot_names:
-                selected_slot_idx = (selected_slot_idx + 1) % len(slot_names)
-            elif selected_panel == "right" and inventory_items:
-                selected_item_idx = (selected_item_idx + 1) % len(inventory_items)
+        if action == "open_status":
+            if current_key == "status":
+                return "close", current_key
+            tab = _PLAYER_MENU_KEYS.index("status")
             continue
 
-        if action in {"menu_select", "confirm_action"} and player_ent is not None:
-            if not esper.has_component(player_ent, Inventory):
-                continue
-            if not esper.has_component(player_ent, Equipment):
-                continue
-
-            inventory = esper.component_for_entity(player_ent, Inventory)
-            equipment = esper.component_for_entity(player_ent, Equipment)
-
-            if selected_panel == "right":
-                if not inventory.items:
-                    message = "No items to use."
-                else:
-                    clamped_idx = max(0, min(selected_item_idx, len(inventory.items) - 1))
-                    # Food/drink is eaten/drunk; everything else is equipped.
-                    consume_message = _apply_consumable(player_ent, clamped_idx)
-                    if consume_message is not None:
-                        message = consume_message
-                    else:
-                        message = _equip_inventory_item(inventory, equipment, clamped_idx)
-                    if inventory.items:
-                        selected_item_idx = min(selected_item_idx, len(inventory.items) - 1)
-                    else:
-                        selected_item_idx = 0
-            else:
-                if slot_names:
-                    slot_name = slot_names[max(0, min(selected_slot_idx, len(slot_names) - 1))]
-                    message = _unequip_slot(inventory, equipment, slot_name)
+        if current_key == "inventory":
+            _handle_inventory_input(action, inv_state)
 
 
 def _spawn_cave_rat(
@@ -1973,6 +2093,9 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         BlocksMovement(),
         Inventory(items=["Bread", "Waterskin"]),
         Equipment(slots=_default_equipment_slots()),
+        # Villagers cook: they gather meat + wood and cook at a stove before
+        # eating (unlike predator monsters, which eat raw on the spot).
+        Diet("cook"),
         Needs(),
     )
     goblin_equipment = _default_equipment_slots()
@@ -2141,6 +2264,8 @@ async def main() -> None:
                 "move_right": -1,
             }
             press_order_counter = 0
+            # The player menu (Tab) reopens on whatever tab you left it on.
+            last_menu_tab = "inventory"
             invalidate_backdrop = getattr(renderer, "invalidate_backdrop", None)
             while True:
                 # Live play has (re)rendered the game, so any menu backdrop
@@ -2195,15 +2320,28 @@ async def main() -> None:
                     if live_action is not None:
                         esper.process(live_action)
                     else:
-                        esper.process(None)
+                        # No direction held: wait in place, passing a turn (needs
+                        # rise, NPCs act) instead of a no-op refresh.
+                        esper.process(WAIT_ACTION)
                     continue
                 if action == "menu_select":
                     interact_action = _action_from_held_keys(held_directions, direction_pressed_order)
-                    interact_npc = _find_interaction_npc(interact_action)
-                    if interact_npc is not None:
-                        dialogue_choice = await _draw_dialogue_menu(renderer, interact_npc)
+                    interact_creature = _find_interaction_creature(interact_action)
+                    if interact_creature is not None:
                         held_directions.clear()
-                        if dialogue_choice == "quit":
+                        if esper.has_component(interact_creature, Friendly):
+                            # Friendlies: full dialogue (which shows their status).
+                            choice = await _draw_dialogue_menu(renderer, game_map, interact_creature)
+                        else:
+                            # Wild/hostile creatures: read-only examine of status.
+                            name = _entity_name(interact_creature, fallback="Creature")
+                            choice = await _draw_info_screen(
+                                renderer,
+                                title=f"EXAMINE - {name}",
+                                lines=_creature_status_lines(game_map, interact_creature),
+                                subtitle="What you can tell at a glance",
+                            )
+                        if choice == "quit":
                             break
                         esper.process(None)
                         continue
@@ -2240,10 +2378,17 @@ async def main() -> None:
                             esper.process(None)
                             continue
 
-                if action == "open_inventory":
-                    inventory_choice = await _draw_inventory_menu(renderer)
+                if action in {"open_menu", "open_inventory", "open_status"}:
+                    # Tab reopens on the last tab; I/C jump straight to a tab.
+                    if action == "open_inventory":
+                        start_tab = "inventory"
+                    elif action == "open_status":
+                        start_tab = "status"
+                    else:
+                        start_tab = last_menu_tab
+                    menu_choice, last_menu_tab = await _draw_player_menu(renderer, game_map, start_tab)
                     held_directions.clear()
-                    if inventory_choice == "quit":
+                    if menu_choice == "quit":
                         break
                     esper.process(None)
                     continue

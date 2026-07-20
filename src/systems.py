@@ -9,9 +9,9 @@ import time
 
 import esper
 
-from components import BlocksMovement, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Inventory, Meat, Name, Needs, NPC, OnFire, Player, Position, Renderable, Tree, Vision
+from components import BlocksMovement, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Inventory, Meat, Name, Needs, NPC, OnFire, Player, Position, Renderable, Stove, Tree, Vision
 from game_map import GameMap
-from items import RAW_MEAT
+from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from renderer.base import Renderer
 
 _ACTION_DELTAS = {
@@ -24,6 +24,11 @@ _ACTION_DELTAS = {
     "move_down_left": (-1, 1),
     "move_down_right": (1, 1),
 }
+
+# The "wait" action passes a turn without moving the player. Time-advancing
+# systems (needs, NPC AI) tick on any of these; movement/combat only on a move.
+WAIT_ACTION = "wait"
+_TURN_ACTIONS = set(_ACTION_DELTAS) | {WAIT_ACTION}
 
 _DIR_TO_ARROW = {
     (-1, -1): "↖",
@@ -73,6 +78,13 @@ _STATUS_DISPLAY: dict[str, tuple[str, tuple[int, int, int] | None, float]] = {
 }
 # Order the identifiers cycle in, after the base tile.
 _STATUS_ORDER: tuple[str, ...] = ("swimming", "on_fire")
+
+# Human-readable status names for status/examine screens.
+_STATUS_LABELS: dict[str, str] = {"swimming": "Swimming", "on_fire": "On fire"}
+
+
+def status_label(name: str) -> str:
+    return _STATUS_LABELS.get(name, name.replace("_", " ").capitalize())
 
 
 def active_statuses(game_map: GameMap, ent: int, pos: Position) -> list[str]:
@@ -362,24 +374,188 @@ class NpcAiProcessor(esper.Processor):
             return True
         return self._step_toward(ent, pos, target_xy, occupied)
 
-    def _hunt(
+    def _seek_food(
         self,
         ent: int,
         pos: Position,
         needs: Needs,
         prey: list[tuple[tuple[int, int], int]],
+        corpses: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
     ) -> bool:
-        live_prey = [item for item in prey if item[1] != ent and esper.entity_exists(item[1])]
-        if not live_prey:
+        """A hungry meat-eater heads to the nearest food: an existing corpse it
+        can scavenge, or a live deer it can hunt."""
+        # (xy, kind, target_ent). Corpses are already filtered to ones with meat.
+        candidates: list[tuple[tuple[int, int], str, int]] = [
+            (xy, "corpse", corpse_ent) for xy, corpse_ent in corpses
+        ]
+        candidates.extend(
+            (xy, "prey", prey_ent)
+            for xy, prey_ent in prey
+            if prey_ent != ent and esper.entity_exists(prey_ent)
+        )
+        if not candidates:
             return False
-        target_xy, target_ent = min(live_prey, key=lambda item: _chebyshev((pos.x, pos.y), item[0]))
-        if _chebyshev((pos.x, pos.y), target_xy) == 1:
-            slay_entity(target_ent)  # kill and butcher; predator feeds
-            occupied.pop(target_xy, None)
-            needs.hunger = max(0.0, needs.hunger - _FEED_RESTORE)
+
+        target_xy, kind, target_ent = min(
+            candidates, key=lambda c: _chebyshev((pos.x, pos.y), c[0])
+        )
+        distance = _chebyshev((pos.x, pos.y), target_xy)
+
+        if kind == "prey":
+            # Deer block their tile, so feed from an adjacent tile.
+            if distance == 1:
+                slay_entity(target_ent)  # kill and butcher; predator feeds
+                occupied.pop(target_xy, None)
+                needs.hunger = max(0.0, needs.hunger - _FEED_RESTORE)
+                return True
+            return self._step_toward(ent, pos, target_xy, occupied)
+
+        # Corpses don't block, so "reach" is standing on or next to them.
+        if distance <= 1:
+            self._eat_from_corpse(target_ent, needs)
             return True
         return self._step_toward(ent, pos, target_xy, occupied)
+
+    def _eat_from_corpse(self, corpse_ent: int, needs: Needs) -> None:
+        if not esper.has_component(corpse_ent, Inventory):
+            return
+        inventory = esper.component_for_entity(corpse_ent, Inventory)
+        for index, item in enumerate(inventory.items):
+            if is_raw_meat(item) or is_cooked_meat(item):
+                inventory.items.pop(index)
+                needs.hunger = max(0.0, needs.hunger - _FEED_RESTORE)
+                return
+
+    def _eat_from_inventory(self, ent: int, needs: Needs) -> bool:
+        """A hungry creature eats a *prepared* item it is carrying (cooked meat,
+        bread, ...) before foraging. Raw meat is skipped -- meat must be cooked
+        first. Returns True if it ate."""
+        if not esper.has_component(ent, Inventory):
+            return False
+        inventory = esper.component_for_entity(ent, Inventory)
+        for index, item in enumerate(inventory.items):
+            if is_raw_meat(item):
+                continue
+            restored = hunger_restored(item)
+            if restored is not None:
+                inventory.items.pop(index)
+                needs.hunger = max(0.0, needs.hunger - restored)
+                return True
+        return False
+
+    # --- "cook" diet: the full loop a villager runs to feed itself ---------
+    # get raw meat (hunt/scavenge into pack) -> get wood (chop a tree) ->
+    # carry both to a stove and cook -> eat the cooked meat (via
+    # _eat_from_inventory next turn). Each call advances one step of that plan.
+
+    def _forage_meat(
+        self,
+        ent: int,
+        pos: Position,
+        inventory: Inventory,
+        prey: list[tuple[tuple[int, int], int]],
+        corpses: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        """Put raw meat in the pack: scavenge a corpse, or kill a deer (which
+        leaves a corpse to scavenge next). Unlike a predator, does not eat here."""
+        candidates: list[tuple[tuple[int, int], str, int]] = [
+            (xy, "corpse", corpse_ent) for xy, corpse_ent in corpses
+        ]
+        candidates.extend(
+            (xy, "prey", prey_ent)
+            for xy, prey_ent in prey
+            if prey_ent != ent and esper.entity_exists(prey_ent)
+        )
+        if not candidates:
+            return False
+        target_xy, kind, target_ent = min(candidates, key=lambda c: _chebyshev((pos.x, pos.y), c[0]))
+        distance = _chebyshev((pos.x, pos.y), target_xy)
+
+        if kind == "prey":
+            if distance == 1:
+                slay_entity(target_ent)  # leaves a corpse to butcher next turn
+                occupied.pop(target_xy, None)
+                return True
+            return self._step_toward(ent, pos, target_xy, occupied)
+
+        if distance <= 1:
+            self._take_meat_from_corpse(target_ent, inventory)
+            return True
+        return self._step_toward(ent, pos, target_xy, occupied)
+
+    def _take_meat_from_corpse(self, corpse_ent: int, inventory: Inventory) -> None:
+        if not esper.has_component(corpse_ent, Inventory):
+            return
+        corpse_inventory = esper.component_for_entity(corpse_ent, Inventory)
+        for index, item in enumerate(corpse_inventory.items):
+            if is_raw_meat(item):
+                corpse_inventory.items.pop(index)
+                inventory.items.append(item)
+                return
+
+    def _gather_wood(
+        self,
+        ent: int,
+        pos: Position,
+        inventory: Inventory,
+        trees: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        if not trees:
+            return False
+        target_xy, tree_ent = min(trees, key=lambda t: _chebyshev((pos.x, pos.y), t[0]))
+        if _chebyshev((pos.x, pos.y), target_xy) == 1:
+            inventory.items.append(WOOD)
+            if esper.entity_exists(tree_ent) and esper.has_component(tree_ent, Tree):
+                tree = esper.component_for_entity(tree_ent, Tree)
+                tree.wood -= 1
+                if tree.wood <= 0:
+                    esper.delete_entity(tree_ent, immediate=True)
+                    occupied.pop(target_xy, None)
+            return True
+        return self._step_toward(ent, pos, target_xy, occupied)
+
+    def _cook_at_stove(
+        self,
+        ent: int,
+        pos: Position,
+        inventory: Inventory,
+        stoves: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        if not stoves:
+            return False
+        target_xy, _stove_ent = min(stoves, key=lambda s: _chebyshev((pos.x, pos.y), s[0]))
+        if _chebyshev((pos.x, pos.y), target_xy) == 1:
+            raw = next((item for item in inventory.items if is_raw_meat(item)), None)
+            if raw is not None and WOOD in inventory.items:
+                inventory.items.remove(WOOD)
+                inventory.items.remove(raw)
+                inventory.items.append(cook_meat(raw))
+            return True
+        return self._step_toward(ent, pos, target_xy, occupied)
+
+    def _feed_cook(
+        self,
+        ent: int,
+        pos: Position,
+        prey: list[tuple[tuple[int, int], int]],
+        corpses: list[tuple[tuple[int, int], int]],
+        trees: list[tuple[tuple[int, int], int]],
+        stoves: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        if not esper.has_component(ent, Inventory):
+            return False
+        inventory = esper.component_for_entity(ent, Inventory)
+        has_raw = any(is_raw_meat(item) for item in inventory.items)
+        if not has_raw:
+            return self._forage_meat(ent, pos, inventory, prey, corpses, occupied)
+        if WOOD in inventory.items:
+            return self._cook_at_stove(ent, pos, inventory, stoves, occupied)
+        return self._gather_wood(ent, pos, inventory, trees, occupied)
 
     def _chase_player(
         self,
@@ -400,7 +576,7 @@ class NpcAiProcessor(esper.Processor):
         return self._step_toward(ent, pos, player_xy, occupied)
 
     def process(self, action: str | None = None) -> None:
-        if action not in _ACTION_DELTAS:
+        if action not in _TURN_ACTIONS:
             return
 
         player_xy = self._find_player_position()
@@ -413,9 +589,15 @@ class NpcAiProcessor(esper.Processor):
         # Snapshot dynamic foraging targets once per turn.
         trees = [((pos.x, pos.y), ent) for ent, (pos, _t) in esper.get_components(Position, Tree)]
         prey = [((pos.x, pos.y), ent) for ent, (pos, _d) in esper.get_components(Position, Deer)]
+        corpses = [
+            ((pos.x, pos.y), ent)
+            for ent, (pos, _c, inv) in esper.get_components(Position, Corpse, Inventory)
+            if any(is_raw_meat(item) or is_cooked_meat(item) for item in inv.items)
+        ]
+        stoves = [((pos.x, pos.y), ent) for ent, (pos, _s) in esper.get_components(Position, Stove)]
 
         # Materialise the list: a predator can kill (delete) another NPC mid-loop
-        # via _hunt, so we snapshot up front and skip anything already gone.
+        # via _seek_food, so we snapshot up front and skip anything already gone.
         for ent, (pos, _npc) in list(esper.get_components(Position, NPC)):
             if not esper.entity_exists(ent):
                 continue
@@ -431,10 +613,17 @@ class NpcAiProcessor(esper.Processor):
                 if needs.thirst >= _FORAGE_THRESHOLD and needs.thirst >= needs.hunger:
                     acted = self._seek_water(ent, pos, needs, occupied)
                 elif needs.hunger >= _FORAGE_THRESHOLD:
-                    if diet_kind == "herbivore":
+                    # Eat prepared food already carried; otherwise forage by diet.
+                    if self._eat_from_inventory(ent, needs):
+                        acted = True
+                    elif diet_kind == "herbivore":
                         acted = self._graze(ent, pos, needs, trees, occupied)
                     elif diet_kind == "carnivore":
-                        acted = self._hunt(ent, pos, needs, prey, occupied)
+                        # Predator: eats raw meat on the spot.
+                        acted = self._seek_food(ent, pos, needs, prey, corpses, occupied)
+                    elif diet_kind == "cook":
+                        # Villager: cooks meat before eating (multi-turn plan).
+                        acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
 
             if acted:
                 continue
@@ -472,15 +661,15 @@ def _crossed_warning(
 
 
 class NeedsProcessor(esper.Processor):
-    """Advances hunger/thirst once per real turn (a movement action).
+    """Advances hunger/thirst once per real turn (a move, or a ``wait``).
 
     Menu refreshes call ``esper.process(None)``; those must not starve the
-    player, so the tick is gated on an actual movement action, matching how the
+    player, so the tick is gated on a turn-advancing action, matching how the
     NPC AI only reacts on real turns.
     """
 
     def process(self, action: str | None = None) -> None:
-        if action not in _ACTION_DELTAS:
+        if action not in _TURN_ACTIONS:
             return
 
         for ent, (needs,) in esper.get_components(Needs):
@@ -1261,7 +1450,7 @@ class RenderProcessor(esper.Processor):
         if player_ent is not None and esper.has_component(player_ent, Needs):
             needs = esper.component_for_entity(player_ent, Needs)
             needs_text = f"Hunger {int(needs.hunger)}%  Thirst {int(needs.thirst)}%    "
-        status_line = f"{needs_text}I inventory  Esc menu  +/- tile scale"
+        status_line = f"{needs_text}I inventory  C status  Esc menu  +/- tile scale"
         if callable(draw_text_clipped):
             draw_text_clipped(0, self._status_y, status_line, self._grid_w)
         else:
