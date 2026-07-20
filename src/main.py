@@ -13,7 +13,7 @@ from typing import Any
 
 import esper
 
-from components import BlocksMovement, Dialogue, Enemy, Equipment, Friendly, Inventory, NPC, Name, Player, Position, Renderable, Vision
+from components import BlocksMovement, Corpse, Dialogue, Enemy, Equipment, Friendly, Inventory, NPC, Name, Player, Position, Renderable, Vision
 from game_map import GameMap
 from persistence import (
     DEFAULT_SAVE_FILE,
@@ -812,6 +812,13 @@ def _direction_target_xy(direction_action: str | None, origin: Position) -> tupl
         return None
 
 
+def _interaction_target_xy(direction_action: str | None, origin: Position) -> tuple[int, int]:
+    target_xy = _direction_target_xy(direction_action, origin)
+    if target_xy is not None:
+        return target_xy
+    return (origin.x, origin.y)
+
+
 def _action_from_held_keys(
     held_directions: set[str],
     pressed_order: dict[str, int] | None = None,
@@ -864,15 +871,24 @@ def _find_interaction_npc(direction_action: str | None) -> int | None:
             continue
         position_to_npc[(pos.x, pos.y)] = ent
 
-    preferred_xy = _direction_target_xy(direction_action, player_pos)
-    if preferred_xy is not None and preferred_xy in position_to_npc:
-        return position_to_npc[preferred_xy]
+    target_xy = _interaction_target_xy(direction_action, player_pos)
+    return position_to_npc.get(target_xy)
 
-    for action_name in ("move_up", "move_right", "move_down", "move_left"):
-        adjacent_xy = _direction_target_xy(action_name, player_pos)
-        if adjacent_xy is not None and adjacent_xy in position_to_npc:
-            return position_to_npc[adjacent_xy]
-    return None
+
+def _find_interaction_corpse(direction_action: str | None) -> int | None:
+    player_ent = _first_player_entity()
+    if player_ent is None or not esper.has_component(player_ent, Position):
+        return None
+
+    player_pos = esper.component_for_entity(player_ent, Position)
+    position_to_corpse: dict[tuple[int, int], int] = {
+        (pos.x, pos.y): ent
+        for ent, (pos, _corpse) in esper.get_components(Position, Corpse)
+        if _entity_has_tradeable_items(ent)
+    }
+
+    target_xy = _interaction_target_xy(direction_action, player_pos)
+    return position_to_corpse.get(target_xy)
 
 
 def _npc_info_lines(npc_ent: int) -> list[str]:
@@ -972,6 +988,36 @@ def _trade_item(source_ent: int, target_ent: int, entry: _TradeEntry) -> str:
     target_inventory = _ensure_inventory(target_ent)
     target_inventory.items.append(item_name)
     return f"{source_name} traded {item_name} to {target_name}."
+
+
+def _entity_has_tradeable_items(actor_ent: int) -> bool:
+    if esper.has_component(actor_ent, Inventory):
+        inventory = esper.component_for_entity(actor_ent, Inventory)
+        if inventory.items:
+            return True
+
+    if esper.has_component(actor_ent, Equipment):
+        slots = esper.component_for_entity(actor_ent, Equipment).slots
+        if any(item for item in slots.values()):
+            return True
+
+    return False
+
+
+def _loot_item_from_corpse(corpse_ent: int, player_ent: int, entry: _TradeEntry) -> str:
+    corpse_name = _entity_name(corpse_ent, fallback="Corpse")
+
+    item_name = _remove_trade_entry(corpse_ent, entry)
+    if item_name is None:
+        return "Loot failed. Item was no longer available."
+
+    player_inventory = _ensure_inventory(player_ent)
+    player_inventory.items.append(item_name)
+
+    if not _entity_has_tradeable_items(corpse_ent):
+        return f"You looted {item_name} from {corpse_name}. Nothing else of value remains."
+
+    return f"You looted {item_name} from {corpse_name}."
 
 
 def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
@@ -1115,6 +1161,172 @@ def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
                     continue
                 entry = player_entries[selected_player_idx]
                 message = _trade_item(player_ent, npc_ent, entry)
+
+
+def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
+    player_ent = _first_player_entity()
+    if player_ent is None:
+        return "close"
+
+    selected_panel = "left"
+    selected_corpse_idx = 0
+    selected_player_idx = 0
+    message = "Enter: loot selected item  A/D: switch side  W/S: move"
+
+    while True:
+        if not esper.entity_exists(corpse_ent):
+            return "close"
+
+        corpse_entries = _list_trade_entries(corpse_ent)
+        player_entries = _list_trade_entries(player_ent)
+
+        if corpse_entries:
+            selected_corpse_idx = max(0, min(selected_corpse_idx, len(corpse_entries) - 1))
+        else:
+            selected_corpse_idx = 0
+
+        if player_entries:
+            selected_player_idx = max(0, min(selected_player_idx, len(player_entries) - 1))
+        else:
+            selected_player_idx = 0
+
+        corpse_name = _entity_name(corpse_ent, fallback="Corpse")
+        player_name = _entity_name(player_ent, fallback="You")
+
+        x, y, width, height = _draw_menu_shell(
+            renderer,
+            title=f"LOOT - {corpse_name}",
+            subtitle="Esc/I closes   A/D switches side",
+            footer=message,
+            width=98,
+            height=30,
+            overlay_game=True,
+        )
+
+        content_y = y + 4
+        content_h = max(10, height - 7)
+        left_w = max(18, (width - 6) // 2)
+        right_w = max(18, width - left_w - 6)
+        left_x = x + 2
+        right_x = left_x + left_w + 2
+
+        draw_panel = getattr(renderer, "draw_panel", None)
+        if callable(draw_panel):
+            draw_panel(left_x, content_y, left_w, content_h, title=f"{corpse_name} ITEMS")
+            draw_panel(right_x, content_y, right_w, content_h, title=f"{player_name} STOCK")
+
+        list_start_y = content_y + 3
+        visible_rows = max(1, content_h - 5)
+        left_line_width = max(1, left_w - 4)
+        right_line_width = max(1, right_w - 4)
+
+        if corpse_entries:
+            start = _scroll_start(selected_corpse_idx, len(corpse_entries), visible_rows)
+            end = min(len(corpse_entries), start + visible_rows)
+            for row_offset, entry_idx in enumerate(range(start, end)):
+                entry = corpse_entries[entry_idx]
+                row_y = list_start_y + row_offset
+                is_selected = selected_panel == "left" and entry_idx == selected_corpse_idx
+                if is_selected:
+                    _fill_ui_cells(renderer, left_x + 1, row_y, left_w - 2, 1, _MENU_SELECTED_BG)
+
+                if entry.kind == "equipment":
+                    label = f"[E] {entry.slot_name}: {entry.item_name}"
+                else:
+                    label = entry.item_name
+
+                prefix = ">" if is_selected else " "
+                color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+                _draw_ui_text(renderer, left_x + 2, row_y, f"{prefix} {label}", color, left_line_width)
+        else:
+            is_selected = selected_panel == "left"
+            if is_selected:
+                _fill_ui_cells(renderer, left_x + 1, list_start_y, left_w - 2, 1, _MENU_SELECTED_BG)
+            prefix = ">" if is_selected else " "
+            color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+            _draw_ui_text(
+                renderer,
+                left_x + 2,
+                list_start_y,
+                f"{prefix} (empty)",
+                color,
+                left_line_width,
+            )
+
+        if player_entries:
+            start = _scroll_start(selected_player_idx, len(player_entries), visible_rows)
+            end = min(len(player_entries), start + visible_rows)
+            for row_offset, entry_idx in enumerate(range(start, end)):
+                entry = player_entries[entry_idx]
+                row_y = list_start_y + row_offset
+                is_selected = selected_panel == "right" and entry_idx == selected_player_idx
+                if is_selected:
+                    _fill_ui_cells(renderer, right_x + 1, row_y, right_w - 2, 1, _MENU_SELECTED_BG)
+
+                if entry.kind == "equipment":
+                    label = f"[E] {entry.slot_name}: {entry.item_name}"
+                else:
+                    label = entry.item_name
+
+                prefix = ">" if is_selected else " "
+                color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+                _draw_ui_text(renderer, right_x + 2, row_y, f"{prefix} {label}", color, right_line_width)
+        else:
+            is_selected = selected_panel == "right"
+            if is_selected:
+                _fill_ui_cells(renderer, right_x + 1, list_start_y, right_w - 2, 1, _MENU_SELECTED_BG)
+            prefix = ">" if is_selected else " "
+            color = _MENU_SELECTED_TEXT if is_selected else _MENU_TEXT_COLOR
+            _draw_ui_text(
+                renderer,
+                right_x + 2,
+                list_start_y,
+                f"{prefix} (empty)",
+                color,
+                right_line_width,
+            )
+
+        renderer.present()
+
+        action = renderer.poll_action()
+        if action in {"open_pause_menu", "open_inventory"}:
+            return "close"
+        if action == "quit":
+            return "quit"
+        if action == "move_left":
+            selected_panel = "left"
+            continue
+        if action == "move_right":
+            selected_panel = "right"
+            continue
+        if action == "move_up":
+            if selected_panel == "left" and corpse_entries:
+                selected_corpse_idx = (selected_corpse_idx - 1) % len(corpse_entries)
+            elif selected_panel == "right" and player_entries:
+                selected_player_idx = (selected_player_idx - 1) % len(player_entries)
+            continue
+        if action == "move_down":
+            if selected_panel == "left" and corpse_entries:
+                selected_corpse_idx = (selected_corpse_idx + 1) % len(corpse_entries)
+            elif selected_panel == "right" and player_entries:
+                selected_player_idx = (selected_player_idx + 1) % len(player_entries)
+            continue
+
+        if action in {"menu_select", "confirm_action"}:
+            if selected_panel == "left":
+                if not corpse_entries:
+                    message = f"{corpse_name} has nothing to loot."
+                    continue
+                entry = corpse_entries[selected_corpse_idx]
+                message = _loot_item_from_corpse(corpse_ent, player_ent, entry)
+            else:
+                message = "Loot is one-way: you can only take from the corpse."
+
+            if not _entity_has_tradeable_items(corpse_ent):
+                return "close"
+
+            if not esper.entity_exists(corpse_ent):
+                continue
 
 
 def _draw_dialogue_menu(renderer: Renderer, npc_ent: int) -> str:
@@ -1600,6 +1812,15 @@ def main() -> None:
                         dialogue_choice = _draw_dialogue_menu(renderer, interact_npc)
                         held_directions.clear()
                         if dialogue_choice == "quit":
+                            break
+                        esper.process(None)
+                        continue
+
+                    interact_corpse = _find_interaction_corpse(interact_action)
+                    if interact_corpse is not None:
+                        loot_choice = _draw_loot_menu(renderer, interact_corpse)
+                        held_directions.clear()
+                        if loot_choice == "quit":
                             break
                         esper.process(None)
                         continue

@@ -22,6 +22,7 @@
     "v": { "tile_id": "creatures_00_01" },
     "g": { "tile_id": "creatures_03_06" },
     "r": { "tile_id": "creatures_09_08" },
+    "x": { "sheet": "general", "tile_number": 53 },
     "%": { "tile_id": "items_03_20" }
   },
   "classifications": {

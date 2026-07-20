@@ -178,6 +178,8 @@ def test_player_attacks_enemy_on_collision() -> None:
         Enemy(),
         BlocksMovement(),
         Vision(8),
+        Inventory(items=["Copper Coin"]),
+        Equipment(slots={"main hand": "Jagged Dagger"}),
     )
     esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
 
@@ -194,6 +196,14 @@ def test_player_attacks_enemy_on_collision() -> None:
     assert (corpses[0][0].x, corpses[0][0].y) == (6, 4)
     assert corpses[0][1].value == "Corpse of Goblin"
     assert any(text == "You attack Goblin." for _x, _y, text in renderer.text)
+
+    corpse_ent = next(ent for ent, (_corpse,) in esper.get_components(Corpse))
+    corpse_renderable = esper.component_for_entity(corpse_ent, Renderable)
+    corpse_inventory = esper.component_for_entity(corpse_ent, Inventory)
+    corpse_equipment = esper.component_for_entity(corpse_ent, Equipment)
+    assert corpse_renderable.glyph == "x"
+    assert corpse_inventory.items == ["Copper Coin"]
+    assert corpse_equipment.slots["main hand"] == "Jagged Dagger"
 
 
 def test_player_bumps_friendly_and_gets_interaction_prompt() -> None:

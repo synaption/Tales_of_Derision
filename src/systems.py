@@ -8,7 +8,7 @@ import textwrap
 
 import esper
 
-from components import BlocksMovement, Corpse, Enemy, Friendly, Name, NPC, Player, Position, Renderable, Vision
+from components import BlocksMovement, Corpse, Enemy, Equipment, Friendly, Inventory, Name, NPC, Player, Position, Renderable, Vision
 from game_map import GameMap
 from renderer.base import Renderer
 
@@ -70,6 +70,8 @@ _AUTOTILE_DIRECTION_MASKS = {
     7: 32,   # SW
     8: 8,    # W
 }
+
+_CORPSE_GLYPH = "x"
 
 _TURN_EVENTS: list[str] = []
 
@@ -138,8 +140,30 @@ class MovementProcessor(esper.Processor):
                     if self.on_melee_attack is not None:
                         self.on_melee_attack()
                     corpse_name = f"Corpse of {target_name}"
+                    corpse_components: list[object] = [
+                        Position(nx, ny),
+                        Renderable(_CORPSE_GLYPH),
+                        Name(corpse_name),
+                        Corpse(),
+                    ]
+
+                    if esper.has_component(target_ent, Inventory):
+                        enemy_inventory = esper.component_for_entity(target_ent, Inventory)
+                        if enemy_inventory.items:
+                            corpse_components.append(Inventory(items=list(enemy_inventory.items)))
+
+                    if esper.has_component(target_ent, Equipment):
+                        enemy_equipment = esper.component_for_entity(target_ent, Equipment)
+                        looted_slots = {
+                            slot_name: item_name
+                            for slot_name, item_name in enemy_equipment.slots.items()
+                            if item_name
+                        }
+                        if looted_slots:
+                            corpse_components.append(Equipment(slots=looted_slots))
+
                     esper.delete_entity(target_ent, immediate=True)
-                    esper.create_entity(Position(nx, ny), Renderable("%"), Name(corpse_name), Corpse())
+                    esper.create_entity(*corpse_components)
                     if self.on_enemy_death is not None:
                         self.on_enemy_death()
                     continue
