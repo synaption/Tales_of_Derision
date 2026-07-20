@@ -49,6 +49,28 @@ _ARROW_TO_WORD = {
 
 _WALL_BROWN = (124, 88, 56)
 
+_AUTOTILE_DIRECTION_OFFSETS = {
+    1: (-1, -1),
+    2: (0, -1),
+    3: (1, -1),
+    4: (1, 0),
+    5: (1, 1),
+    6: (0, 1),
+    7: (-1, 1),
+    8: (-1, 0),
+}
+
+_AUTOTILE_DIRECTION_MASKS = {
+    1: 1,    # NW
+    2: 2,    # N
+    3: 4,    # NE
+    4: 16,   # E
+    5: 128,  # SE
+    6: 64,   # S
+    7: 32,   # SW
+    8: 8,    # W
+}
+
 _TURN_EVENTS: list[str] = []
 
 _NearbyEntry = tuple[
@@ -218,6 +240,34 @@ class RenderProcessor(esper.Processor):
         dx = self._clamp_sign(target.x - source.x)
         dy = self._clamp_sign(target.y - source.y)
         return _DIR_TO_ARROW[(dx, dy)]
+
+    def _neighbor_mask(self, x: int, y: int, tile_char: str) -> int:
+        connected: dict[int, bool] = {}
+        for direction, (dx, dy) in _AUTOTILE_DIRECTION_OFFSETS.items():
+            nx = x + dx
+            ny = y + dy
+            connected[direction] = self.game_map.in_bounds(nx, ny) and self.game_map.tile_at(nx, ny) == tile_char
+
+        mask_value = 0
+        if connected.get(2, False):
+            mask_value |= _AUTOTILE_DIRECTION_MASKS[2]  # N
+        if connected.get(4, False):
+            mask_value |= _AUTOTILE_DIRECTION_MASKS[4]  # E
+        if connected.get(6, False):
+            mask_value |= _AUTOTILE_DIRECTION_MASKS[6]  # S
+        if connected.get(8, False):
+            mask_value |= _AUTOTILE_DIRECTION_MASKS[8]  # W
+
+        if connected.get(1, False) and connected.get(2, False) and connected.get(8, False):
+            mask_value |= _AUTOTILE_DIRECTION_MASKS[1]  # NW
+        if connected.get(3, False) and connected.get(2, False) and connected.get(4, False):
+            mask_value |= _AUTOTILE_DIRECTION_MASKS[3]  # NE
+        if connected.get(7, False) and connected.get(6, False) and connected.get(8, False):
+            mask_value |= _AUTOTILE_DIRECTION_MASKS[7]  # SW
+        if connected.get(5, False) and connected.get(6, False) and connected.get(4, False):
+            mask_value |= _AUTOTILE_DIRECTION_MASKS[5]  # SE
+
+        return mask_value
 
     def _append_message(self, text: str) -> None:
         self._message_log.append(text)
@@ -626,6 +676,7 @@ class RenderProcessor(esper.Processor):
         self._compute_layout(player_pos)
 
         self._visible_tiles = self._compute_visible_tiles(player_ent, player_pos)
+        draw_autotile_variant = getattr(r, "draw_autotile_variant", None)
 
         for vy in range(self._view_height):
             wy = self._view_origin_y + vy
@@ -633,6 +684,21 @@ class RenderProcessor(esper.Processor):
                 wx = self._view_origin_x + vx
                 if (wx, wy) in self._visible_tiles:
                     tile = self.game_map.tile_at(wx, wy)
+                    if tile == self.game_map.WALL and callable(draw_autotile_variant):
+                        wall_mask = self._neighbor_mask(wx, wy, self.game_map.WALL)
+                        drew = bool(
+                            draw_autotile_variant(
+                                vx,
+                                vy,
+                                "wall",
+                                wall_mask,
+                                fg=_WALL_BROWN,
+                                bg=None,
+                            )
+                        )
+                        if drew:
+                            continue
+
                     classification = "wall" if tile == self.game_map.WALL else "default"
                     tile_fg = _WALL_BROWN if classification == "wall" else None
                     r.draw_glyph_classified(vx, vy, tile, classification, fg=tile_fg, bg=None)

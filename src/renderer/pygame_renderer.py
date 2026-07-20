@@ -219,6 +219,8 @@ class PygameRenderer(Renderer):
         self._sheet_cache: dict[str, object] = {}
         self._glyph_tiles: dict[str, object] = {}
         self._class_tiles: dict[str, object] = {}
+        self._tile_index_lookup: dict[str, tuple[str, int, int, int | None]] = {}
+        self._autotile_tiles: dict[str, dict[int, object]] = {"wall": {}, "water": {}, "ledges": {}}
         self._fallback_tiles: dict[
             tuple[str, str, tuple[int, int, int], tuple[int, int, int], int, int],
             object,
@@ -281,6 +283,8 @@ class PygameRenderer(Renderer):
         self._sheet_cache = {}
         self._glyph_tiles = {}
         self._class_tiles = {}
+        self._tile_index_lookup = {}
+        self._autotile_tiles = {"wall": {}, "water": {}, "ledges": {}}
         self._fallback_tiles = {}
         self._tinted_tiles = {}
         self._load_tileset_config()
@@ -559,6 +563,42 @@ class PygameRenderer(Renderer):
                             )
             except Exception:
                 tile_index = {}
+
+        self._tile_index_lookup = dict(tile_index)
+        self._autotile_tiles = {"wall": {}, "water": {}, "ledges": {}}
+        for key, indexed in tile_index.items():
+            if "/" not in key:
+                continue
+
+            sheet_name, tile_name = key.split("/", 1)
+            tile_name = tile_name.strip().lower()
+
+            base_name: str | None = None
+            for base in ("wall", "water", "ledges"):
+                if tile_name.startswith(base):
+                    base_name = base
+                    break
+            if base_name is None:
+                continue
+
+            suffix = tile_name[len(base_name) :]
+            if not suffix.isdigit():
+                continue
+
+            mask_value = int(suffix)
+            if mask_value < 0 or mask_value > 255:
+                continue
+
+            indexed_sheet, tile_x, tile_y, sample_size = indexed
+            sheet_path = resolve_sheet_alias(indexed_sheet or sheet_name)
+            if not sheet_path:
+                continue
+
+            tile = self._load_tile(sheet_path, tile_x, tile_y, sample_size)
+            if tile is None:
+                continue
+
+            self._autotile_tiles[base_name][mask_value] = tile
 
         def load_tile_from_spec(spec: dict) -> object | None:
             tile_id = spec.get("tile_id")
@@ -902,6 +942,48 @@ class PygameRenderer(Renderer):
             return
 
         self._blit_text(x, y, glyph, resolved_fg)
+
+    def draw_autotile_variant(
+        self,
+        x: int,
+        y: int,
+        base_name: str,
+        mask_value: int,
+        fg: tuple[int, int, int] | None = None,
+        bg: tuple[int, int, int] | None = None,
+    ) -> bool:
+        normalized_base = (base_name or "").strip().lower()
+        bank = self._autotile_tiles.get(normalized_base, {})
+        if not bank:
+            return False
+
+        tile = bank.get(mask_value)
+        if tile is None:
+            tile = bank.get(0)
+
+        if tile is None:
+            best_key = min(
+                bank.keys(),
+                key=lambda cand: (
+                    (mask_value & ~cand).bit_count(),
+                    (cand & ~mask_value).bit_count(),
+                    -(mask_value & cand).bit_count(),
+                    cand,
+                ),
+            )
+            tile = bank.get(best_key)
+
+        if tile is None:
+            return False
+
+        draw_tile = tile
+        if fg is not None:
+            draw_tile = self._tint_tile(tile, _coerce_rgb(fg, self._default_fg))
+
+        resolved_bg = _coerce_rgb(bg, self._bg)
+        tile_bg = resolved_bg if bg is not None else None
+        self._blit_world_tile(x, y, draw_tile, tile_bg)
+        return True
 
     def draw_ui_glyph(
         self,
