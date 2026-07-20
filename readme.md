@@ -178,9 +178,9 @@ Run only totally unrendered logic/data tests:
 
 ## Survival (food, water, wood)
 
-The player has **hunger** and **thirst** that rise every turn (a step, or a
-`Space` wait; shown on the bottom status line). Keep them down or you'll get
-escalating warnings:
+The player has **hunger**, **thirst**, and **tiredness** that rise every turn (a
+step, or a `Space` wait; shown on the bottom status line). Keep them down or
+you'll get escalating warnings:
 
 - **Water** — face the stone **well** (`O`) and press the interact key (Enter) to
   drink and quench your thirst. A `Waterskin` in your inventory can also be drunk
@@ -201,8 +201,28 @@ Interaction targets the tile you're facing: hold a movement key toward the
 well/tree/stove/corpse, then press Enter (the same targeting used for talking to
 NPCs).
 
-Every creature (player and NPCs alike) accumulates hunger and thirst each turn,
-though only the player's needs are surfaced as on-screen warnings.
+Every creature (player and NPCs alike) accumulates hunger, thirst, and tiredness
+each turn, though only the player's needs are surfaced as on-screen warnings.
+
+## Day/night cycle and sleep
+
+Time flows with your turns. A full **day** runs dawn → day → dusk → night (the
+current phase leads the bottom status line), and the world **visibly darkens**
+after dusk. Every character must **sleep once a day**: **tiredness** climbs each
+turn and climbs **twice as fast at night**, so you can't stay up forever.
+
+- **Sleep** — press `R` to rest. Standing next to your **bed** (`=`, in your camp
+  by the well and stove) beds you down **at home**; anywhere else you **set up
+  camp** (a campfire `^` appears) and sleep there. You can also face the bed and
+  press Enter. Sleeping fast-forwards turns — the whole world keeps simulating
+  through the night — until you wake rested, then breaks camp automatically.
+- **NPCs sleep too.** When a creature gets tired it drops what it's doing and
+  heads for bed, **preferring its home**: villagers walk back to their house,
+  while homeless wildlife (and anyone too exhausted to make it home) just camp
+  where they stand. Sleepers skip their turn until their tiredness recovers.
+
+The clock, phase boundaries, tiredness rates, and the night multiplier live at
+the top of [src/systems.py](src/systems.py) and are easy to tune.
 
 **The world is a living ecosystem.** The map is a **3×3 grid of sections**. You
 are only ever in one section at a time: the camera shows just your current
@@ -229,7 +249,7 @@ opens Status (pressing the same key again closes). `Esc` closes.
 To read another creature, face it and press the interact key (Enter): friendlies
 open a dialogue with a **Status** option (like Trade), while wild or hostile
 creatures show a read-only **examine** panel with their disposition, hunger,
-thirst, and statuses.
+thirst, tiredness, and statuses (including whether they're **asleep**).
 
 **Swimming.** Water blocks NPCs and line of sight, but *you* can wade in and
 swim across lakes and rivers (walls still block).
@@ -237,9 +257,10 @@ swim across lakes and rivers (walls still block).
 **Status identifiers.** A character's tile animates through its own glyph plus an
 identifier for each active status, each for a configurable length of time, in a
 repeating cycle that plays in real time even while you stand still. Swimming
-shows your tile for 1s then a `~` for 0.5s. Statuses **stack sequentially**: if
-you were also on fire, the cycle would be your tile (1s) → `~` (0.5s) → a red `F`
-(0.5s) → repeat. Durations and identifiers live in `_STATUS_DISPLAY` /
+shows your tile for 1s then a `~` for 0.5s; sleeping shows a `Z`. Statuses
+**stack sequentially**: if you were also on fire, the cycle would be your tile
+(1s) → `~` (0.5s) → a red `F` (0.5s) → repeat. Durations and identifiers live in
+`_STATUS_DISPLAY` /
 `_STATUS_BASE_SECONDS` in [src/systems.py](src/systems.py).
 
 Survival item names and their food/water values live in

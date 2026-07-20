@@ -14,7 +14,7 @@ from typing import Any
 
 import esper
 
-from components import BlocksMovement, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Friendly, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Stove, Tree, Vision, Well
+from components import Asleep, Bed, BlocksMovement, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Stove, Tree, Vision, Well, WorldClock
 from game_map import GameMap
 from items import WOOD, cook_meat, hunger_restored, is_raw_meat, thirst_restored
 from persistence import (
@@ -28,7 +28,7 @@ from persistence import (
 )
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, WAIT_ACTION, active_statuses, player_is_animated, queue_message, status_label
+from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, WAIT_ACTION, active_statuses, go_to_sleep, player_is_animated, queue_message, status_label, wake_up
 
 # The world is a 3x3 expansion of the original 40x20 room, giving room for
 # lakes, rivers, and roaming wildlife.
@@ -422,6 +422,7 @@ _TREE_GREEN = (58, 138, 66)
 _WELL_STONE = (150, 168, 190)
 _STOVE_IRON = (120, 120, 128)
 _DEER_TAN = (176, 132, 92)
+_BED_WOOD = (156, 116, 72)
 _HUMAN_SKIN_TONES: list[tuple[int, int, int]] = [
     (255, 238, 220),
     (248, 227, 208),
@@ -1112,6 +1113,7 @@ def _creature_status_lines(game_map: GameMap, ent: int) -> list[str]:
         needs = esper.component_for_entity(ent, Needs)
         lines.append(f"Hunger: {int(needs.hunger)}%")
         lines.append(f"Thirst: {int(needs.thirst)}%")
+        lines.append(f"Tiredness: {int(needs.tiredness)}%")
 
     statuses: list[str] = []
     if esper.has_component(ent, Position):
@@ -1349,6 +1351,59 @@ def _apply_consumable(player_ent: int, item_index: int) -> str | None:
         return f"You eat the {item_name}."
     needs.thirst = max(0.0, needs.thirst - thirst_value)
     return f"You drink the {item_name}."
+
+
+# Below this tiredness the player gets a "not tired enough" nudge instead of
+# sleeping; the cap bounds the fast-forward loop so a stuck sleeper always wakes.
+_MIN_SLEEP_TIREDNESS = 1.0
+_SLEEP_MAX_TURNS = 400
+
+
+def _player_near_bed() -> bool:
+    """True when a Bed sits on or beside the player's tile, so the sleep action
+    can bed them down at home rather than pitching a camp."""
+    player_ent = _first_player_entity()
+    if player_ent is None or not esper.has_component(player_ent, Position):
+        return False
+    ppos = esper.component_for_entity(player_ent, Position)
+    for _ent, (pos, _bed) in esper.get_components(Position, Bed):
+        if max(abs(pos.x - ppos.x), abs(pos.y - ppos.y)) <= 1:
+            return True
+    return False
+
+
+async def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
+    """Send the player to sleep and fast-forward turns until they wake rested.
+
+    The whole world keeps simulating during the rest (NPCs act, needs shift, the
+    clock advances), so a night's sleep really passes the night. Each turn yields
+    to the browser so the web build's single thread stays responsive."""
+    player_ent = _first_player_entity()
+    if player_ent is None:
+        return
+    if not esper.has_component(player_ent, Needs):
+        esper.add_component(player_ent, Needs())
+    needs = esper.component_for_entity(player_ent, Needs)
+    if needs.tiredness < _MIN_SLEEP_TIREDNESS:
+        queue_message("You are not tired enough to sleep.")
+        esper.process(None)
+        return
+
+    queue_message(
+        "You set up camp and settle in to rest." if in_camp else "You climb into bed and close your eyes."
+    )
+    go_to_sleep(player_ent, in_camp=in_camp)
+
+    turns = 0
+    while esper.has_component(player_ent, Asleep) and turns < _SLEEP_MAX_TURNS:
+        esper.process(WAIT_ACTION)
+        turns += 1
+        await asyncio.sleep(0)
+
+    # Safety net: never leave the player stuck asleep past the cap.
+    if esper.has_component(player_ent, Asleep):
+        wake_up(player_ent)
+    esper.process(None)
 
 
 async def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
@@ -2046,6 +2101,13 @@ def _spawn_cave_rat(
 
 
 def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool = False) -> int:
+    # Singleton world clock driving the day/night cycle and the night-time
+    # tiredness ramp. Created before any creature so the first turn has a time.
+    # The game opens mid-morning so the player starts a fresh day in daylight.
+    start_clock = WorldClock()
+    start_clock.turn = int(start_clock.day_length * 0.2)
+    esper.create_entity(start_clock)
+
     player_name = "You"
     villager_name = "Friendly Villager"
     player_skin = _human_skin_tone(player_name)
@@ -2097,6 +2159,8 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         # eating (unlike predator monsters, which eat raw on the spot).
         Diet("cook"),
         Needs(),
+        # Villagers have a home to return to each night rather than camping.
+        Home(villager_pos.x, villager_pos.y),
     )
     goblin_equipment = _default_equipment_slots()
     goblin_equipment["main hand"] = "Jagged Dagger"
@@ -2178,6 +2242,8 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
 
     place(2, 2, Renderable("O", fg=_WELL_STONE), Name("Stone Well"), Well(), BlocksMovement())
     place(4, 2, Renderable("#", fg=_STOVE_IRON), Name("Iron Stove"), Stove(), BlocksMovement())
+    # The player's bed: sleep beside it to rest at home instead of camping.
+    place(3, 2, Renderable("=", fg=_BED_WOOD), Name("Bed"), Bed())
 
     def plant_tree(x: int, y: int) -> None:
         place_at(x, y, Renderable("T", fg=_TREE_GREEN), Name("Tree"), Tree(), BlocksMovement())
@@ -2247,6 +2313,9 @@ async def main() -> None:
                 ),
                 priority=1,
             )
+            # TimeProcessor runs first (priority above movement) so the clock is
+            # current before needs/AI read the time of day this turn.
+            esper.add_processor(TimeProcessor(), priority=2)
             esper.add_processor(NpcAiProcessor(game_map), priority=0)
             esper.add_processor(NeedsProcessor(), priority=0)
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
@@ -2304,6 +2373,11 @@ async def main() -> None:
                 if action == "ui_layout_changed":
                     save_options(options)
                     esper.process(None)
+                    continue
+                if action == "sleep":
+                    held_directions.clear()
+                    # Rest at home when a bed is at hand; otherwise pitch a camp.
+                    await _sleep_player(renderer, in_camp=not _player_near_bed())
                     continue
                 if action in _CARDINAL_ACTION_DELTAS:
                     held_directions.add(action)
@@ -2376,6 +2450,11 @@ async def main() -> None:
                         if interact_stove is not None:
                             queue_message(_cook_at_stove(interact_stove, player_ent))
                             esper.process(None)
+                            continue
+
+                        interact_bed = _find_adjacent_feature(interact_action, Bed)
+                        if interact_bed is not None:
+                            await _sleep_player(renderer, in_camp=False)
                             continue
 
                 if action in {"open_menu", "open_inventory", "open_status"}:

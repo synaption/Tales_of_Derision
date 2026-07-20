@@ -55,7 +55,13 @@ def test_initial_tick_renders_map_player_and_status_line() -> None:
     assert renderer.glyphs[(0, 0)] == game_map.WALL
     assert renderer.glyphs[(1, 1)] == game_map.FLOOR
     assert renderer.glyphs[(player_pos.x, player_pos.y)] == "@"
-    assert (0, game_map.height, "I inventory  C status  Esc menu  +/- tile scale") in renderer.text
+    status_lines = [text for x, y, text in renderer.text if (x, y) == (0, game_map.height)]
+    assert status_lines, "expected a status line at the bottom row"
+    status_line = status_lines[0]
+    # The status line leads with the time of day and lists the key hints.
+    assert status_line.startswith("Day")
+    assert "R sleep" in status_line
+    assert "C status" in status_line
     assert any(text == "[NEARBY]" for _x, _y, text in renderer.text)
     assert any(text.startswith("g → Goblin") or text.startswith("You notice Goblin") for _x, _y, text in renderer.text)
     assert any(text == "[LOG]" for _x, _y, text in renderer.text)

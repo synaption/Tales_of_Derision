@@ -69,14 +69,18 @@ class Corpse:
 class Needs:
     """Survival needs. Values rise each turn; 0 is sated, ``max_value`` is dire.
 
-    Only entities that get hungry/thirsty (currently the player) carry this. The
-    per-turn increase is stored here so different creatures could tick at
-    different rates later without touching the processor.
+    Every creature that eats/drinks/sleeps carries this. The per-turn increase is
+    stored here so different creatures could tick at different rates without
+    touching the processor. ``tiredness`` climbs like the others but faster at
+    night (the multiplier lives in ``systems``) and is reduced by sleeping rather
+    than by eating/drinking.
     """
     hunger: float = 0.0
     thirst: float = 0.0
+    tiredness: float = 0.0
     hunger_rate: float = 1.0
     thirst_rate: float = 1.4
+    tiredness_rate: float = 0.5
     max_value: float = 100.0
 
 
@@ -123,6 +127,41 @@ class Well:
 class Stove:
     """Tag component: a cooking station that turns Wood + Raw Meat into a
     Cooked Meat."""
+
+
+@dataclass
+class WorldClock:
+    """Singleton component tracking the passage of time. ``turn`` advances once
+    per real turn; a full day is ``day_length`` turns. ``systems`` derives the
+    time-of-day phase (and whether it is night) from ``turn % day_length``."""
+    turn: int = 0
+    day_length: int = 240
+
+
+@dataclass
+class Home:
+    """The tile a character returns to in order to sleep. NPCs prefer their home
+    over camping; the player's bed sits on (or beside) theirs."""
+    x: int
+    y: int
+
+
+@dataclass
+class Bed:
+    """Tag component: a place the player interacts with to sleep at home."""
+
+
+@dataclass
+class Camp:
+    """Tag component: a temporary campsite a character sets up to sleep away from
+    home. Broken (removed) when the sleeper wakes."""
+
+
+@dataclass
+class Asleep:
+    """Tag: the character is sleeping. Sleepers skip their turn while their
+    tiredness recovers; ``in_camp`` marks a camp to break on waking."""
+    in_camp: bool = False
 
 
 @dataclass

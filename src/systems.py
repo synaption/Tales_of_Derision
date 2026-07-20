@@ -9,7 +9,7 @@ import time
 
 import esper
 
-from components import BlocksMovement, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Inventory, Meat, Name, Needs, NPC, OnFire, Player, Position, Renderable, Stove, Tree, Vision
+from components import Asleep, Bed, BlocksMovement, Camp, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Player, Position, Renderable, Stove, Tree, Vision, WorldClock
 from game_map import GameMap
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from renderer.base import Renderer
@@ -75,12 +75,17 @@ _STATUS_BASE_SECONDS = 1.0
 _STATUS_DISPLAY: dict[str, tuple[str, tuple[int, int, int] | None, float]] = {
     "swimming": ("~", None, 0.5),
     "on_fire": ("F", (224, 74, 44), 0.5),
+    "asleep": ("Z", (150, 170, 220), 0.6),
 }
 # Order the identifiers cycle in, after the base tile.
-_STATUS_ORDER: tuple[str, ...] = ("swimming", "on_fire")
+_STATUS_ORDER: tuple[str, ...] = ("swimming", "on_fire", "asleep")
 
 # Human-readable status names for status/examine screens.
-_STATUS_LABELS: dict[str, str] = {"swimming": "Swimming", "on_fire": "On fire"}
+_STATUS_LABELS: dict[str, str] = {
+    "swimming": "Swimming",
+    "on_fire": "On fire",
+    "asleep": "Asleep",
+}
 
 
 def status_label(name: str) -> str:
@@ -95,6 +100,8 @@ def active_statuses(game_map: GameMap, ent: int, pos: Position) -> list[str]:
         active.add("swimming")
     if esper.has_component(ent, OnFire):
         active.add("on_fire")
+    if esper.has_component(ent, Asleep):
+        active.add("asleep")
     return [name for name in _STATUS_ORDER if name in active]
 
 
@@ -104,6 +111,145 @@ def player_is_animated(game_map: GameMap) -> bool:
     for ent, (pos, _player) in esper.get_components(Position, Player):
         return bool(active_statuses(game_map, ent, pos))
     return False
+
+
+# --- Day / night cycle -----------------------------------------------------
+# A day runs dawn -> day -> dusk -> night as a fraction of ``WorldClock``. The
+# boundaries below are fractions of ``day_length``; tune them freely.
+_PHASE_BOUNDS: tuple[tuple[float, str], ...] = (
+    (0.10, "Dawn"),
+    (0.45, "Day"),
+    (0.55, "Day"),
+    (0.70, "Dusk"),
+    (1.00, "Night"),
+)
+# Phases counted as "night" for the tiredness multiplier and the screen tint.
+_NIGHTFALL_PHASES: frozenset[str] = frozenset({"Dusk", "Night"})
+# Tiredness climbs this much faster while it is night.
+_NIGHT_TIREDNESS_MULTIPLIER = 2.0
+# Colour of the darkening overlay drawn over the world after dusk.
+_NIGHT_TINT = (12, 20, 54)
+
+
+def world_clock() -> WorldClock | None:
+    """The singleton world clock, or ``None`` on maps that never created one
+    (e.g. focused unit tests)."""
+    for _ent, (clock,) in esper.get_components(WorldClock):
+        return clock
+    return None
+
+
+def day_fraction(clock: WorldClock) -> float:
+    """Where we are in the current day, in ``[0.0, 1.0)``."""
+    if clock.day_length <= 0:
+        return 0.0
+    return (clock.turn % clock.day_length) / clock.day_length
+
+
+def time_phase(clock: WorldClock | None) -> str:
+    """Human-readable phase of day (``"Dawn"``/``"Day"``/``"Dusk"``/``"Night"``).
+    A missing clock reads as plain ``"Day"``."""
+    if clock is None:
+        return "Day"
+    fraction = day_fraction(clock)
+    for upper, label in _PHASE_BOUNDS:
+        if fraction < upper:
+            return label
+    return _PHASE_BOUNDS[-1][1]
+
+
+def is_night(clock: WorldClock | None) -> bool:
+    """True during the phases when tiredness climbs faster and the world dims."""
+    return time_phase(clock) in _NIGHTFALL_PHASES
+
+
+def night_overlay_alpha(clock: WorldClock | None) -> int:
+    """Alpha (0-255) for the darkening night overlay: none by day, a light wash
+    at dusk/dawn, deeper at night. Zero means draw nothing."""
+    phase = time_phase(clock)
+    if phase == "Night":
+        return 110
+    if phase in ("Dusk", "Dawn"):
+        return 55
+    return 0
+
+
+class TimeProcessor(esper.Processor):
+    """Advances the world clock one tick per real turn and announces the day's
+    phase changes (``"Night falls."`` and friends) in the log."""
+
+    _PHASE_MESSAGES = {
+        "Dawn": "The sky lightens as dawn breaks.",
+        "Day": "The sun climbs into the sky.",
+        "Dusk": "The light fades as dusk settles in.",
+        "Night": "Night falls over the land.",
+    }
+
+    def __init__(self) -> None:
+        self._last_phase: str | None = None
+
+    def process(self, action: str | None = None) -> None:
+        if action not in _TURN_ACTIONS:
+            return
+        clock = world_clock()
+        if clock is None:
+            return
+        clock.turn += 1
+        phase = time_phase(clock)
+        if phase != self._last_phase:
+            if self._last_phase is not None:
+                _push_turn_event(self._PHASE_MESSAGES.get(phase, ""))
+            self._last_phase = phase
+
+
+# --- Sleep, camps, and waking ----------------------------------------------
+_CAMP_GLYPH = "^"
+_CAMP_ORANGE = (210, 130, 60)
+
+
+def _camp_at(x: int, y: int) -> int | None:
+    for ent, (pos, _camp) in esper.get_components(Position, Camp):
+        if (pos.x, pos.y) == (x, y):
+            return ent
+    return None
+
+
+def go_to_sleep(ent: int, in_camp: bool) -> None:
+    """Put a character to sleep. Camping pitches a campfire on its tile (if one
+    isn't already there); sleeping at home just marks it ``Asleep``."""
+    if not esper.has_component(ent, Asleep):
+        esper.add_component(ent, Asleep(in_camp=in_camp))
+    if in_camp and esper.has_component(ent, Position):
+        pos = esper.component_for_entity(ent, Position)
+        if _camp_at(pos.x, pos.y) is None:
+            esper.create_entity(
+                Position(pos.x, pos.y),
+                Renderable(_CAMP_GLYPH, fg=_CAMP_ORANGE),
+                Name("Camp"),
+                Camp(),
+            )
+
+
+def wake_up(ent: int) -> None:
+    """Wake a sleeper: drop the ``Asleep`` tag, break any camp it pitched, and
+    (for the player) log that it rose. Safe to call on an already-awake entity."""
+    in_camp = False
+    if esper.has_component(ent, Asleep):
+        in_camp = esper.component_for_entity(ent, Asleep).in_camp
+        esper.remove_component(ent, Asleep)
+    if in_camp and esper.has_component(ent, Position):
+        pos = esper.component_for_entity(ent, Position)
+        camp_ent = _camp_at(pos.x, pos.y)
+        if camp_ent is not None:
+            esper.delete_entity(camp_ent, immediate=True)
+    if esper.has_component(ent, Player):
+        _push_turn_event("You wake, feeling rested.")
+
+
+# Tiredness (percent of max) at which an NPC drops what it's doing to sleep, and
+# the level past which it gives up on reaching home and camps where it stands.
+_SLEEP_THRESHOLD = 70.0
+_EXHAUSTED_THRESHOLD = 95.0
 
 _AUTOTILE_DIRECTION_OFFSETS = {
     1: (-1, -1),
@@ -557,6 +703,34 @@ class NpcAiProcessor(esper.Processor):
             return self._cook_at_stove(ent, pos, inventory, stoves, occupied)
         return self._gather_wood(ent, pos, inventory, trees, occupied)
 
+    def _seek_sleep(
+        self, ent: int, pos: Position, needs: Needs, occupied: dict[tuple[int, int], int]
+    ) -> bool:
+        """A tired NPC heads for bed. It prefers its home tile, walking there a
+        step at a time; homeless creatures (and any too exhausted to make it
+        home) camp where they stand."""
+        home = None
+        if esper.has_component(ent, Home):
+            home = esper.component_for_entity(ent, Home)
+
+        if home is None:
+            go_to_sleep(ent, in_camp=True)
+            return True
+
+        home_xy = (home.x, home.y)
+        if (pos.x, pos.y) == home_xy:
+            go_to_sleep(ent, in_camp=False)
+            return True
+
+        if self._step_toward(ent, pos, home_xy, occupied):
+            return True
+
+        # Couldn't advance toward home; collapse into a camp only when spent.
+        if needs.tiredness >= _EXHAUSTED_THRESHOLD:
+            go_to_sleep(ent, in_camp=True)
+            return True
+        return False
+
     def _chase_player(
         self,
         ent: int,
@@ -601,6 +775,9 @@ class NpcAiProcessor(esper.Processor):
         for ent, (pos, _npc) in list(esper.get_components(Position, NPC)):
             if not esper.entity_exists(ent):
                 continue
+            # Sleepers skip their turn; NeedsProcessor recovers and wakes them.
+            if esper.has_component(ent, Asleep):
+                continue
             acted = False
 
             if esper.has_component(ent, Needs):
@@ -609,8 +786,12 @@ class NpcAiProcessor(esper.Processor):
                 if esper.has_component(ent, Diet):
                     diet_kind = esper.component_for_entity(ent, Diet).kind
 
+                # Sleep is the strongest drive: a spent creature beds down before
+                # it forages, preferring its home over camping.
+                if needs.tiredness >= _SLEEP_THRESHOLD:
+                    acted = self._seek_sleep(ent, pos, needs, occupied)
                 # Thirst wins ties -- a parched animal drinks before it eats.
-                if needs.thirst >= _FORAGE_THRESHOLD and needs.thirst >= needs.hunger:
+                elif needs.thirst >= _FORAGE_THRESHOLD and needs.thirst >= needs.hunger:
                     acted = self._seek_water(ent, pos, needs, occupied)
                 elif needs.hunger >= _FORAGE_THRESHOLD:
                     # Eat prepared food already carried; otherwise forage by diet.
@@ -645,6 +826,14 @@ _THIRST_WARNINGS = (
     (80.0, "Your throat is parched."),
     (50.0, "You are getting thirsty."),
 )
+_TIREDNESS_WARNINGS = (
+    (100.0, "You can barely keep your eyes open."),
+    (80.0, "You are exhausted and need sleep."),
+    (50.0, "You are getting tired."),
+)
+
+# How much tiredness a single turn of sleep restores.
+_SLEEP_RECOVERY = 3.0
 
 
 def _crossed_warning(
@@ -672,11 +861,27 @@ class NeedsProcessor(esper.Processor):
         if action not in _TURN_ACTIONS:
             return
 
+        night = is_night(world_clock())
+        woke: list[int] = []
+
         for ent, (needs,) in esper.get_components(Needs):
             prev_hunger = needs.hunger
             prev_thirst = needs.thirst
+            prev_tiredness = needs.tiredness
+            asleep = esper.has_component(ent, Asleep)
+
+            # Hunger and thirst creep up whether awake or asleep.
             needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate)
             needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate)
+
+            if asleep:
+                # Sleeping pays down tiredness; waking is handled after the loop.
+                needs.tiredness = max(0.0, needs.tiredness - _SLEEP_RECOVERY)
+                if needs.tiredness <= 0.0:
+                    woke.append(ent)
+            else:
+                rate = needs.tiredness_rate * (_NIGHT_TIREDNESS_MULTIPLIER if night else 1.0)
+                needs.tiredness = min(needs.max_value, needs.tiredness + rate)
 
             # Every creature accumulates needs, but only the player's are
             # surfaced as log warnings -- a hungry goblin shouldn't print
@@ -690,6 +895,14 @@ class NeedsProcessor(esper.Processor):
             thirst_msg = _crossed_warning(prev_thirst, needs.thirst, _THIRST_WARNINGS)
             if thirst_msg is not None:
                 _push_turn_event(thirst_msg)
+            # Tiredness warnings only make sense while awake (it falls in sleep).
+            if not asleep:
+                tired_msg = _crossed_warning(prev_tiredness, needs.tiredness, _TIREDNESS_WARNINGS)
+                if tired_msg is not None:
+                    _push_turn_event(tired_msg)
+
+        for ent in woke:
+            wake_up(ent)
 
 
 class RenderProcessor(esper.Processor):
@@ -1445,12 +1658,24 @@ class RenderProcessor(esper.Processor):
 
         self._draw_sidebar(player_pos, entity_lookup)
 
+        # Dim the world when night draws in (a translucent wash over everything
+        # already drawn). Skipped on renderers without the overlay hook (tests).
+        clock = world_clock()
+        overlay_alpha = night_overlay_alpha(clock)
+        draw_overlay = getattr(r, "draw_overlay", None)
+        if overlay_alpha > 0 and callable(draw_overlay):
+            draw_overlay(_NIGHT_TINT, overlay_alpha)
+
         draw_text_clipped = getattr(r, "draw_text_clipped", None)
+        time_text = f"{time_phase(clock)}  "
         needs_text = ""
         if player_ent is not None and esper.has_component(player_ent, Needs):
             needs = esper.component_for_entity(player_ent, Needs)
-            needs_text = f"Hunger {int(needs.hunger)}%  Thirst {int(needs.thirst)}%    "
-        status_line = f"{needs_text}I inventory  C status  Esc menu  +/- tile scale"
+            needs_text = (
+                f"Hunger {int(needs.hunger)}%  Thirst {int(needs.thirst)}%  "
+                f"Tired {int(needs.tiredness)}%    "
+            )
+        status_line = f"{time_text}{needs_text}I inv  C status  R sleep  Esc menu"
         if callable(draw_text_clipped):
             draw_text_clipped(0, self._status_y, status_line, self._grid_w)
         else:

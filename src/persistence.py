@@ -39,6 +39,7 @@ _DEFAULT_OPTIONS = {
         "open_menu": ["tab"],
         "open_inventory": ["i"],
         "open_status": ["c"],
+        "sleep": ["r"],
         "open_pause_menu": ["esc"],
         "tile_scale_up": ["equals", "kp_plus"],
         "tile_scale_down": ["minus", "kp_minus"],
