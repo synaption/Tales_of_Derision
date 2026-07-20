@@ -1,4 +1,4 @@
 from .base import Renderer
-from .terminal import TerminalRenderer
+from .pygame_renderer import PygameRenderer
 
-__all__ = ["Renderer", "TerminalRenderer"]
+__all__ = ["Renderer", "PygameRenderer"]

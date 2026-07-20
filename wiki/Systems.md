@@ -2,7 +2,7 @@
 
 Systems (esper calls them **processors**) hold all behaviour. Each subclasses
 `esper.Processor` and implements `process(*args)`, which receives whatever was
-passed to `esper.process(...)`. Defined in [`systems.py`](../systems.py).
+passed to `esper.process(...)`. Defined in [src/systems.py](../src/systems.py).
 
 ## `MovementProcessor` (priority 1)
 
@@ -50,16 +50,17 @@ class RenderProcessor(esper.Processor):
         for _ent, (pos, rend) in esper.get_components(Position, Renderable):
             r.draw_glyph(pos.x, pos.y, rend.glyph)
         # 3. UI
-        r.draw_text(0, self.game_map.height, "move: arrows/hjkl/wasd   menu: esc")
+        r.draw_text(0, self.game_map.height, "I inventory  Esc menu  +/- tile scale")
         r.present()
 ```
 
-It talks only to the [`Renderer`](Renderers.md) interface, never to curses.
+    It talks only to the [`Renderer`](Renderers.md) interface, never to pygame
+    directly.
 
 ## Priority and ordering
 
 `esper.process(action)` calls each processor's `process(action)` in **descending
-priority**. Registration in [`main.py`](../main.py):
+priority**. Registration in [src/main.py](../src/main.py):
 
 ```python
 esper.add_processor(MovementProcessor(game_map), priority=1)  # runs first
@@ -70,9 +71,9 @@ Move-before-draw means a keypress is reflected in the same frame.
 
 ## Adding a system
 
-1. Subclass `esper.Processor` in [`systems.py`](../systems.py) and implement
+1. Subclass `esper.Processor` in [src/systems.py](../src/systems.py) and implement
    `process(self, action=None)`.
-2. Register it in [`main.py`](../main.py) with a `priority` that places it
+2. Register it in [src/main.py](../src/main.py) with a `priority` that places it
    correctly relative to movement and rendering.
 3. Query the components it needs with `esper.get_components(...)`.
 

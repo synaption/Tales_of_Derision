@@ -4,62 +4,66 @@
 
 - **Python 3.12+** (uses `str | None` syntax in annotations)
 - **[esper](https://github.com/benmoran56/esper) 3.x** — the ECS library
-- **curses** — for the terminal backend (standard library on Linux/macOS; on
-  Windows use `windows-curses` or run under WSL)
+- **pygame** — window/input/audio runtime used by the game
 
 ## Install
 
 ```bash
-pip install esper
+python3 -m pip install --user esper pygame
 ```
 
 ## Run
 
 ```bash
-cd project-alpha/pyRL2
-python3 main.py
+python3 src/main.py
 ```
 
 Load a specific save and skip title/main menu:
 
 ```bash
-python3 main.py --save_file data/saves/my_run.json
+python3 src/main.py --save_file src/data/saves/my_run.json
 ```
-
-> ⚠️ curses needs a **real terminal**. It will not run from an IDE output pane or
-> a captured/non-TTY process.
 
 ## Controls
 
+### Gameplay controls
+
 | Action | Keys |
 |--------|------|
-| Move up | `w` · `k` · ↑ |
-| Move down | `s` · `j` · ↓ |
-| Move left | `a` · `h` · ← |
-| Move right | `d` · `l` · → |
+| Set direction | Hold `W/A/S/D` |
+| Take a turn / move | `Space` |
+| Interact / menu select | `Enter` |
+| Open inventory | `I` |
 | Open pause menu | `Esc` |
+| Tile scale up/down | `+` / `-` |
+
+Diagonal movement is supported by holding two directions (for example `W` + `D`)
+while pressing `Space`.
 
 ### Menu controls
 
 | Action | Keys |
 |--------|------|
-| Move selection | `w/s` · `k/j` · ↑/↓ |
+| Move selection | `W/S` |
 | Select item | `Enter` |
 | Close pause menu (resume) | `Esc` |
 
 Pause menu contains `Save Game`, `Options`, and `Quit`.
 
-Key-to-action mapping lives in [`renderer/terminal.py`](../renderer/terminal.py);
-see [Renderers](Renderers.md) to change it.
+Key-to-action mapping lives in [src/renderer/pygame_renderer.py](../src/renderer/pygame_renderer.py);
+see [Renderers](Renderers.md) for backend details.
 
 ## Saves and options files
 
-- Default save: `data/saves/default_save.json`
-- Default options: `data/config/default_options.json`
-- Working options: `data/config/options.json`
+- Default save: `src/data/saves/default_save.json`
+- Default options: `src/data/config/default_options.json`
+- Working options: `src/data/config/options.json`
 - On startup, missing `options.json` is auto-copied from `default_options.json`.
 
-## Verifying without a terminal
+Keybinds live under `keybinds` in `options.json` using action names (for example
+`move_up`, `confirm_action`, `open_pause_menu`).
+
+## Verifying headlessly
 
 Because the renderer is decoupled, you can drive the whole game headless with a
 fake renderer that records `draw_glyph` calls and feeds actions to

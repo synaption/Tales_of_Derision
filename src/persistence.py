@@ -22,13 +22,24 @@ WORKING_OPTIONS_FILE = CONFIG_DIR / "options.json"
 _DEFAULT_OPTIONS = {
     "fullscreen": False,
     "show_fps": False,
+    "tile_scale": 1.5,
+    "ui_scale": 1.0,
+    "sidebar_width_ratio": 0.22,
+    "audio_buffer": 16384,
+    "combat_sfx": True,
+    "melee_attack_sfx": "audio/sfx/swipe.wav",
+    "death_sfx": "audio/sfx/splat_quick.wav",
     "keybinds": {
-        "up": ["w", "k", "up"],
-        "down": ["s", "j", "down"],
-        "left": ["a", "h", "left"],
-        "right": ["d", "l", "right"],
-        "save": ["p"],
-        "quit": ["q", "esc"],
+        "move_up": ["w"],
+        "move_down": ["s"],
+        "move_left": ["a"],
+        "move_right": ["d"],
+        "confirm_action": ["space"],
+        "menu_select": ["enter", "kp_enter"],
+        "open_inventory": ["i"],
+        "open_pause_menu": ["esc"],
+        "tile_scale_up": ["equals", "kp_plus"],
+        "tile_scale_down": ["minus", "kp_minus"],
     },
 }
 
@@ -75,7 +86,15 @@ def load_options() -> dict:
         payload = json.load(file)
     if not isinstance(payload, dict):
         return dict(_DEFAULT_OPTIONS)
-    return payload
+
+    merged = dict(_DEFAULT_OPTIONS)
+    merged.update(payload)
+    if isinstance(_DEFAULT_OPTIONS.get("keybinds"), dict):
+        merged_keybinds = dict(_DEFAULT_OPTIONS["keybinds"])
+        if isinstance(payload.get("keybinds"), dict):
+            merged_keybinds.update(payload["keybinds"])
+        merged["keybinds"] = merged_keybinds
+    return merged
 
 
 def save_options(options: dict) -> None:

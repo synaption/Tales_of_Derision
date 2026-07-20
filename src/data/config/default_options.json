@@ -1,33 +1,46 @@
 {
   "fullscreen": false,
   "show_fps": false,
+  "tile_scale": 1.5,
+  "ui_scale": 1.0,
+  "sidebar_width_ratio": 0.22,
+  "audio_buffer": 16384,
+  "combat_sfx": true,
+  "melee_attack_sfx": "audio/sfx/swipe.wav",
+  "death_sfx": "audio/sfx/splat_quick.wav",
   "keybinds": {
-    "up": [
-      "w",
-      "k",
-      "up"
+    "move_up": [
+      "w"
     ],
-    "down": [
-      "s",
-      "j",
-      "down"
+    "move_down": [
+      "s"
     ],
-    "left": [
-      "a",
-      "h",
-      "left"
+    "move_left": [
+      "a"
     ],
-    "right": [
-      "d",
-      "l",
-      "right"
+    "move_right": [
+      "d"
     ],
-    "save": [
-      "p"
+    "confirm_action": [
+      "space"
     ],
-    "quit": [
-      "q",
+    "menu_select": [
+      "enter",
+      "kp_enter"
+    ],
+    "open_inventory": [
+      "i"
+    ],
+    "open_pause_menu": [
       "esc"
+    ],
+    "tile_scale_up": [
+      "equals",
+      "kp_plus"
+    ],
+    "tile_scale_down": [
+      "minus",
+      "kp_minus"
     ]
   }
 }

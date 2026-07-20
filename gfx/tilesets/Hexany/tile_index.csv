@@ -1,0 +1,453 @@
+tilesheet,tile_number,tile_name
+creatures,0,humanoid adventurer / NPC variant
+creatures,1,humanoid adventurer / NPC variant
+creatures,2,humanoid adventurer / NPC variant
+creatures,3,humanoid adventurer / NPC variant
+creatures,4,humanoid adventurer / NPC variant
+creatures,5,humanoid adventurer / NPC variant
+creatures,6,humanoid adventurer / NPC variant
+creatures,7,humanoid adventurer / NPC variant
+creatures,8,humanoid adventurer / NPC variant
+creatures,9,humanoid adventurer / NPC variant
+creatures,10,humanoid adventurer / NPC variant
+creatures,11,humanoid adventurer / NPC variant
+creatures,12,humanoid adventurer / NPC variant
+creatures,13,humanoid adventurer / NPC variant
+creatures,14,humanoid adventurer / NPC variant
+creatures,15,humanoid adventurer / NPC variant
+creatures,16,humanoid adventurer / NPC variant
+creatures,17,humanoid adventurer / NPC variant
+creatures,18,humanoid adventurer / NPC variant
+creatures,19,humanoid adventurer / NPC variant
+creatures,20,humanoid adventurer / NPC variant
+creatures,21,humanoid adventurer / NPC variant
+creatures,22,humanoid adventurer / NPC variant
+creatures,23,humanoid adventurer / NPC variant
+creatures,24,humanoid adventurer / NPC variant
+creatures,25,humanoid adventurer / NPC variant
+creatures,26,humanoid adventurer / NPC variant
+creatures,27,humanoid adventurer / NPC variant
+creatures,48,small monster / goblin-like creature
+creatures,49,small monster / goblin-like creature
+creatures,50,small monster / goblin-like creature
+creatures,51,small monster / goblin-like creature
+creatures,52,small monster / goblin-like creature
+creatures,53,small monster / goblin-like creature
+creatures,54,small monster / goblin-like creature
+creatures,55,small monster / goblin-like creature
+creatures,56,small humanoid / mage variant
+creatures,57,small humanoid / mage variant
+creatures,58,small humanoid / mage variant
+creatures,59,small humanoid / mage variant
+creatures,60,small flying/monster icon
+creatures,61,small flying/monster icon
+creatures,62,small flying/monster icon
+creatures,63,small flying/monster icon
+creatures,64,large monster / humanoid beast variant
+creatures,65,large monster / humanoid beast variant
+creatures,66,large monster / humanoid beast variant
+creatures,67,large monster / humanoid beast variant
+creatures,68,large monster / humanoid beast variant
+creatures,69,large monster / humanoid beast variant
+creatures,70,large monster / humanoid beast variant
+creatures,71,large monster / humanoid beast variant
+creatures,72,large monster / humanoid beast variant
+creatures,73,large monster / humanoid beast variant
+creatures,74,large monster / humanoid beast variant
+creatures,75,large monster / humanoid beast variant
+creatures,76,large monster / humanoid beast variant
+creatures,96,skeleton / ghostly creature
+creatures,97,skeleton / ghostly creature
+creatures,98,skeleton / ghostly creature
+creatures,99,skeleton / ghostly creature
+creatures,100,orb / elemental / eye monster
+creatures,101,orb / elemental / eye monster
+creatures,102,orb / elemental / eye monster
+creatures,103,orb / elemental / eye monster
+creatures,104,orb / elemental / eye monster
+creatures,105,spirit / blob / jelly creature
+creatures,106,spirit / blob / jelly creature
+creatures,107,spirit / blob / jelly creature
+creatures,108,spirit / blob / jelly creature
+creatures,109,tree/plant monster or winged creature
+creatures,110,tree/plant monster or winged creature
+creatures,111,tree/plant monster or winged creature
+creatures,112,hooded figure / ghost variant
+creatures,113,hooded figure / ghost variant
+creatures,114,hooded figure / ghost variant
+creatures,115,hooded figure / ghost variant
+creatures,116,humanoid monster / beast variant
+creatures,117,humanoid monster / beast variant
+creatures,118,humanoid monster / beast variant
+creatures,119,humanoid monster / beast variant
+creatures,120,humanoid monster / beast variant
+creatures,121,humanoid monster / beast variant
+creatures,144,small animal / rodent variant
+creatures,145,small animal / rodent variant
+creatures,146,small animal / rodent variant
+creatures,147,small animal / rodent variant
+creatures,148,large animal / beast variant
+creatures,149,large animal / beast variant
+creatures,150,large animal / beast variant
+creatures,151,large animal / beast variant
+creatures,152,large animal / beast variant
+creatures,153,bird / flying creature variant
+creatures,154,bird / flying creature variant
+creatures,155,bird / flying creature variant
+creatures,156,bird / flying creature variant
+creatures,157,bird / flying creature variant
+creatures,160,flying beast / bird / dragon variant
+creatures,161,flying beast / bird / dragon variant
+creatures,162,flying beast / bird / dragon variant
+creatures,163,flying beast / bird / dragon variant
+creatures,164,flying beast / bird / dragon variant
+creatures,165,flying beast / bird / dragon variant
+creatures,166,flying beast / bird / dragon variant
+creatures,167,flying beast / bird / dragon variant
+creatures,168,flying beast / bird / dragon variant
+creatures,192,flying monster / dragon / magical entity
+creatures,193,flying monster / dragon / magical entity
+creatures,194,flying monster / dragon / magical entity
+creatures,195,flying monster / dragon / magical entity
+creatures,196,flying monster / dragon / magical entity
+creatures,197,flying monster / dragon / magical entity
+creatures,198,flying monster / dragon / magical entity
+creatures,199,flying monster / dragon / magical entity
+creatures,224,terrain hazard / plant / nest
+creatures,225,terrain hazard / plant / nest
+creatures,226,terrain hazard / plant / nest
+creatures,227,structure / statue / object creature
+creatures,228,structure / statue / object creature
+creatures,229,structure / statue / object creature
+creatures,230,structure / statue / object creature
+creatures,231,slime / mushroom / plant creature
+creatures,232,slime / mushroom / plant creature
+creatures,233,slime / mushroom / plant creature
+creatures,234,slime / mushroom / plant creature
+creatures,235,slime / mushroom / plant creature
+creatures,236,slime / mushroom / plant creature
+creatures,237,large beast / worm creature
+creatures,238,large beast / worm creature
+creatures,239,large beast / worm creature
+creatures,240,large monster / beast variant
+creatures,241,large monster / beast variant
+creatures,242,large monster / beast variant
+creatures,243,large monster / beast variant
+creatures,244,large monster / beast variant
+creatures,245,large monster / beast variant
+creatures,246,large monster / beast variant
+creatures,247,large monster / beast variant
+creatures,248,large monster / beast variant
+creatures,249,large monster / beast variant
+creatures,250,large monster / beast variant
+creatures,251,large monster / beast variant
+creatures,252,large monster / beast variant
+creatures,253,large monster / beast variant
+creatures,254,large monster / beast variant
+creatures,255,large monster / beast variant
+creatures,256,small monster / demon / beast variant
+creatures,257,small monster / demon / beast variant
+creatures,258,small monster / demon / beast variant
+creatures,259,small monster / demon / beast variant
+creatures,260,small monster / demon / beast variant
+creatures,261,small monster / demon / beast variant
+general,0,cursor
+general,1,default dot
+general,2,stairs down
+general,3,stairs up
+general,4,door
+general,5,open door
+general,6,gate
+general,7,door no wall
+general,8,door no wall open
+general,9,gate no wall
+general,10,window
+general,11,cursor bullseye
+general,12,cursor blocking
+general,13,floor pillow
+general,14,lever
+general,15,cauldron bubbling
+general,16,cauldron
+general,17,keyboard
+general,18,chair
+general,19,throne
+general,20,table
+general,21,grave
+general,22,stone tablet
+general,23,pot
+general,24,coffin
+general,25,coffin open
+general,26,treasure chest
+general,27,treasure chest open
+general,28,treasure chest alt
+general,29,treasure chest open alt
+general,30,box
+general,31,broken box
+general,32,grass
+general,33,bush
+general,34,tree
+general,35,wheat
+general,36,bridge
+general,37,bridge verticle
+general,38,pentagram
+general,39,vortex
+general,40,stove
+general,41,stove with flame
+general,42,cabinet
+general,43,wardrobe
+general,44,wardrobe open
+general,45,alchemy table
+general,46,statue
+general,47,sink
+general,48,toilet
+general,49,bookshelf
+general,50,shelf
+general,51,candles lit
+general,52,candles unlit
+general,53,bones
+general,54,rubble
+general,55,fence in wall
+general,56,fence
+general,57,stones
+general,58,spikes
+general,59,rail verticle
+general,60,rail horizontal
+general,61,tv off
+general,62,tv on
+general,63,stalagtight
+general,64,banner
+general,65,small debris / stones
+general,66,rock pile
+general,67,rock / boulder
+general,68,stalagmite / rock spire
+general,69,
+general,70,
+items,0,long sword
+items,1,short sword / dagger
+items,2,slanted sword
+items,3,club / cudgel
+items,4,magic wand
+items,5,mace
+items,6,axe
+items,7,pickaxe
+items,8,pickaxe variant
+items,9,bow
+items,10,staff / hooked tool
+items,11,small shield / buckler
+items,12,arrow / bolt
+items,13,star / shuriken
+items,24,dagger
+items,25,rapier / narrow sword
+items,26,knife
+items,27,curved dagger
+items,28,hatchet
+items,29,hand axe
+items,30,battle axe head
+items,31,spear / javelin
+items,32,halberd / polearm
+items,33,crossbow
+items,34,small pouch / herbs
+items,35,gem cluster / ore
+items,36,scroll / parchment
+items,37,ring / amulet
+items,48,chest armor / breastplate
+items,49,chainmail / scale armor
+items,50,tunic / armor vest
+items,51,belt / sash
+items,52,boot
+items,53,helmet
+items,54,skull mask / helm
+items,55,round shield
+items,56,kite shield
+items,57,door / tall shield
+items,58,food / meat scraps
+items,59,food / meat scraps variant
+items,60,pants / leggings
+items,61,wing / cloak
+items,72,cauldron / pot
+items,73,necklace / pendant
+items,74,magic wand / staff
+items,75,key ring / bones
+items,76,sparkles / magic effect
+items,77,egg / rock
+items,78,candle / tower marker
+items,79,feather
+items,80,bag / backpack
+items,81,wand / scepter
+items,82,potion bottle
+items,83,broken bone / tool
+items,84,treasure chest
+items,85,money bag
+items,86,chain / hook
+items,87,rope / snake cord
+items,88,jar / barrel
+items,89,map / document
+items,90,waterskin / flask
+items,91,bird / winged item
+items,92,horned skull
+items,93,fish bones
+items,94,egg / pebble
+items,95,crown / diadem
+items,96,book / tome
+items,97,potion flask
+items,98,flower / herbs
+items,99,house / hut icon
+items,100,ring with sparkle
+items,101,scythe
+items,102,bow / curved staff
+items,103,map / parchment
+items,104,orb / crystal ball
+items,105,lantern
+items,106,seated small figure
+items,107,kneeling small figure
+items,108,cloak / robe
+items,109,pedestal / stand
+items,110,needle / spike
+items,111,sword with hilt
+items,112,cracked wall / debris
+items,113,bed / bench
+items,114,tattered map / banner
+items,115,long key
+items,116,glove / hand
+items,117,shirt / tunic
+autotile_transparent_wall,0,wall208
+autotile_transparent_wall,1,wall248
+autotile_transparent_wall,2,wall104
+autotile_transparent_wall,12,wall214
+autotile_transparent_wall,13,wall255
+autotile_transparent_wall,14,wall107
+autotile_transparent_wall,24,wall22
+autotile_transparent_wall,25,wall31
+autotile_transparent_wall,26,wall11
+autotile_transparent_wall,4,wall64
+autotile_transparent_wall,16,wall66
+autotile_transparent_wall,28,wall2
+autotile_transparent_wall,6,wall80
+autotile_transparent_wall,7,wall88
+autotile_transparent_wall,8,wall72
+autotile_transparent_wall,18,wall82
+autotile_transparent_wall,19,wall90
+autotile_transparent_wall,20,wall74
+autotile_transparent_wall,30,wall18
+autotile_transparent_wall,31,wall26
+autotile_transparent_wall,32,wall10
+autotile_transparent_wall,9,wall91
+autotile_transparent_wall,10,wall94
+autotile_transparent_wall,21,wall122
+autotile_transparent_wall,22,wall218
+autotile_transparent_wall,48,wall16
+autotile_transparent_wall,49,wall24
+autotile_transparent_wall,50,wall8
+autotile_transparent_wall,52,wall0
+autotile_transparent_wall,54,wall219
+autotile_transparent_wall,55,wall126
+autotile_transparent_wall,45,wall123
+autotile_transparent_wall,46,wall95
+autotile_transparent_wall,57,wall250
+autotile_transparent_wall,58,wall222
+autotile_transparent_wall,3,wall127
+autotile_transparent_wall,5,wall223
+autotile_transparent_wall,15,wall251
+autotile_transparent_wall,17,wall254
+autotile_transparent_wall,27,wall120
+autotile_transparent_wall,29,wall216
+autotile_transparent_wall,33,wall27
+autotile_transparent_wall,34,wall30
+autotile_transparent_wall,36,wall86
+autotile_transparent_wall,37,wall75
+autotile_transparent_wall,38,wall210
+autotile_transparent_wall,39,wall106
+autotile_transparent_water,0,water208
+autotile_transparent_water,1,water248
+autotile_transparent_water,2,water104
+autotile_transparent_water,12,water214
+autotile_transparent_water,13,water255
+autotile_transparent_water,14,water107
+autotile_transparent_water,24,water22
+autotile_transparent_water,25,water31
+autotile_transparent_water,26,water11
+autotile_transparent_water,4,water64
+autotile_transparent_water,16,water66
+autotile_transparent_water,28,water2
+autotile_transparent_water,6,water80
+autotile_transparent_water,7,water88
+autotile_transparent_water,8,water72
+autotile_transparent_water,18,water82
+autotile_transparent_water,19,water90
+autotile_transparent_water,20,water74
+autotile_transparent_water,30,water18
+autotile_transparent_water,31,water26
+autotile_transparent_water,32,water10
+autotile_transparent_water,9,water91
+autotile_transparent_water,10,water94
+autotile_transparent_water,21,water122
+autotile_transparent_water,22,water218
+autotile_transparent_water,48,water16
+autotile_transparent_water,49,water24
+autotile_transparent_water,50,water8
+autotile_transparent_water,52,water0
+autotile_transparent_water,54,water219
+autotile_transparent_water,55,water126
+autotile_transparent_water,45,water123
+autotile_transparent_water,46,water95
+autotile_transparent_water,57,water250
+autotile_transparent_water,58,water222
+autotile_transparent_water,3,water127
+autotile_transparent_water,5,water223
+autotile_transparent_water,15,water251
+autotile_transparent_water,17,water254
+autotile_transparent_water,27,water120
+autotile_transparent_water,29,water216
+autotile_transparent_water,33,water27
+autotile_transparent_water,34,water30
+autotile_transparent_water,36,water86
+autotile_transparent_water,37,water75
+autotile_transparent_water,38,water210
+autotile_transparent_water,39,water106
+autotile_transparent_ledges,0,ledges208
+autotile_transparent_ledges,1,ledges248
+autotile_transparent_ledges,2,ledges104
+autotile_transparent_ledges,12,ledges214
+autotile_transparent_ledges,13,ledges255
+autotile_transparent_ledges,14,ledges107
+autotile_transparent_ledges,24,ledges22
+autotile_transparent_ledges,25,ledges31
+autotile_transparent_ledges,26,ledges11
+autotile_transparent_ledges,4,ledges64
+autotile_transparent_ledges,16,ledges66
+autotile_transparent_ledges,28,ledges2
+autotile_transparent_ledges,6,ledges80
+autotile_transparent_ledges,7,ledges88
+autotile_transparent_ledges,8,ledges72
+autotile_transparent_ledges,18,ledges82
+autotile_transparent_ledges,19,ledges90
+autotile_transparent_ledges,20,ledges74
+autotile_transparent_ledges,30,ledges18
+autotile_transparent_ledges,31,ledges26
+autotile_transparent_ledges,32,ledges10
+autotile_transparent_ledges,9,ledges91
+autotile_transparent_ledges,10,ledges94
+autotile_transparent_ledges,21,ledges122
+autotile_transparent_ledges,22,ledges218
+autotile_transparent_ledges,48,ledges16
+autotile_transparent_ledges,49,ledges24
+autotile_transparent_ledges,50,ledges8
+autotile_transparent_ledges,52,ledges0
+autotile_transparent_ledges,54,ledges219
+autotile_transparent_ledges,55,ledges126
+autotile_transparent_ledges,45,ledges123
+autotile_transparent_ledges,46,ledges95
+autotile_transparent_ledges,57,ledges250
+autotile_transparent_ledges,58,ledges222
+autotile_transparent_ledges,3,ledges127
+autotile_transparent_ledges,5,ledges223
+autotile_transparent_ledges,15,ledges251
+autotile_transparent_ledges,17,ledges254
+autotile_transparent_ledges,27,ledges120
+autotile_transparent_ledges,29,ledges216
+autotile_transparent_ledges,33,ledges27
+autotile_transparent_ledges,34,ledges30
+autotile_transparent_ledges,36,ledges86
+autotile_transparent_ledges,37,ledges75
+autotile_transparent_ledges,38,ledges210
+autotile_transparent_ledges,39,ledges106

@@ -1,0 +1,33 @@
+{
+  "tile_size": 16,
+  "default_sheet": "gfx/tilesets/Hexany/general_transparent.png",
+  "tile_index_csv": "gfx/tilesets/Hexany/tile_index.csv",
+  "sheet_paths": {
+    "general": "gfx/tilesets/Hexany/general_transparent.png",
+    "items": "gfx/tilesets/Hexany/items_transparent.png",
+    "creatures": "gfx/tilesets/Hexany/creatures_transparent.png"
+  },
+  "fallback": {
+    "sheet": "gfx/tilesets/Bisasam_16x16.png",
+    "tile_size": 16,
+    "columns": 16,
+    "rows": 16,
+    "tint_with_fg": true,
+    "use_bg_fill": true
+  },
+  "glyphs": {
+    ".": { "tile_id": "general_00_01" },
+    "#": { "tile_id": "general_00_20" },
+    "@": { "tile_id": "creatures_00_00" },
+    "v": { "tile_id": "creatures_00_01" },
+    "g": { "tile_id": "creatures_03_06" },
+    "r": { "tile_id": "creatures_09_08" },
+    "x": { "sheet": "general", "tile_number": 53 },
+    "%": { "tile_id": "items_03_20" }
+  },
+  "classifications": {
+    "friendly": { "tile_id": "creatures_00_01" },
+    "enemy": { "tile_id": "creatures_03_06" },
+    "wall": { "tile_id": "general_00_20" }
+  }
+}

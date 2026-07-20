@@ -1,19 +1,19 @@
-# pyRL2 Wiki
+# Tales of Derision Wiki
 
-An ECS-based roguelike in Python that runs in the terminal today and is built to
-be re-rendered with tcod, pygame, raylib, or OpenGL later — without rewriting the
-game.
+An ECS-based roguelike in Python with a pygame runtime and a renderer seam that
+keeps game logic backend-agnostic.
 
 ## Status
 
 - ✅ esper ECS wired up (3.x, module-level API)
-- ✅ Bordered map rendered to the terminal via curses
-- ✅ Movable `@` with wall collision (arrows / hjkl / wasd)
+- ✅ Pygame renderer with scalable tile/UI presentation
+- ✅ Turn-based movement, collision, combat bump, and NPC movement
 - ✅ Title screen + main menu + in-game pause menu
+- ✅ Dialogue, inventory/equipment, and trade menus
 - ✅ Save/load flow with default and user save files
 - ✅ Default/working options files with auto-bootstrap
-- ✅ Renderer fully decoupled behind an interface
-- ⬜ Enemies, FOV, dungeon generation, real turn queue (see [Roadmap](Roadmap.md))
+- ✅ Renderer decoupled behind an interface for headless tests
+- ⬜ Expanded content, richer AI, world simulation depth (see [Roadmap](Roadmap.md))
 
 ## Pages
 
@@ -29,8 +29,8 @@ game.
 
 ## The one idea to take away
 
-Game and system code **never import curses**. Display goes through a `Renderer`
-interface and input arrives as abstract action strings (`move_up`, `menu_select`,
-`open_pause_menu`, …). Swapping to raylib/pygame means writing one class —
-nothing else changes. See
+Game and system code avoid direct renderer dependencies. Display goes through a
+`Renderer` interface and input arrives as abstract action strings (`move_up`,
+`menu_select`, `open_pause_menu`, ...). This is what keeps integration tests
+headless and makes future backend work isolated to renderer code. See
 [Renderers](Renderers.md).
