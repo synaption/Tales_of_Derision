@@ -1,449 +1,453 @@
-tile_id,sheet,row,col,x,y,w,h,cv_label,cv_tags,coverage,bbox,thumbnail
-general_00_00,general,0,0,0,0,16,16,selection frame / square outline,general;sparse,0.094,"1,1,15,15",thumbs/general_00_00.png
-general_00_01,general,0,1,16,0,16,16,single floor dot,general;sparse,0.016,"7,10,9,12",thumbs/general_00_01.png
-general_00_02,general,0,2,32,0,16,16,ruined tower / building,general;medium;diagonal;edge-touching;centered,0.445,"0,1,15,16",thumbs/general_00_02.png
-general_00_03,general,0,3,48,0,16,16,city skyline,general;medium;diagonal;edge-touching;centered,0.469,"2,1,16,16",thumbs/general_00_03.png
-general_00_04,general,0,4,64,0,16,16,arched doorway,general;dense;diagonal;edge-touching;centered;door,0.656,"0,0,16,15",thumbs/general_00_04.png
-general_00_05,general,0,5,80,0,16,16,arched opening,general;sparse;edge-touching,0.188,"0,0,16,15",thumbs/general_00_05.png
-general_00_06,general,0,6,96,0,16,16,barred gate / portcullis,general;medium;diagonal;edge-touching;centered,0.492,"0,0,16,15",thumbs/general_00_06.png
-general_00_07,general,0,7,112,0,16,16,arched doorway variant,general;dense;diagonal;edge-touching;centered;door,0.602,"0,1,16,15",thumbs/general_00_07.png
-general_00_08,general,0,8,128,0,16,16,large arch opening,general;sparse;edge-touching,0.133,"0,1,16,15",thumbs/general_00_08.png
-general_00_09,general,0,9,144,0,16,16,barred gate variant,general;medium;edge-touching;centered,0.438,"0,1,16,15",thumbs/general_00_09.png
-general_00_10,general,0,10,160,0,16,16,tombstone / shrine,general;medium;diagonal;edge-touching;centered,0.422,"0,0,16,15",thumbs/general_00_10.png
-general_00_11,general,0,11,176,0,16,16,closed hatch / X marker,general;medium;diagonal;centered,0.375,"1,1,15,15",thumbs/general_00_11.png
-general_00_12,general,0,12,192,0,16,16,temple / facade,general;medium;diagonal;edge-touching;centered,0.527,"0,0,16,16",thumbs/general_00_12.png
-general_00_13,general,0,13,208,0,16,16,floor grate / puddle,general;sparse,0.164,"1,9,15,15",thumbs/general_00_13.png
-general_00_14,general,0,14,224,0,16,16,altar / small shrine,general;sparse,0.199,"1,3,14,15",thumbs/general_00_14.png
-general_00_15,general,0,15,240,0,16,16,table / bench,general;medium;centered,0.293,"1,1,15,15",thumbs/general_00_15.png
-general_00_16,general,0,16,256,0,16,16,table / bench variant,general;sparse,0.25,"1,7,15,15",thumbs/general_00_16.png
-general_00_17,general,0,17,272,0,16,16,barred alcove,general;sparse;diagonal,0.273,"2,1,15,15",thumbs/general_00_17.png
-general_00_18,general,0,18,288,0,16,16,bed / cot,general;sparse;diagonal;centered,0.227,"3,1,13,15",thumbs/general_00_18.png
-general_00_19,general,0,19,304,0,16,16,small shelter / tent,general;medium;diagonal;centered,0.285,"2,1,14,15",thumbs/general_00_19.png
-general_00_20,general,0,20,320,0,16,16,crenellated wall segment,general;sparse;centered;wall,0.18,"1,8,15,15",thumbs/general_00_20.png
-general_00_21,general,0,21,336,0,16,16,scroll / wall plaque,general;medium;diagonal;edge-touching;centered;wall,0.359,"3,0,14,16",thumbs/general_00_21.png
-general_00_22,general,0,22,352,0,16,16,standing sign / notice,general;medium;diagonal;centered,0.375,"2,2,14,15",thumbs/general_00_22.png
-general_00_23,general,0,23,368,0,16,16,barrel / jar,general;medium;diagonal;centered,0.32,"3,2,13,15",thumbs/general_00_23.png
-general_00_24,general,0,24,384,0,16,16,hanging cocoon / sack,general;sparse;diagonal;centered,0.273,"3,0,13,16",thumbs/general_00_24.png
-general_00_25,general,0,25,400,0,16,16,hanging cocoon / sack variant,general;sparse,0.148,"3,0,13,16",thumbs/general_00_25.png
-general_00_26,general,0,26,416,0,16,16,chest,general;medium;diagonal;centered;chest,0.344,"2,6,15,15",thumbs/general_00_26.png
-general_00_27,general,0,27,432,0,16,16,open chest,general;medium;diagonal;centered;chest,0.348,"2,2,15,15",thumbs/general_00_27.png
-general_00_28,general,0,28,448,0,16,16,crate / box,general;sparse;diagonal;centered,0.234,"1,7,14,15",thumbs/general_00_28.png
-general_00_29,general,0,29,464,0,16,16,small crate / drawer,general;sparse,0.211,"2,7,15,15",thumbs/general_00_29.png
-general_00_30,general,0,30,480,0,16,16,wooden door / gate,general;medium;diagonal;centered;door,0.453,"1,1,15,15",thumbs/general_00_30.png
-general_00_31,general,0,31,496,0,16,16,double door / barred gate,general;medium;diagonal;door,0.398,"2,1,16,15",thumbs/general_00_31.png
-general_01_00,general,1,0,0,16,16,16,floor rubble,general;sparse,0.059,"2,9,15,14",thumbs/general_01_00.png
-general_01_01,general,1,1,16,16,16,16,spiky bush / thicket,general;sparse;diagonal;centered,0.254,"2,4,14,15",thumbs/general_01_01.png
-general_01_02,general,1,2,32,16,16,16,round bush / tree top,general;medium;diagonal;centered,0.43,"1,1,14,15",thumbs/general_01_02.png
-general_01_03,general,1,3,48,16,16,16,flower / plant patch,general;sparse;centered;plant,0.188,"1,2,15,15",thumbs/general_01_03.png
-general_01_04,general,1,4,64,16,16,16,wooden fence,general;medium;diagonal;edge-touching;centered,0.531,"0,2,16,14",thumbs/general_01_04.png
-general_01_05,general,1,5,80,16,16,16,ladder / planks,general;medium;diagonal;edge-touching;centered,0.531,"2,0,14,16",thumbs/general_01_05.png
-general_01_06,general,1,6,96,16,16,16,wagon wheel / round mechanism,general;medium;diagonal;centered,0.316,"1,1,15,15",thumbs/general_01_06.png
-general_01_07,general,1,7,112,16,16,16,thorny bush / dense shrub,general;medium;diagonal;edge-touching;centered,0.438,"0,0,16,16",thumbs/general_01_07.png
-general_01_08,general,1,8,128,16,16,16,large chest / table,general;sparse;chest,0.227,"2,0,15,15",thumbs/general_01_08.png
-general_01_09,general,1,9,144,16,16,16,chest / table variant,general;sparse;centered;chest,0.266,"2,0,15,15",thumbs/general_01_09.png
-general_01_10,general,1,10,160,16,16,16,bookshelf / cabinet,general;medium;diagonal;centered;book,0.32,"1,5,16,15",thumbs/general_01_10.png
-general_01_11,general,1,11,176,16,16,16,closed door,general;medium;diagonal;centered;door,0.48,"2,1,15,15",thumbs/general_01_11.png
-general_01_12,general,1,12,192,16,16,16,door opening,general;medium;door,0.355,"2,1,15,15",thumbs/general_01_12.png
-general_01_13,general,1,13,208,16,16,16,well / pile of stones,general;sparse;diagonal;centered,0.25,"1,2,15,15",thumbs/general_01_13.png
-general_01_14,general,1,14,224,16,16,16,small stairs / triangular marker,general;sparse,0.145,"4,1,14,15",thumbs/general_01_14.png
-general_01_15,general,1,15,240,16,16,16,down stairs / funnel,general;sparse;centered,0.141,"4,4,12,15",thumbs/general_01_15.png
-general_01_16,general,1,16,256,16,16,16,stacked stairs / ladder,general;sparse;centered,0.246,"3,1,13,15",thumbs/general_01_16.png
-general_01_17,general,1,17,272,16,16,16,bed / bunk,general;medium;diagonal;centered,0.406,"2,1,15,15",thumbs/general_01_17.png
-general_01_18,general,1,18,288,16,16,16,window / shutter,general;medium;diagonal,0.355,"2,1,15,15",thumbs/general_01_18.png
-general_01_19,general,1,19,304,16,16,16,dense rubble patch,general;sparse;centered,0.195,"3,1,14,15",thumbs/general_01_19.png
-general_01_20,general,1,20,320,16,16,16,small rubble patch,general;sparse;centered,0.164,"3,2,14,15",thumbs/general_01_20.png
-general_01_21,general,1,21,336,16,16,16,scattered stones,general;sparse,0.168,"1,1,15,14",thumbs/general_01_21.png
-general_01_22,general,1,22,352,16,16,16,cracked floor / rubble,general;medium;diagonal;centered,0.344,"0,4,16,14",thumbs/general_01_22.png
-general_01_23,general,1,23,368,16,16,16,palisade fence,general;medium;diagonal;edge-touching;centered,0.574,"0,0,16,15",thumbs/general_01_23.png
-general_01_24,general,1,24,384,16,16,16,stone wall / block fence,general;medium;diagonal;edge-touching;centered;wall,0.555,"0,1,16,15",thumbs/general_01_24.png
-general_01_25,general,1,25,400,16,16,16,three stones,general;sparse,0.203,"2,3,14,14",thumbs/general_01_25.png
-general_01_26,general,1,26,416,16,16,16,claw marks / scratches,general;sparse,0.203,"2,1,14,14",thumbs/general_01_26.png
-general_01_27,general,1,27,432,16,16,16,ladder,general;sparse;diagonal,0.25,"1,0,15,16",thumbs/general_01_27.png
-general_01_28,general,1,28,448,16,16,16,bars / portcullis,general;sparse;diagonal,0.25,"0,1,16,15",thumbs/general_01_28.png
-general_01_29,general,1,29,464,16,16,16,open hatch / trapdoor,general;medium;diagonal;door,0.309,"2,2,14,15",thumbs/general_01_29.png
-general_01_30,general,1,30,480,16,16,16,paper / map,general;medium;diagonal;centered,0.371,"2,2,14,15",thumbs/general_01_30.png
-general_01_31,general,1,31,496,16,16,16,cliff / wall edge,general;sparse;wall,0.129,"3,2,13,15",thumbs/general_01_31.png
-general_02_00,general,2,0,0,32,16,16,tattered flag / banner,general;sparse,0.113,"4,1,13,11",thumbs/general_02_00.png
-general_02_01,general,2,1,16,32,16,16,small debris / stones,general;sparse,0.09,"3,4,15,14",thumbs/general_02_01.png
-general_02_02,general,2,2,32,32,16,16,rock pile,general;sparse;diagonal;centered;rock,0.223,"2,6,15,14",thumbs/general_02_02.png
-general_02_03,general,2,3,48,32,16,16,rock / boulder,general;sparse;centered;rock,0.254,"2,2,15,14",thumbs/general_02_03.png
-general_02_04,general,2,4,64,32,16,16,stalagmite / rock spire,general;medium;diagonal;centered;rock,0.297,"1,2,15,15",thumbs/general_02_04.png
-items_00_00,items,0,0,0,0,16,16,long sword,items;sparse;diagonal;sword,0.113,"1,2,15,15",thumbs/items_00_00.png
-items_00_01,items,0,1,16,0,16,16,short sword / dagger,items;sparse;diagonal;sword;dagger,0.129,"1,0,16,15",thumbs/items_00_01.png
-items_00_02,items,0,2,32,0,16,16,slanted sword,items;sparse;diagonal;sword,0.109,"1,2,15,15",thumbs/items_00_02.png
-items_00_03,items,0,3,48,0,16,16,club / cudgel,items;sparse;diagonal;centered,0.137,"1,6,12,15",thumbs/items_00_03.png
-items_00_04,items,0,4,64,0,16,16,magic wand,items;sparse;diagonal;centered,0.113,"1,3,13,15",thumbs/items_00_04.png
-items_00_05,items,0,5,80,0,16,16,mace,items;sparse;diagonal,0.137,"1,1,15,15",thumbs/items_00_05.png
-items_00_06,items,0,6,96,0,16,16,axe,items;sparse;diagonal;centered;axe,0.113,"1,2,12,15",thumbs/items_00_06.png
-items_00_07,items,0,7,112,0,16,16,pickaxe,items;sparse;diagonal;axe,0.133,"1,2,14,15",thumbs/items_00_07.png
-items_00_08,items,0,8,128,0,16,16,pickaxe variant,items;sparse;axe,0.094,"4,1,13,15",thumbs/items_00_08.png
-items_00_09,items,0,9,144,0,16,16,bow,items;sparse;bow,0.125,"1,1,15,15",thumbs/items_00_09.png
-items_00_10,items,0,10,160,0,16,16,staff / hooked tool,items;sparse;diagonal,0.074,"2,3,13,14",thumbs/items_00_10.png
-items_00_11,items,0,11,176,0,16,16,small shield / buckler,items;sparse;shield,0.047,"5,6,11,12",thumbs/items_00_11.png
-items_00_12,items,0,12,192,0,16,16,arrow / bolt,items;sparse;diagonal,0.062,"2,3,13,14",thumbs/items_00_12.png
-items_00_13,items,0,13,208,0,16,16,star / shuriken,items;sparse;centered,0.109,"4,4,12,12",thumbs/items_00_13.png
-items_01_00,items,1,0,0,16,16,16,dagger,items;sparse;diagonal;dagger,0.074,"3,4,13,13",thumbs/items_01_00.png
-items_01_01,items,1,1,16,16,16,16,rapier / narrow sword,items;sparse;diagonal;sword,0.121,"0,2,15,15",thumbs/items_01_01.png
-items_01_02,items,1,2,32,16,16,16,knife,items;sparse;diagonal,0.09,"1,3,15,15",thumbs/items_01_02.png
-items_01_03,items,1,3,48,16,16,16,curved dagger,items;sparse;diagonal;centered;dagger,0.199,"1,1,15,15",thumbs/items_01_03.png
-items_01_04,items,1,4,64,16,16,16,hatchet,items;sparse;diagonal,0.09,"1,3,14,15",thumbs/items_01_04.png
-items_01_05,items,1,5,80,16,16,16,hand axe,items;sparse;diagonal;axe,0.152,"1,1,15,15",thumbs/items_01_05.png
-items_01_06,items,1,6,96,16,16,16,battle axe head,items;sparse;diagonal;centered;axe,0.129,"1,2,13,15",thumbs/items_01_06.png
-items_01_07,items,1,7,112,16,16,16,spear / javelin,items;sparse;diagonal,0.117,"1,0,16,15",thumbs/items_01_07.png
-items_01_08,items,1,8,128,16,16,16,halberd / polearm,items;sparse;diagonal,0.152,"1,3,16,15",thumbs/items_01_08.png
-items_01_09,items,1,9,144,16,16,16,crossbow,items;sparse;diagonal;bow,0.164,"2,1,15,14",thumbs/items_01_09.png
-items_01_10,items,1,10,160,16,16,16,small pouch / herbs,items;sparse;diagonal;centered,0.164,"4,2,14,14",thumbs/items_01_10.png
-items_01_11,items,1,11,176,16,16,16,gem cluster / ore,items;sparse,0.117,"2,1,13,14",thumbs/items_01_11.png
-items_01_12,items,1,12,192,16,16,16,scroll / parchment,items;sparse,0.117,"4,1,12,15",thumbs/items_01_12.png
-items_01_13,items,1,13,208,16,16,16,ring / amulet,items;sparse,0.273,"1,2,14,15",thumbs/items_01_13.png
-items_02_00,items,2,0,0,32,16,16,chest armor / breastplate,items;medium;diagonal;centered;armor;chest,0.414,"2,3,15,14",thumbs/items_02_00.png
-items_02_01,items,2,1,16,32,16,16,chainmail / scale armor,items;sparse;diagonal;centered;armor,0.223,"2,3,15,14",thumbs/items_02_01.png
-items_02_02,items,2,2,32,32,16,16,tunic / armor vest,items;medium;diagonal;centered;armor,0.293,"2,3,15,14",thumbs/items_02_02.png
-items_02_03,items,2,3,48,32,16,16,belt / sash,items;sparse,0.141,"1,7,14,14",thumbs/items_02_03.png
-items_02_04,items,2,4,64,32,16,16,boot,items;sparse;diagonal;centered,0.215,"1,3,16,13",thumbs/items_02_04.png
-items_02_05,items,2,5,80,32,16,16,helmet,items;sparse;diagonal;centered,0.227,"4,3,12,14",thumbs/items_02_05.png
-items_02_06,items,2,6,96,32,16,16,skull mask / helm,items;sparse;diagonal;centered,0.258,"4,3,12,15",thumbs/items_02_06.png
-items_02_07,items,2,7,112,32,16,16,round shield,items;sparse;diagonal;centered;shield,0.273,"2,2,14,14",thumbs/items_02_07.png
-items_02_08,items,2,8,128,32,16,16,kite shield,items;medium;diagonal;centered;shield,0.297,"3,1,13,15",thumbs/items_02_08.png
-items_02_09,items,2,9,144,32,16,16,door / tall shield,items;sparse;diagonal;centered;shield;door,0.273,"4,1,13,15",thumbs/items_02_09.png
-items_02_10,items,2,10,160,32,16,16,food / meat scraps,items;sparse,0.195,"1,2,15,15",thumbs/items_02_10.png
-items_02_11,items,2,11,176,32,16,16,food / meat scraps variant,items;sparse,0.219,"1,2,14,15",thumbs/items_02_11.png
-items_02_12,items,2,12,192,32,16,16,pants / leggings,items;sparse;diagonal;centered,0.258,"4,2,13,15",thumbs/items_02_12.png
-items_02_13,items,2,13,208,32,16,16,wing / cloak,items;sparse,0.188,"3,3,14,14",thumbs/items_02_13.png
-items_03_00,items,3,0,0,48,16,16,cauldron / pot,items;sparse,0.176,"3,6,14,15",thumbs/items_03_00.png
-items_03_01,items,3,1,16,48,16,16,necklace / pendant,items;sparse,0.086,"4,2,13,15",thumbs/items_03_01.png
-items_03_02,items,3,2,32,48,16,16,magic wand / staff,items;sparse,0.141,"1,0,16,15",thumbs/items_03_02.png
-items_03_03,items,3,3,48,48,16,16,key ring / bones,items;sparse;diagonal;centered;key,0.188,"2,1,15,13",thumbs/items_03_03.png
-items_03_04,items,3,4,64,48,16,16,sparkles / magic effect,items;sparse;diagonal,0.168,"1,2,16,15",thumbs/items_03_04.png
-items_03_05,items,3,5,80,48,16,16,egg / rock,items;sparse;diagonal;centered;rock,0.234,"2,7,14,14",thumbs/items_03_05.png
-items_03_06,items,3,6,96,48,16,16,candle / tower marker,items;sparse,0.152,"3,4,14,14",thumbs/items_03_06.png
-items_03_07,items,3,7,112,48,16,16,feather,items;sparse;diagonal;centered,0.191,"2,2,15,15",thumbs/items_03_07.png
-items_03_08,items,3,8,128,48,16,16,bag / backpack,items;medium;centered,0.285,"2,1,14,16",thumbs/items_03_08.png
-items_03_09,items,3,9,144,48,16,16,wand / scepter,items;sparse;diagonal;centered,0.137,"1,3,14,15",thumbs/items_03_09.png
-items_03_10,items,3,10,160,48,16,16,potion bottle,items;sparse;centered;potion,0.172,"5,1,13,15",thumbs/items_03_10.png
-items_03_11,items,3,11,176,48,16,16,broken bone / tool,items;sparse,0.168,"1,3,15,14",thumbs/items_03_11.png
-items_03_12,items,3,12,192,48,16,16,treasure chest,items;medium;diagonal;centered;chest,0.367,"1,2,15,15",thumbs/items_03_12.png
-items_03_13,items,3,13,208,48,16,16,money bag,items;sparse;centered,0.25,"3,3,13,15",thumbs/items_03_13.png
-items_03_14,items,3,14,224,48,16,16,chain / hook,items;sparse,0.16,"2,1,15,15",thumbs/items_03_14.png
-items_03_15,items,3,15,240,48,16,16,rope / snake cord,items;sparse,0.156,"2,1,15,15",thumbs/items_03_15.png
-items_03_16,items,3,16,256,48,16,16,jar / barrel,items;sparse;diagonal;centered,0.258,"4,3,15,14",thumbs/items_03_16.png
-items_03_17,items,3,17,272,48,16,16,map / document,items;medium;diagonal;centered,0.316,"2,5,16,15",thumbs/items_03_17.png
-items_03_18,items,3,18,288,48,16,16,waterskin / flask,items;sparse,0.102,"2,3,15,15",thumbs/items_03_18.png
-items_03_19,items,3,19,304,48,16,16,bird / winged item,items;sparse;centered;bird,0.168,"2,4,14,15",thumbs/items_03_19.png
-items_03_20,items,3,20,320,48,16,16,horned skull,items;medium;diagonal;centered,0.336,"2,1,15,16",thumbs/items_03_20.png
-items_03_21,items,3,21,336,48,16,16,fish bones,items;sparse,0.195,"1,1,14,15",thumbs/items_03_21.png
-items_03_22,items,3,22,352,48,16,16,egg / pebble,items;sparse;centered,0.191,"4,6,13,15",thumbs/items_03_22.png
-items_03_23,items,3,23,368,48,16,16,crown / diadem,items;sparse,0.211,"1,7,16,16",thumbs/items_03_23.png
-items_04_00,items,4,0,0,64,16,16,book / tome,items;medium;diagonal;centered;book,0.383,"1,2,15,16",thumbs/items_04_00.png
-items_04_01,items,4,1,16,64,16,16,potion flask,items;sparse;centered;potion,0.246,"3,2,13,15",thumbs/items_04_01.png
-items_04_02,items,4,2,32,64,16,16,flower / herbs,items;sparse,0.195,"1,0,16,15",thumbs/items_04_02.png
-items_04_03,items,4,3,48,64,16,16,house / hut icon,items;sparse;diagonal;centered,0.227,"3,2,14,14",thumbs/items_04_03.png
-items_04_04,items,4,4,64,64,16,16,ring with sparkle,items;sparse;diagonal;centered,0.18,"1,3,15,14",thumbs/items_04_04.png
-items_04_05,items,4,5,80,64,16,16,scythe,items;sparse;diagonal,0.156,"1,1,15,15",thumbs/items_04_05.png
-items_04_06,items,4,6,96,64,16,16,bow / curved staff,items;sparse;diagonal;centered;bow,0.168,"2,1,15,15",thumbs/items_04_06.png
-items_04_07,items,4,7,112,64,16,16,map / parchment,items;medium;diagonal;centered,0.473,"2,1,15,15",thumbs/items_04_07.png
-items_04_08,items,4,8,128,64,16,16,orb / crystal ball,items;medium;diagonal;centered,0.348,"2,1,14,15",thumbs/items_04_08.png
-items_04_09,items,4,9,144,64,16,16,lantern,items;sparse,0.129,"4,1,11,15",thumbs/items_04_09.png
-items_04_10,items,4,10,160,64,16,16,seated small figure,items;sparse;centered,0.121,"5,2,12,14",thumbs/items_04_10.png
-items_04_11,items,4,11,176,64,16,16,kneeling small figure,items;sparse,0.129,"5,2,12,15",thumbs/items_04_11.png
-items_04_12,items,4,12,192,64,16,16,cloak / robe,items;sparse;diagonal;centered,0.203,"4,3,13,14",thumbs/items_04_12.png
-items_04_13,items,4,13,208,64,16,16,pedestal / stand,items;sparse;centered,0.18,"4,4,12,15",thumbs/items_04_13.png
-items_04_14,items,4,14,224,64,16,16,needle / spike,items;sparse;diagonal,0.094,"1,4,13,15",thumbs/items_04_14.png
-items_04_15,items,4,15,240,64,16,16,sword with hilt,items;sparse;centered;sword,0.199,"1,0,15,15",thumbs/items_04_15.png
-items_04_16,items,4,16,256,64,16,16,cracked wall / debris,items;sparse;centered;wall,0.195,"3,2,15,15",thumbs/items_04_16.png
-items_04_17,items,4,17,272,64,16,16,bed / bench,items;sparse;centered,0.191,"1,5,16,13",thumbs/items_04_17.png
-items_04_18,items,4,18,288,64,16,16,tattered map / banner,items;medium;diagonal;centered,0.332,"2,1,14,15",thumbs/items_04_18.png
-items_04_19,items,4,19,304,64,16,16,long key,items;sparse;key,0.102,"1,7,15,11",thumbs/items_04_19.png
-items_04_20,items,4,20,320,64,16,16,glove / hand,items;sparse;diagonal;centered,0.184,"2,4,14,15",thumbs/items_04_20.png
-items_04_21,items,4,21,336,64,16,16,shirt / tunic,items;sparse;centered,0.137,"5,1,11,15",thumbs/items_04_21.png
-creatures_00_00,creatures,0,0,0,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.164,"3,1,13,15",thumbs/creatures_00_00.png
-creatures_00_01,creatures,0,1,16,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.176,"3,1,13,15",thumbs/creatures_00_01.png
-creatures_00_02,creatures,0,2,32,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.195,"1,1,13,15",thumbs/creatures_00_02.png
-creatures_00_03,creatures,0,3,48,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.25,"1,0,13,15",thumbs/creatures_00_03.png
-creatures_00_04,creatures,0,4,64,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.238,"2,0,14,15",thumbs/creatures_00_04.png
-creatures_00_05,creatures,0,5,80,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.246,"2,0,14,15",thumbs/creatures_00_05.png
-creatures_00_06,creatures,0,6,96,0,16,16,humanoid adventurer / NPC variant,creatures;medium;diagonal;centered;humanoid,0.324,"0,0,15,15",thumbs/creatures_00_06.png
-creatures_00_07,creatures,0,7,112,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.195,"2,1,15,15",thumbs/creatures_00_07.png
-creatures_00_08,creatures,0,8,128,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.27,"3,0,15,15",thumbs/creatures_00_08.png
-creatures_00_09,creatures,0,9,144,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.262,"1,0,15,15",thumbs/creatures_00_09.png
-creatures_00_10,creatures,0,10,160,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.223,"1,0,13,15",thumbs/creatures_00_10.png
-creatures_00_11,creatures,0,11,176,0,16,16,humanoid adventurer / NPC variant,creatures;sparse;humanoid,0.23,"1,0,13,15",thumbs/creatures_00_11.png
-creatures_00_12,creatures,0,12,192,0,16,16,humanoid adventurer / NPC variant,creatures;medium;diagonal;centered;humanoid,0.281,"2,0,13,15",thumbs/creatures_00_12.png
-creatures_00_13,creatures,0,13,208,0,16,16,humanoid adventurer / NPC variant,creatures;medium;diagonal;centered;humanoid,0.281,"2,0,13,15",thumbs/creatures_00_13.png
-creatures_00_14,creatures,0,14,224,0,16,16,humanoid adventurer / NPC variant,creatures;medium;diagonal;centered;humanoid,0.316,"2,0,14,16",thumbs/creatures_00_14.png
-creatures_00_15,creatures,0,15,240,0,16,16,humanoid adventurer / NPC variant,creatures;medium;diagonal;centered;humanoid,0.332,"2,0,15,16",thumbs/creatures_00_15.png
-creatures_01_00,creatures,1,0,0,16,16,16,humanoid adventurer / NPC variant,creatures;medium;diagonal;centered;humanoid,0.285,"0,0,14,15",thumbs/creatures_01_00.png
-creatures_01_01,creatures,1,1,16,16,16,16,humanoid adventurer / NPC variant,creatures;medium;diagonal;centered;humanoid,0.289,"0,0,14,15",thumbs/creatures_01_01.png
-creatures_01_02,creatures,1,2,32,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;edge-touching;centered;humanoid,0.211,"2,0,16,16",thumbs/creatures_01_02.png
-creatures_01_03,creatures,1,3,48,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;edge-touching;centered;humanoid,0.227,"2,0,16,16",thumbs/creatures_01_03.png
-creatures_01_04,creatures,1,4,64,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.211,"3,1,13,16",thumbs/creatures_01_04.png
-creatures_01_05,creatures,1,5,80,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.223,"3,1,13,16",thumbs/creatures_01_05.png
-creatures_01_06,creatures,1,6,96,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.23,"2,1,14,16",thumbs/creatures_01_06.png
-creatures_01_07,creatures,1,7,112,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.242,"2,1,14,16",thumbs/creatures_01_07.png
-creatures_01_08,creatures,1,8,128,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.18,"3,1,13,16",thumbs/creatures_01_08.png
-creatures_01_09,creatures,1,9,144,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.238,"3,1,13,16",thumbs/creatures_01_09.png
-creatures_01_10,creatures,1,10,160,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.16,"3,1,13,15",thumbs/creatures_01_10.png
-creatures_01_11,creatures,1,11,176,16,16,16,humanoid adventurer / NPC variant,creatures;sparse;centered;humanoid,0.203,"3,1,13,15",thumbs/creatures_01_11.png
-creatures_03_00,creatures,3,0,0,48,16,16,small monster / goblin-like creature,creatures;medium;diagonal;centered;creature;monster,0.297,"0,0,15,15",thumbs/creatures_03_00.png
-creatures_03_01,creatures,3,1,16,48,16,16,small monster / goblin-like creature,creatures;medium;diagonal;edge-touching;centered;creature;monster,0.359,"0,0,16,15",thumbs/creatures_03_01.png
-creatures_03_02,creatures,3,2,32,48,16,16,small monster / goblin-like creature,creatures;medium;creature;monster,0.328,"0,0,15,15",thumbs/creatures_03_02.png
-creatures_03_03,creatures,3,3,48,48,16,16,small monster / goblin-like creature,creatures;sparse;centered;creature;monster,0.238,"1,1,14,15",thumbs/creatures_03_03.png
-creatures_03_04,creatures,3,4,64,48,16,16,small monster / goblin-like creature,creatures;sparse;creature;monster,0.207,"2,1,14,15",thumbs/creatures_03_04.png
-creatures_03_05,creatures,3,5,80,48,16,16,small monster / goblin-like creature,creatures;medium;centered;creature;monster,0.305,"1,0,15,16",thumbs/creatures_03_05.png
-creatures_03_06,creatures,3,6,96,48,16,16,small monster / goblin-like creature,creatures;sparse;centered;creature;monster,0.234,"1,0,13,15",thumbs/creatures_03_06.png
-creatures_03_07,creatures,3,7,112,48,16,16,small monster / goblin-like creature,creatures;sparse;centered;creature;monster,0.246,"1,0,13,15",thumbs/creatures_03_07.png
-creatures_03_08,creatures,3,8,128,48,16,16,small humanoid / mage variant,creatures;sparse;humanoid,0.156,"3,0,13,15",thumbs/creatures_03_08.png
-creatures_03_09,creatures,3,9,144,48,16,16,small humanoid / mage variant,creatures;sparse;humanoid,0.164,"3,0,13,15",thumbs/creatures_03_09.png
-creatures_03_10,creatures,3,10,160,48,16,16,small humanoid / mage variant,creatures;sparse;centered;humanoid,0.16,"3,2,13,15",thumbs/creatures_03_10.png
-creatures_03_11,creatures,3,11,176,48,16,16,small humanoid / mage variant,creatures;sparse;centered;humanoid,0.16,"3,3,13,15",thumbs/creatures_03_11.png
-creatures_03_12,creatures,3,12,192,48,16,16,small flying/monster icon,creatures;sparse;monster,0.129,"2,4,14,15",thumbs/creatures_03_12.png
-creatures_03_13,creatures,3,13,208,48,16,16,small flying/monster icon,creatures;sparse;centered;monster,0.18,"1,1,15,15",thumbs/creatures_03_13.png
-creatures_03_14,creatures,3,14,224,48,16,16,small flying/monster icon,creatures;sparse;centered;monster,0.195,"3,3,15,15",thumbs/creatures_03_14.png
-creatures_03_15,creatures,3,15,240,48,16,16,small flying/monster icon,creatures;sparse;centered;monster,0.121,"3,6,15,15",thumbs/creatures_03_15.png
-creatures_04_00,creatures,4,0,0,64,16,16,large monster / humanoid beast variant,creatures;medium;edge-touching;centered;monster;humanoid,0.363,"0,0,16,16",thumbs/creatures_04_00.png
-creatures_04_01,creatures,4,1,16,64,16,16,large monster / humanoid beast variant,creatures;medium;diagonal;centered;monster;humanoid,0.34,"4,1,16,16",thumbs/creatures_04_01.png
-creatures_04_02,creatures,4,2,32,64,16,16,large monster / humanoid beast variant,creatures;sparse;diagonal;centered;monster;humanoid,0.227,"1,1,14,16",thumbs/creatures_04_02.png
-creatures_04_03,creatures,4,3,48,64,16,16,large monster / humanoid beast variant,creatures;medium;diagonal;centered;monster;humanoid,0.461,"1,0,15,16",thumbs/creatures_04_03.png
-creatures_04_04,creatures,4,4,64,64,16,16,large monster / humanoid beast variant,creatures;medium;diagonal;centered;monster;humanoid,0.312,"1,1,15,15",thumbs/creatures_04_04.png
-creatures_04_05,creatures,4,5,80,64,16,16,large monster / humanoid beast variant,creatures;medium;diagonal;centered;monster;humanoid,0.387,"1,2,16,15",thumbs/creatures_04_05.png
-creatures_04_06,creatures,4,6,96,64,16,16,large monster / humanoid beast variant,creatures;sparse;diagonal;monster;humanoid,0.238,"2,1,15,16",thumbs/creatures_04_06.png
-creatures_04_07,creatures,4,7,112,64,16,16,large monster / humanoid beast variant,creatures;medium;monster;humanoid,0.293,"2,0,15,16",thumbs/creatures_04_07.png
-creatures_04_08,creatures,4,8,128,64,16,16,large monster / humanoid beast variant,creatures;sparse;diagonal;centered;monster;humanoid,0.242,"2,1,15,15",thumbs/creatures_04_08.png
-creatures_04_09,creatures,4,9,144,64,16,16,large monster / humanoid beast variant,creatures;medium;diagonal;edge-touching;centered;monster;humanoid,0.461,"0,0,16,16",thumbs/creatures_04_09.png
-creatures_04_10,creatures,4,10,160,64,16,16,large monster / humanoid beast variant,creatures;medium;edge-touching;centered;monster;humanoid,0.398,"0,0,16,16",thumbs/creatures_04_10.png
-creatures_04_11,creatures,4,11,176,64,16,16,large monster / humanoid beast variant,creatures;medium;diagonal;centered;monster;humanoid,0.328,"2,0,16,16",thumbs/creatures_04_11.png
-creatures_04_12,creatures,4,12,192,64,16,16,large monster / humanoid beast variant,creatures;medium;diagonal;centered;monster;humanoid,0.375,"2,1,15,16",thumbs/creatures_04_12.png
-creatures_06_00,creatures,6,0,0,96,16,16,skeleton / ghostly creature,creatures;sparse;creature,0.172,"1,2,13,15",thumbs/creatures_06_00.png
-creatures_06_01,creatures,6,1,16,96,16,16,skeleton / ghostly creature,creatures;sparse;creature,0.137,"1,2,14,15",thumbs/creatures_06_01.png
-creatures_06_02,creatures,6,2,32,96,16,16,skeleton / ghostly creature,creatures;sparse;centered;creature,0.191,"2,1,13,15",thumbs/creatures_06_02.png
-creatures_06_03,creatures,6,3,48,96,16,16,skeleton / ghostly creature,creatures;sparse;centered;creature,0.156,"1,1,16,14",thumbs/creatures_06_03.png
-creatures_06_04,creatures,6,4,64,96,16,16,orb / elemental / eye monster,creatures;medium;diagonal;centered;monster,0.422,"1,1,16,15",thumbs/creatures_06_04.png
-creatures_06_05,creatures,6,5,80,96,16,16,orb / elemental / eye monster,creatures;sparse;monster,0.184,"1,3,15,15",thumbs/creatures_06_05.png
-creatures_06_06,creatures,6,6,96,96,16,16,orb / elemental / eye monster,creatures;sparse;monster,0.199,"1,4,16,15",thumbs/creatures_06_06.png
-creatures_06_07,creatures,6,7,112,96,16,16,orb / elemental / eye monster,creatures;sparse;diagonal;centered;monster,0.23,"2,1,15,15",thumbs/creatures_06_07.png
-creatures_06_08,creatures,6,8,128,96,16,16,orb / elemental / eye monster,creatures;medium;diagonal;edge-touching;centered;monster,0.48,"0,0,16,16",thumbs/creatures_06_08.png
-creatures_06_09,creatures,6,9,144,96,16,16,spirit / blob / jelly creature,creatures;sparse;centered;creature,0.18,"3,2,13,15",thumbs/creatures_06_09.png
-creatures_06_10,creatures,6,10,160,96,16,16,spirit / blob / jelly creature,creatures;sparse;diagonal;centered;creature,0.227,"2,2,15,15",thumbs/creatures_06_10.png
-creatures_06_11,creatures,6,11,176,96,16,16,spirit / blob / jelly creature,creatures;sparse;diagonal;centered;creature,0.246,"1,0,16,15",thumbs/creatures_06_11.png
-creatures_06_12,creatures,6,12,192,96,16,16,spirit / blob / jelly creature,creatures;medium;centered;creature,0.281,"2,1,15,16",thumbs/creatures_06_12.png
-creatures_06_13,creatures,6,13,208,96,16,16,tree/plant monster or winged creature,creatures;sparse;creature;monster;plant,0.152,"2,1,14,15",thumbs/creatures_06_13.png
-creatures_06_14,creatures,6,14,224,96,16,16,tree/plant monster or winged creature,creatures;sparse;centered;creature;monster;plant,0.238,"2,1,15,15",thumbs/creatures_06_14.png
-creatures_06_15,creatures,6,15,240,96,16,16,tree/plant monster or winged creature,creatures;medium;diagonal;centered;creature;monster;plant,0.438,"1,1,16,15",thumbs/creatures_06_15.png
-creatures_07_00,creatures,7,0,0,112,16,16,hooded figure / ghost variant,creatures;medium;diagonal;centered,0.418,"0,0,16,16",thumbs/creatures_07_00.png
-creatures_07_01,creatures,7,1,16,112,16,16,hooded figure / ghost variant,creatures;sparse;diagonal;centered,0.227,"3,0,13,15",thumbs/creatures_07_01.png
-creatures_07_02,creatures,7,2,32,112,16,16,hooded figure / ghost variant,creatures;medium;diagonal,0.348,"0,1,16,15",thumbs/creatures_07_02.png
-creatures_07_03,creatures,7,3,48,112,16,16,hooded figure / ghost variant,creatures;medium;diagonal,0.34,"0,1,16,15",thumbs/creatures_07_03.png
-creatures_07_04,creatures,7,4,64,112,16,16,humanoid monster / beast variant,creatures;sparse;diagonal;centered;monster;humanoid,0.219,"2,0,13,15",thumbs/creatures_07_04.png
-creatures_07_05,creatures,7,5,80,112,16,16,humanoid monster / beast variant,creatures;medium;diagonal;centered;monster;humanoid,0.289,"2,0,15,16",thumbs/creatures_07_05.png
-creatures_07_06,creatures,7,6,96,112,16,16,humanoid monster / beast variant,creatures;sparse;diagonal;centered;monster;humanoid,0.277,"1,1,15,15",thumbs/creatures_07_06.png
-creatures_07_07,creatures,7,7,112,112,16,16,humanoid monster / beast variant,creatures;medium;diagonal;centered;monster;humanoid,0.363,"1,0,16,16",thumbs/creatures_07_07.png
-creatures_07_08,creatures,7,8,128,112,16,16,humanoid monster / beast variant,creatures;medium;centered;monster;humanoid,0.32,"1,0,16,16",thumbs/creatures_07_08.png
-creatures_07_09,creatures,7,9,144,112,16,16,humanoid monster / beast variant,creatures;medium;centered;monster;humanoid,0.293,"1,0,16,16",thumbs/creatures_07_09.png
-creatures_09_00,creatures,9,0,0,144,16,16,small animal / rodent variant,creatures;sparse,0.109,"3,7,14,15",thumbs/creatures_09_00.png
-creatures_09_01,creatures,9,1,16,144,16,16,small animal / rodent variant,creatures;sparse;diagonal;centered,0.262,"2,3,15,15",thumbs/creatures_09_01.png
-creatures_09_02,creatures,9,2,32,144,16,16,small animal / rodent variant,creatures;sparse;diagonal;centered,0.238,"2,2,14,15",thumbs/creatures_09_02.png
-creatures_09_03,creatures,9,3,48,144,16,16,small animal / rodent variant,creatures;sparse;diagonal;centered,0.27,"1,0,16,15",thumbs/creatures_09_03.png
-creatures_09_04,creatures,9,4,64,144,16,16,large animal / beast variant,creatures;medium;diagonal;centered,0.367,"1,0,16,15",thumbs/creatures_09_04.png
-creatures_09_05,creatures,9,5,80,144,16,16,large animal / beast variant,creatures;medium;diagonal;centered,0.43,"1,2,16,15",thumbs/creatures_09_05.png
-creatures_09_06,creatures,9,6,96,144,16,16,large animal / beast variant,creatures;sparse;diagonal;centered,0.258,"3,3,15,15",thumbs/creatures_09_06.png
-creatures_09_07,creatures,9,7,112,144,16,16,large animal / beast variant,creatures;medium;centered,0.297,"1,2,16,15",thumbs/creatures_09_07.png
-creatures_09_08,creatures,9,8,128,144,16,16,large animal / beast variant,creatures;sparse,0.129,"2,6,15,15",thumbs/creatures_09_08.png
-creatures_09_09,creatures,9,9,144,144,16,16,bird / flying creature variant,creatures;sparse;centered;creature;bird,0.152,"2,5,15,15",thumbs/creatures_09_09.png
-creatures_09_10,creatures,9,10,160,144,16,16,bird / flying creature variant,creatures;sparse;creature;bird,0.148,"4,3,15,15",thumbs/creatures_09_10.png
-creatures_09_11,creatures,9,11,176,144,16,16,bird / flying creature variant,creatures;medium;diagonal;centered;creature;bird,0.297,"0,2,16,15",thumbs/creatures_09_11.png
-creatures_09_12,creatures,9,12,192,144,16,16,bird / flying creature variant,creatures;medium;diagonal;centered;creature;bird,0.531,"0,1,16,15",thumbs/creatures_09_12.png
-creatures_09_13,creatures,9,13,208,144,16,16,bird / flying creature variant,creatures;medium;diagonal;centered;creature;bird,0.457,"2,0,16,16",thumbs/creatures_09_13.png
-creatures_10_00,creatures,10,0,0,160,16,16,flying beast / bird / dragon variant,creatures;sparse;centered;bird;dragon,0.129,"3,7,14,15",thumbs/creatures_10_00.png
-creatures_10_01,creatures,10,1,16,160,16,16,flying beast / bird / dragon variant,creatures;sparse;diagonal;centered;bird;dragon,0.258,"1,1,15,15",thumbs/creatures_10_01.png
-creatures_10_02,creatures,10,2,32,160,16,16,flying beast / bird / dragon variant,creatures;medium;diagonal;centered;bird;dragon,0.285,"1,0,15,15",thumbs/creatures_10_02.png
-creatures_10_03,creatures,10,3,48,160,16,16,flying beast / bird / dragon variant,creatures;sparse;diagonal;centered;bird;dragon,0.262,"0,3,16,15",thumbs/creatures_10_03.png
-creatures_10_04,creatures,10,4,64,160,16,16,flying beast / bird / dragon variant,creatures;medium;diagonal;centered;bird;dragon,0.336,"1,1,16,15",thumbs/creatures_10_04.png
-creatures_10_05,creatures,10,5,80,160,16,16,flying beast / bird / dragon variant,creatures;medium;diagonal;centered;bird;dragon,0.332,"1,1,16,16",thumbs/creatures_10_05.png
-creatures_10_06,creatures,10,6,96,160,16,16,flying beast / bird / dragon variant,creatures;sparse;centered;bird;dragon,0.172,"1,3,16,11",thumbs/creatures_10_06.png
-creatures_10_07,creatures,10,7,112,160,16,16,flying beast / bird / dragon variant,creatures;sparse;diagonal;centered;bird;dragon,0.258,"0,2,16,12",thumbs/creatures_10_07.png
-creatures_10_08,creatures,10,8,128,160,16,16,flying beast / bird / dragon variant,creatures;sparse;diagonal;bird;dragon,0.262,"1,1,16,13",thumbs/creatures_10_08.png
-creatures_12_00,creatures,12,0,0,192,16,16,flying monster / dragon / magical entity,creatures;sparse;centered;monster;dragon,0.223,"2,4,15,16",thumbs/creatures_12_00.png
-creatures_12_01,creatures,12,1,16,192,16,16,flying monster / dragon / magical entity,creatures;sparse;diagonal;centered;monster;dragon,0.277,"0,4,15,16",thumbs/creatures_12_01.png
-creatures_12_02,creatures,12,2,32,192,16,16,flying monster / dragon / magical entity,creatures;medium;diagonal;centered;monster;dragon,0.371,"0,2,16,14",thumbs/creatures_12_02.png
-creatures_12_03,creatures,12,3,48,192,16,16,flying monster / dragon / magical entity,creatures;medium;diagonal;centered;monster;dragon,0.281,"3,2,16,16",thumbs/creatures_12_03.png
-creatures_12_04,creatures,12,4,64,192,16,16,flying monster / dragon / magical entity,creatures;sparse;diagonal;centered;monster;dragon,0.277,"1,1,16,16",thumbs/creatures_12_04.png
-creatures_12_05,creatures,12,5,80,192,16,16,flying monster / dragon / magical entity,creatures;medium;diagonal;edge-touching;centered;monster;dragon,0.504,"0,0,16,15",thumbs/creatures_12_05.png
-creatures_12_06,creatures,12,6,96,192,16,16,flying monster / dragon / magical entity,creatures;sparse;centered;monster;dragon,0.227,"1,2,14,14",thumbs/creatures_12_06.png
-creatures_12_07,creatures,12,7,112,192,16,16,flying monster / dragon / magical entity,creatures;medium;diagonal;centered;monster;dragon,0.316,"1,0,16,16",thumbs/creatures_12_07.png
-creatures_14_00,creatures,14,0,0,224,16,16,terrain hazard / plant / nest,creatures;sparse;terrain;plant,0.172,"2,8,15,15",thumbs/creatures_14_00.png
-creatures_14_01,creatures,14,1,16,224,16,16,terrain hazard / plant / nest,creatures;sparse;terrain;plant,0.18,"2,1,15,15",thumbs/creatures_14_01.png
-creatures_14_02,creatures,14,2,32,224,16,16,terrain hazard / plant / nest,creatures;medium;diagonal;centered;terrain;plant,0.375,"1,5,16,15",thumbs/creatures_14_02.png
-creatures_14_03,creatures,14,3,48,224,16,16,structure / statue / object creature,creatures;sparse;diagonal;centered;creature,0.242,"0,1,16,15",thumbs/creatures_14_03.png
-creatures_14_04,creatures,14,4,64,224,16,16,structure / statue / object creature,creatures;medium;diagonal;centered;creature,0.383,"1,1,16,15",thumbs/creatures_14_04.png
-creatures_14_05,creatures,14,5,80,224,16,16,structure / statue / object creature,creatures;medium;diagonal;centered;creature,0.359,"2,0,15,15",thumbs/creatures_14_05.png
-creatures_14_06,creatures,14,6,96,224,16,16,structure / statue / object creature,creatures;medium;diagonal;edge-touching;creature,0.438,"0,1,16,15",thumbs/creatures_14_06.png
-creatures_14_07,creatures,14,7,112,224,16,16,slime / mushroom / plant creature,creatures;sparse;diagonal;centered;creature;plant;slime,0.254,"2,8,14,15",thumbs/creatures_14_07.png
-creatures_14_08,creatures,14,8,128,224,16,16,slime / mushroom / plant creature,creatures;medium;diagonal;centered;creature;plant;slime,0.289,"1,4,15,15",thumbs/creatures_14_08.png
-creatures_14_09,creatures,14,9,144,224,16,16,slime / mushroom / plant creature,creatures;sparse;centered;creature;plant;slime,0.242,"3,4,15,15",thumbs/creatures_14_09.png
-creatures_14_10,creatures,14,10,160,224,16,16,slime / mushroom / plant creature,creatures;medium;centered;creature;plant;slime,0.281,"1,2,15,15",thumbs/creatures_14_10.png
-creatures_14_11,creatures,14,11,176,224,16,16,slime / mushroom / plant creature,creatures;sparse;creature;plant;slime,0.266,"1,1,16,15",thumbs/creatures_14_11.png
-creatures_14_12,creatures,14,12,192,224,16,16,slime / mushroom / plant creature,creatures;medium;diagonal;centered;creature;plant;slime,0.285,"0,1,16,16",thumbs/creatures_14_12.png
-creatures_14_13,creatures,14,13,208,224,16,16,large beast / worm creature,creatures;sparse;diagonal;creature,0.258,"2,1,15,16",thumbs/creatures_14_13.png
-creatures_14_14,creatures,14,14,224,224,16,16,large beast / worm creature,creatures;medium;creature,0.281,"1,2,15,16",thumbs/creatures_14_14.png
-creatures_14_15,creatures,14,15,240,224,16,16,large beast / worm creature,creatures;medium;diagonal;centered;creature,0.355,"1,0,16,15",thumbs/creatures_14_15.png
-creatures_15_00,creatures,15,0,0,240,16,16,large monster / beast variant,creatures;medium;diagonal;edge-touching;centered;monster,0.492,"0,0,16,16",thumbs/creatures_15_00.png
-creatures_15_01,creatures,15,1,16,240,16,16,large monster / beast variant,creatures;sparse;monster,0.227,"1,1,16,16",thumbs/creatures_15_01.png
-creatures_15_02,creatures,15,2,32,240,16,16,large monster / beast variant,creatures;medium;diagonal;edge-touching;centered;monster,0.348,"2,0,16,16",thumbs/creatures_15_02.png
-creatures_15_03,creatures,15,3,48,240,16,16,large monster / beast variant,creatures;medium;diagonal;centered;monster,0.359,"0,1,16,15",thumbs/creatures_15_03.png
-creatures_15_04,creatures,15,4,64,240,16,16,large monster / beast variant,creatures;medium;diagonal;centered;monster,0.391,"1,0,16,16",thumbs/creatures_15_04.png
-creatures_15_05,creatures,15,5,80,240,16,16,large monster / beast variant,creatures;medium;monster,0.355,"1,2,15,15",thumbs/creatures_15_05.png
-creatures_15_06,creatures,15,6,96,240,16,16,large monster / beast variant,creatures;sparse;monster,0.168,"3,7,14,15",thumbs/creatures_15_06.png
-creatures_15_07,creatures,15,7,112,240,16,16,large monster / beast variant,creatures;sparse;monster,0.176,"1,2,14,16",thumbs/creatures_15_07.png
-creatures_15_08,creatures,15,8,128,240,16,16,large monster / beast variant,creatures;medium;diagonal;centered;monster,0.301,"0,2,14,15",thumbs/creatures_15_08.png
-creatures_15_09,creatures,15,9,144,240,16,16,large monster / beast variant,creatures;medium;diagonal;edge-touching;centered;monster,0.418,"1,0,16,16",thumbs/creatures_15_09.png
-creatures_15_10,creatures,15,10,160,240,16,16,large monster / beast variant,creatures;medium;diagonal;centered;monster,0.348,"1,1,15,15",thumbs/creatures_15_10.png
-creatures_15_11,creatures,15,11,176,240,16,16,large monster / beast variant,creatures;medium;centered;monster,0.309,"1,2,15,15",thumbs/creatures_15_11.png
-creatures_15_12,creatures,15,12,192,240,16,16,large monster / beast variant,creatures;sparse;diagonal;centered;monster,0.18,"2,6,14,15",thumbs/creatures_15_12.png
-creatures_15_13,creatures,15,13,208,240,16,16,large monster / beast variant,creatures;sparse;diagonal;centered;monster,0.227,"3,3,14,14",thumbs/creatures_15_13.png
-creatures_15_14,creatures,15,14,224,240,16,16,large monster / beast variant,creatures;medium;diagonal;edge-touching;centered;monster,0.508,"1,0,14,16",thumbs/creatures_15_14.png
-creatures_15_15,creatures,15,15,240,240,16,16,large monster / beast variant,creatures;medium;diagonal;centered;monster,0.34,"0,1,16,16",thumbs/creatures_15_15.png
-creatures_16_00,creatures,16,0,0,256,16,16,small monster / demon / beast variant,creatures;medium;diagonal;centered;monster,0.383,"1,1,15,16",thumbs/creatures_16_00.png
-creatures_16_01,creatures,16,1,16,256,16,16,small monster / demon / beast variant,creatures;sparse;diagonal;centered;monster,0.234,"1,1,15,15",thumbs/creatures_16_01.png
-creatures_16_02,creatures,16,2,32,256,16,16,small monster / demon / beast variant,creatures;medium;diagonal;centered;monster,0.359,"2,2,16,16",thumbs/creatures_16_02.png
-creatures_16_03,creatures,16,3,48,256,16,16,small monster / demon / beast variant,creatures;sparse;diagonal;centered;monster,0.238,"4,3,15,15",thumbs/creatures_16_03.png
-creatures_16_04,creatures,16,4,64,256,16,16,small monster / demon / beast variant,creatures;sparse;centered;monster,0.242,"2,1,14,15",thumbs/creatures_16_04.png
-creatures_16_05,creatures,16,5,80,256,16,16,small monster / demon / beast variant,creatures;medium;diagonal;centered;monster,0.309,"1,1,14,14",thumbs/creatures_16_05.png
-autotile_00_00,autotile,0,0,0,0,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.273,"0,0,16,16",thumbs/autotile_00_00.png
-autotile_00_01,autotile,0,1,16,0,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.125,"0,0,16,2",thumbs/autotile_00_01.png
-autotile_00_02,autotile,0,2,32,0,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.273,"0,0,16,16",thumbs/autotile_00_02.png
-autotile_00_03,autotile,0,3,48,0,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.453,"0,0,16,16",thumbs/autotile_00_03.png
-autotile_00_04,autotile,0,4,64,0,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.398,"0,0,16,16",thumbs/autotile_00_04.png
-autotile_00_05,autotile,0,5,80,0,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.25,"0,0,16,16",thumbs/autotile_00_05.png
-autotile_00_06,autotile,0,6,96,0,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.25,"0,0,16,16",thumbs/autotile_00_06.png
-autotile_00_07,autotile,0,7,112,0,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.398,"0,0,16,16",thumbs/autotile_00_07.png
-autotile_00_08,autotile,0,8,128,0,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.375,"0,0,16,16",thumbs/autotile_00_08.png
-autotile_00_09,autotile,0,9,144,0,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.156,"0,0,16,16",thumbs/autotile_00_09.png
-autotile_00_12,autotile,0,12,192,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.77,"0,0,16,16",thumbs/autotile_00_12.png
-autotile_00_13,autotile,0,13,208,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.859,"0,0,16,16",thumbs/autotile_00_13.png
-autotile_00_14,autotile,0,14,224,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.867,"0,0,16,16",thumbs/autotile_00_14.png
-autotile_00_15,autotile,0,15,240,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.855,"0,0,16,16",thumbs/autotile_00_15.png
-autotile_00_16,autotile,0,16,256,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.766,"0,0,16,16",thumbs/autotile_00_16.png
-autotile_00_17,autotile,0,17,272,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.867,"0,0,16,16",thumbs/autotile_00_17.png
-autotile_00_18,autotile,0,18,288,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.871,"0,0,16,16",thumbs/autotile_00_18.png
-autotile_00_19,autotile,0,19,304,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.766,"0,0,16,16",thumbs/autotile_00_19.png
-autotile_00_20,autotile,0,20,320,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.832,"0,1,16,16",thumbs/autotile_00_20.png
-autotile_00_21,autotile,0,21,336,0,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.859,"0,0,16,16",thumbs/autotile_00_21.png
-autotile_01_00,autotile,1,0,0,16,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.188,"0,0,4,16",thumbs/autotile_01_00.png
-autotile_01_02,autotile,1,2,32,16,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.188,"12,0,16,16",thumbs/autotile_01_02.png
-autotile_01_03,autotile,1,3,48,16,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.375,"0,0,16,16",thumbs/autotile_01_03.png
-autotile_01_04,autotile,1,4,64,16,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.312,"0,0,16,16",thumbs/autotile_01_04.png
-autotile_01_05,autotile,1,5,80,16,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.125,"12,5,16,16",thumbs/autotile_01_05.png
-autotile_01_06,autotile,1,6,96,16,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.125,"0,5,4,16",thumbs/autotile_01_06.png
-autotile_01_07,autotile,1,7,112,16,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.312,"0,0,16,16",thumbs/autotile_01_07.png
-autotile_01_08,autotile,1,8,128,16,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.25,"0,5,16,16",thumbs/autotile_01_08.png
-autotile_01_09,autotile,1,9,144,16,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.152,"0,0,16,16",thumbs/autotile_01_09.png
-autotile_01_12,autotile,1,12,192,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.797,"1,0,16,16",thumbs/autotile_01_12.png
-autotile_01_13,autotile,1,13,208,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.961,"0,0,16,16",thumbs/autotile_01_13.png
-autotile_01_14,autotile,1,14,224,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.855,"0,0,16,16",thumbs/autotile_01_14.png
-autotile_01_15,autotile,1,15,240,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.879,"0,0,16,16",thumbs/autotile_01_15.png
-autotile_01_16,autotile,1,16,256,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.871,"1,0,16,16",thumbs/autotile_01_16.png
-autotile_01_17,autotile,1,17,272,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.957,"0,0,16,16",thumbs/autotile_01_17.png
-autotile_01_18,autotile,1,18,288,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.957,"0,0,16,16",thumbs/autotile_01_18.png
-autotile_01_19,autotile,1,19,304,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.852,"0,0,15,16",thumbs/autotile_01_19.png
-autotile_01_20,autotile,1,20,320,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.938,"0,0,16,16",thumbs/autotile_01_20.png
-autotile_01_21,autotile,1,21,336,16,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.859,"0,0,16,16",thumbs/autotile_01_21.png
-autotile_02_00,autotile,2,0,0,32,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.617,"0,0,16,15",thumbs/autotile_02_00.png
-autotile_02_01,autotile,2,1,16,32,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;centered;wall,0.562,"0,5,16,15",thumbs/autotile_02_01.png
-autotile_02_02,autotile,2,2,32,32,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.617,"0,0,16,15",thumbs/autotile_02_02.png
-autotile_02_03,autotile,2,3,48,32,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.711,"0,0,16,15",thumbs/autotile_02_03.png
-autotile_02_04,autotile,2,4,64,32,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.219,"0,0,16,16",thumbs/autotile_02_04.png
-autotile_02_05,autotile,2,5,80,32,16,16,autotile wall/room edge variant,autotile;sparse;wall,0.031,"12,0,16,2",thumbs/autotile_02_05.png
-autotile_02_06,autotile,2,6,96,32,16,16,autotile wall/room edge variant,autotile;sparse;wall,0.031,"0,0,4,2",thumbs/autotile_02_06.png
-autotile_02_07,autotile,2,7,112,32,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.219,"0,0,16,16",thumbs/autotile_02_07.png
-autotile_02_08,autotile,2,8,128,32,16,16,autotile wall/room edge variant,autotile;sparse;wall,0.062,"0,0,16,2",thumbs/autotile_02_08.png
-autotile_02_09,autotile,2,9,144,32,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.184,"0,0,16,16",thumbs/autotile_02_09.png
-autotile_02_10,autotile,2,10,160,32,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.188,"0,0,16,16",thumbs/autotile_02_10.png
-autotile_02_12,autotile,2,12,192,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.867,"0,0,16,16",thumbs/autotile_02_12.png
-autotile_02_13,autotile,2,13,208,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.844,"0,0,16,16",thumbs/autotile_02_13.png
-autotile_02_14,autotile,2,14,224,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.848,"0,0,16,16",thumbs/autotile_02_14.png
-autotile_02_15,autotile,2,15,240,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.809,"1,0,16,16",thumbs/autotile_02_15.png
-autotile_02_16,autotile,2,16,256,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.93,"0,0,16,16",thumbs/autotile_02_16.png
-autotile_02_17,autotile,2,17,272,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.957,"0,0,16,16",thumbs/autotile_02_17.png
-autotile_02_18,autotile,2,18,288,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.957,"0,0,16,16",thumbs/autotile_02_18.png
-autotile_02_19,autotile,2,19,304,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.883,"0,0,16,16",thumbs/autotile_02_19.png
-autotile_02_20,autotile,2,20,320,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.938,"0,0,16,16",thumbs/autotile_02_20.png
-autotile_02_21,autotile,2,21,336,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.949,"0,0,16,16",thumbs/autotile_02_21.png
-autotile_02_22,autotile,2,22,352,32,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.949,"0,0,16,16",thumbs/autotile_02_22.png
-autotile_03_00,autotile,3,0,0,48,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.695,"0,0,16,15",thumbs/autotile_03_00.png
-autotile_03_01,autotile,3,1,16,48,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.688,"0,0,16,15",thumbs/autotile_03_01.png
-autotile_03_02,autotile,3,2,32,48,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.695,"0,0,16,15",thumbs/autotile_03_02.png
-autotile_03_03,autotile,3,3,48,48,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.703,"0,0,16,15",thumbs/autotile_03_03.png
-autotile_03_04,autotile,3,4,64,48,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.648,"0,0,16,15",thumbs/autotile_03_04.png
-autotile_03_05,autotile,3,5,80,48,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;centered;wall,0.594,"0,0,16,15",thumbs/autotile_03_05.png
-autotile_03_06,autotile,3,6,96,48,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;centered;wall,0.594,"0,0,16,15",thumbs/autotile_03_06.png
-autotile_03_07,autotile,3,7,112,48,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.648,"0,0,16,15",thumbs/autotile_03_07.png
-autotile_03_08,autotile,3,8,128,48,16,16,autotile wall/room edge variant,autotile;dense;diagonal;edge-touching;centered;wall,0.625,"0,0,16,15",thumbs/autotile_03_08.png
-autotile_03_09,autotile,3,9,144,48,16,16,autotile wall/room edge variant,autotile;medium;edge-touching;wall,0.281,"0,0,16,16",thumbs/autotile_03_09.png
-autotile_03_10,autotile,3,10,160,48,16,16,autotile wall/room edge variant,autotile;medium;edge-touching;wall,0.281,"0,0,16,16",thumbs/autotile_03_10.png
-autotile_03_12,autotile,3,12,192,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.816,"0,0,16,16",thumbs/autotile_03_12.png
-autotile_03_13,autotile,3,13,208,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.879,"0,0,16,16",thumbs/autotile_03_13.png
-autotile_03_14,autotile,3,14,224,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.855,"0,0,16,16",thumbs/autotile_03_14.png
-autotile_03_15,autotile,3,15,240,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.742,"1,0,16,16",thumbs/autotile_03_15.png
-autotile_03_16,autotile,3,16,256,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.875,"0,0,16,16",thumbs/autotile_03_16.png
-autotile_03_17,autotile,3,17,272,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.91,"0,0,16,16",thumbs/autotile_03_17.png
-autotile_03_18,autotile,3,18,288,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.895,"0,0,16,16",thumbs/autotile_03_18.png
-autotile_03_19,autotile,3,19,304,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.836,"0,0,16,16",thumbs/autotile_03_19.png
-autotile_03_20,autotile,3,20,320,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.949,"0,0,16,16",thumbs/autotile_03_20.png
-autotile_03_21,autotile,3,21,336,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.949,"0,0,16,16",thumbs/autotile_03_21.png
-autotile_03_22,autotile,3,22,352,48,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.949,"0,0,16,16",thumbs/autotile_03_22.png
-autotile_04_04,autotile,4,4,64,64,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.344,"0,0,16,16",thumbs/autotile_04_04.png
-autotile_04_05,autotile,4,5,80,64,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.156,"12,0,16,16",thumbs/autotile_04_05.png
-autotile_04_06,autotile,4,6,96,64,16,16,autotile wall/room edge variant,autotile;sparse;edge-touching;wall,0.156,"0,0,4,16",thumbs/autotile_04_06.png
-autotile_04_07,autotile,4,7,112,64,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.344,"0,0,16,16",thumbs/autotile_04_07.png
-autotile_04_08,autotile,4,8,128,64,16,16,autotile wall/room edge variant,autotile;medium;diagonal;edge-touching;wall,0.312,"0,0,16,16",thumbs/autotile_04_08.png
-autotile_04_16,autotile,4,16,256,64,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.789,"1,0,16,16",thumbs/autotile_04_16.png
-autotile_04_17,autotile,4,17,272,64,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.953,"0,0,16,16",thumbs/autotile_04_17.png
-autotile_04_18,autotile,4,18,288,64,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.953,"0,0,16,16",thumbs/autotile_04_18.png
-autotile_04_19,autotile,4,19,304,64,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.848,"0,0,16,16",thumbs/autotile_04_19.png
-autotile_04_20,autotile,4,20,320,64,16,16,autotile ground/rock texture variant,autotile;dense;diagonal;edge-touching;centered;rock,0.941,"0,0,16,16",thumbs/autotile_04_20.png
-autotile_06_00,autotile,6,0,0,96,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;centered;wall,0.312,"0,0,16,16",thumbs/autotile_06_00.png
-autotile_06_01,autotile,6,1,16,96,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;centered;wall,0.312,"0,0,16,10",thumbs/autotile_06_01.png
-autotile_06_02,autotile,6,2,32,96,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;wall,0.344,"0,0,16,16",thumbs/autotile_06_02.png
-autotile_06_03,autotile,6,3,48,96,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;wall,0.41,"0,0,16,16",thumbs/autotile_06_03.png
-autotile_06_04,autotile,6,4,64,96,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;centered;wall,0.316,"1,0,16,16",thumbs/autotile_06_04.png
-autotile_06_05,autotile,6,5,80,96,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;wall,0.332,"0,0,16,16",thumbs/autotile_06_05.png
-autotile_06_06,autotile,6,6,96,96,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;centered;wall,0.332,"0,0,16,16",thumbs/autotile_06_06.png
-autotile_06_07,autotile,6,7,112,96,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;wall,0.344,"0,0,16,16",thumbs/autotile_06_07.png
-autotile_06_08,autotile,6,8,128,96,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;wall,0.352,"0,0,16,16",thumbs/autotile_06_08.png
-autotile_06_09,autotile,6,9,144,96,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.074,"0,0,16,16",thumbs/autotile_06_09.png
-autotile_07_00,autotile,7,0,0,112,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.125,"1,0,7,16",thumbs/autotile_07_00.png
-autotile_07_02,autotile,7,2,32,112,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.125,"10,0,16,16",thumbs/autotile_07_02.png
-autotile_07_03,autotile,7,3,48,112,16,16,autotile cave wall / cliff edge variant,autotile;sparse;diagonal;edge-touching;wall,0.25,"0,0,15,16",thumbs/autotile_07_03.png
-autotile_07_04,autotile,7,4,64,112,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.145,"1,0,16,16",thumbs/autotile_07_04.png
-autotile_07_05,autotile,7,5,80,112,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.02,"12,14,16,16",thumbs/autotile_07_05.png
-autotile_07_06,autotile,7,6,96,112,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.02,"0,14,4,16",thumbs/autotile_07_06.png
-autotile_07_07,autotile,7,7,112,112,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.148,"0,0,15,16",thumbs/autotile_07_07.png
-autotile_07_08,autotile,7,8,128,112,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.039,"0,14,16,16",thumbs/autotile_07_08.png
-autotile_07_09,autotile,7,9,144,112,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.074,"0,0,16,16",thumbs/autotile_07_09.png
-autotile_08_00,autotile,8,0,0,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.16,"0,0,16,16",thumbs/autotile_08_00.png
-autotile_08_01,autotile,8,1,16,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.062,"0,12,16,16",thumbs/autotile_08_01.png
-autotile_08_02,autotile,8,2,32,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.168,"0,0,16,16",thumbs/autotile_08_02.png
-autotile_08_03,autotile,8,3,48,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.266,"1,0,16,16",thumbs/autotile_08_03.png
-autotile_08_04,autotile,8,4,64,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.18,"2,0,16,16",thumbs/autotile_08_04.png
-autotile_08_05,autotile,8,5,80,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.055,"12,0,16,6",thumbs/autotile_08_05.png
-autotile_08_06,autotile,8,6,96,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.055,"0,0,4,6",thumbs/autotile_08_06.png
-autotile_08_07,autotile,8,7,112,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.18,"0,0,15,16",thumbs/autotile_08_07.png
-autotile_08_08,autotile,8,8,128,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.109,"0,0,16,6",thumbs/autotile_08_08.png
-autotile_08_09,autotile,8,9,144,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.129,"0,0,16,16",thumbs/autotile_08_09.png
-autotile_08_10,autotile,8,10,160,128,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.129,"0,0,16,16",thumbs/autotile_08_10.png
-autotile_09_00,autotile,9,0,0,144,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;wall,0.359,"0,1,16,16",thumbs/autotile_09_00.png
-autotile_09_01,autotile,9,1,16,144,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;wall,0.375,"0,0,16,15",thumbs/autotile_09_01.png
-autotile_09_02,autotile,9,2,32,144,16,16,autotile cave wall / cliff edge variant,autotile;medium;diagonal;edge-touching;wall,0.387,"0,0,16,15",thumbs/autotile_09_02.png
-autotile_09_03,autotile,9,3,48,144,16,16,autotile cave wall / cliff edge variant,autotile;medium;edge-touching;wall,0.363,"0,0,15,16",thumbs/autotile_09_03.png
-autotile_09_04,autotile,9,4,64,144,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.215,"1,0,16,16",thumbs/autotile_09_04.png
-autotile_09_05,autotile,9,5,80,144,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.117,"0,0,16,16",thumbs/autotile_09_05.png
-autotile_09_06,autotile,9,6,96,144,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.117,"0,0,16,16",thumbs/autotile_09_06.png
-autotile_09_07,autotile,9,7,112,144,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.215,"0,0,16,16",thumbs/autotile_09_07.png
-autotile_09_08,autotile,9,8,128,144,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.172,"0,0,16,16",thumbs/autotile_09_08.png
-autotile_09_09,autotile,9,9,144,144,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.094,"0,0,16,16",thumbs/autotile_09_09.png
-autotile_09_10,autotile,9,10,160,144,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.09,"0,0,16,16",thumbs/autotile_09_10.png
-autotile_10_04,autotile,10,4,64,160,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.199,"1,0,16,16",thumbs/autotile_10_04.png
-autotile_10_05,autotile,10,5,80,160,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.074,"12,0,16,16",thumbs/autotile_10_05.png
-autotile_10_06,autotile,10,6,96,160,16,16,autotile cave wall / cliff edge variant,autotile;sparse;wall,0.074,"0,0,4,16",thumbs/autotile_10_06.png
-autotile_10_07,autotile,10,7,112,160,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.199,"0,0,15,16",thumbs/autotile_10_07.png
-autotile_10_08,autotile,10,8,128,160,16,16,autotile cave wall / cliff edge variant,autotile;sparse;edge-touching;wall,0.148,"0,0,16,16",thumbs/autotile_10_08.png
+tilesheet,tile_number,tile_name
+creatures,0,humanoid adventurer / NPC variant
+creatures,1,humanoid adventurer / NPC variant
+creatures,2,humanoid adventurer / NPC variant
+creatures,3,humanoid adventurer / NPC variant
+creatures,4,humanoid adventurer / NPC variant
+creatures,5,humanoid adventurer / NPC variant
+creatures,6,humanoid adventurer / NPC variant
+creatures,7,humanoid adventurer / NPC variant
+creatures,8,humanoid adventurer / NPC variant
+creatures,9,humanoid adventurer / NPC variant
+creatures,10,humanoid adventurer / NPC variant
+creatures,11,humanoid adventurer / NPC variant
+creatures,12,humanoid adventurer / NPC variant
+creatures,13,humanoid adventurer / NPC variant
+creatures,14,humanoid adventurer / NPC variant
+creatures,15,humanoid adventurer / NPC variant
+creatures,16,humanoid adventurer / NPC variant
+creatures,17,humanoid adventurer / NPC variant
+creatures,18,humanoid adventurer / NPC variant
+creatures,19,humanoid adventurer / NPC variant
+creatures,20,humanoid adventurer / NPC variant
+creatures,21,humanoid adventurer / NPC variant
+creatures,22,humanoid adventurer / NPC variant
+creatures,23,humanoid adventurer / NPC variant
+creatures,24,humanoid adventurer / NPC variant
+creatures,25,humanoid adventurer / NPC variant
+creatures,26,humanoid adventurer / NPC variant
+creatures,27,humanoid adventurer / NPC variant
+creatures,48,small monster / goblin-like creature
+creatures,49,small monster / goblin-like creature
+creatures,50,small monster / goblin-like creature
+creatures,51,small monster / goblin-like creature
+creatures,52,small monster / goblin-like creature
+creatures,53,small monster / goblin-like creature
+creatures,54,small monster / goblin-like creature
+creatures,55,small monster / goblin-like creature
+creatures,56,small humanoid / mage variant
+creatures,57,small humanoid / mage variant
+creatures,58,small humanoid / mage variant
+creatures,59,small humanoid / mage variant
+creatures,60,small flying/monster icon
+creatures,61,small flying/monster icon
+creatures,62,small flying/monster icon
+creatures,63,small flying/monster icon
+creatures,64,large monster / humanoid beast variant
+creatures,65,large monster / humanoid beast variant
+creatures,66,large monster / humanoid beast variant
+creatures,67,large monster / humanoid beast variant
+creatures,68,large monster / humanoid beast variant
+creatures,69,large monster / humanoid beast variant
+creatures,70,large monster / humanoid beast variant
+creatures,71,large monster / humanoid beast variant
+creatures,72,large monster / humanoid beast variant
+creatures,73,large monster / humanoid beast variant
+creatures,74,large monster / humanoid beast variant
+creatures,75,large monster / humanoid beast variant
+creatures,76,large monster / humanoid beast variant
+creatures,96,skeleton / ghostly creature
+creatures,97,skeleton / ghostly creature
+creatures,98,skeleton / ghostly creature
+creatures,99,skeleton / ghostly creature
+creatures,100,orb / elemental / eye monster
+creatures,101,orb / elemental / eye monster
+creatures,102,orb / elemental / eye monster
+creatures,103,orb / elemental / eye monster
+creatures,104,orb / elemental / eye monster
+creatures,105,spirit / blob / jelly creature
+creatures,106,spirit / blob / jelly creature
+creatures,107,spirit / blob / jelly creature
+creatures,108,spirit / blob / jelly creature
+creatures,109,tree/plant monster or winged creature
+creatures,110,tree/plant monster or winged creature
+creatures,111,tree/plant monster or winged creature
+creatures,112,hooded figure / ghost variant
+creatures,113,hooded figure / ghost variant
+creatures,114,hooded figure / ghost variant
+creatures,115,hooded figure / ghost variant
+creatures,116,humanoid monster / beast variant
+creatures,117,humanoid monster / beast variant
+creatures,118,humanoid monster / beast variant
+creatures,119,humanoid monster / beast variant
+creatures,120,humanoid monster / beast variant
+creatures,121,humanoid monster / beast variant
+creatures,144,small animal / rodent variant
+creatures,145,small animal / rodent variant
+creatures,146,small animal / rodent variant
+creatures,147,small animal / rodent variant
+creatures,148,large animal / beast variant
+creatures,149,large animal / beast variant
+creatures,150,large animal / beast variant
+creatures,151,large animal / beast variant
+creatures,152,large animal / beast variant
+creatures,153,bird / flying creature variant
+creatures,154,bird / flying creature variant
+creatures,155,bird / flying creature variant
+creatures,156,bird / flying creature variant
+creatures,157,bird / flying creature variant
+creatures,160,flying beast / bird / dragon variant
+creatures,161,flying beast / bird / dragon variant
+creatures,162,flying beast / bird / dragon variant
+creatures,163,flying beast / bird / dragon variant
+creatures,164,flying beast / bird / dragon variant
+creatures,165,flying beast / bird / dragon variant
+creatures,166,flying beast / bird / dragon variant
+creatures,167,flying beast / bird / dragon variant
+creatures,168,flying beast / bird / dragon variant
+creatures,192,flying monster / dragon / magical entity
+creatures,193,flying monster / dragon / magical entity
+creatures,194,flying monster / dragon / magical entity
+creatures,195,flying monster / dragon / magical entity
+creatures,196,flying monster / dragon / magical entity
+creatures,197,flying monster / dragon / magical entity
+creatures,198,flying monster / dragon / magical entity
+creatures,199,flying monster / dragon / magical entity
+creatures,224,terrain hazard / plant / nest
+creatures,225,terrain hazard / plant / nest
+creatures,226,terrain hazard / plant / nest
+creatures,227,structure / statue / object creature
+creatures,228,structure / statue / object creature
+creatures,229,structure / statue / object creature
+creatures,230,structure / statue / object creature
+creatures,231,slime / mushroom / plant creature
+creatures,232,slime / mushroom / plant creature
+creatures,233,slime / mushroom / plant creature
+creatures,234,slime / mushroom / plant creature
+creatures,235,slime / mushroom / plant creature
+creatures,236,slime / mushroom / plant creature
+creatures,237,large beast / worm creature
+creatures,238,large beast / worm creature
+creatures,239,large beast / worm creature
+creatures,240,large monster / beast variant
+creatures,241,large monster / beast variant
+creatures,242,large monster / beast variant
+creatures,243,large monster / beast variant
+creatures,244,large monster / beast variant
+creatures,245,large monster / beast variant
+creatures,246,large monster / beast variant
+creatures,247,large monster / beast variant
+creatures,248,large monster / beast variant
+creatures,249,large monster / beast variant
+creatures,250,large monster / beast variant
+creatures,251,large monster / beast variant
+creatures,252,large monster / beast variant
+creatures,253,large monster / beast variant
+creatures,254,large monster / beast variant
+creatures,255,large monster / beast variant
+creatures,256,small monster / demon / beast variant
+creatures,257,small monster / demon / beast variant
+creatures,258,small monster / demon / beast variant
+creatures,259,small monster / demon / beast variant
+creatures,260,small monster / demon / beast variant
+creatures,261,small monster / demon / beast variant
+general,0,cursor
+general,1,default dot
+general,2,stairs down
+general,3,stairs up
+general,4,door
+general,5,open door
+general,6,gate
+general,7,door no wall
+general,8,door no wall open
+general,9,gate no wall
+general,10,window
+general,11,cursor bullseye
+general,12,cursor blocking
+general,13,floor pillow
+general,14,lever
+general,15,cauldron bubbling
+general,16,cauldron
+general,17,keyboard
+general,18,chair
+general,19,throne
+general,20,table
+general,21,grave
+general,22,stone tablet
+general,23,pot
+general,24,coffin
+general,25,coffin open
+general,26,treasure chest
+general,27,treasure chest open
+general,28,treasure chest alt
+general,29,treasure chest open alt
+general,30,box
+general,31,broken box
+general,32,grass
+general,33,bush
+general,34,tree
+general,35,wheat
+general,36,bridge
+general,37,bridge verticle
+general,38,pentagram
+general,39,vortex
+general,40,stove
+general,41,stove with flame
+general,42,cabinet
+general,43,wardrobe
+general,44,wardrobe open
+general,45,alchemy table
+general,46,statue
+general,47,sink
+general,48,toilet
+general,49,bookshelf
+general,50,shelf
+general,51,candles lit
+general,52,candles unlit
+general,53,bones
+general,54,rubble
+general,55,fence in wall
+general,56,fence
+general,57,stones
+general,58,spikes
+general,59,rail verticle
+general,60,rail horizontal
+general,61,tv off
+general,62,tv on
+general,63,stalagtight
+general,64,banner
+general,65,small debris / stones
+general,66,rock pile
+general,67,rock / boulder
+general,68,stalagmite / rock spire
+general,69,
+general,70,
+items,0,long sword
+items,1,short sword / dagger
+items,2,slanted sword
+items,3,club / cudgel
+items,4,magic wand
+items,5,mace
+items,6,axe
+items,7,pickaxe
+items,8,pickaxe variant
+items,9,bow
+items,10,staff / hooked tool
+items,11,small shield / buckler
+items,12,arrow / bolt
+items,13,star / shuriken
+items,24,dagger
+items,25,rapier / narrow sword
+items,26,knife
+items,27,curved dagger
+items,28,hatchet
+items,29,hand axe
+items,30,battle axe head
+items,31,spear / javelin
+items,32,halberd / polearm
+items,33,crossbow
+items,34,small pouch / herbs
+items,35,gem cluster / ore
+items,36,scroll / parchment
+items,37,ring / amulet
+items,48,chest armor / breastplate
+items,49,chainmail / scale armor
+items,50,tunic / armor vest
+items,51,belt / sash
+items,52,boot
+items,53,helmet
+items,54,skull mask / helm
+items,55,round shield
+items,56,kite shield
+items,57,door / tall shield
+items,58,food / meat scraps
+items,59,food / meat scraps variant
+items,60,pants / leggings
+items,61,wing / cloak
+items,72,cauldron / pot
+items,73,necklace / pendant
+items,74,magic wand / staff
+items,75,key ring / bones
+items,76,sparkles / magic effect
+items,77,egg / rock
+items,78,candle / tower marker
+items,79,feather
+items,80,bag / backpack
+items,81,wand / scepter
+items,82,potion bottle
+items,83,broken bone / tool
+items,84,treasure chest
+items,85,money bag
+items,86,chain / hook
+items,87,rope / snake cord
+items,88,jar / barrel
+items,89,map / document
+items,90,waterskin / flask
+items,91,bird / winged item
+items,92,horned skull
+items,93,fish bones
+items,94,egg / pebble
+items,95,crown / diadem
+items,96,book / tome
+items,97,potion flask
+items,98,flower / herbs
+items,99,house / hut icon
+items,100,ring with sparkle
+items,101,scythe
+items,102,bow / curved staff
+items,103,map / parchment
+items,104,orb / crystal ball
+items,105,lantern
+items,106,seated small figure
+items,107,kneeling small figure
+items,108,cloak / robe
+items,109,pedestal / stand
+items,110,needle / spike
+items,111,sword with hilt
+items,112,cracked wall / debris
+items,113,bed / bench
+items,114,tattered map / banner
+items,115,long key
+items,116,glove / hand
+items,117,shirt / tunic
+autotile_transparent_wall,0,wall208
+autotile_transparent_wall,1,wall248
+autotile_transparent_wall,2,wall104
+autotile_transparent_wall,12,wall214
+autotile_transparent_wall,13,wall255
+autotile_transparent_wall,14,wall107
+autotile_transparent_wall,24,wall22
+autotile_transparent_wall,25,wall31
+autotile_transparent_wall,26,wall11
+autotile_transparent_wall,4,wall64
+autotile_transparent_wall,16,wall66
+autotile_transparent_wall,28,wall2
+autotile_transparent_wall,6,wall80
+autotile_transparent_wall,7,wall88
+autotile_transparent_wall,8,wall72
+autotile_transparent_wall,18,wall82
+autotile_transparent_wall,19,wall90
+autotile_transparent_wall,20,wall74
+autotile_transparent_wall,30,wall18
+autotile_transparent_wall,31,wall26
+autotile_transparent_wall,32,wall10
+autotile_transparent_wall,9,wall91
+autotile_transparent_wall,10,wall94
+autotile_transparent_wall,21,wall122
+autotile_transparent_wall,22,wall218
+autotile_transparent_wall,48,wall16
+autotile_transparent_wall,49,wall24
+autotile_transparent_wall,50,wall8
+autotile_transparent_wall,52,wall0
+autotile_transparent_wall,54,wall219
+autotile_transparent_wall,55,wall126
+autotile_transparent_wall,45,wall123
+autotile_transparent_wall,46,wall95
+autotile_transparent_wall,57,wall250
+autotile_transparent_wall,58,wall222
+autotile_transparent_wall,3,wall127
+autotile_transparent_wall,5,wall223
+autotile_transparent_wall,15,wall251
+autotile_transparent_wall,17,wall254
+autotile_transparent_wall,27,wall120
+autotile_transparent_wall,29,wall216
+autotile_transparent_wall,33,wall27
+autotile_transparent_wall,34,wall30
+autotile_transparent_wall,36,wall86
+autotile_transparent_wall,37,wall75
+autotile_transparent_wall,38,wall210
+autotile_transparent_wall,39,wall106
+autotile_transparent_water,0,water208
+autotile_transparent_water,1,water248
+autotile_transparent_water,2,water104
+autotile_transparent_water,12,water214
+autotile_transparent_water,13,water255
+autotile_transparent_water,14,water107
+autotile_transparent_water,24,water22
+autotile_transparent_water,25,water31
+autotile_transparent_water,26,water11
+autotile_transparent_water,4,water64
+autotile_transparent_water,16,water66
+autotile_transparent_water,28,water2
+autotile_transparent_water,6,water80
+autotile_transparent_water,7,water88
+autotile_transparent_water,8,water72
+autotile_transparent_water,18,water82
+autotile_transparent_water,19,water90
+autotile_transparent_water,20,water74
+autotile_transparent_water,30,water18
+autotile_transparent_water,31,water26
+autotile_transparent_water,32,water10
+autotile_transparent_water,9,water91
+autotile_transparent_water,10,water94
+autotile_transparent_water,21,water122
+autotile_transparent_water,22,water218
+autotile_transparent_water,48,water16
+autotile_transparent_water,49,water24
+autotile_transparent_water,50,water8
+autotile_transparent_water,52,water0
+autotile_transparent_water,54,water219
+autotile_transparent_water,55,water126
+autotile_transparent_water,45,water123
+autotile_transparent_water,46,water95
+autotile_transparent_water,57,water250
+autotile_transparent_water,58,water222
+autotile_transparent_water,3,water127
+autotile_transparent_water,5,water223
+autotile_transparent_water,15,water251
+autotile_transparent_water,17,water254
+autotile_transparent_water,27,water120
+autotile_transparent_water,29,water216
+autotile_transparent_water,33,water27
+autotile_transparent_water,34,water30
+autotile_transparent_water,36,water86
+autotile_transparent_water,37,water75
+autotile_transparent_water,38,water210
+autotile_transparent_water,39,water106
+autotile_transparent_ledges,0,ledges208
+autotile_transparent_ledges,1,ledges248
+autotile_transparent_ledges,2,ledges104
+autotile_transparent_ledges,12,ledges214
+autotile_transparent_ledges,13,ledges255
+autotile_transparent_ledges,14,ledges107
+autotile_transparent_ledges,24,ledges22
+autotile_transparent_ledges,25,ledges31
+autotile_transparent_ledges,26,ledges11
+autotile_transparent_ledges,4,ledges64
+autotile_transparent_ledges,16,ledges66
+autotile_transparent_ledges,28,ledges2
+autotile_transparent_ledges,6,ledges80
+autotile_transparent_ledges,7,ledges88
+autotile_transparent_ledges,8,ledges72
+autotile_transparent_ledges,18,ledges82
+autotile_transparent_ledges,19,ledges90
+autotile_transparent_ledges,20,ledges74
+autotile_transparent_ledges,30,ledges18
+autotile_transparent_ledges,31,ledges26
+autotile_transparent_ledges,32,ledges10
+autotile_transparent_ledges,9,ledges91
+autotile_transparent_ledges,10,ledges94
+autotile_transparent_ledges,21,ledges122
+autotile_transparent_ledges,22,ledges218
+autotile_transparent_ledges,48,ledges16
+autotile_transparent_ledges,49,ledges24
+autotile_transparent_ledges,50,ledges8
+autotile_transparent_ledges,52,ledges0
+autotile_transparent_ledges,54,ledges219
+autotile_transparent_ledges,55,ledges126
+autotile_transparent_ledges,45,ledges123
+autotile_transparent_ledges,46,ledges95
+autotile_transparent_ledges,57,ledges250
+autotile_transparent_ledges,58,ledges222
+autotile_transparent_ledges,3,ledges127
+autotile_transparent_ledges,5,ledges223
+autotile_transparent_ledges,15,ledges251
+autotile_transparent_ledges,17,ledges254
+autotile_transparent_ledges,27,ledges120
+autotile_transparent_ledges,29,ledges216
+autotile_transparent_ledges,33,ledges27
+autotile_transparent_ledges,34,ledges30
+autotile_transparent_ledges,36,ledges86
+autotile_transparent_ledges,37,ledges75
+autotile_transparent_ledges,38,ledges210
+autotile_transparent_ledges,39,ledges106

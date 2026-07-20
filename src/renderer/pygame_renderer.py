@@ -416,52 +416,6 @@ class PygameRenderer(Renderer):
                 if resolved:
                     sheet_aliases[alias_name] = resolved
 
-        tile_index_path: Path | None = None
-        raw_tile_index = payload.get("tile_index_csv")
-        if isinstance(raw_tile_index, str) and raw_tile_index.strip():
-            candidate = Path(raw_tile_index.strip())
-            if not candidate.is_absolute():
-                candidate = Path(__file__).resolve().parents[2] / candidate
-            tile_index_path = candidate
-        elif default_sheet:
-            default_sheet_path = Path(resolve_sheet(default_sheet))
-            inferred = default_sheet_path.parent / "tile_index.csv"
-            if inferred.exists():
-                tile_index_path = inferred
-
-        tile_index: dict[str, tuple[str, int, int, int | None]] = {}
-        if tile_index_path is not None and tile_index_path.exists():
-            try:
-                with tile_index_path.open("r", encoding="utf-8", newline="") as index_file:
-                    for row in csv.DictReader(index_file):
-                        if not isinstance(row, dict):
-                            continue
-
-                        tile_id = str(row.get("tile_id", "")).strip()
-                        sheet_name = str(row.get("sheet", "")).strip()
-                        if not tile_id:
-                            continue
-
-                        try:
-                            tile_x = int(row.get("col", ""))
-                            tile_y = int(row.get("row", ""))
-                        except (TypeError, ValueError):
-                            continue
-
-                        sample_size: int | None = None
-                        width_raw = row.get("w")
-                        try:
-                            if width_raw is not None and str(width_raw).strip():
-                                parsed = int(width_raw)
-                                if parsed > 0:
-                                    sample_size = parsed
-                        except (TypeError, ValueError):
-                            sample_size = None
-
-                        tile_index[tile_id] = (sheet_name, tile_x, tile_y, sample_size)
-            except Exception:
-                tile_index = {}
-
         def resolve_sheet_alias(sheet_value: str) -> str:
             sheet_value = (sheet_value or "").strip()
             if not sheet_value:
@@ -479,6 +433,133 @@ class PygameRenderer(Renderer):
 
             return resolve_sheet(sheet_value)
 
+        tile_index_path: Path | None = None
+        raw_tile_index = payload.get("tile_index_csv")
+        if isinstance(raw_tile_index, str) and raw_tile_index.strip():
+            candidate = Path(raw_tile_index.strip())
+            if not candidate.is_absolute():
+                candidate = Path(__file__).resolve().parents[2] / candidate
+            tile_index_path = candidate
+        elif default_sheet:
+            default_sheet_path = Path(resolve_sheet(default_sheet))
+            inferred = default_sheet_path.parent / "tile_index.csv"
+            if inferred.exists():
+                tile_index_path = inferred
+
+        sheet_column_cache: dict[tuple[str, int], int] = {}
+
+        def sheet_columns(sheet_name: str, sample_size: int | None = None) -> int | None:
+            sheet_path = resolve_sheet_alias(sheet_name)
+            if not sheet_path:
+                return None
+
+            tile_px = sample_size if isinstance(sample_size, int) and sample_size > 0 else self._tile_size
+            key = (sheet_path, tile_px)
+            cached = sheet_column_cache.get(key)
+            if cached is not None:
+                return cached
+
+            sheet = self._sheet_cache.get(sheet_path)
+            if sheet is None:
+                try:
+                    sheet = self._pygame.image.load(sheet_path).convert_alpha()
+                    self._sheet_cache[sheet_path] = sheet
+                except Exception:
+                    return None
+
+            cols = sheet.get_width() // max(1, tile_px)
+            if cols <= 0:
+                return None
+
+            sheet_column_cache[key] = cols
+            return cols
+
+        tile_index: dict[str, tuple[str, int, int, int | None]] = {}
+        if tile_index_path is not None and tile_index_path.exists():
+            try:
+                with tile_index_path.open("r", encoding="utf-8", newline="") as index_file:
+                    for row in csv.DictReader(index_file):
+                        if not isinstance(row, dict):
+                            continue
+
+                        sample_size: int | None = None
+                        width_raw = row.get("w")
+                        try:
+                            if width_raw is not None and str(width_raw).strip():
+                                parsed = int(width_raw)
+                                if parsed > 0:
+                                    sample_size = parsed
+                        except (TypeError, ValueError):
+                            sample_size = None
+
+                        legacy_tile_id = str(row.get("tile_id", "")).strip()
+                        legacy_sheet_name = str(row.get("sheet", "")).strip()
+                        legacy_col = row.get("col")
+                        legacy_row = row.get("row")
+                        if legacy_tile_id and legacy_sheet_name:
+                            try:
+                                tile_x = int(legacy_col)
+                                tile_y = int(legacy_row)
+                            except (TypeError, ValueError):
+                                continue
+                            tile_index[legacy_tile_id] = (legacy_sheet_name, tile_x, tile_y, sample_size)
+                            tile_number = tile_y * max(1, sheet_columns(legacy_sheet_name, sample_size) or 1) + tile_x
+                            tile_index[f"{legacy_sheet_name}:{tile_number}"] = (
+                                legacy_sheet_name,
+                                tile_x,
+                                tile_y,
+                                sample_size,
+                            )
+                            tile_name = str(row.get("tile_name", row.get("cv_label", ""))).strip().lower()
+                            if tile_name:
+                                tile_index[f"{legacy_sheet_name}/{tile_name}"] = (
+                                    legacy_sheet_name,
+                                    tile_x,
+                                    tile_y,
+                                    sample_size,
+                                )
+                            continue
+
+                        simple_sheet_name = str(row.get("tilesheet", row.get("sheet", ""))).strip()
+                        if not simple_sheet_name:
+                            continue
+
+                        tile_number_raw = row.get("tile_number")
+                        try:
+                            tile_number = int(str(tile_number_raw).strip())
+                        except (TypeError, ValueError):
+                            continue
+
+                        cols = sheet_columns(simple_sheet_name, sample_size)
+                        if cols is None or cols <= 0:
+                            continue
+
+                        tile_x = tile_number % cols
+                        tile_y = tile_number // cols
+                        tile_index[f"{simple_sheet_name}:{tile_number}"] = (
+                            simple_sheet_name,
+                            tile_x,
+                            tile_y,
+                            sample_size,
+                        )
+                        tile_index[f"{simple_sheet_name}_{tile_y:02d}_{tile_x:02d}"] = (
+                            simple_sheet_name,
+                            tile_x,
+                            tile_y,
+                            sample_size,
+                        )
+
+                        tile_name = str(row.get("tile_name", "")).strip().lower()
+                        if tile_name:
+                            tile_index[f"{simple_sheet_name}/{tile_name}"] = (
+                                simple_sheet_name,
+                                tile_x,
+                                tile_y,
+                                sample_size,
+                            )
+            except Exception:
+                tile_index = {}
+
         def load_tile_from_spec(spec: dict) -> object | None:
             tile_id = spec.get("tile_id")
             if isinstance(tile_id, str):
@@ -486,6 +567,39 @@ class PygameRenderer(Renderer):
                 if indexed is not None:
                     sheet_name, tile_x, tile_y, sample_size = indexed
                     sheet_path = resolve_sheet_alias(sheet_name)
+                    if sheet_path:
+                        tile = self._load_tile(sheet_path, tile_x, tile_y, sample_size)
+                        if tile is not None:
+                            return tile
+
+            sheet_name = str(spec.get("sheet", "")).strip()
+
+            tile_number = spec.get("tile_number")
+            if isinstance(tile_number, int) and sheet_name:
+                indexed = tile_index.get(f"{sheet_name}:{tile_number}")
+                if indexed is not None:
+                    indexed_sheet, tile_x, tile_y, sample_size = indexed
+                    sheet_path = resolve_sheet_alias(indexed_sheet)
+                    if sheet_path:
+                        tile = self._load_tile(sheet_path, tile_x, tile_y, sample_size)
+                        if tile is not None:
+                            return tile
+                cols = sheet_columns(sheet_name, None)
+                if cols is not None and cols > 0:
+                    tile_x = tile_number % cols
+                    tile_y = tile_number // cols
+                    sheet_path = resolve_sheet_alias(sheet_name)
+                    if sheet_path:
+                        tile = self._load_tile(sheet_path, tile_x, tile_y, None)
+                        if tile is not None:
+                            return tile
+
+            tile_name = spec.get("tile_name")
+            if isinstance(tile_name, str) and sheet_name:
+                indexed = tile_index.get(f"{sheet_name}/{tile_name.strip().lower()}")
+                if indexed is not None:
+                    indexed_sheet, tile_x, tile_y, sample_size = indexed
+                    sheet_path = resolve_sheet_alias(indexed_sheet)
                     if sheet_path:
                         tile = self._load_tile(sheet_path, tile_x, tile_y, sample_size)
                         if tile is not None:

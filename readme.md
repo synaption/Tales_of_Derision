@@ -166,7 +166,7 @@ Action Economy:
 Targets
 - desktop fully rendered on windows and linux
 - steam
-- itch.io
+- itch.io via Pygbag
 
 All NPCs are playable.
 
