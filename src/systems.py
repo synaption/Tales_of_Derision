@@ -256,6 +256,15 @@ class RenderProcessor(esper.Processor):
         # moves; wall autotile masks never change on a static map.
         self._visible_cache_key: tuple[int | None, int, int] | None = None
         self._wall_mask_cache: dict[tuple[int, int], int] = {}
+        # Per-player-position FOV memo: pos -> (visible set, view bbox, shadow
+        # cells). Lets a walking step blit one cached map region + a few shadow
+        # fills instead of re-drawing every visible tile.
+        self._visible_bbox: tuple[int, int, int, int] | None = None
+        self._shadow_cells: tuple[tuple[int, int], ...] = ()
+        self._fov_cache: dict[
+            tuple[int | None, int, int],
+            tuple[set[tuple[int, int]], tuple[int, int, int, int] | None, tuple[tuple[int, int], ...]],
+        ] = {}
 
     @staticmethod
     def _clamp_sign(value: int) -> int:
@@ -388,6 +397,95 @@ class RenderProcessor(esper.Processor):
                 if self.game_map.has_line_of_sight(origin, (x, y)):
                     visible.add((x, y))
         return visible
+
+    @staticmethod
+    def _fov_bbox_and_shadows(
+        visible: set[tuple[int, int]],
+    ) -> tuple[tuple[int, int, int, int] | None, tuple[tuple[int, int], ...]]:
+        """Bounding box of the visible set plus the cells inside that box that
+        are *not* visible (wall shadows). Used to composite the map as one blit
+        of the box followed by a few shadow blackouts."""
+        if not visible:
+            return None, ()
+        xs = [c[0] for c in visible]
+        ys = [c[1] for c in visible]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        bbox = (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+        shadows = tuple(
+            (x, y)
+            for y in range(min_y, max_y + 1)
+            for x in range(min_x, max_x + 1)
+            if (x, y) not in visible
+        )
+        return bbox, shadows
+
+    def _draw_map_tile(self, r, vx: int, vy: int, wx: int, wy: int, draw_autotile_variant) -> None:
+        tile = self.game_map.tile_at(wx, wy)
+        if tile == self.game_map.WALL and callable(draw_autotile_variant):
+            wall_mask = self._wall_mask_cache.get((wx, wy))
+            if wall_mask is None:
+                wall_mask = self._neighbor_mask(wx, wy, self.game_map.WALL)
+                self._wall_mask_cache[(wx, wy)] = wall_mask
+            if bool(draw_autotile_variant(vx, vy, "wall", wall_mask, fg=_WALL_BROWN, bg=None)):
+                return
+        classification = "wall" if tile == self.game_map.WALL else "default"
+        tile_fg = _WALL_BROWN if classification == "wall" else None
+        r.draw_glyph_classified(vx, vy, tile, classification, fg=tile_fg, bg=None)
+
+    def _render_map_layer(self, r, draw_autotile_variant) -> None:
+        """Draw the map for the current FOV. When the renderer supports a cached
+        map surface, a step becomes one region blit + a few shadow fills instead
+        of re-drawing every visible tile (the dominant walking cost on web)."""
+        has_map_surface = getattr(r, "has_map_surface", None)
+        build_map_surface = getattr(r, "build_map_surface", None)
+        blit_map_region = getattr(r, "blit_map_region", None)
+        fill_cell_bg = getattr(r, "fill_cell_bg", None)
+        can_composite = all(
+            callable(fn) for fn in (has_map_surface, build_map_surface, blit_map_region, fill_cell_bg)
+        )
+
+        ox, oy = self._view_origin_x, self._view_origin_y
+
+        if not can_composite:
+            # Fallback (e.g. test double renderer): original per-visible-tile draw.
+            for vy in range(self._view_height):
+                wy = oy + vy
+                for vx in range(self._view_width):
+                    wx = ox + vx
+                    if (wx, wy) in self._visible_tiles:
+                        self._draw_map_tile(r, vx, vy, wx, wy, draw_autotile_variant)
+            return
+
+        if not has_map_surface():
+            # One-time: render every tile fully lit to a world-sized off-screen
+            # surface. World coords stay valid when the camera scrolls at zoom.
+            def _draw_full_map() -> None:
+                for wy in range(self.game_map.height):
+                    for wx in range(self.game_map.width):
+                        self._draw_map_tile(r, wx, wy, wx, wy, draw_autotile_variant)
+
+            build_map_surface(self.game_map.width, self.game_map.height, _draw_full_map)
+
+        if self._visible_bbox is None:
+            return
+        # Screen was cleared at the top of process(); blit only the visible FOV
+        # box (offset by the scroll origin) and black out wall-shadowed cells.
+        # Clip to the viewport so the single big blit can't spill into the
+        # sidebar/status area when the FOV box is larger than the visible map.
+        set_map_clip = getattr(r, "set_map_clip", None)
+        clear_clip = getattr(r, "clear_clip", None)
+        clipped = callable(set_map_clip) and callable(clear_clip)
+        if clipped:
+            set_map_clip(self._view_width, self._view_height)
+        try:
+            bx, by, bw, bh = self._visible_bbox
+            blit_map_region(bx, by, bw, bh, ox, oy)
+            for wx, wy in self._shadow_cells:
+                fill_cell_bg(wx - ox, wy - oy)
+        finally:
+            if clipped:
+                clear_clip()
 
     def _update_sighting_events(self, nearby: list[tuple[int, str, str, str, int, int, int, int]]) -> None:
         newly_seen = [item for item in nearby if item[0] not in self._seen_entity_ids]
@@ -705,43 +803,25 @@ class RenderProcessor(esper.Processor):
         self._compute_layout(player_pos)
 
         # Only recompute field-of-view when the player actually moved; the LOS
-        # raycast over every tile is one of the heaviest per-frame costs.
+        # raycast over every tile is one of the heaviest per-frame costs. Results
+        # are memoized per position (the map is static, so FOV is deterministic).
         vis_key = None if player_pos is None else (player_ent, player_pos.x, player_pos.y)
-        if vis_key is None or vis_key != self._visible_cache_key:
-            self._visible_tiles = self._compute_visible_tiles(player_ent, player_pos)
+        if vis_key != self._visible_cache_key:
             self._visible_cache_key = vis_key
+            if vis_key is None:
+                self._visible_tiles = set()
+                self._visible_bbox = None
+                self._shadow_cells = ()
+            else:
+                cached = self._fov_cache.get(vis_key)
+                if cached is None:
+                    visible = self._compute_visible_tiles(player_ent, player_pos)
+                    cached = (visible, *self._fov_bbox_and_shadows(visible))
+                    self._fov_cache[vis_key] = cached
+                self._visible_tiles, self._visible_bbox, self._shadow_cells = cached
         draw_autotile_variant = getattr(r, "draw_autotile_variant", None)
 
-        for vy in range(self._view_height):
-            wy = self._view_origin_y + vy
-            for vx in range(self._view_width):
-                wx = self._view_origin_x + vx
-                if (wx, wy) in self._visible_tiles:
-                    tile = self.game_map.tile_at(wx, wy)
-                    if tile == self.game_map.WALL and callable(draw_autotile_variant):
-                        wall_mask = self._wall_mask_cache.get((wx, wy))
-                        if wall_mask is None:
-                            wall_mask = self._neighbor_mask(wx, wy, self.game_map.WALL)
-                            self._wall_mask_cache[(wx, wy)] = wall_mask
-                        drew = bool(
-                            draw_autotile_variant(
-                                vx,
-                                vy,
-                                "wall",
-                                wall_mask,
-                                fg=_WALL_BROWN,
-                                bg=None,
-                            )
-                        )
-                        if drew:
-                            continue
-
-                    classification = "wall" if tile == self.game_map.WALL else "default"
-                    tile_fg = _WALL_BROWN if classification == "wall" else None
-                    r.draw_glyph_classified(vx, vy, tile, classification, fg=tile_fg, bg=None)
-                # Non-visible tiles are left as-is: clear() already filled the
-                # screen with the background each frame, so drawing a blank glyph
-                # over them is redundant work (~half the map cells while walking).
+        self._render_map_layer(r, draw_autotile_variant)
 
         player_draw: tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None] | None = None
         character_draws: list[

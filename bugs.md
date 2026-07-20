@@ -1,1 +1,1 @@
-audio glitch in emscripten but not online
+audio glitch in emscripten but not on desktop only.  
