@@ -37,10 +37,28 @@ jobs:
         run: bash scripts/build_pygbag.sh
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        id: configure_pages
+        continue-on-error: true
+        uses: actions/configure-pages@v6
+
+      - name: Configure Pages (auto-enable)
+        if: ${{ steps.configure_pages.outcome == 'failure' && secrets.PAGES_ADMIN_TOKEN != '' }}
+        uses: actions/configure-pages@v6
+        with:
+          token: ${{ secrets.PAGES_ADMIN_TOKEN }}
+          enablement: true
+
+      - name: Fail with setup guidance
+        if: ${{ steps.configure_pages.outcome == 'failure' && secrets.PAGES_ADMIN_TOKEN == '' }}
+        run: |
+          echo "GitHub Pages is not enabled for this repository."
+          echo "Enable it in Settings > Pages and set Source to GitHub Actions,"
+          echo "or add repository secret PAGES_ADMIN_TOKEN to let this workflow auto-enable Pages."
+          echo "PAGES_ADMIN_TOKEN should be a PAT with repo and pages administration/write permissions."
+          exit 1
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: build/web
 
@@ -53,4 +71,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

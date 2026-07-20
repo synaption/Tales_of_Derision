@@ -49,8 +49,9 @@ Then open `http://localhost:8000` in your browser.
 ## GitHub Pages deployment
 
 - Workflow file: `.github/workflows/pygbag-pages.yml`
-- Trigger: push to `main` (or run manually from Actions)
-- Publish source: GitHub Actions (repo Settings -> Pages)
+- Trigger: push to `main`/`master` (or run manually from Actions)
+- One-time setup: repo Settings -> Pages -> Source -> GitHub Actions
+- Optional auto-enable: add repository secret `PAGES_ADMIN_TOKEN` (PAT with repo + pages admin/write permissions)
 
 After the workflow finishes, the deploy job prints the final Pages URL.
 
