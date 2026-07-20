@@ -18,8 +18,10 @@ fuser -k "${PORT}/tcp" 2>/dev/null || true
 # Build using the existing build script.
 bash "${ROOT_DIR}/scripts/build_pygbag.sh"
 
-# Serve the built bundle.
-python3 -m http.server "${PORT}" --directory "${ROOT_DIR}/build/web" &
+# Serve the built bundle with cross-origin isolation headers (COOP/COEP) so
+# pygbag/emscripten can use threaded (glitch-free) audio. Plain http.server can't
+# set these headers.
+python3 "${ROOT_DIR}/scripts/serve_coi.py" "${ROOT_DIR}/build/web" "${PORT}" &
 SERVER_PID=$!
 
 # On exit or Ctrl+C, stop our server and free the port.

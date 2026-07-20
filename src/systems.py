@@ -251,6 +251,11 @@ class RenderProcessor(esper.Processor):
         self._last_player_pos: tuple[int, int] | None = None
         self._seen_entity_ids: set[int] = set()
         self._visible_tiles: set[tuple[int, int]] = set()
+        # Render caches (big win on web, where every re-render is main-thread work
+        # that can stutter audio). Field-of-view only changes when the player
+        # moves; wall autotile masks never change on a static map.
+        self._visible_cache_key: tuple[int | None, int, int] | None = None
+        self._wall_mask_cache: dict[tuple[int, int], int] = {}
 
     @staticmethod
     def _clamp_sign(value: int) -> int:
@@ -699,7 +704,12 @@ class RenderProcessor(esper.Processor):
         self._describe_movement(action, player_pos, suppress_wall_message=bool(events))
         self._compute_layout(player_pos)
 
-        self._visible_tiles = self._compute_visible_tiles(player_ent, player_pos)
+        # Only recompute field-of-view when the player actually moved; the LOS
+        # raycast over every tile is one of the heaviest per-frame costs.
+        vis_key = None if player_pos is None else (player_ent, player_pos.x, player_pos.y)
+        if vis_key is None or vis_key != self._visible_cache_key:
+            self._visible_tiles = self._compute_visible_tiles(player_ent, player_pos)
+            self._visible_cache_key = vis_key
         draw_autotile_variant = getattr(r, "draw_autotile_variant", None)
 
         for vy in range(self._view_height):
@@ -709,7 +719,10 @@ class RenderProcessor(esper.Processor):
                 if (wx, wy) in self._visible_tiles:
                     tile = self.game_map.tile_at(wx, wy)
                     if tile == self.game_map.WALL and callable(draw_autotile_variant):
-                        wall_mask = self._neighbor_mask(wx, wy, self.game_map.WALL)
+                        wall_mask = self._wall_mask_cache.get((wx, wy))
+                        if wall_mask is None:
+                            wall_mask = self._neighbor_mask(wx, wy, self.game_map.WALL)
+                            self._wall_mask_cache[(wx, wy)] = wall_mask
                         drew = bool(
                             draw_autotile_variant(
                                 vx,
@@ -726,8 +739,9 @@ class RenderProcessor(esper.Processor):
                     classification = "wall" if tile == self.game_map.WALL else "default"
                     tile_fg = _WALL_BROWN if classification == "wall" else None
                     r.draw_glyph_classified(vx, vy, tile, classification, fg=tile_fg, bg=None)
-                else:
-                    r.draw_glyph(vx, vy, " ")
+                # Non-visible tiles are left as-is: clear() already filled the
+                # screen with the background each frame, so drawing a blank glyph
+                # over them is redundant work (~half the map cells while walking).
 
         player_draw: tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None] | None = None
         character_draws: list[

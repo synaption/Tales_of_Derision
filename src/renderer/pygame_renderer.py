@@ -262,6 +262,9 @@ class PygameRenderer(Renderer):
         self._mouse_visible = True
         self._last_mouse_activity_ms = 0
         self._mouse_hide_delay_ms = 2400
+        # Cached game-scene snapshot reused as a static menu backdrop (see
+        # capture_backdrop). Avoids a full esper.process() render per menu frame.
+        self._backdrop_snapshot = None
 
     def apply_options(self, options: dict) -> None:
         self._options = dict(options)
@@ -317,6 +320,8 @@ class PygameRenderer(Renderer):
         self._autotile_tiles = {"wall": {}, "water": {}, "ledges": {}}
         self._fallback_tiles = {}
         self._tinted_tiles = {}
+        # Screen was just re-created (set_mode); any old backdrop is wrong size.
+        self._backdrop_snapshot = None
         self._load_tileset_config()
 
         self._keydown_to_action, self._keyup_to_action = _build_key_mappings(self._pygame, self._options)
@@ -1107,6 +1112,24 @@ class PygameRenderer(Renderer):
         )
         overlay.fill((color[0], color[1], color[2], clamped_alpha))
         self._screen.blit(overlay, (0, 0))
+
+    def capture_backdrop(self) -> None:
+        """Snapshot the current screen so menus can reuse it as a static
+        backdrop instead of re-rendering the whole game every keypress."""
+        if self._screen is not None:
+            self._backdrop_snapshot = self._screen.copy()
+
+    def has_backdrop(self) -> bool:
+        return self._backdrop_snapshot is not None
+
+    def blit_backdrop(self) -> bool:
+        if self._screen is None or self._backdrop_snapshot is None:
+            return False
+        self._screen.blit(self._backdrop_snapshot, (0, 0))
+        return True
+
+    def invalidate_backdrop(self) -> None:
+        self._backdrop_snapshot = None
 
     def draw_text_clipped(self, x: int, y: int, text: str, max_cells: int) -> None:
         if max_cells <= 0:

@@ -75,6 +75,13 @@ IS_WEB = sys.platform == "emscripten"
 # ~60Hz frees the thread for audio while keeping input latency imperceptible.
 _WEB_IDLE_POLL_SECONDS = 1 / 60
 
+# Web audio buffer (frames). On the single web thread the per-turn render blocks
+# audio mixing; a large buffer keeps enough pre-mixed audio queued to play
+# through that hitch without underrunning. Latency is irrelevant for looping
+# background music, so we bias big. Override per-run with "web_audio_buffer" in
+# options.json to A/B test without editing code.
+WEB_AUDIO_BUFFER = 16384
+
 
 def _audio_driver_order() -> list[str | None]:
     if os.environ.get("PULSE_SERVER"):
@@ -151,6 +158,51 @@ def _pick_music_track(
     return candidates[0]
 
 
+def _web_audio_buffer_order(options: dict | None) -> list[int]:
+    configured = None
+    if isinstance(options, dict):
+        configured = options.get("web_audio_buffer")
+
+    first = configured if isinstance(configured, int) and configured > 0 else WEB_AUDIO_BUFFER
+    ordered: list[int] = []
+    for size in (first, 16384, 8192, 4096, 2048):
+        if size > 0 and size not in ordered:
+            ordered.append(size)
+    return ordered
+
+
+def _init_web_mixer(pygame: Any, options: dict | None) -> Any | None:
+    # Let SDL open the device at the browser AudioContext's native rate
+    # (AUDIO_ALLOW_FREQUENCY_CHANGE) instead of forcing 44100Hz. Forcing a rate
+    # the browser doesn't use makes SDL resample every audio callback on the busy
+    # main thread, which crackles; matching the device rate resamples each Sound
+    # once at load instead. Paired with a moderate buffer (not the desktop ~3s).
+    allowed = getattr(pygame, "AUDIO_ALLOW_FREQUENCY_CHANGE", 1)
+    last_error: Exception | None = None
+    for buffer_size in _web_audio_buffer_order(options):
+        try:
+            pygame.mixer.quit()
+            pygame.mixer.init(
+                frequency=AUDIO_SAMPLE_RATE,
+                size=AUDIO_SAMPLE_SIZE,
+                channels=AUDIO_CHANNELS,
+                buffer=buffer_size,
+                allowedchanges=allowed,
+            )
+            init = pygame.mixer.get_init()
+            print(f"Web audio: buffer={buffer_size}, init={init}", file=sys.stderr)
+            return pygame
+        except Exception as exc:
+            last_error = exc
+            try:
+                pygame.mixer.quit()
+            except Exception:
+                pass
+    if last_error is not None:
+        print(f"Audio disabled: {last_error}", file=sys.stderr)
+    return None
+
+
 def _init_pygame_mixer(options: dict | None = None) -> Any | None:
     try:
         pygame = __import__("pygame")
@@ -159,6 +211,11 @@ def _init_pygame_mixer(options: dict | None = None) -> Any | None:
 
     if pygame.mixer.get_init() is not None:
         return pygame
+
+    if IS_WEB:
+        # The desktop driver-probing dance below is meaningless in the browser
+        # (one audio backend) and its huge buffer is the wrong default for web.
+        return _init_web_mixer(pygame, options)
 
     original_driver = os.environ.get("SDL_AUDIODRIVER")
     last_error: Exception | None = None
@@ -456,7 +513,20 @@ def _draw_menu_shell(
 ) -> tuple[int, int, int, int]:
     drew_game_background = False
     if overlay_game and esper.get_processor(RenderProcessor) is not None:
-        esper.process(None)
+        # The game behind a menu is static, so render it once and reuse a
+        # snapshot for subsequent menu frames. Re-running esper.process() every
+        # keypress is the main cost that makes menu scrolling stutter audio on
+        # web. The snapshot is invalidated by the game loop when play resumes.
+        blit_backdrop = getattr(renderer, "blit_backdrop", None)
+        has_backdrop = getattr(renderer, "has_backdrop", None)
+        capture_backdrop = getattr(renderer, "capture_backdrop", None)
+        reused = False
+        if callable(blit_backdrop) and callable(has_backdrop) and has_backdrop():
+            reused = blit_backdrop()
+        if not reused:
+            esper.process(None)
+            if callable(capture_backdrop):
+                capture_backdrop()
         drew_game_background = True
 
     if drew_game_background:
@@ -548,6 +618,15 @@ async def _await_action(renderer: Renderer) -> str | None:
         else:
             action = renderer.poll_action()
         if action is not None:
+            # Sleep a real frame before returning to the heavy, synchronous render
+            # this action triggers. During sustained/held movement actions stream
+            # out back-to-back; asyncio.sleep(0) returns to Python almost
+            # immediately without giving the browser wall-clock time to run the
+            # audio callback, so the buffer drains faster the longer you move and
+            # the music stutters. A real ~16ms yield guarantees audio refill time
+            # between renders (movement is already gated by key-repeat, so this
+            # doesn't slow it) and is imperceptible latency for a single input.
+            await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
             return action
         await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
 
@@ -1847,7 +1926,12 @@ async def main() -> None:
                 "move_right": -1,
             }
             press_order_counter = 0
+            invalidate_backdrop = getattr(renderer, "invalidate_backdrop", None)
             while True:
+                # Live play has (re)rendered the game, so any menu backdrop
+                # snapshot is stale; the next menu to open will re-capture.
+                if callable(invalidate_backdrop):
+                    invalidate_backdrop()
                 action = await _await_action(renderer)
                 if action == "quit":
                     break
