@@ -10,8 +10,32 @@ import csv
 from collections import deque
 import json
 from pathlib import Path
+import sys
 
 from .base import Renderer
+
+
+# Under pygbag the browser canvas fills the page via CSS (width/height: 100%),
+# so the pygame surface resolution must match the visible canvas or the browser
+# scales it and the game looks wrong-sized.
+IS_WEB = sys.platform == "emscripten"
+
+
+def _web_display_size(default: tuple[int, int] = (1280, 720)) -> tuple[int, int]:
+    """Visible browser canvas size (CSS pixels) for the pygbag build.
+
+    Falls back to a sane default off-web or if the JS bridge is unavailable.
+    """
+    try:
+        import platform as _platform  # pygbag injects a `window` proxy here
+
+        width = int(_platform.window.innerWidth)
+        height = int(_platform.window.innerHeight)
+        if width > 0 and height > 0:
+            return (width, height)
+    except Exception:
+        pass
+    return default
 
 
 _DEFAULT_ACTION_KEYBINDS: dict[str, list[str]] = {
@@ -262,7 +286,13 @@ class PygameRenderer(Renderer):
         self._sidebar_width_ratio = min(0.5, max(0.14, ratio))
 
         fullscreen = bool(self._options.get("fullscreen", False))
-        if fullscreen:
+        if IS_WEB:
+            # Browser "fullscreen" isn't a real display mode. Match the surface to
+            # the visible canvas so 1 surface px == 1 CSS px; otherwise the browser
+            # rescales an oversized surface and the whole game looks tiny.
+            window_w, window_h = _web_display_size()
+            self._screen = self._pygame.display.set_mode((window_w, window_h))
+        elif fullscreen:
             self._screen = self._pygame.display.set_mode((0, 0), self._pygame.FULLSCREEN)
         else:
             window_w = max(640, self._cols * self._cell_w)
