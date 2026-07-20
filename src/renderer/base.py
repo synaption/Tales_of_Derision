@@ -45,11 +45,14 @@ class Renderer(ABC):
         classification: str,
         fg: tuple[int, int, int] | None = None,
         bg: tuple[int, int, int] | None = None,
+        force_glyph: bool = False,
     ) -> None:
         """Draw a glyph with semantic classification (wall, enemy, etc).
 
         Renderers that do not support color/class styling can ignore
-        classification and fall back to plain glyph drawing.
+        classification and fall back to plain glyph drawing. ``force_glyph``
+        asks the renderer to draw the literal glyph rather than any sprite the
+        classification maps to (used for status identifiers like "~").
         """
         self.draw_glyph(x, y, glyph, fg=fg, bg=bg)
 

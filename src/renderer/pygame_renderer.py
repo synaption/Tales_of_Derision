@@ -976,6 +976,7 @@ class PygameRenderer(Renderer):
         classification: str,
         fg: tuple[int, int, int] | None = None,
         bg: tuple[int, int, int] | None = None,
+        force_glyph: bool = False,
     ) -> None:
         explicit_fg = fg is not None
         if fg is None:
@@ -987,7 +988,11 @@ class PygameRenderer(Renderer):
         if bg is not None:
             self._fill_glyph_background(x, y, resolved_bg)
 
-        tile, source = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
+        # force_glyph renders the literal glyph (e.g. a status identifier like
+        # "~"): resolve with no classification so it can't fall back to the
+        # classification's sprite, which would otherwise mask the glyph.
+        resolve_classification = None if force_glyph else classification
+        tile, source = self._resolve_tile_surface(glyph, resolve_classification, resolved_fg, resolved_bg)
         if self._screen is not None and tile is not None:
             draw_tile = tile
             if explicit_fg and source in {"glyph", "class"}:

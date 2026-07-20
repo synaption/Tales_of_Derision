@@ -174,6 +174,62 @@ Run only totally unrendered logic/data tests:
 
   ./run_tests.sh unrendered
 
+## Survival (food, water, wood)
+
+The player has **hunger** and **thirst** that rise every turn you take a step
+(shown on the bottom status line). Keep them down or you'll get escalating
+warnings:
+
+- **Water** — face the stone **well** (`O`) and press the interact key (Enter) to
+  drink and quench your thirst. A `Waterskin` in your inventory can also be drunk
+  (from the inventory screen) as portable water.
+- **Meat** — kill an enemy, then face its **corpse** and press Enter to open the
+  loot menu; every corpse yields meat you can take, named for the creature (a rat
+  drops `Rat Meat`, a goblin drops `Goblin Meat`). Raw meat barely fills you —
+  cook it first.
+- **Wood** — face a **tree** (`T`) and press Enter to chop a piece of `Wood`. The
+  tree falls after a few chops.
+- **Cooking** — face the iron **stove** (`#`) with `Wood` **and** any raw meat in
+  your inventory and press Enter: the wood fuels a fire that cooks the meat into a
+  filling `Cooked ... Meat`.
+- **Eating/drinking** — open the inventory (`I`), select a food or drink on the
+  items side, and press Enter to consume it (everything else equips as before).
+
+Interaction targets the tile you're facing: hold a movement key toward the
+well/tree/stove/corpse, then press Enter (the same targeting used for talking to
+NPCs).
+
+Every creature (player and NPCs alike) accumulates hunger and thirst each turn,
+though only the player's needs are surfaced as on-screen warnings.
+
+**The world is a living ecosystem.** The map is a **3×3 grid of sections**. You
+are only ever in one section at a time: the camera shows just your current
+section, and when you walk off its edge you cross into the neighbouring section
+("You cross into a new area."). The other eight sections are **still fully
+simulated** every turn — deer graze and drink, predators hunt — so the world
+keeps living while you're elsewhere.
+
+Two lakes and a river (`~` water) run through it. Wild **deer** (`d`) roam:
+when hungry they graze trees, when thirsty they drink from lakes and rivers.
+**Carnivores** (goblins, cave rats) hunt deer when hungry — a kill leaves a
+corpse you can loot. You can hunt deer too: walk into one to take it down for
+`Deer Meat`.
+
+**Swimming.** Water blocks NPCs and line of sight, but *you* can wade in and
+swim across lakes and rivers (walls still block).
+
+**Status identifiers.** A character's tile animates through its own glyph plus an
+identifier for each active status, each for a configurable length of time, in a
+repeating cycle that plays in real time even while you stand still. Swimming
+shows your tile for 1s then a `~` for 0.5s. Statuses **stack sequentially**: if
+you were also on fire, the cycle would be your tile (1s) → `~` (0.5s) → a red `F`
+(0.5s) → repeat. Durations and identifiers live in `_STATUS_DISPLAY` /
+`_STATUS_BASE_SECONDS` in [src/systems.py](src/systems.py).
+
+Survival item names and their food/water values live in
+[src/items.py](src/items.py). Note: survival state is not saved yet — the world
+regenerates each session (only map size + player position are persisted).
+
 ## Menus
 
 - Startup flow: Title Screen -> Main Menu (`Continue`, `New Game`, `Quit`)

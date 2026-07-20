@@ -14,8 +14,9 @@ from typing import Any
 
 import esper
 
-from components import BlocksMovement, Corpse, Dialogue, Enemy, Equipment, Friendly, Inventory, NPC, Name, Player, Position, Renderable, Vision
+from components import BlocksMovement, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Friendly, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Stove, Tree, Vision, Well
 from game_map import GameMap
+from items import WOOD, cook_meat, hunger_restored, is_raw_meat, thirst_restored
 from persistence import (
     DEFAULT_SAVE_FILE,
     bootstrap_files,
@@ -27,10 +28,12 @@ from persistence import (
 )
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import MovementProcessor, NpcAiProcessor, RenderProcessor
+from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, player_is_animated, queue_message
 
-MAP_WIDTH = 40
-MAP_HEIGHT = 20
+# The world is a 3x3 expansion of the original 40x20 room, giving room for
+# lakes, rivers, and roaming wildlife.
+MAP_WIDTH = 120
+MAP_HEIGHT = 60
 
 _CARDINAL_ACTION_DELTAS = {
     "move_up": (0, -1),
@@ -415,6 +418,10 @@ _MENU_SELECTED_TEXT = (252, 252, 252)
 _TITLE_SPLASH_SECONDS = 3.0
 _GOBLIN_GREEN = (82, 166, 74)
 _RAT_BROWN = (128, 92, 60)
+_TREE_GREEN = (58, 138, 66)
+_WELL_STONE = (150, 168, 190)
+_STOVE_IRON = (120, 120, 128)
+_DEER_TAN = (176, 132, 92)
 _HUMAN_SKIN_TONES: list[tuple[int, int, int]] = [
     (255, 238, 220),
     (248, 227, 208),
@@ -628,6 +635,30 @@ async def _await_action(renderer: Renderer) -> str | None:
             # doesn't slow it) and is imperceptible latency for a single input.
             await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
             return action
+        await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
+
+
+# How often to re-render while the player has an active status animation, so the
+# sub-second identifiers (e.g. the 0.5s "~") are visible without waiting for
+# input. Shorter than the shortest status frame; only used while animating.
+_STATUS_ANIM_POLL_SECONDS = 0.2
+
+
+async def _await_action_or_idle(renderer: Renderer, idle_timeout: float) -> str | None:
+    """Like ``_await_action`` but returns ``None`` after ``idle_timeout`` seconds
+    with no input -- an animation tick. Non-blocking on both desktop and web so
+    idle status animations keep playing while we wait."""
+    poll_nonblocking = getattr(renderer, "poll_action_nonblocking", None)
+    poll = poll_nonblocking if callable(poll_nonblocking) else renderer.poll_action
+    deadline = time.monotonic() + idle_timeout
+    while True:
+        action = poll()
+        if action is not None:
+            if IS_WEB:
+                await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
+            return action
+        if time.monotonic() >= deadline:
+            return None
         await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
 
 
@@ -935,6 +966,12 @@ def _item_visual(item_name: str) -> tuple[str, str, tuple[int, int, int] | None,
     if any(token in lowered for token in ("bandage", "scroll", "map", "book", "torch")):
         return ("?", "valuable", (236, 210, 150), None)
 
+    if any(token in lowered for token in ("wood", "log", "branch", "kindling")):
+        return ("=", "valuable", (150, 111, 70), None)
+
+    if "cooked" in lowered and "meat" in lowered:
+        return ("%", "valuable", (196, 118, 74), None)
+
     if any(token in lowered for token in ("apple", "bread", "meat", "food")):
         return ("%", "valuable", (222, 142, 106), None)
 
@@ -1180,6 +1217,97 @@ def _loot_item_from_corpse(corpse_ent: int, player_ent: int, entry: _TradeEntry)
         return f"You looted {item_name} from {corpse_name}. Nothing else of value remains."
 
     return f"You looted {item_name} from {corpse_name}."
+
+
+def _find_adjacent_feature(direction_action: str | None, component: type) -> int | None:
+    """Return the entity carrying ``component`` on the tile the player is facing
+    (the aimed direction), or ``None``. Used to interact with wells, stoves, and
+    trees the same way corpses/NPCs are targeted."""
+    player_ent = _first_player_entity()
+    if player_ent is None or not esper.has_component(player_ent, Position):
+        return None
+
+    player_pos = esper.component_for_entity(player_ent, Position)
+    target_xy = _interaction_target_xy(direction_action, player_pos)
+    for ent, (pos, _feature) in esper.get_components(Position, component):
+        if (pos.x, pos.y) == target_xy:
+            return ent
+    return None
+
+
+def _chop_tree(tree_ent: int, player_ent: int) -> str:
+    """Chop one load of wood off a tree. When the last load is taken the tree
+    falls (its entity is removed, freeing the tile)."""
+    tree = esper.component_for_entity(tree_ent, Tree)
+    inventory = _ensure_inventory(player_ent)
+    inventory.items.append(WOOD)
+    tree.wood -= 1
+    if tree.wood <= 0:
+        esper.delete_entity(tree_ent, immediate=True)
+        return "You fell the tree, gathering a last piece of wood."
+    return "You chop a piece of wood from the tree."
+
+
+def _drink_from_well(well_ent: int, player_ent: int) -> str:
+    """Drink from a well, quenching thirst. Wells are a renewable source."""
+    if not esper.has_component(player_ent, Needs):
+        return "The water is cool and clear."
+
+    needs = esper.component_for_entity(player_ent, Needs)
+    if needs.thirst <= 0:
+        return "You drink from the well, but you were not thirsty."
+
+    needs.thirst = 0.0
+    return "You drink deeply from the well. Your thirst is quenched."
+
+
+def _cook_at_stove(stove_ent: int, player_ent: int) -> str:
+    """Turn one Wood + one Raw Meat into a Cooked Meat at the stove. Needs both:
+    wood fuels the fire, raw meat is the ingredient."""
+    if not esper.has_component(player_ent, Inventory):
+        return "You have nothing to cook."
+
+    inventory = esper.component_for_entity(player_ent, Inventory)
+    raw_meat = next((item for item in inventory.items if is_raw_meat(item)), None)
+
+    if raw_meat is None:
+        return "You have no raw meat to cook. Butcher it from a corpse first."
+    if WOOD not in inventory.items:
+        return "The stove is cold. You need wood to make a fire."
+
+    inventory.items.remove(WOOD)
+    inventory.items.remove(raw_meat)
+    inventory.items.append(cook_meat(raw_meat))
+    return f"You light the stove and cook the {raw_meat.lower()} into a hot meal."
+
+
+def _apply_consumable(player_ent: int, item_index: int) -> str | None:
+    """Eat/drink the inventory item at ``item_index`` if it is consumable,
+    removing it and reducing the matching need. Returns a message, or ``None``
+    when the item is not food/drink (so the caller can fall back to equipping)."""
+    if not esper.has_component(player_ent, Inventory):
+        return None
+
+    inventory = esper.component_for_entity(player_ent, Inventory)
+    if item_index < 0 or item_index >= len(inventory.items):
+        return None
+
+    item_name = inventory.items[item_index]
+    hunger_value = hunger_restored(item_name)
+    thirst_value = thirst_restored(item_name)
+    if hunger_value is None and thirst_value is None:
+        return None
+
+    if not esper.has_component(player_ent, Needs):
+        esper.add_component(player_ent, Needs())
+    needs = esper.component_for_entity(player_ent, Needs)
+
+    inventory.items.pop(item_index)
+    if hunger_value is not None:
+        needs.hunger = max(0.0, needs.hunger - hunger_value)
+        return f"You eat the {item_name}."
+    needs.thirst = max(0.0, needs.thirst - thirst_value)
+    return f"You drink the {item_name}."
 
 
 async def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
@@ -1749,10 +1877,15 @@ async def _draw_inventory_menu(renderer: Renderer) -> str:
 
             if selected_panel == "right":
                 if not inventory.items:
-                    message = "No items to equip."
+                    message = "No items to use."
                 else:
                     clamped_idx = max(0, min(selected_item_idx, len(inventory.items) - 1))
-                    message = _equip_inventory_item(inventory, equipment, clamped_idx)
+                    # Food/drink is eaten/drunk; everything else is equipped.
+                    consume_message = _apply_consumable(player_ent, clamped_idx)
+                    if consume_message is not None:
+                        message = consume_message
+                    else:
+                        message = _equip_inventory_item(inventory, equipment, clamped_idx)
                     if inventory.items:
                         selected_item_idx = min(selected_item_idx, len(inventory.items) - 1)
                     else:
@@ -1777,6 +1910,9 @@ def _spawn_cave_rat(
         Enemy(),
         Vision(6),
         BlocksMovement(),
+        Meat("Rat Meat"),
+        Diet("carnivore"),
+        Needs(),
     ]
     if include_loot:
         components.extend(
@@ -1807,6 +1943,7 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         BlocksMovement(),
         Inventory(items=["Bandage", "Torch", "Apple"]),
         Equipment(slots=player_equipment),
+        Needs(),
     )
 
     if rat_flood:
@@ -1836,6 +1973,7 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         BlocksMovement(),
         Inventory(items=["Bread", "Waterskin"]),
         Equipment(slots=_default_equipment_slots()),
+        Needs(),
     )
     goblin_equipment = _default_equipment_slots()
     goblin_equipment["main hand"] = "Jagged Dagger"
@@ -1849,6 +1987,9 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         BlocksMovement(),
         Inventory(items=["Copper Coin", "Bone Charm"]),
         Equipment(slots=goblin_equipment),
+        Meat("Goblin Meat"),
+        Diet("carnivore"),
+        Needs(),
     )
     esper.create_entity(
         rat_pos,
@@ -1860,8 +2001,81 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         BlocksMovement(),
         Inventory(items=["String", "Pebble"]),
         Equipment(slots=_default_equipment_slots()),
+        Meat("Rat Meat"),
+        Diet("carnivore"),
+        Needs(),
     )
+
+    _spawn_environment_features(game_map, player_position)
     return 1
+
+
+def _spawn_deer(game_map: GameMap, x: int, y: int) -> None:
+    """Create a wild deer: prey that grazes trees and drinks water, and yields
+    Deer Meat when hunted."""
+    if not game_map.is_walkable(x, y):
+        return
+    esper.create_entity(
+        Position(x, y),
+        Renderable("d", fg=_DEER_TAN),
+        Name("Deer"),
+        NPC(),
+        Deer(),
+        Diet("herbivore"),
+        Vision(8),
+        BlocksMovement(),
+        Meat("Deer Meat"),
+        Needs(hunger=30.0, thirst=30.0),
+    )
+
+
+def _spawn_environment_features(game_map: GameMap, player_position: Position) -> None:
+    """Populate the world: a well and stove by the player for the survival loop,
+    tree stands and roaming deer scattered across the map, with the wildlife
+    biased toward the water so grazing/drinking is nearby."""
+    # Safety: never leave the player standing in (or walled by) a lake/river.
+    game_map.clear_water_around(player_position.x, player_position.y, radius=2)
+
+    occupied = {
+        (pos.x, pos.y)
+        for _ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
+    }
+
+    def place_at(x: int, y: int, *components: object) -> bool:
+        if not game_map.is_walkable(x, y):
+            return False
+        if (x, y) in occupied or (x, y) == (player_position.x, player_position.y):
+            return False
+        occupied.add((x, y))
+        esper.create_entity(Position(x, y), *components)
+        return True
+
+    def place(dx: int, dy: int, *components: object) -> bool:
+        return place_at(player_position.x + dx, player_position.y + dy, *components)
+
+    place(2, 2, Renderable("O", fg=_WELL_STONE), Name("Stone Well"), Well(), BlocksMovement())
+    place(4, 2, Renderable("#", fg=_STOVE_IRON), Name("Iron Stove"), Stove(), BlocksMovement())
+
+    def plant_tree(x: int, y: int) -> None:
+        place_at(x, y, Renderable("T", fg=_TREE_GREEN), Name("Tree"), Tree(), BlocksMovement())
+
+    # A few starter trees within reach, plus deterministic forest stands spread
+    # across the map so both the player and grazing deer have wood/food.
+    for tree_dx, tree_dy in ((-3, -2), (-4, -2), (-3, 3), (5, 3), (6, 3)):
+        plant_tree(player_position.x + tree_dx, player_position.y + tree_dy)
+
+    stand_centers = [
+        (int(game_map.width * fx), int(game_map.height * fy))
+        for fx, fy in ((0.15, 0.25), (0.4, 0.8), (0.7, 0.6), (0.85, 0.75), (0.55, 0.2))
+    ]
+    for cx, cy in stand_centers:
+        for tx, ty in ((0, 0), (1, 0), (0, 1), (2, 1), (1, 2)):
+            plant_tree(cx + tx, cy + ty)
+
+    # Deer near the tree stands / water so they can graze and drink.
+    for cx, cy in stand_centers:
+        for dxy in ((-2, 0), (3, 2)):
+            _spawn_deer(game_map, cx + dxy[0], cy + dxy[1])
 
 
 async def main() -> None:
@@ -1911,6 +2125,7 @@ async def main() -> None:
                 priority=1,
             )
             esper.add_processor(NpcAiProcessor(game_map), priority=0)
+            esper.add_processor(NeedsProcessor(), priority=0)
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame
@@ -1932,7 +2147,17 @@ async def main() -> None:
                 # snapshot is stale; the next menu to open will re-capture.
                 if callable(invalidate_backdrop):
                     invalidate_backdrop()
-                action = await _await_action(renderer)
+                # When the player has an active status animation (swimming, on
+                # fire, ...), poll on a short timeout and re-render on each idle
+                # tick so the identifiers cycle without input; otherwise keep the
+                # efficient blocking wait (desktop truly idles).
+                if player_is_animated(game_map):
+                    action = await _await_action_or_idle(renderer, _STATUS_ANIM_POLL_SECONDS)
+                    if action is None:
+                        esper.process(None)
+                        continue
+                else:
+                    action = await _await_action(renderer)
                 if action == "quit":
                     break
                 if action == "tile_scale_up":
@@ -1991,6 +2216,29 @@ async def main() -> None:
                             break
                         esper.process(None)
                         continue
+
+                    # Environment features: chop a faced tree, drink from a faced
+                    # well, or cook at a faced stove. Each queues a log line and
+                    # refreshes the frame (a free action, like looting).
+                    player_ent = _first_player_entity()
+                    if player_ent is not None:
+                        interact_tree = _find_adjacent_feature(interact_action, Tree)
+                        if interact_tree is not None:
+                            queue_message(_chop_tree(interact_tree, player_ent))
+                            esper.process(None)
+                            continue
+
+                        interact_well = _find_adjacent_feature(interact_action, Well)
+                        if interact_well is not None:
+                            queue_message(_drink_from_well(interact_well, player_ent))
+                            esper.process(None)
+                            continue
+
+                        interact_stove = _find_adjacent_feature(interact_action, Stove)
+                        if interact_stove is not None:
+                            queue_message(_cook_at_stove(interact_stove, player_ent))
+                            esper.process(None)
+                            continue
 
                 if action == "open_inventory":
                     inventory_choice = await _draw_inventory_menu(renderer)

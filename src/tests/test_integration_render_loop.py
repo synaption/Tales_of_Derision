@@ -202,7 +202,8 @@ def test_player_attacks_enemy_on_collision() -> None:
     corpse_inventory = esper.component_for_entity(corpse_ent, Inventory)
     corpse_equipment = esper.component_for_entity(corpse_ent, Equipment)
     assert corpse_renderable.glyph == "x"
-    assert corpse_inventory.items == ["Copper Coin"]
+    # A corpse always yields butcherable Raw Meat on top of carried loot.
+    assert corpse_inventory.items == ["Raw Meat", "Copper Coin"]
     assert corpse_equipment.slots["main hand"] == "Jagged Dagger"
 
 

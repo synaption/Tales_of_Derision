@@ -5,11 +5,13 @@ process() receives whatever args are passed to esper.process().
 """
 from collections.abc import Callable
 import textwrap
+import time
 
 import esper
 
-from components import BlocksMovement, Corpse, Enemy, Equipment, Friendly, Inventory, Name, NPC, Player, Position, Renderable, Vision
+from components import BlocksMovement, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Inventory, Meat, Name, Needs, NPC, OnFire, Player, Position, Renderable, Tree, Vision
 from game_map import GameMap
+from items import RAW_MEAT
 from renderer.base import Renderer
 
 _ACTION_DELTAS = {
@@ -48,6 +50,48 @@ _ARROW_TO_WORD = {
 }
 
 _WALL_BROWN = (124, 88, 56)
+_WATER_BLUE = (64, 118, 190)
+
+# A section must be at least this big for the 3x3 section camera to engage;
+# below it (tiny test maps) the renderer keeps its plain centred camera.
+_MIN_SECTION_W = 12
+_MIN_SECTION_H = 8
+
+# --- Status identifier animation -------------------------------------------
+# A character's rendered tile cycles through its own glyph followed by an
+# identifier for each active status, each shown for a configurable length of
+# time, then repeats. Statuses stack sequentially: e.g. swimming + on fire ->
+# own tile (1.0s) -> "~" (0.5s) -> red "F" (0.5s) -> loop.
+#
+# How long the character's own tile shows before the status identifiers cycle.
+_STATUS_BASE_SECONDS = 1.0
+# status name -> (identifier glyph, fg override or None to keep the character's
+# colour, seconds shown). Tune these freely.
+_STATUS_DISPLAY: dict[str, tuple[str, tuple[int, int, int] | None, float]] = {
+    "swimming": ("~", None, 0.5),
+    "on_fire": ("F", (224, 74, 44), 0.5),
+}
+# Order the identifiers cycle in, after the base tile.
+_STATUS_ORDER: tuple[str, ...] = ("swimming", "on_fire")
+
+
+def active_statuses(game_map: GameMap, ent: int, pos: Position) -> list[str]:
+    """The status keys currently affecting an entity, in display order. Swimming
+    is derived from standing on water; on_fire from the OnFire component."""
+    active: set[str] = set()
+    if game_map.is_water(pos.x, pos.y):
+        active.add("swimming")
+    if esper.has_component(ent, OnFire):
+        active.add("on_fire")
+    return [name for name in _STATUS_ORDER if name in active]
+
+
+def player_is_animated(game_map: GameMap) -> bool:
+    """True when the player has any active timed status, so the turn loop knows
+    to keep re-rendering while idle for the animation to play."""
+    for ent, (pos, _player) in esper.get_components(Position, Player):
+        return bool(active_statuses(game_map, ent, pos))
+    return False
 
 _AUTOTILE_DIRECTION_OFFSETS = {
     1: (-1, -1),
@@ -98,6 +142,54 @@ def _pull_turn_events() -> list[str]:
     return events
 
 
+def queue_message(text: str) -> None:
+    """Public hook for non-processor code (e.g. the turn loop's interaction
+    handlers) to push a line into the on-screen log. The RenderProcessor drains
+    the queue at the top of every ``process`` call."""
+    _push_turn_event(text)
+
+
+def slay_entity(target_ent: int) -> int:
+    """Turn ``target_ent`` into a corpse and return the new corpse entity.
+
+    Shared by player melee (MovementProcessor) and predator kills (the AI). The
+    corpse carries butcherable meat (named per creature via ``Meat``, falling
+    back to generic Raw Meat) plus whatever the creature was carrying/wearing.
+    """
+    pos = esper.component_for_entity(target_ent, Position)
+    target_name = "Unknown"
+    if esper.has_component(target_ent, Name):
+        target_name = esper.component_for_entity(target_ent, Name).value
+
+    meat_name = RAW_MEAT
+    if esper.has_component(target_ent, Meat):
+        meat_name = esper.component_for_entity(target_ent, Meat).name
+
+    corpse_items: list[str] = [meat_name]
+    if esper.has_component(target_ent, Inventory):
+        corpse_items.extend(esper.component_for_entity(target_ent, Inventory).items)
+
+    corpse_components: list[object] = [
+        Position(pos.x, pos.y),
+        Renderable(_CORPSE_GLYPH),
+        Name(f"Corpse of {target_name}"),
+        Corpse(),
+        Inventory(items=corpse_items),
+    ]
+
+    if esper.has_component(target_ent, Equipment):
+        looted_slots = {
+            slot_name: item_name
+            for slot_name, item_name in esper.component_for_entity(target_ent, Equipment).slots.items()
+            if item_name
+        }
+        if looted_slots:
+            corpse_components.append(Equipment(slots=looted_slots))
+
+    esper.delete_entity(target_ent, immediate=True)
+    return esper.create_entity(*corpse_components)
+
+
 class MovementProcessor(esper.Processor):
     """Applies a movement action to every player-controlled entity."""
 
@@ -125,7 +217,9 @@ class MovementProcessor(esper.Processor):
         for _ent, (pos, _player) in esper.get_components(Position, Player):
             nx, ny = pos.x + dx, pos.y + dy
             target_occupied = (nx, ny) in occupied and occupied[(nx, ny)] != _ent
-            if self.game_map.is_walkable(nx, ny):
+            # The player can swim, so movement uses is_passable (land + water);
+            # walls still block. NPCs keep using is_walkable (land only).
+            if self.game_map.is_passable(nx, ny):
                 if not target_occupied:
                     pos.x, pos.y = nx, ny
                     continue
@@ -135,35 +229,15 @@ class MovementProcessor(esper.Processor):
                 if esper.has_component(target_ent, Name):
                     target_name = esper.component_for_entity(target_ent, Name).value
 
-                if esper.has_component(target_ent, Enemy):
+                # Hostiles are fought; deer are wild game the player can hunt.
+                is_huntable = esper.has_component(target_ent, Enemy) or esper.has_component(
+                    target_ent, Deer
+                )
+                if is_huntable:
                     _push_turn_event(f"You attack {target_name}.")
                     if self.on_melee_attack is not None:
                         self.on_melee_attack()
-                    corpse_name = f"Corpse of {target_name}"
-                    corpse_components: list[object] = [
-                        Position(nx, ny),
-                        Renderable(_CORPSE_GLYPH),
-                        Name(corpse_name),
-                        Corpse(),
-                    ]
-
-                    if esper.has_component(target_ent, Inventory):
-                        enemy_inventory = esper.component_for_entity(target_ent, Inventory)
-                        if enemy_inventory.items:
-                            corpse_components.append(Inventory(items=list(enemy_inventory.items)))
-
-                    if esper.has_component(target_ent, Equipment):
-                        enemy_equipment = esper.component_for_entity(target_ent, Equipment)
-                        looted_slots = {
-                            slot_name: item_name
-                            for slot_name, item_name in enemy_equipment.slots.items()
-                            if item_name
-                        }
-                        if looted_slots:
-                            corpse_components.append(Equipment(slots=looted_slots))
-
-                    esper.delete_entity(target_ent, immediate=True)
-                    esper.create_entity(*corpse_components)
+                    slay_entity(target_ent)
                     if self.on_enemy_death is not None:
                         self.on_enemy_death()
                     continue
@@ -175,62 +249,258 @@ class MovementProcessor(esper.Processor):
                 _push_turn_event("Something blocks your way.")
 
 
+# Need level (percent of max) at which an NPC stops what it's doing and forages.
+_FORAGE_THRESHOLD = 55.0
+# How much a single grazing/drinking/feeding action restores.
+_GRAZE_RESTORE = 45.0
+_DRINK_RESTORE = 100.0
+_FEED_RESTORE = 60.0
+
+
+def _chebyshev(a: tuple[int, int], b: tuple[int, int]) -> int:
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
 class NpcAiProcessor(esper.Processor):
-    """Makes NPCs chase the player when they have line of sight."""
+    """Drives NPC behaviour each turn.
+
+    Priority order per creature:
+      1. Satisfy an urgent need -- drink at water, or (by diet) graze a tree or
+         hunt prey.
+      2. Otherwise, hostiles chase the player when they can see them.
+
+    Water tiles and the walkable "shore" tiles beside them are precomputed once
+    (the map is static) so a thirsty animal is a cheap nearest-lookup plus one
+    pathfind, not a full-map rescan every turn.
+    """
 
     def __init__(self, game_map: GameMap):
         self.game_map = game_map
+        self._shore_tiles: list[tuple[int, int]] = self._compute_shore_tiles()
+
+    def _compute_shore_tiles(self) -> list[tuple[int, int]]:
+        shore: list[tuple[int, int]] = []
+        for y in range(self.game_map.height):
+            for x in range(self.game_map.width):
+                if not self.game_map.is_walkable(x, y):
+                    continue
+                if any(self.game_map.is_water(nx, ny) for nx, ny in self.game_map.neighbors_8(x, y)):
+                    shore.append((x, y))
+        return shore
 
     def _find_player_position(self) -> tuple[int, int] | None:
         for _ent, (pos, _player) in esper.get_components(Position, Player):
             return (pos.x, pos.y)
         return None
 
+    @staticmethod
+    def _nearest(origin: tuple[int, int], candidates: list[tuple[int, int]]) -> tuple[int, int] | None:
+        best: tuple[int, int] | None = None
+        best_dist = None
+        for cand in candidates:
+            dist = _chebyshev(origin, cand)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = cand
+        return best
+
+    def _step_toward(
+        self,
+        ent: int,
+        pos: Position,
+        goal: tuple[int, int],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        """Move one step along a path to ``goal``. Returns True if it moved."""
+        blocked = {xy for xy, occ_ent in occupied.items() if occ_ent != ent}
+        path = self.game_map.find_path((pos.x, pos.y), goal, blocked_tiles=blocked)
+        if not path:
+            return False
+        next_x, next_y = path[0]
+        if (next_x, next_y) == goal and (next_x, next_y) in occupied:
+            # The goal tile itself is occupied (e.g. a tree/prey we path *to*);
+            # don't step onto it -- the caller handles the adjacent interaction.
+            return False
+        if (next_x, next_y) in occupied and occupied[(next_x, next_y)] != ent:
+            return False
+        old_xy = (pos.x, pos.y)
+        pos.x, pos.y = next_x, next_y
+        occupied.pop(old_xy, None)
+        occupied[(next_x, next_y)] = ent
+        return True
+
+    def _seek_water(
+        self, ent: int, pos: Position, needs: Needs, occupied: dict[tuple[int, int], int]
+    ) -> bool:
+        if any(self.game_map.is_water(nx, ny) for nx, ny in self.game_map.neighbors_8(pos.x, pos.y)):
+            needs.thirst = max(0.0, needs.thirst - _DRINK_RESTORE)
+            return True
+        target = self._nearest((pos.x, pos.y), self._shore_tiles)
+        if target is None:
+            return False
+        return self._step_toward(ent, pos, target, occupied)
+
+    def _graze(
+        self,
+        ent: int,
+        pos: Position,
+        needs: Needs,
+        trees: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        if not trees:
+            return False
+        target_xy, target_ent = min(trees, key=lambda item: _chebyshev((pos.x, pos.y), item[0]))
+        if _chebyshev((pos.x, pos.y), target_xy) == 1:
+            needs.hunger = max(0.0, needs.hunger - _GRAZE_RESTORE)
+            if esper.entity_exists(target_ent) and esper.has_component(target_ent, Tree):
+                tree = esper.component_for_entity(target_ent, Tree)
+                tree.wood -= 1
+                if tree.wood <= 0:
+                    esper.delete_entity(target_ent, immediate=True)  # grazed bare
+                    occupied.pop(target_xy, None)
+            return True
+        return self._step_toward(ent, pos, target_xy, occupied)
+
+    def _hunt(
+        self,
+        ent: int,
+        pos: Position,
+        needs: Needs,
+        prey: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        live_prey = [item for item in prey if item[1] != ent and esper.entity_exists(item[1])]
+        if not live_prey:
+            return False
+        target_xy, target_ent = min(live_prey, key=lambda item: _chebyshev((pos.x, pos.y), item[0]))
+        if _chebyshev((pos.x, pos.y), target_xy) == 1:
+            slay_entity(target_ent)  # kill and butcher; predator feeds
+            occupied.pop(target_xy, None)
+            needs.hunger = max(0.0, needs.hunger - _FEED_RESTORE)
+            return True
+        return self._step_toward(ent, pos, target_xy, occupied)
+
+    def _chase_player(
+        self,
+        ent: int,
+        pos: Position,
+        player_xy: tuple[int, int],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        vision_radius = 8
+        if esper.has_component(ent, Vision):
+            vision_radius = esper.component_for_entity(ent, Vision).radius
+        if _chebyshev((pos.x, pos.y), player_xy) > vision_radius:
+            return False
+        if not self.game_map.has_line_of_sight((pos.x, pos.y), player_xy):
+            return False
+        if _chebyshev((pos.x, pos.y), player_xy) == 1:
+            return False  # adjacent: hold (player-facing combat is player-driven)
+        return self._step_toward(ent, pos, player_xy, occupied)
+
     def process(self, action: str | None = None) -> None:
         if action not in _ACTION_DELTAS:
             return
 
         player_xy = self._find_player_position()
-        if player_xy is None:
-            return
 
         occupied = {
             (pos.x, pos.y): ent
             for ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
         }
 
-        for ent, (pos, _npc, _enemy) in esper.get_components(Position, NPC, Enemy):
-            vision_radius = 8
-            if esper.has_component(ent, Vision):
-                vision_radius = esper.component_for_entity(ent, Vision).radius
+        # Snapshot dynamic foraging targets once per turn.
+        trees = [((pos.x, pos.y), ent) for ent, (pos, _t) in esper.get_components(Position, Tree)]
+        prey = [((pos.x, pos.y), ent) for ent, (pos, _d) in esper.get_components(Position, Deer)]
 
-            dx = player_xy[0] - pos.x
-            dy = player_xy[1] - pos.y
-            if max(abs(dx), abs(dy)) > vision_radius:
+        # Materialise the list: a predator can kill (delete) another NPC mid-loop
+        # via _hunt, so we snapshot up front and skip anything already gone.
+        for ent, (pos, _npc) in list(esper.get_components(Position, NPC)):
+            if not esper.entity_exists(ent):
                 continue
-            if not self.game_map.has_line_of_sight((pos.x, pos.y), player_xy):
+            acted = False
+
+            if esper.has_component(ent, Needs):
+                needs = esper.component_for_entity(ent, Needs)
+                diet_kind = None
+                if esper.has_component(ent, Diet):
+                    diet_kind = esper.component_for_entity(ent, Diet).kind
+
+                # Thirst wins ties -- a parched animal drinks before it eats.
+                if needs.thirst >= _FORAGE_THRESHOLD and needs.thirst >= needs.hunger:
+                    acted = self._seek_water(ent, pos, needs, occupied)
+                elif needs.hunger >= _FORAGE_THRESHOLD:
+                    if diet_kind == "herbivore":
+                        acted = self._graze(ent, pos, needs, trees, occupied)
+                    elif diet_kind == "carnivore":
+                        acted = self._hunt(ent, pos, needs, prey, occupied)
+
+            if acted:
                 continue
 
-            blocked_tiles = {
-                tile_xy
-                for tile_xy, occ_ent in occupied.items()
-                if occ_ent not in {ent}
-            }
-            path = self.game_map.find_path((pos.x, pos.y), player_xy, blocked_tiles=blocked_tiles)
-            if not path:
+            if player_xy is not None and esper.has_component(ent, Enemy):
+                self._chase_player(ent, pos, player_xy, occupied)
+
+
+# Hunger/thirst thresholds (percent of max) that emit an escalating warning the
+# first turn each is crossed going up. Ordered high -> low so we report the most
+# severe newly-crossed level.
+_HUNGER_WARNINGS = (
+    (100.0, "You are starving!"),
+    (80.0, "Your stomach growls with hunger."),
+    (50.0, "You are getting hungry."),
+)
+_THIRST_WARNINGS = (
+    (100.0, "You are dying of thirst!"),
+    (80.0, "Your throat is parched."),
+    (50.0, "You are getting thirsty."),
+)
+
+
+def _crossed_warning(
+    previous: float,
+    current: float,
+    warnings: tuple[tuple[float, str], ...],
+) -> str | None:
+    """Return the message for the highest threshold newly crossed upward this
+    turn (``previous < threshold <= current``), or ``None`` if none was."""
+    for threshold, message in warnings:
+        if previous < threshold <= current:
+            return message
+    return None
+
+
+class NeedsProcessor(esper.Processor):
+    """Advances hunger/thirst once per real turn (a movement action).
+
+    Menu refreshes call ``esper.process(None)``; those must not starve the
+    player, so the tick is gated on an actual movement action, matching how the
+    NPC AI only reacts on real turns.
+    """
+
+    def process(self, action: str | None = None) -> None:
+        if action not in _ACTION_DELTAS:
+            return
+
+        for ent, (needs,) in esper.get_components(Needs):
+            prev_hunger = needs.hunger
+            prev_thirst = needs.thirst
+            needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate)
+            needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate)
+
+            # Every creature accumulates needs, but only the player's are
+            # surfaced as log warnings -- a hungry goblin shouldn't print
+            # "You are starving!" to the player.
+            if not esper.has_component(ent, Player):
                 continue
 
-            next_x, next_y = path[0]
-            if (next_x, next_y) == player_xy:
-                continue
-
-            if (next_x, next_y) in occupied and occupied[(next_x, next_y)] != ent:
-                continue
-
-            old_xy = (pos.x, pos.y)
-            pos.x, pos.y = next_x, next_y
-            occupied.pop(old_xy, None)
-            occupied[(next_x, next_y)] = ent
+            hunger_msg = _crossed_warning(prev_hunger, needs.hunger, _HUNGER_WARNINGS)
+            if hunger_msg is not None:
+                _push_turn_event(hunger_msg)
+            thirst_msg = _crossed_warning(prev_thirst, needs.thirst, _THIRST_WARNINGS)
+            if thirst_msg is not None:
+                _push_turn_event(thirst_msg)
 
 
 class RenderProcessor(esper.Processor):
@@ -256,6 +526,7 @@ class RenderProcessor(esper.Processor):
         # moves; wall autotile masks never change on a static map.
         self._visible_cache_key: tuple[int | None, int, int] | None = None
         self._wall_mask_cache: dict[tuple[int, int], int] = {}
+        self._water_mask_cache: dict[tuple[int, int], int] = {}
         # Per-player-position FOV memo: pos -> (visible set, view bbox, shadow
         # cells). Lets a walking step blit one cached map region + a few shadow
         # fills instead of re-drawing every visible tile.
@@ -265,6 +536,22 @@ class RenderProcessor(esper.Processor):
             tuple[int | None, int, int],
             tuple[set[tuple[int, int]], tuple[int, int, int, int] | None, tuple[tuple[int, int], ...]],
         ] = {}
+        # The world is a 3x3 grid of sections. Only the section the player stands
+        # in is rendered (the whole map keeps simulating); the camera snaps to it
+        # and the view/FOV are clipped to its bounds. Sectioning only engages on a
+        # map big enough for the grid to be meaningful (the real 120x60 world);
+        # smaller maps (e.g. tests) keep the plain centred camera.
+        self._section_w = max(1, game_map.width // 3)
+        self._section_h = max(1, game_map.height // 3)
+        self._sections_enabled = (
+            game_map.width >= 3 * _MIN_SECTION_W and game_map.height >= 3 * _MIN_SECTION_H
+        )
+        self._section_bounds: tuple[int, int, int, int] | None = None
+        self._current_section: tuple[int, int] | None = None
+        # Wall clock driving the swimming glyph bob: it flips every second of
+        # real time, independent of turns (so an idle swimmer still shimmers).
+        # Injectable so tests can pin the time.
+        self._clock: Callable[[], float] = time.monotonic
 
     @staticmethod
     def _clamp_sign(value: int) -> int:
@@ -388,10 +675,20 @@ class RenderProcessor(esper.Processor):
         if player_ent is not None and esper.has_component(player_ent, Vision):
             radius = esper.component_for_entity(player_ent, Vision).radius
 
+        # Clip the scan (and thus visibility) to the current section: other
+        # sections are simulated but never drawn.
+        if self._section_bounds is not None:
+            sx, sy, sw, sh = self._section_bounds
+            x_lo, x_hi = sx, sx + sw
+            y_lo, y_hi = sy, sy + sh
+        else:
+            x_lo, x_hi = 0, self.game_map.width
+            y_lo, y_hi = 0, self.game_map.height
+
         visible: set[tuple[int, int]] = set()
         origin = (player_pos.x, player_pos.y)
-        for y in range(self.game_map.height):
-            for x in range(self.game_map.width):
+        for y in range(y_lo, y_hi):
+            for x in range(x_lo, x_hi):
                 if max(abs(x - player_pos.x), abs(y - player_pos.y)) > radius:
                     continue
                 if self.game_map.has_line_of_sight(origin, (x, y)):
@@ -429,8 +726,20 @@ class RenderProcessor(esper.Processor):
                 self._wall_mask_cache[(wx, wy)] = wall_mask
             if bool(draw_autotile_variant(vx, vy, "wall", wall_mask, fg=_WALL_BROWN, bg=None)):
                 return
+        if tile == self.game_map.WATER and callable(draw_autotile_variant):
+            water_mask = self._water_mask_cache.get((wx, wy))
+            if water_mask is None:
+                water_mask = self._neighbor_mask(wx, wy, self.game_map.WATER)
+                self._water_mask_cache[(wx, wy)] = water_mask
+            if bool(draw_autotile_variant(vx, vy, "water", water_mask, fg=_WATER_BLUE, bg=None)):
+                return
         classification = "wall" if tile == self.game_map.WALL else "default"
-        tile_fg = _WALL_BROWN if classification == "wall" else None
+        if tile == self.game_map.WALL:
+            tile_fg: tuple[int, int, int] | None = _WALL_BROWN
+        elif tile == self.game_map.WATER:
+            tile_fg = _WATER_BLUE
+        else:
+            tile_fg = None
         r.draw_glyph_classified(vx, vy, tile, classification, fg=tile_fg, bg=None)
 
     def _render_map_layer(self, r, draw_autotile_variant) -> None:
@@ -775,6 +1084,75 @@ class RenderProcessor(esper.Processor):
             return None
         return (vx, vy)
 
+    def _apply_section_camera(self, player_pos: Position | None) -> None:
+        """Lock the camera to the 3x3 section the player occupies. Sets
+        ``_section_bounds`` (used to clip FOV) and clamps the view origin inside
+        that section, so only the current section is ever drawn. Emits a log line
+        when the player crosses into a new section."""
+        if player_pos is None or not self._sections_enabled:
+            self._section_bounds = None
+            return
+
+        sw, sh = self._section_w, self._section_h
+        col = min(2, max(0, player_pos.x // sw))
+        row = min(2, max(0, player_pos.y // sh))
+        sec_ox, sec_oy = col * sw, row * sh
+        # The bottom/right sections absorb any remainder when the map isn't
+        # evenly divisible by 3, so the whole map is covered.
+        sec_w = self.game_map.width - sec_ox if col == 2 else sw
+        sec_h = self.game_map.height - sec_oy if row == 2 else sh
+        self._section_bounds = (sec_ox, sec_oy, sec_w, sec_h)
+
+        if self._current_section is not None and self._current_section != (col, row):
+            self._append_message("You cross into a new area.")
+        self._current_section = (col, row)
+
+        # Never render wider/taller than the section; clamp the origin inside it.
+        self._view_width = min(self._view_width, sec_w)
+        self._view_height = min(self._view_height, sec_h)
+        max_ox = sec_ox + sec_w - self._view_width
+        max_oy = sec_oy + sec_h - self._view_height
+        self._view_origin_x = min(max_ox, max(sec_ox, player_pos.x - self._view_width // 2))
+        self._view_origin_y = min(max_oy, max(sec_oy, player_pos.y - self._view_height // 2))
+
+    def _status_appearance(
+        self,
+        ent: int,
+        pos: Position,
+        glyph: str,
+        fg: tuple[int, int, int] | None,
+    ) -> tuple[str, tuple[int, int, int] | None, bool]:
+        """The (glyph, colour, is_status_identifier) to draw for a character this
+        instant. With no active status it's just its own tile; with statuses it
+        cycles through the base tile then each status identifier in turn, on a
+        wall clock, so the animation plays even while idle. The bool marks the
+        status-identifier frames, which the renderer must draw as literal glyphs
+        (not the character's classification sprite)."""
+        statuses = active_statuses(self.game_map, ent, pos)
+        if not statuses:
+            return glyph, fg, False
+
+        # (glyph, fg, seconds, is_status_identifier)
+        frames: list[tuple[str, tuple[int, int, int] | None, float, bool]] = [
+            (glyph, fg, _STATUS_BASE_SECONDS, False)
+        ]
+        for name in statuses:
+            id_glyph, id_fg, seconds = _STATUS_DISPLAY[name]
+            frames.append((id_glyph, id_fg if id_fg is not None else fg, seconds, True))
+
+        total = sum(frame[2] for frame in frames)
+        if total <= 0:
+            return glyph, fg, False
+
+        elapsed = self._clock() % total
+        cursor = 0.0
+        for frame_glyph, frame_fg, seconds, is_status in frames:
+            cursor += seconds
+            if elapsed < cursor:
+                return frame_glyph, frame_fg, is_status
+        last = frames[-1]
+        return last[0], last[1], last[3]
+
     def process(self, action: str | None = None) -> None:
         r = self.renderer
         r.clear()
@@ -801,6 +1179,7 @@ class RenderProcessor(esper.Processor):
 
         self._describe_movement(action, player_pos, suppress_wall_message=bool(events))
         self._compute_layout(player_pos)
+        self._apply_section_camera(player_pos)
 
         # Only recompute field-of-view when the player actually moved; the LOS
         # raycast over every tile is one of the heaviest per-frame costs. Results
@@ -823,10 +1202,10 @@ class RenderProcessor(esper.Processor):
 
         self._render_map_layer(r, draw_autotile_variant)
 
-        player_draw: tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None] | None = None
-        character_draws: list[
-            tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None]
-        ] = []
+        # draw tuple: (vx, vy, glyph, classification, fg, bg, force_glyph)
+        DrawData = tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None, bool]
+        player_draw: DrawData | None = None
+        character_draws: list[DrawData] = []
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
             is_player = esper.has_component(ent, Player)
             is_character = is_player or esper.has_component(ent, NPC)
@@ -843,49 +1222,46 @@ class RenderProcessor(esper.Processor):
             elif esper.has_component(ent, Enemy):
                 classification = "enemy"
 
+            if is_character:
+                glyph, fg, force_glyph = self._status_appearance(ent, pos, rend.glyph, rend.fg)
+            else:
+                glyph, fg, force_glyph = rend.glyph, rend.fg, False
+
             if is_player:
                 if view_xy is not None:
-                    player_draw = (view_xy[0], view_xy[1], rend.glyph, classification, rend.fg, rend.bg)
+                    player_draw = (view_xy[0], view_xy[1], glyph, classification, fg, rend.bg, force_glyph)
                 continue
 
             if view_xy is not None:
-                draw_data = (view_xy[0], view_xy[1], rend.glyph, classification, rend.fg, rend.bg)
+                draw_data = (view_xy[0], view_xy[1], glyph, classification, fg, rend.bg, force_glyph)
                 if is_character:
                     character_draws.append(draw_data)
                 else:
                     r.draw_glyph_classified(
-                        draw_data[0],
-                        draw_data[1],
-                        draw_data[2],
-                        draw_data[3],
-                        fg=draw_data[4],
-                        bg=draw_data[5],
+                        draw_data[0], draw_data[1], draw_data[2], draw_data[3],
+                        fg=draw_data[4], bg=draw_data[5], force_glyph=draw_data[6],
                     )
 
         for draw_data in character_draws:
             r.draw_glyph_classified(
-                draw_data[0],
-                draw_data[1],
-                draw_data[2],
-                draw_data[3],
-                fg=draw_data[4],
-                bg=draw_data[5],
+                draw_data[0], draw_data[1], draw_data[2], draw_data[3],
+                fg=draw_data[4], bg=draw_data[5], force_glyph=draw_data[6],
             )
 
         if player_draw is not None:
             r.draw_glyph_classified(
-                player_draw[0],
-                player_draw[1],
-                player_draw[2],
-                player_draw[3],
-                fg=player_draw[4],
-                bg=player_draw[5],
+                player_draw[0], player_draw[1], player_draw[2], player_draw[3],
+                fg=player_draw[4], bg=player_draw[5], force_glyph=player_draw[6],
             )
 
         self._draw_sidebar(player_pos, entity_lookup)
 
         draw_text_clipped = getattr(r, "draw_text_clipped", None)
-        status_line = "I inventory  Esc menu  +/- tile scale"
+        needs_text = ""
+        if player_ent is not None and esper.has_component(player_ent, Needs):
+            needs = esper.component_for_entity(player_ent, Needs)
+            needs_text = f"Hunger {int(needs.hunger)}%  Thirst {int(needs.thirst)}%    "
+        status_line = f"{needs_text}I inventory  Esc menu  +/- tile scale"
         if callable(draw_text_clipped):
             draw_text_clipped(0, self._status_y, status_line, self._grid_w)
         else:

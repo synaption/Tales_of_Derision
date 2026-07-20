@@ -1,0 +1,1 @@
+there should not be walls at the end of the map.  it should just say, "you can go no farther" if there is no tile beyond the one you are on.  

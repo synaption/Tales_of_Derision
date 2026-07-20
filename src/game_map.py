@@ -10,6 +10,7 @@ from collections import deque
 class GameMap:
     WALL = "#"
     FLOOR = "."
+    WATER = "~"
 
     def __init__(self, width: int, height: int):
         self.width = width
@@ -25,6 +26,7 @@ class GameMap:
             for y in range(height)
         ]
         self._add_default_buildings()
+        self._add_water_features()
 
     def _carve_building(
         self,
@@ -61,10 +63,73 @@ class GameMap:
             door=(self.width - 10, 11),
         )
 
+    def _spawn_safe_zone(self) -> tuple[int, int, int, int]:
+        """A rectangle around the map centre kept clear of water so the player
+        (who spawns near the centre) never starts stuck in a lake or river.
+        Returns (min_x, min_y, max_x, max_y)."""
+        cx, cy = self.width // 2, self.height // 2
+        return (cx - 6, cy - 4, cx + 6, cy + 4)
+
+    def _carve_lake(self, cx: int, cy: int, rx: int, ry: int) -> None:
+        """Flood an ellipse of interior floor into water."""
+        sx0, sy0, sx1, sy1 = self._spawn_safe_zone()
+        for y in range(max(1, cy - ry), min(self.height - 1, cy + ry + 1)):
+            for x in range(max(1, cx - rx), min(self.width - 1, cx + rx + 1)):
+                if sx0 <= x <= sx1 and sy0 <= y <= sy1:
+                    continue
+                nx = (x - cx) / max(1, rx)
+                ny = (y - cy) / max(1, ry)
+                if nx * nx + ny * ny <= 1.0 and self.tiles[y][x] == self.FLOOR:
+                    self.tiles[y][x] = self.WATER
+
+    def _carve_river(self, start_x: int, width: int = 2) -> None:
+        """Carve a gently wavering vertical river down the map, skipping the
+        central spawn zone so it never seals the player in."""
+        sx0, sy0, sx1, sy1 = self._spawn_safe_zone()
+        x = start_x
+        for y in range(1, self.height - 1):
+            # Deterministic gentle meander (no RNG so maps stay reproducible).
+            if (y // 3) % 2 == 0:
+                x += 1
+            else:
+                x -= 1
+            x = max(2, min(self.width - 3, x))
+            for wx in range(x, x + width):
+                if sx0 <= wx <= sx1 and sy0 <= y <= sy1:
+                    continue
+                if self.in_bounds(wx, y) and self.tiles[y][wx] == self.FLOOR:
+                    self.tiles[y][wx] = self.WATER
+
+    def _add_water_features(self) -> None:
+        if self.width < 24 or self.height < 14:
+            return
+        self._carve_lake(cx=int(self.width * 0.22), cy=int(self.height * 0.72), rx=6, ry=4)
+        self._carve_lake(cx=int(self.width * 0.80), cy=int(self.height * 0.28), rx=7, ry=5)
+        self._carve_river(start_x=int(self.width * 0.62))
+
+    def clear_water_around(self, x: int, y: int, radius: int = 1) -> None:
+        """Turn any water in a square around (x, y) back into floor. Used as a
+        final safety so an entity (the player) is never spawned onto water."""
+        for ny in range(y - radius, y + radius + 1):
+            for nx in range(x - radius, x + radius + 1):
+                if self.in_bounds(nx, ny) and self.tiles[ny][nx] == self.WATER:
+                    self.tiles[ny][nx] = self.FLOOR
+
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.width and 0 <= y < self.height
 
     def is_walkable(self, x: int, y: int) -> bool:
+        # Walls and water both block movement; water stays transparent to sight
+        # (see has_line_of_sight, which only blocks on walls).
+        return self.in_bounds(x, y) and self.tiles[y][x] not in (self.WALL, self.WATER)
+
+    def is_water(self, x: int, y: int) -> bool:
+        return self.in_bounds(x, y) and self.tiles[y][x] == self.WATER
+
+    def is_passable(self, x: int, y: int) -> bool:
+        """Can a *swimming* actor (the player) move here? Everything but walls,
+        including water. NPC pathfinding still uses ``is_walkable`` (land only),
+        so animals stay ashore while the player can wade in to swim."""
         return self.in_bounds(x, y) and self.tiles[y][x] != self.WALL
 
     def tile_at(self, x: int, y: int) -> str:
