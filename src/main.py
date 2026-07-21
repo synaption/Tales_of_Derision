@@ -2947,11 +2947,11 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
                     set_bed_owner(bed_ent, player_ent)
                     break
 
-    def plant_tree(x: int, y: int) -> None:
-        place_at(x, y, Renderable("T", fg=_TREE_GREEN), Name("Tree"), Tree(), BlocksMovement())
+    def plant_tree(x: int, y: int) -> bool:
+        return place_at(x, y, Renderable("T", fg=_TREE_GREEN), Name("Tree"), Tree(), BlocksMovement())
 
-    def plant_bush(x: int, y: int) -> None:
-        place_at(x, y, Renderable("%", fg=_BERRY_RED), Name("Berry Bush"), BerryBush(), BlocksMovement())
+    def plant_bush(x: int, y: int) -> bool:
+        return place_at(x, y, Renderable("%", fg=_BERRY_RED), Name("Berry Bush"), BerryBush(), BlocksMovement())
 
     # A few starter trees within reach, plus a forest scattered across the land
     # so both the player and grazing deer have wood/food.
@@ -2965,20 +2965,38 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
     for bush_dx, bush_dy in ((-2, 3), (4, -2)):
         plant_bush(player_position.x + bush_dx, player_position.y + bush_dy)
 
-    # Scatter flora across the land so starting tree cover is roughly 10% of
-    # walkable land tiles, with a sparser sprinkling of berry bushes for
-    # foragers. Randomised each new world.
-    _TREE_COVER = 0.10
-    _BUSH_COVER = 0.01
-    for y in range(game_map.land_y0, game_map.land_y0 + game_map.land_h):
-        for x in range(game_map.land_x0, game_map.land_x0 + game_map.land_w):
-            if not game_map.is_walkable(x, y):
-                continue
-            roll = random.random()
-            if roll < _TREE_COVER:
-                plant_tree(x, y)
-            elif roll < _TREE_COVER + _BUSH_COVER:
-                plant_bush(x, y)
+    # Grow the forest in clustered stands rather than a uniform sprinkle: cover
+    # roughly 10% of the walkable land in trees while leaving open clearings
+    # between the stands so villagers can still find room to raise cabins. Each
+    # stand is a dense core that thins toward its edges, with the odd ripe berry
+    # bush mixed in for foragers. Randomised each new world.
+    walkable = [
+        (x, y)
+        for y in range(game_map.land_y0, game_map.land_y0 + game_map.land_h)
+        for x in range(game_map.land_x0, game_map.land_x0 + game_map.land_w)
+        if game_map.is_walkable(x, y)
+    ]
+    tree_target = int(len(walkable) * 0.10)
+    planted = 0
+    guard = 0
+    while walkable and planted < tree_target and guard < tree_target * 50:
+        guard += 1
+        cx, cy = random.choice(walkable)
+        radius = random.randint(2, 6)
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if planted >= tree_target:
+                    break
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist > radius:
+                    continue
+                # Denser at the core, thinning out toward the stand's edge.
+                if random.random() < dist / (radius + 1):
+                    continue
+                if random.random() < 0.04:
+                    plant_bush(cx + dx, cy + dy)
+                elif plant_tree(cx + dx, cy + dy):
+                    planted += 1
 
     stand_centers = [
         (int(game_map.width * fx), int(game_map.height * fy))
