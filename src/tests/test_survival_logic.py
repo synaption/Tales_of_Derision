@@ -6,6 +6,7 @@ import esper
 import pytest
 
 from components import (
+    BerryBush,
     BlocksMovement,
     Corpse,
     Enemy,
@@ -21,6 +22,7 @@ from components import (
     Tree,
     Vision,
     Well,
+    WorldClock,
 )
 from game_map import GameMap
 from items import (
@@ -40,6 +42,7 @@ from main import (
     _drink_from_well,
     _find_adjacent_feature,
     _find_interaction_creature,
+    _harvest_bush,
 )
 from components import Deer, Diet, Friendly, OnFire
 from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, WAIT_ACTION, _pull_turn_events
@@ -122,6 +125,21 @@ def test_chop_tree_yields_wood_and_falls_when_exhausted() -> None:
     assert inventory.items == [WOOD, WOOD]
     assert not esper.entity_exists(tree)
     assert "fell" in second.lower()
+
+
+def test_harvest_bush_gives_berries_then_needs_regrowth() -> None:
+    esper.create_entity(WorldClock(turn=100, day_length=240))
+    player = esper.create_entity(Position(5, 5), Player(), Inventory(items=[]))
+    bush = esper.create_entity(Position(5, 4), Name("Berry Bush"), BerryBush())
+
+    message = _harvest_bush(bush, player)
+    assert "Berries" in esper.component_for_entity(player, Inventory).items
+    assert "berries" in message.lower()
+
+    # The bush is now bare; picking again yields nothing until it regrows.
+    again = _harvest_bush(bush, player)
+    assert esper.component_for_entity(player, Inventory).items.count("Berries") == 1
+    assert "no ripe" in again.lower()
 
 
 def test_drink_from_well_quenches_thirst() -> None:
@@ -431,6 +449,22 @@ def test_cook_villager_gathers_cooks_then_eats_cooked_meat() -> None:
 
     assert saw_cooked  # it actually cooked the meat
     assert esper.component_for_entity(villager, Needs).hunger < 90.0  # then ate it
+
+
+def test_cook_villager_forages_from_a_tree_when_no_meat_is_reachable() -> None:
+    # A cook villager with no reachable deer/corpse must not starve: it forages
+    # food from a nearby tree (renewable) instead of standing idle.
+    game_map = GameMap(24, 14)
+    processor = NpcAiProcessor(game_map)
+    tree = esper.create_entity(Position(11, 6), Tree(wood=3), BlocksMovement())
+    villager = esper.create_entity(
+        Position(10, 6), NPC(), Diet("cook"), Inventory(items=[]),
+        Needs(hunger=90.0, thirst=10.0, tiredness=0.0), BlocksMovement(), Name("Villager"),
+    )
+
+    processor.process("wait")
+    assert esper.component_for_entity(villager, Needs).hunger < 90.0  # it ate
+    assert esper.component_for_entity(tree, Tree).wood == 2  # foraged from the tree
 
 
 def test_cook_villager_will_not_eat_raw_meat_from_its_pack() -> None:

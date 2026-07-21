@@ -46,10 +46,10 @@ def _run(actions: list[str | None], start_tab: str = "inventory") -> tuple[str, 
 
 def test_tab_cycles_and_close_reports_the_current_tab() -> None:
     _player()
-    # Start on inventory, Tab once -> status, then close.
+    # Start on inventory, Tab once -> craft, then close.
     result, last_tab = _run(["open_menu", "open_pause_menu"], start_tab="inventory")
     assert result == "close"
-    assert last_tab == "status"
+    assert last_tab == "craft"
 
 
 def test_direct_key_jumps_to_a_tab_then_toggles_closed() -> None:

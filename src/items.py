@@ -14,6 +14,45 @@ RAW_MEAT = "Raw Meat"  # generic fallback when a creature has no named meat
 COOKED_MEAT = "Cooked Meat"  # what cooking generic Raw Meat yields
 WOOD = "Wood"
 
+# --- Buildable items --------------------------------------------------------
+# Craftable pieces the player carries and then *places* on a faced tile, turning
+# it into the matching map tile. NPCs build the same pieces straight from wood.
+WOOD_WALL = "Wall"
+WOOD_DOOR = "Door"
+WOOD_WINDOW = "Window"
+
+# Placeable item -> the GameMap tile char it becomes when placed. The tile chars
+# are duplicated here (rather than imported from GameMap) to keep this module
+# renderer/map agnostic and trivially testable; they must stay in sync.
+PLACEABLE_TILES: dict[str, str] = {
+    WOOD_WALL: "#",
+    WOOD_DOOR: "+",
+    WOOD_WINDOW: "o",
+}
+
+# Crafting recipes: placeable item -> wood pieces it costs to craft one. A door
+# (hinges, a latch) costs more than a plain wall panel.
+CRAFTING_RECIPES: dict[str, int] = {
+    WOOD_WALL: 2,
+    WOOD_WINDOW: 2,
+    WOOD_DOOR: 3,
+}
+
+
+def is_placeable(item_name: str) -> bool:
+    """True when the item is a buildable piece the player can place on a tile."""
+    return item_name in PLACEABLE_TILES
+
+
+def placed_tile(item_name: str) -> str | None:
+    """The map tile a placeable item becomes, or ``None`` if it isn't placeable."""
+    return PLACEABLE_TILES.get(item_name)
+
+
+def craft_cost(item_name: str) -> int | None:
+    """Wood pieces needed to craft ``item_name``, or ``None`` if not craftable."""
+    return CRAFTING_RECIPES.get(item_name)
+
 # Meat is named per creature ("Rat Meat", "Goblin Meat", ...) rather than a fixed
 # item, so these are recognised by shape rather than by a lookup table. A raw
 # meat is any "... Meat" item; cooking prefixes "Cooked ".
@@ -25,10 +64,13 @@ _COOKED_PREFIX = "Cooked "
 COOKED_MEAT_HUNGER = 45.0
 RAW_MEAT_HUNGER = 8.0
 
+BERRIES = "Berries"
+
 # Non-meat edibles and their hunger values.
 EAT_VALUES: dict[str, float] = {
     "Bread": 30.0,
     "Apple": 15.0,
+    BERRIES: 12.0,
 }
 
 # How much thirst (points) a drinkable item removes when consumed. A well is the

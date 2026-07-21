@@ -14,9 +14,22 @@ from typing import Any
 
 import esper
 
-from components import Asleep, Bed, BlocksMovement, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Stove, Tree, Vision, Well, WorldClock
+from components import Asleep, Bed, BerryBush, BlocksMovement, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Resident, Stove, Tree, Vision, Well, WorldClock
 from game_map import GameMap
-from items import WOOD, cook_meat, hunger_restored, is_raw_meat, thirst_restored
+from items import (
+    BERRIES,
+    WOOD,
+    WOOD_DOOR,
+    WOOD_WALL,
+    WOOD_WINDOW,
+    cook_meat,
+    craft_cost,
+    hunger_restored,
+    is_placeable,
+    is_raw_meat,
+    placed_tile,
+    thirst_restored,
+)
 from persistence import (
     DEFAULT_SAVE_FILE,
     bootstrap_files,
@@ -28,7 +41,7 @@ from persistence import (
 )
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, WAIT_ACTION, active_statuses, go_to_sleep, player_is_animated, queue_message, status_label, wake_up
+from systems import HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, furnish_house, go_to_sleep, pick_berries, player_is_animated, queue_message, status_label, wake_up, world_clock
 
 # The world is a 3x3 expansion of the original 40x20 room, giving room for
 # lakes, rivers, and roaming wildlife.
@@ -423,6 +436,7 @@ _WELL_STONE = (150, 168, 190)
 _STOVE_IRON = (120, 120, 128)
 _DEER_TAN = (176, 132, 92)
 _BED_WOOD = (156, 116, 72)
+_BERRY_RED = (200, 74, 96)
 _HUMAN_SKIN_TONES: list[tuple[int, int, int]] = [
     (255, 238, 220),
     (248, 227, 208),
@@ -1291,6 +1305,15 @@ def _chop_tree(tree_ent: int, player_ent: int) -> str:
     return "You chop a piece of wood from the tree."
 
 
+def _harvest_bush(bush_ent: int, player_ent: int) -> str:
+    """Pick a ripe berry bush into the player's pack. The bush goes bare and its
+    berries regrow a week later (handled by the growth processor)."""
+    if pick_berries(bush_ent, world_clock()):
+        _ensure_inventory(player_ent).items.append(BERRIES)
+        return "You pick a handful of ripe berries."
+    return "The bush has no ripe berries yet."
+
+
 def _drink_from_well(well_ent: int, player_ent: int) -> str:
     """Drink from a well, quenching thirst. Wells are a renewable source."""
     if not esper.has_component(player_ent, Needs):
@@ -1403,6 +1426,73 @@ async def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
     # Safety net: never leave the player stuck asleep past the cap.
     if esper.has_component(player_ent, Asleep):
         wake_up(player_ent)
+    esper.process(None)
+
+
+# Order of recipes shown in the Crafting tab.
+_CRAFT_MENU = [WOOD_WALL, WOOD_WINDOW, WOOD_DOOR]
+
+
+def _craft_item(player_ent: int, item_name: str) -> str:
+    """Craft one ``item_name`` from Wood in the player's pack, or explain why it
+    can't be made. The crafted piece lands in the inventory to be placed later."""
+    cost = craft_cost(item_name)
+    if cost is None:
+        return f"You don't know how to craft {item_name}."
+    inventory = _ensure_inventory(player_ent)
+    wood_count = inventory.items.count(WOOD)
+    if wood_count < cost:
+        return f"You need {cost} Wood to craft a {item_name} (you have {wood_count})."
+    for _ in range(cost):
+        inventory.items.remove(WOOD)
+    inventory.items.append(item_name)
+    return f"You craft a {item_name} from {cost} Wood."
+
+
+def _place_buildable_at(
+    player_ent: int, game_map: GameMap, item_name: str, target_xy: tuple[int, int]
+) -> str:
+    """Place a buildable piece onto ``target_xy``, turning it into the matching
+    map tile and consuming the item. Returns a log message."""
+    tile = placed_tile(item_name)
+    if tile is None:
+        return f"You can't place the {item_name}."
+    tx, ty = target_xy
+    if not game_map.in_bounds(tx, ty):
+        return "You can't build there."
+    if tx == 0 or ty == 0 or tx == game_map.width - 1 or ty == game_map.height - 1:
+        return "You can't build on the edge of the world."
+    if game_map.tile_at(tx, ty) != game_map.FLOOR:
+        return "You can only build on open ground."
+    for _ent, (pos,) in esper.get_components(Position):
+        if (pos.x, pos.y) == (tx, ty):
+            return "Something is in the way."
+
+    inventory = _ensure_inventory(player_ent)
+    if item_name not in inventory.items:
+        return f"You have no {item_name} to place."
+    if not game_map.set_tile(tx, ty, tile):
+        return "You can't build there."
+    inventory.items.remove(item_name)
+    return f"You build a {item_name}."
+
+
+async def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name: str) -> None:
+    """Prompt for a direction and build the selected piece on that adjacent tile.
+    Any non-direction key cancels and keeps the item."""
+    player_ent = _first_player_entity()
+    if player_ent is None or not esper.has_component(player_ent, Position):
+        return
+    queue_message(f"Place the {item_name}: press a direction (Esc/other to cancel).")
+    esper.process(None)
+
+    action = await _await_action(renderer)
+    player_pos = esper.component_for_entity(player_ent, Position)
+    target = _direction_target_xy(action, player_pos)
+    if target is None:
+        queue_message(f"You put the {item_name} away.")
+    else:
+        queue_message(_place_buildable_at(player_ent, game_map, item_name, target))
     esper.process(None)
 
 
@@ -1933,9 +2023,11 @@ def _render_inventory_body(
         _draw_ui_text(renderer, right_x + 2 + text_offset, list_start_y, f"{prefix} (empty)", color, max(1, right_w - 4 - text_offset))
 
 
-def _handle_inventory_input(action: str, state: _InventoryState) -> None:
-    """Apply one input action to the Inventory tab (navigation + equip/use).
-    Tab switching and closing are handled by the enclosing player menu."""
+def _handle_inventory_input(action: str, state: _InventoryState) -> str | None:
+    """Apply one input action to the Inventory tab (navigation + equip/use). Tab
+    switching and closing are handled by the enclosing player menu. Returns the
+    name of a buildable item when the player selects one to place (the menu then
+    hands off to placement); otherwise ``None``."""
     player_ent = _first_player_entity()
 
     slot_count = 0
@@ -1967,7 +2059,7 @@ def _handle_inventory_input(action: str, state: _InventoryState) -> None:
 
     if action in {"menu_select", "confirm_action"} and player_ent is not None:
         if not esper.has_component(player_ent, Inventory) or not esper.has_component(player_ent, Equipment):
-            return
+            return None
         inventory = esper.component_for_entity(player_ent, Inventory)
         equipment = esper.component_for_entity(player_ent, Equipment)
 
@@ -1976,7 +2068,11 @@ def _handle_inventory_input(action: str, state: _InventoryState) -> None:
                 state.message = "No items to use."
             else:
                 clamped_idx = max(0, min(state.selected_item_idx, len(inventory.items) - 1))
-                # Food/drink is eaten/drunk; everything else is equipped.
+                item_name = inventory.items[clamped_idx]
+                # Buildable pieces hand off to placement; food/drink is consumed;
+                # everything else equips.
+                if is_placeable(item_name):
+                    return item_name
                 consume_message = _apply_consumable(player_ent, clamped_idx)
                 if consume_message is not None:
                     state.message = consume_message
@@ -1989,11 +2085,81 @@ def _handle_inventory_input(action: str, state: _InventoryState) -> None:
                 slot_name = slot_names[max(0, min(state.selected_slot_idx, len(slot_names) - 1))]
                 state.message = _unequip_slot(inventory, equipment, slot_name)
 
+    return None
 
-# The player menu tabs. Inventory and Status are live; the rest are placeholders
-# for planned screens so the tab framework is already in place.
+
+@dataclass
+class _CraftingState:
+    """Cursor/message state for the Crafting tab, held across frames like the
+    Inventory tab so a re-entered tab keeps its selection."""
+    selected_idx: int = 0
+    message: str = "Enter: craft   W/S: move"
+
+
+def _render_crafting_body(
+    renderer: Renderer,
+    x: int,
+    content_y: int,
+    width: int,
+    content_h: int,
+    state: _CraftingState,
+) -> None:
+    """Draw the Crafting tab: your Wood on hand and the buildable recipes."""
+    player_ent = _first_player_entity()
+    wood_count = 0
+    if player_ent is not None and esper.has_component(player_ent, Inventory):
+        wood_count = esper.component_for_entity(player_ent, Inventory).items.count(WOOD)
+
+    _draw_ui_text(renderer, x + 3, content_y, state.message, _MENU_MUTED_COLOR, width - 6)
+    _draw_ui_text(renderer, x + 3, content_y + 1, f"Wood in pack: {wood_count}", _MENU_TEXT_COLOR, width - 6)
+
+    list_y = content_y + 3
+    for idx, item_name in enumerate(_CRAFT_MENU):
+        cost = craft_cost(item_name) or 0
+        affordable = wood_count >= cost
+        is_selected = idx == state.selected_idx
+        row_y = list_y + idx
+        if is_selected:
+            _fill_ui_cells(renderer, x + 2, row_y, width - 4, 1, _MENU_SELECTED_BG)
+        prefix = ">" if is_selected else " "
+        if is_selected:
+            color = _MENU_SELECTED_TEXT
+        elif affordable:
+            color = _MENU_TEXT_COLOR
+        else:
+            color = _MENU_MUTED_COLOR
+        _draw_ui_text(renderer, x + 3, row_y, f"{prefix} {item_name:8} - {cost} Wood", color, width - 6)
+
+    hint_y = list_y + len(_CRAFT_MENU) + 1
+    _draw_ui_text(
+        renderer,
+        x + 3,
+        hint_y,
+        "Craft pieces here, then place them from the Inventory tab.",
+        _MENU_MUTED_COLOR,
+        width - 6,
+    )
+
+
+def _handle_crafting_input(action: str, state: _CraftingState) -> None:
+    """Navigate the recipe list and craft the selected piece."""
+    if action == "move_up":
+        state.selected_idx = (state.selected_idx - 1) % len(_CRAFT_MENU)
+        return
+    if action == "move_down":
+        state.selected_idx = (state.selected_idx + 1) % len(_CRAFT_MENU)
+        return
+    if action in {"menu_select", "confirm_action"}:
+        player_ent = _first_player_entity()
+        if player_ent is not None:
+            state.message = _craft_item(player_ent, _CRAFT_MENU[state.selected_idx])
+
+
+# The player menu tabs. Inventory, Craft, and Status are live; the rest are
+# placeholders for planned screens so the tab framework is already in place.
 _PLAYER_MENU_TABS: list[tuple[str, str]] = [
     ("inventory", "Inventory"),
+    ("craft", "Craft"),
     ("status", "Status"),
     ("map", "Map"),
     ("journal", "Journal"),
@@ -2019,6 +2185,7 @@ async def _draw_player_menu(renderer: Renderer, game_map: GameMap, start_tab: st
     caller can reopen on the tab you left on."""
     tab = _PLAYER_MENU_KEYS.index(start_tab) if start_tab in _PLAYER_MENU_KEYS else 0
     inv_state = _InventoryState()
+    craft_state = _CraftingState()
 
     while True:
         current_key = _PLAYER_MENU_KEYS[tab]
@@ -2037,6 +2204,8 @@ async def _draw_player_menu(renderer: Renderer, game_map: GameMap, start_tab: st
 
         if current_key == "inventory":
             _render_inventory_body(renderer, x, content_y, width, content_h, inv_state)
+        elif current_key == "craft":
+            _render_crafting_body(renderer, x, content_y, width, content_h, craft_state)
         elif current_key == "status":
             player_ent = _first_player_entity()
             lines = _creature_status_lines(game_map, player_ent) if player_ent is not None else ["No player."]
@@ -2068,7 +2237,12 @@ async def _draw_player_menu(renderer: Renderer, game_map: GameMap, start_tab: st
             continue
 
         if current_key == "inventory":
-            _handle_inventory_input(action, inv_state)
+            place_item = _handle_inventory_input(action, inv_state)
+            if place_item is not None:
+                # Hand off to placement; the caller drives the direction prompt.
+                return f"place:{place_item}", current_key
+        elif current_key == "craft":
+            _handle_crafting_input(action, craft_state)
 
 
 def _spawn_cave_rat(
@@ -2123,7 +2297,9 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         Player(),
         Vision(10),
         BlocksMovement(),
-        Inventory(items=["Bandage", "Torch", "Apple"]),
+        # Some starting wood so the player can craft walls/doors/windows right
+        # away (Crafting tab in the Tab menu, then place from the inventory).
+        Inventory(items=["Bandage", "Torch", "Apple", WOOD, WOOD, WOOD, WOOD, WOOD]),
         Equipment(slots=player_equipment),
         Needs(),
     )
@@ -2142,26 +2318,32 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         return rats_spawned
 
     villager_pos = Position(max(2, player_position.x - 2), player_position.y + 1)
+    villager2_pos = Position(max(2, player_position.x - 3), player_position.y + 2)
     guard_pos = Position(max(2, player_position.x - 5), player_position.y)
     rat_pos = Position(min(game_map.width - 3, player_position.x + 6), max(2, player_position.y - 2))
 
-    esper.create_entity(
-        villager_pos,
-        Renderable("v", fg=villager_skin),
-        Name(villager_name),
-        NPC(),
-        Friendly(),
-        Dialogue("##!/$*~# GH01^@"),
-        BlocksMovement(),
-        Inventory(items=["Bread", "Waterskin"]),
-        Equipment(slots=_default_equipment_slots()),
-        # Villagers cook: they gather meat + wood and cook at a stove before
-        # eating (unlike predator monsters, which eat raw on the spot).
-        Diet("cook"),
-        Needs(),
-        # Villagers have a home to return to each night rather than camping.
-        Home(villager_pos.x, villager_pos.y),
-    )
+    def spawn_villager(pos: Position, name: str, skin: tuple[int, int, int]) -> None:
+        esper.create_entity(
+            pos,
+            Renderable("v", fg=skin),
+            Name(name),
+            NPC(),
+            Friendly(),
+            Dialogue("##!/$*~# GH01^@"),
+            BlocksMovement(),
+            Inventory(items=["Bread", "Waterskin"]),
+            Equipment(slots=_default_equipment_slots()),
+            # Villagers cook: they gather meat + wood and cook at a stove before
+            # eating (unlike predator monsters, which eat raw on the spot).
+            Diet("cook"),
+            Needs(),
+            # Residents seek out an unowned house to live in (claiming it as their
+            # home), and build a cabin of their own if none is free.
+            Resident(),
+        )
+
+    spawn_villager(villager_pos, villager_name, villager_skin)
+    spawn_villager(villager2_pos, "Villager Mara", _human_skin_tone("Villager Mara", offset=13))
     goblin_equipment = _default_equipment_slots()
     goblin_equipment["main hand"] = "Jagged Dagger"
     esper.create_entity(
@@ -2194,6 +2376,12 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     )
 
     _spawn_environment_features(game_map, player_position)
+
+    # Furnish the pre-built houses (bed, oven, chest, table, wardrobe,
+    # bookshelf). Residents claim these unowned houses as homes at runtime.
+    for interior in game_map.find_enclosed_rooms():
+        furnish_house(game_map, interior)
+
     return 1
 
 
@@ -2248,18 +2436,34 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
     def plant_tree(x: int, y: int) -> None:
         place_at(x, y, Renderable("T", fg=_TREE_GREEN), Name("Tree"), Tree(), BlocksMovement())
 
+    def plant_bush(x: int, y: int) -> None:
+        place_at(x, y, Renderable("%", fg=_BERRY_RED), Name("Berry Bush"), BerryBush(), BlocksMovement())
+
     # A few starter trees within reach, plus deterministic forest stands spread
-    # across the map so both the player and grazing deer have wood/food.
-    for tree_dx, tree_dy in ((-3, -2), (-4, -2), (-3, 3), (5, 3), (6, 3)):
+    # across the map so both the player and grazing deer have wood/food. Twice
+    # the trees of the old world -- ten per stand, ten starters.
+    for tree_dx, tree_dy in (
+        (-3, -2), (-4, -2), (-3, 3), (5, 3), (6, 3),
+        (-5, -2), (-4, 3), (6, 4), (-5, 2), (5, 4),
+    ):
         plant_tree(player_position.x + tree_dx, player_position.y + tree_dy)
+
+    # A couple of ripe berry bushes within reach of the player to start.
+    for bush_dx, bush_dy in ((-2, 3), (4, -2)):
+        plant_bush(player_position.x + bush_dx, player_position.y + bush_dy)
 
     stand_centers = [
         (int(game_map.width * fx), int(game_map.height * fy))
         for fx, fy in ((0.15, 0.25), (0.4, 0.8), (0.7, 0.6), (0.85, 0.75), (0.55, 0.2))
     ]
     for cx, cy in stand_centers:
-        for tx, ty in ((0, 0), (1, 0), (0, 1), (2, 1), (1, 2)):
+        for tx, ty in (
+            (0, 0), (1, 0), (0, 1), (2, 1), (1, 2),
+            (2, 2), (3, 0), (0, 3), (3, 2), (2, 3),
+        ):
             plant_tree(cx + tx, cy + ty)
+        # Each stand also carries a berry bush for foragers.
+        plant_bush(cx + 1, cy + 1)
 
     # Deer near the tree stands / water so they can graze and drink.
     for cx, cy in stand_centers:
@@ -2316,8 +2520,12 @@ async def main() -> None:
             # TimeProcessor runs first (priority above movement) so the clock is
             # current before needs/AI read the time of day this turn.
             esper.add_processor(TimeProcessor(), priority=2)
+            # Housing runs before the AI so a villager that just claimed a home
+            # can start heading there this turn.
+            esper.add_processor(HousingProcessor(game_map), priority=0)
             esper.add_processor(NpcAiProcessor(game_map), priority=0)
             esper.add_processor(NeedsProcessor(), priority=0)
+            esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame
@@ -2440,6 +2648,12 @@ async def main() -> None:
                             esper.process(None)
                             continue
 
+                        interact_bush = _find_adjacent_feature(interact_action, BerryBush)
+                        if interact_bush is not None:
+                            queue_message(_harvest_bush(interact_bush, player_ent))
+                            esper.process(None)
+                            continue
+
                         interact_well = _find_adjacent_feature(interact_action, Well)
                         if interact_well is not None:
                             queue_message(_drink_from_well(interact_well, player_ent))
@@ -2469,6 +2683,11 @@ async def main() -> None:
                     held_directions.clear()
                     if menu_choice == "quit":
                         break
+                    if menu_choice.startswith("place:"):
+                        # The player chose a buildable in the inventory; ask for a
+                        # direction and build it on that tile.
+                        await _place_from_inventory(renderer, game_map, menu_choice[len("place:"):])
+                        continue
                     esper.process(None)
                     continue
                 if action == "open_pause_menu":

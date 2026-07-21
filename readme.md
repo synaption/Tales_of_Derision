@@ -224,6 +224,40 @@ turn and climbs **twice as fast at night**, so you can't stay up forever.
 The clock, phase boundaries, tiredness rates, and the night multiplier live at
 the top of [src/systems.py](src/systems.py) and are easy to tune.
 
+**Calendar.** Turns also drive a calendar: a **year is 4 months, each 4 weeks of
+7 days** (112 days a year). The status line leads with the full date and clock
+time, e.g. `Y1 M2 W3 D4 13:45 Day` (year, month, week, day-of-week, time, phase).
+See `calendar` / `format_datetime` in [src/systems.py](src/systems.py).
+
+## Houses, residents, and building
+
+A **house** is any floor area fully sealed by walls (`#`) and/or windows (`o`)
+whose only opening is a **door** (`+`) -- windows block movement but you (and the
+light) can see through them, doors you can walk through. Enclosed rooms are found
+by a flood-fill in [src/game_map.py](src/game_map.py) (`find_enclosed_rooms`).
+
+Every house is furnished with a **bed**, an **oven** (the cooking stove), a
+**chest**, a **table**, a **wardrobe**, and a **bookshelf**
+(`furnish_house` in [src/systems.py](src/systems.py)).
+
+**Residents move in.** Villagers are *residents*: each turn a homeless villager
+claims the nearest **unowned** house (one with a bed and no other resident living
+there) as its home, walks there to sleep, and cooks at its oven. A house counts
+as owned once a resident's home is inside it, so two villagers never share one.
+
+**Villagers build.** When no unowned house is free, a villager takes a preset
+cabin design, finds a clear spot, gathers **wood**, and raises the walls and door
+one piece at a time over many turns (it still stops to eat, drink, and sleep, so
+a cabin takes a while). When the last piece goes up the cabin is furnished and
+the builder moves in.
+
+**You can build too.** Open the **Craft** tab in the `Tab` menu to craft `Wall`,
+`Window`, and `Door` pieces out of `Wood` (walls/windows cost 2, doors 3). The
+crafted pieces go into your pack; switch to the **Inventory** tab, select a
+piece, and press a **direction** to place it on that adjacent tile -- seal off a
+room with four walls and a door and you've built a house of your own. Recipes and
+the item/tile mapping live in [src/items.py](src/items.py).
+
 **The world is a living ecosystem.** The map is a **3×3 grid of sections**. You
 are only ever in one section at a time: the camera shows just your current
 section, and when you walk off its edge you cross into the neighbouring section
@@ -234,11 +268,35 @@ keeps living while you're elsewhere.
 Two lakes and a river (`~` water) run through it. Wild **deer** (`d`) roam:
 when hungry they graze trees, when thirsty they drink from lakes and rivers.
 
+**The forest grows and regrows.** Each day, every open outdoor ground tile has a
+small chance of sprouting a **seedling** -- a **tree** (`t` -> `T`, 0.01%/tile) or,
+less often, a **berry bush** (`,` -> `%`) -- and every mature tree/bush has a
+**0.005% chance** (half that) of dying. A seedling that survives a full **year**
+(112 days) matures. So the woods slowly spread across open ground while old
+plants fall, and as villagers chop wood and deer graze the stands down, fresh
+seedlings keep reseeding -- a living, self-sustaining forest. The per-day odds
+and the map's soft plant cap live in `TreeGrowthProcessor` in
+[src/systems.py](src/systems.py); growth is evaluated once per in-game day.
+
+**Berry bushes** (`%`) are a renewable food source. A ripe bush shows red; face
+it and press the interact key (Enter) to **pick a handful of `Berries`** (eaten
+from the inventory like any food). The picked bush turns bare green, and grows a
+**fresh crop of berries 7 days later** -- so a patch of bushes feeds you (and
+foraging villagers) indefinitely if you don't strip it faster than it regrows.
+
 When hungry, **villagers cook**, just like you: they scavenge meat from a corpse
 (or hunt a deer), chop a tree for **wood**, carry both to a **stove**, cook the
-raw meat into a meal, and then eat it — meat is never eaten raw. Predator
-monsters (**goblins**, **cave rats**) are less civilised and eat raw meat on the
-spot. You can hunt deer too: walk into one to take it down for `Deer Meat`.
+raw meat into a meal, and then eat it — meat is never eaten raw. If no game or
+meat is reachable in their area, they fall back to **foraging from trees**
+(nuts/berries — renewable, unlike deer) rather than starve. Predator monsters
+(**goblins**, **cave rats**) are less civilised and eat raw meat on the spot. You
+can hunt deer too: walk into one to take it down for `Deer Meat`.
+
+NPCs only pursue food, water, and homes they can actually **walk to**: the map
+tracks connected walkable regions (`region_of`/`same_region` in
+[src/game_map.py](src/game_map.py)), so a villager won't strand itself trying to
+reach a deer or a house on the far bank of a river it can't cross — it forages
+what's on its side, and builds a home there if it can't reach an empty one.
 
 **Player menu.** Press `Tab` to open the player menu — a tabbed screen with
 **Inventory** and **Status** (with **Map**, **Journal**, and **Skills** stubbed
@@ -270,9 +328,11 @@ regenerates each session (only map size + player position are persisted).
 ## Menus
 
 - Startup flow: Title Screen -> Main Menu (`Continue`, `New Game`, `Quit`)
-- Player menu: press `Tab` to open the tabbed player menu (`Inventory`, `Status`,
-  and stubbed `Map`/`Journal`/`Skills`). `Tab` reopens on the last tab and cycles
-  tabs from inside; `I`/`C` jump straight to Inventory/Status (and toggle closed).
+- Player menu: press `Tab` to open the tabbed player menu (`Inventory`, `Craft`,
+  `Status`, and stubbed `Map`/`Journal`/`Skills`). `Tab` reopens on the last tab
+  and cycles tabs from inside; `I`/`C` jump straight to Inventory/Status (and
+  toggle closed). The `Craft` tab builds wall/window/door pieces from wood; place
+  them from the `Inventory` tab by selecting one and pressing a direction.
 - In-game pause menu: press `Esc` to open Pause Menu (`Save Game`, `Options`, `Quit`)
 - Pause menu navigation: WASD to move selection, Enter to select, `Esc` to resume game
 - Options menu: toggle `Fullscreen` and `Show FPS`; changes are written to working options file

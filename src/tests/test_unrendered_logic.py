@@ -158,11 +158,11 @@ def test_large_default_map_contains_buildings() -> None:
 
     assert game_map.tile_at(4, 3) == game_map.WALL
     assert game_map.tile_at(12, 8) == game_map.WALL
-    assert game_map.tile_at(8, 8) == game_map.FLOOR
+    assert game_map.tile_at(8, 8) == game_map.DOOR  # carved doorway
 
     assert game_map.tile_at(26, 5) == game_map.WALL
     assert game_map.tile_at(35, 11) == game_map.WALL
-    assert game_map.tile_at(30, 11) == game_map.FLOOR
+    assert game_map.tile_at(30, 11) == game_map.DOOR
 
 
 def test_setup_world_rat_flood_spawns_rat_on_every_walkable_tile() -> None:

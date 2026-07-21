@@ -4,12 +4,13 @@ esper 3.x uses module-level state and esper.Processor subclasses whose
 process() receives whatever args are passed to esper.process().
 """
 from collections.abc import Callable
+import random
 import textwrap
 import time
 
 import esper
 
-from components import Asleep, Bed, BlocksMovement, Camp, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Player, Position, Renderable, Stove, Tree, Vision, WorldClock
+from components import Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Furniture, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Player, Position, Renderable, Resident, Sapling, Stove, Tree, Vision, WorldClock
 from game_map import GameMap
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from renderer.base import Renderer
@@ -56,6 +57,37 @@ _ARROW_TO_WORD = {
 
 _WALL_BROWN = (124, 88, 56)
 _WATER_BLUE = (64, 118, 190)
+_DOOR_BROWN = (150, 106, 58)
+_WINDOW_CYAN = (128, 186, 206)
+_TREE_GREEN = (58, 138, 66)
+_SAPLING_GREEN = (120, 176, 90)
+_BUSH_GREEN = (86, 140, 78)   # a bush that has been picked bare
+_BERRY_RED = (200, 74, 96)    # a bush heavy with ripe berries
+_BUSH_GLYPH = "%"
+
+
+def _set_bush_appearance(ent: int, has_berries: bool) -> None:
+    """Colour a berry bush by whether it's ripe: reddish with berries, plain
+    green once picked. The glyph stays ``%``."""
+    if not esper.has_component(ent, Renderable):
+        return
+    rend = esper.component_for_entity(ent, Renderable)
+    rend.glyph = _BUSH_GLYPH
+    rend.fg = _BERRY_RED if has_berries else _BUSH_GREEN
+
+
+def pick_berries(bush_ent: int, clock: WorldClock | None) -> bool:
+    """Take a bush's berries if it is ripe. Marks it bare and stamps the harvest
+    time so the berries regrow 7 days later. Returns True if berries were taken."""
+    if not esper.has_component(bush_ent, BerryBush):
+        return False
+    bush = esper.component_for_entity(bush_ent, BerryBush)
+    if not bush.has_berries:
+        return False
+    bush.has_berries = False
+    bush.harvested_turn = clock.turn if clock is not None else 0
+    _set_bush_appearance(bush_ent, False)
+    return True
 
 # A section must be at least this big for the 3x3 section camera to engage;
 # below it (tiny test maps) the renderer keeps its plain centred camera.
@@ -163,6 +195,42 @@ def is_night(clock: WorldClock | None) -> bool:
     return time_phase(clock) in _NIGHTFALL_PHASES
 
 
+# --- Calendar --------------------------------------------------------------
+# A year is 4 months, each 4 weeks of 7 days -> 4*4*7 = 112 days.
+_DAYS_PER_WEEK = 7
+_WEEKS_PER_MONTH = 4
+_MONTHS_PER_YEAR = 4
+_DAYS_PER_MONTH = _DAYS_PER_WEEK * _WEEKS_PER_MONTH  # 28
+_DAYS_PER_YEAR = _DAYS_PER_MONTH * _MONTHS_PER_YEAR  # 112
+
+
+def calendar(clock: WorldClock) -> tuple[int, int, int, int, int, int]:
+    """Break the clock down into ``(year, month, week, day, hour, minute)``.
+
+    Year/month/week/day are 1-based for display; hour/minute are the clock time
+    within the current day (24h), derived from the fraction of the day elapsed.
+    """
+    day_length = max(1, clock.day_length)
+    total_days = clock.turn // day_length
+    day_of_year = total_days % _DAYS_PER_YEAR
+    day_in_month = day_of_year % _DAYS_PER_MONTH
+    year = total_days // _DAYS_PER_YEAR + 1
+    month = day_of_year // _DAYS_PER_MONTH + 1
+    week = day_in_month // _DAYS_PER_WEEK + 1
+    day = day_in_month % _DAYS_PER_WEEK + 1
+    minutes_into_day = int(day_fraction(clock) * 24 * 60)
+    return year, month, week, day, minutes_into_day // 60, minutes_into_day % 60
+
+
+def format_datetime(clock: WorldClock | None) -> str:
+    """Compact date + clock-time + phase string for the status line, e.g.
+    ``"Y1 M2 W3 D4 13:45 Night"``. A missing clock reads as ``"Day"``."""
+    if clock is None:
+        return "Day"
+    year, month, week, day, hour, minute = calendar(clock)
+    return f"Y{year} M{month} W{week} D{day} {hour:02d}:{minute:02d} {time_phase(clock)}"
+
+
 def night_overlay_alpha(clock: WorldClock | None) -> int:
     """Alpha (0-255) for the darkening night overlay: none by day, a light wash
     at dusk/dawn, deeper at night. Zero means draw nothing."""
@@ -250,6 +318,149 @@ def wake_up(ent: int) -> None:
 # the level past which it gives up on reaching home and camps where it stands.
 _SLEEP_THRESHOLD = 70.0
 _EXHAUSTED_THRESHOLD = 95.0
+
+
+# --- Houses: detection cache, furnishing, and building ---------------------
+_FURNITURE_TAN = (150, 116, 74)
+_CHEST_BROWN = (168, 120, 66)
+_BOOKSHELF_RED = (150, 92, 70)
+
+
+def houses_for(game_map: GameMap, cache: dict) -> list[frozenset[tuple[int, int]]]:
+    """Enclosed house interiors, recomputed only when the map has changed since
+    the cache was filled. ``cache`` is any dict the caller keeps around."""
+    revision = getattr(game_map, "revision", 0)
+    if cache.get("revision") != revision:
+        cache["revision"] = revision
+        cache["houses"] = game_map.find_enclosed_rooms()
+    return cache["houses"]
+
+
+def _bed_in_interior(interior: frozenset[tuple[int, int]]) -> int | None:
+    for ent, (pos, _bed) in esper.get_components(Position, Bed):
+        if (pos.x, pos.y) in interior:
+            return ent
+    return None
+
+
+def house_is_owned(interior: frozenset[tuple[int, int]]) -> bool:
+    """A house is owned when some resident's home lies inside it."""
+    for _ent, (home, _res) in esper.get_components(Home, Resident):
+        if (home.x, home.y) in interior:
+            return True
+    return False
+
+
+# Furnishing spec: (glyph, colour, name, blocks, factory-for-extra-components).
+# Order matters -- the bed is placed first (farthest from the door), the rest
+# fill remaining interior tiles.
+_FURNISHINGS: list[tuple[str, tuple[int, int, int], str, bool, Callable[[], list[object]]]] = [
+    ("=", (156, 116, 72), "Bed", False, lambda: [Bed()]),
+    ("#", (120, 120, 128), "Oven", True, lambda: [Stove()]),
+    ("=", _CHEST_BROWN, "Chest", True, lambda: [Chest(), Inventory(items=[])]),
+    ("T", _FURNITURE_TAN, "Table", True, lambda: [Furniture("table")]),
+    ("W", _FURNITURE_TAN, "Wardrobe", True, lambda: [Furniture("wardrobe")]),
+    ("B", _BOOKSHELF_RED, "Bookshelf", True, lambda: [Furniture("bookshelf")]),
+]
+
+
+def furnish_house(game_map: GameMap, interior: frozenset[tuple[int, int]]) -> tuple[int, int] | None:
+    """Populate a house interior with a bed, oven, chest, table, wardrobe, and
+    bookshelf on distinct floor tiles, keeping the doorway clear. Returns the bed
+    tile (a resident's sleep spot) or ``None`` if the room was too small."""
+    door_adjacent: set[tuple[int, int]] = set()
+    for (x, y) in interior:
+        if any(game_map.tile_at(nx, ny) == game_map.DOOR for nx, ny in game_map.neighbors_4(x, y)):
+            door_adjacent.add((x, y))
+
+    occupied = {
+        (pos.x, pos.y)
+        for _ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
+    }
+    occupied |= {(pos.x, pos.y) for _ent, (pos, _bed) in esper.get_components(Position, Bed)}
+
+    def door_distance(tile: tuple[int, int]) -> int:
+        if not door_adjacent:
+            return 0
+        return min(_chebyshev(tile, d) for d in door_adjacent)
+
+    # Bed goes farthest from the door; the rest take the nearest free tiles.
+    free = sorted(t for t in interior if t not in occupied)
+    if not free:
+        return None
+
+    bed_tile = max(free, key=door_distance)
+    bed_glyph, bed_color, bed_name, _bed_blocks, bed_extra = _FURNISHINGS[0]
+    esper.create_entity(Position(*bed_tile), Renderable(bed_glyph, fg=bed_color), Name(bed_name), *bed_extra())
+    occupied.add(bed_tile)
+
+    remaining = [t for t in free if t not in occupied and t not in door_adjacent]
+    for glyph, color, name, blocks, extra in _FURNISHINGS[1:]:
+        if not remaining:
+            break
+        tile = remaining.pop(0)
+        components: list[object] = [Position(*tile), Renderable(glyph, fg=color), Name(name)]
+        if blocks:
+            components.append(BlocksMovement())
+        components.extend(extra())
+        esper.create_entity(*components)
+        occupied.add(tile)
+
+    return bed_tile
+
+
+# Preset house the villagers build when no home is free: a 6x5 walled cabin with
+# a door in the south wall. Coordinates are relative to the top-left corner.
+_BLUEPRINT_W = 6
+_BLUEPRINT_H = 5
+_BLUEPRINT_DOOR = (2, _BLUEPRINT_H - 1)
+
+
+def _blueprint_tiles(game_map: GameMap, ox: int, oy: int) -> tuple[list[tuple[int, int, str]], list[tuple[int, int]]]:
+    """The (x, y, tile) wall/door pieces and the interior floor tiles for a cabin
+    whose top-left corner is at (ox, oy)."""
+    build: list[tuple[int, int, str]] = []
+    interior: list[tuple[int, int]] = []
+    for dy in range(_BLUEPRINT_H):
+        for dx in range(_BLUEPRINT_W):
+            x, y = ox + dx, oy + dy
+            edge = dx in (0, _BLUEPRINT_W - 1) or dy in (0, _BLUEPRINT_H - 1)
+            if (dx, dy) == _BLUEPRINT_DOOR:
+                build.append((x, y, game_map.DOOR))
+            elif edge:
+                build.append((x, y, game_map.WALL))
+            else:
+                interior.append((x, y))
+    return build, interior
+
+
+def choose_build_site(game_map: GameMap, near: tuple[int, int], occupied: set[tuple[int, int]]) -> tuple[int, int] | None:
+    """Find a clear top-left corner for a cabin near ``near``: a WxH block of
+    open floor tiles (no water, walls, borders, or occupants) with a one-tile
+    margin so cabins don't fuse. Searches outward in rings; returns ``None`` if
+    nowhere fits within range."""
+    nx, ny = near
+    for radius in range(3, 22):
+        for oy in range(ny - radius, ny + radius + 1):
+            for ox in range(nx - radius, nx + radius + 1):
+                if _site_is_clear(game_map, ox, oy, occupied):
+                    return (ox, oy)
+    return None
+
+
+def _site_is_clear(game_map: GameMap, ox: int, oy: int, occupied: set[tuple[int, int]]) -> bool:
+    # One-tile margin around the footprint keeps cabins from sharing walls.
+    for y in range(oy - 1, oy + _BLUEPRINT_H + 1):
+        for x in range(ox - 1, ox + _BLUEPRINT_W + 1):
+            if not game_map.in_bounds(x, y):
+                return False
+            if x == 0 or y == 0 or x == game_map.width - 1 or y == game_map.height - 1:
+                return False
+            if game_map.tile_at(x, y) != game_map.FLOOR:
+                return False
+            if (x, y) in occupied:
+                return False
+    return True
 
 _AUTOTILE_DIRECTION_OFFSETS = {
     1: (-1, -1),
@@ -487,13 +698,21 @@ class NpcAiProcessor(esper.Processor):
         occupied[(next_x, next_y)] = ent
         return True
 
+    def _reachable(
+        self, pos: Position, items: list[tuple[tuple[int, int], int]]
+    ) -> list[tuple[tuple[int, int], int]]:
+        """Keep only ``(xy, ent)`` targets in the same walkable region as ``pos``,
+        so a creature never fixates on food/water across a river it can't cross."""
+        return [item for item in items if self.game_map.same_region((pos.x, pos.y), item[0])]
+
     def _seek_water(
         self, ent: int, pos: Position, needs: Needs, occupied: dict[tuple[int, int], int]
     ) -> bool:
         if any(self.game_map.is_water(nx, ny) for nx, ny in self.game_map.neighbors_8(pos.x, pos.y)):
             needs.thirst = max(0.0, needs.thirst - _DRINK_RESTORE)
             return True
-        target = self._nearest((pos.x, pos.y), self._shore_tiles)
+        reachable = [s for s in self._shore_tiles if self.game_map.same_region((pos.x, pos.y), s)]
+        target = self._nearest((pos.x, pos.y), reachable)
         if target is None:
             return False
         return self._step_toward(ent, pos, target, occupied)
@@ -506,6 +725,7 @@ class NpcAiProcessor(esper.Processor):
         trees: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
     ) -> bool:
+        trees = self._reachable(pos, trees)
         if not trees:
             return False
         target_xy, target_ent = min(trees, key=lambda item: _chebyshev((pos.x, pos.y), item[0]))
@@ -531,7 +751,10 @@ class NpcAiProcessor(esper.Processor):
     ) -> bool:
         """A hungry meat-eater heads to the nearest food: an existing corpse it
         can scavenge, or a live deer it can hunt."""
-        # (xy, kind, target_ent). Corpses are already filtered to ones with meat.
+        # (xy, kind, target_ent). Corpses are already filtered to ones with meat;
+        # keep only what's actually reachable from here.
+        corpses = self._reachable(pos, corpses)
+        prey = self._reachable(pos, prey)
         candidates: list[tuple[tuple[int, int], str, int]] = [
             (xy, "corpse", corpse_ent) for xy, corpse_ent in corpses
         ]
@@ -606,6 +829,8 @@ class NpcAiProcessor(esper.Processor):
     ) -> bool:
         """Put raw meat in the pack: scavenge a corpse, or kill a deer (which
         leaves a corpse to scavenge next). Unlike a predator, does not eat here."""
+        corpses = self._reachable(pos, corpses)
+        prey = self._reachable(pos, prey)
         candidates: list[tuple[tuple[int, int], str, int]] = [
             (xy, "corpse", corpse_ent) for xy, corpse_ent in corpses
         ]
@@ -649,6 +874,7 @@ class NpcAiProcessor(esper.Processor):
         trees: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
     ) -> bool:
+        trees = self._reachable(pos, trees)
         if not trees:
             return False
         target_xy, tree_ent = min(trees, key=lambda t: _chebyshev((pos.x, pos.y), t[0]))
@@ -671,6 +897,7 @@ class NpcAiProcessor(esper.Processor):
         stoves: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
     ) -> bool:
+        stoves = self._reachable(pos, stoves)
         if not stoves:
             return False
         target_xy, _stove_ent = min(stoves, key=lambda s: _chebyshev((pos.x, pos.y), s[0]))
@@ -696,9 +923,16 @@ class NpcAiProcessor(esper.Processor):
         if not esper.has_component(ent, Inventory):
             return False
         inventory = esper.component_for_entity(ent, Inventory)
+        needs = esper.component_for_entity(ent, Needs) if esper.has_component(ent, Needs) else None
         has_raw = any(is_raw_meat(item) for item in inventory.items)
         if not has_raw:
-            return self._forage_meat(ent, pos, inventory, prey, corpses, occupied)
+            if self._forage_meat(ent, pos, inventory, prey, corpses, occupied):
+                return True
+            # No reachable game or meat in this area: rather than starve, forage
+            # food from the trees around (nuts/berries -- renewable, unlike deer).
+            if needs is not None:
+                return self._graze(ent, pos, needs, trees, occupied)
+            return False
         if WOOD in inventory.items:
             return self._cook_at_stove(ent, pos, inventory, stoves, occupied)
         return self._gather_wood(ent, pos, inventory, trees, occupied)
@@ -725,11 +959,75 @@ class NpcAiProcessor(esper.Processor):
         if self._step_toward(ent, pos, home_xy, occupied):
             return True
 
-        # Couldn't advance toward home; collapse into a camp only when spent.
-        if needs.tiredness >= _EXHAUSTED_THRESHOLD:
+        # Couldn't advance toward home. Camp where we stand if we're spent, or if
+        # home is genuinely unreachable (blocked by water/walls) -- better to camp
+        # and recover than to idle at a barrier, pinning tiredness and starving.
+        if needs.tiredness >= _EXHAUSTED_THRESHOLD or not self.game_map.same_region((pos.x, pos.y), home_xy):
             go_to_sleep(ent, in_camp=True)
             return True
         return False
+
+    def _ensure_inventory(self, ent: int) -> Inventory:
+        if esper.has_component(ent, Inventory):
+            return esper.component_for_entity(ent, Inventory)
+        inventory = Inventory(items=[])
+        esper.add_component(ent, inventory)
+        return inventory
+
+    def _build(
+        self,
+        ent: int,
+        pos: Position,
+        trees: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        """Advance a resident's ``BuildPlan`` by one step: gather wood if short,
+        place an adjacent pending piece, or walk toward the nearest one. Finishing
+        the last piece furnishes and claims the new house."""
+        plan = esper.component_for_entity(ent, BuildPlan)
+        if not plan.remaining:
+            self._complete_build(ent, plan)
+            return True
+
+        inventory = self._ensure_inventory(ent)
+        if WOOD not in inventory.items:
+            return self._gather_wood(ent, pos, inventory, trees, occupied)
+
+        # Place a piece we're already standing next to.
+        for index, (bx, by, tile) in enumerate(plan.remaining):
+            if _chebyshev((pos.x, pos.y), (bx, by)) == 1:
+                if self.game_map.set_tile(bx, by, tile):
+                    inventory.items.remove(WOOD)
+                plan.remaining.pop(index)
+                if not plan.remaining:
+                    self._complete_build(ent, plan)
+                return True
+
+        # Otherwise approach the nearest pending piece, treating all pending
+        # tiles as blocked so the builder stops beside them instead of on them.
+        target = min(plan.remaining, key=lambda t: _chebyshev((pos.x, pos.y), (t[0], t[1])))
+        added: list[tuple[int, int]] = []
+        for bx, by, _tile in plan.remaining:
+            if (bx, by) not in occupied:
+                occupied[(bx, by)] = -1  # sentinel: not a real entity, just blocked
+                added.append((bx, by))
+        moved = self._step_toward(ent, pos, (target[0], target[1]), occupied)
+        for xy in added:
+            if occupied.get(xy) == -1:
+                del occupied[xy]
+        return moved
+
+    def _complete_build(self, ent: int, plan: BuildPlan) -> None:
+        bed = furnish_house(self.game_map, frozenset(plan.interior))
+        if bed is not None:
+            if esper.has_component(ent, Home):
+                home = esper.component_for_entity(ent, Home)
+                home.x, home.y = bed
+            else:
+                esper.add_component(ent, Home(bed[0], bed[1]))
+        if esper.has_component(ent, BuildPlan):
+            esper.remove_component(ent, BuildPlan)
+        _push_turn_event("A villager finishes building a new cabin.")
 
     def _chase_player(
         self,
@@ -806,11 +1104,232 @@ class NpcAiProcessor(esper.Processor):
                         # Villager: cooks meat before eating (multi-turn plan).
                         acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
 
+            # Building a house is the lowest-priority drive: a resident works its
+            # BuildPlan only once fed, watered, and rested.
+            if not acted and esper.has_component(ent, BuildPlan):
+                acted = self._build(ent, pos, trees, occupied)
+
             if acted:
                 continue
 
             if player_xy is not None and esper.has_component(ent, Enemy):
                 self._chase_player(ent, pos, player_xy, occupied)
+
+
+class HousingProcessor(esper.Processor):
+    """Settles residents into homes. Each turn every ``Resident`` without a valid
+    home tries to **claim the nearest unowned house** (one with a bed and no other
+    resident living in it); if none is free it is given a ``BuildPlan`` for a
+    preset cabin, which the NPC AI then constructs over many turns.
+
+    House detection is cached and only rebuilt when the map changes, so this is a
+    cheap per-turn pass on a static map.
+    """
+
+    def __init__(self, game_map: GameMap):
+        self.game_map = game_map
+        self._cache: dict = {}
+
+    def process(self, action: str | None = None) -> None:
+        if action not in _TURN_ACTIONS:
+            return
+        houses = houses_for(self.game_map, self._cache)
+
+        for ent, (_res,) in list(esper.get_components(Resident)):
+            if esper.has_component(ent, BuildPlan):
+                continue  # already building its own home
+            if esper.has_component(ent, Home):
+                home = esper.component_for_entity(ent, Home)
+                if any((home.x, home.y) in interior for interior in houses):
+                    continue  # home still stands and is theirs
+            if self._claim_unowned_house(ent, houses):
+                continue
+            self._start_build(ent)
+
+    def _claim_unowned_house(self, ent: int, houses: list[frozenset[tuple[int, int]]]) -> bool:
+        pos = esper.component_for_entity(ent, Position) if esper.has_component(ent, Position) else None
+        candidates: list[tuple[frozenset[tuple[int, int]], tuple[int, int]]] = []
+        for interior in houses:
+            if house_is_owned(interior):
+                continue
+            bed_ent = _bed_in_interior(interior)
+            if bed_ent is None:
+                continue
+            bed_pos = esper.component_for_entity(bed_ent, Position)
+            candidates.append((interior, (bed_pos.x, bed_pos.y)))
+        if not candidates:
+            return False
+        if pos is not None:
+            candidates.sort(key=lambda c: _chebyshev((pos.x, pos.y), c[1]))
+
+        for _interior, bed_xy in candidates:
+            # Only claim a house the villager can actually walk to -- otherwise it
+            # would strand itself commuting to a home across water/walls and never
+            # get back to foraging. If none are reachable, it builds one instead.
+            if pos is not None and (pos.x, pos.y) != bed_xy and not self.game_map.same_region((pos.x, pos.y), bed_xy):
+                continue
+            if esper.has_component(ent, Home):
+                home = esper.component_for_entity(ent, Home)
+                home.x, home.y = bed_xy
+            else:
+                esper.add_component(ent, Home(bed_xy[0], bed_xy[1]))
+            return True
+        return False
+
+    def _start_build(self, ent: int) -> None:
+        if not esper.has_component(ent, Position):
+            return
+        pos = esper.component_for_entity(ent, Position)
+        occupied = {
+            (p.x, p.y) for _e, (p, _b) in esper.get_components(Position, BlocksMovement)
+        }
+        origin = choose_build_site(self.game_map, (pos.x, pos.y), occupied)
+        if origin is None:
+            return
+        build, interior = _blueprint_tiles(self.game_map, origin[0], origin[1])
+        bed = interior[0] if interior else origin
+        esper.add_component(ent, BuildPlan(remaining=build, interior=interior, bed=bed))
+
+
+# Daily, per-tile odds that shape the flora. A sapling can sprout on any open
+# outdoor ground tile; a mature tree/bush can die (rot/fall) at half that rate.
+# Berry bushes sprout less often than trees.
+_DAILY_SPROUT_CHANCE = 0.0001       # 0.01% per outdoor ground tile per day (trees)
+_DAILY_BUSH_SPROUT_CHANCE = 0.00004  # bushes are rarer than trees
+_DAILY_DEATH_CHANCE = 0.00005       # 0.005% per plant per day (half the sprout rate)
+# Days after a bush's berries are picked before a fresh crop ripens.
+_BERRY_REGROW_DAYS = 7
+
+
+class TreeGrowthProcessor(esper.Processor):
+    """Ages the flora one **day** at a time (it acts on the turn a new day
+    begins, matching the per-day odds below).
+
+    Each day: any sapling that has lived a full year (112 days) matures (into a
+    tree or a berry bush, per its kind); every tree/bush has a small chance of
+    dying; picked bushes regrow their berries once 7 days have passed; and every
+    open outdoor ground tile has a small chance of sprouting a fresh sapling. A
+    soft cap (scaled to the map) keeps the world from filling solid. The RNG is
+    injectable so tests can force or suppress growth.
+    """
+
+    def __init__(self, game_map: GameMap, rng: Callable[[], float] | None = None):
+        self.game_map = game_map
+        self._rng = rng if rng is not None else random.random
+        self._cap = max(40, (game_map.width * game_map.height) // 20)
+        self._last_day: int | None = None
+        # Cached list of outdoor ground tiles (floor, not inside a house),
+        # rebuilt only when the map changes.
+        self._ground_cache: dict = {}
+
+    def process(self, action: str | None = None) -> None:
+        if action not in _TURN_ACTIONS:
+            return
+        clock = world_clock()
+        if clock is None:
+            return
+        day = clock.turn // max(1, clock.day_length)
+        if self._last_day is None:
+            self._last_day = day  # establish a baseline; age the flora from here
+            return
+        if day == self._last_day:
+            return
+        self._last_day = day
+        self._mature_saplings(clock)
+        self._kill_flora()
+        self._regrow_berries(clock)
+        self._sprout_saplings(clock)
+
+    def _mature_saplings(self, clock: WorldClock) -> None:
+        mature_age = _DAYS_PER_YEAR * max(1, clock.day_length)
+        blockers = {
+            (pos.x, pos.y) for _e, (pos, _b) in esper.get_components(Position, BlocksMovement)
+        }
+        for ent, (pos, sapling) in list(esper.get_components(Position, Sapling)):
+            if clock.turn - sapling.planted_turn < mature_age:
+                continue
+            if (pos.x, pos.y) in blockers:
+                continue  # occupied -- let it mature once the tile clears
+            esper.remove_component(ent, Sapling)
+            esper.add_component(ent, BlocksMovement())
+            if sapling.kind == "bush":
+                esper.add_component(ent, BerryBush())
+                _set_bush_appearance(ent, True)
+                if esper.has_component(ent, Name):
+                    esper.component_for_entity(ent, Name).value = "Berry Bush"
+            else:
+                esper.add_component(ent, Tree())
+                if esper.has_component(ent, Renderable):
+                    rend = esper.component_for_entity(ent, Renderable)
+                    rend.glyph = "T"
+                    rend.fg = _TREE_GREEN
+                if esper.has_component(ent, Name):
+                    esper.component_for_entity(ent, Name).value = "Tree"
+
+    def _kill_flora(self) -> None:
+        for ent, (_pos, _tree) in list(esper.get_components(Position, Tree)):
+            if self._rng() < _DAILY_DEATH_CHANCE:
+                esper.delete_entity(ent, immediate=True)
+        for ent, (_pos, _bush) in list(esper.get_components(Position, BerryBush)):
+            if self._rng() < _DAILY_DEATH_CHANCE:
+                esper.delete_entity(ent, immediate=True)
+
+    def _regrow_berries(self, clock: WorldClock) -> None:
+        ready_after = _BERRY_REGROW_DAYS * max(1, clock.day_length)
+        for ent, (bush,) in esper.get_components(BerryBush):
+            if bush.has_berries or bush.harvested_turn is None:
+                continue
+            if clock.turn - bush.harvested_turn >= ready_after:
+                bush.has_berries = True
+                bush.harvested_turn = None
+                _set_bush_appearance(ent, True)
+
+    def _outdoor_ground(self) -> list[tuple[int, int]]:
+        """Every regular ground tile that is outdoors (floor, and not inside an
+        enclosed house). Cached until the map changes."""
+        revision = getattr(self.game_map, "revision", 0)
+        if self._ground_cache.get("revision") != revision:
+            interiors: set[tuple[int, int]] = set()
+            for interior in self.game_map.find_enclosed_rooms():
+                interiors |= interior
+            tiles = [
+                (x, y)
+                for y in range(1, self.game_map.height - 1)
+                for x in range(1, self.game_map.width - 1)
+                if self.game_map.tiles[y][x] == self.game_map.FLOOR and (x, y) not in interiors
+            ]
+            self._ground_cache = {"revision": revision, "tiles": tiles}
+        return self._ground_cache["tiles"]
+
+    def _sprout_saplings(self, clock: WorldClock) -> None:
+        total = (
+            sum(1 for _e, _c in esper.get_components(Tree))
+            + sum(1 for _e, _c in esper.get_components(BerryBush))
+            + sum(1 for _e, _c in esper.get_components(Sapling))
+        )
+        if total >= self._cap:
+            return
+        occupied = {(pos.x, pos.y) for _e, (pos,) in esper.get_components(Position)}
+        for x, y in self._outdoor_ground():
+            if total >= self._cap:
+                break
+            if (x, y) in occupied:
+                continue
+            roll = self._rng()
+            if roll < _DAILY_SPROUT_CHANCE:
+                kind, glyph, name = "tree", "t", "Sapling"
+            elif roll < _DAILY_SPROUT_CHANCE + _DAILY_BUSH_SPROUT_CHANCE:
+                kind, glyph, name = "bush", ",", "Bush Seedling"
+            else:
+                continue
+            esper.create_entity(
+                Position(x, y),
+                Renderable(glyph, fg=_SAPLING_GREEN),
+                Name(name),
+                Sapling(planted_turn=clock.turn, kind=kind),
+            )
+            occupied.add((x, y))
+            total += 1
 
 
 # Hunger/thirst thresholds (percent of max) that emit an escalating warning the
@@ -929,6 +1448,10 @@ class RenderProcessor(esper.Processor):
         self._visible_cache_key: tuple[int | None, int, int] | None = None
         self._wall_mask_cache: dict[tuple[int, int], int] = {}
         self._water_mask_cache: dict[tuple[int, int], int] = {}
+        # Last map revision drawn. When the map mutates at runtime (a wall or door
+        # gets built), the cached map surface, autotile masks, and FOV memo all go
+        # stale, so we drop them and let the next frame rebuild.
+        self._map_revision = getattr(game_map, "revision", 0)
         # Per-player-position FOV memo: pos -> (visible set, view bbox, shadow
         # cells). Lets a walking step blit one cached map region + a few shadow
         # fills instead of re-drawing every visible tile.
@@ -1140,6 +1663,10 @@ class RenderProcessor(esper.Processor):
             tile_fg: tuple[int, int, int] | None = _WALL_BROWN
         elif tile == self.game_map.WATER:
             tile_fg = _WATER_BLUE
+        elif tile == self.game_map.DOOR:
+            tile_fg = _DOOR_BROWN
+        elif tile == self.game_map.WINDOW:
+            tile_fg = _WINDOW_CYAN
         else:
             tile_fg = None
         r.draw_glyph_classified(vx, vy, tile, classification, fg=tile_fg, bg=None)
@@ -1555,9 +2082,26 @@ class RenderProcessor(esper.Processor):
         last = frames[-1]
         return last[0], last[1], last[3]
 
+    def _invalidate_map_caches_if_changed(self) -> None:
+        """Drop map-derived caches when the map has been edited since last frame,
+        so a newly built wall/door/window shows up immediately."""
+        revision = getattr(self.game_map, "revision", 0)
+        if revision == self._map_revision:
+            return
+        self._map_revision = revision
+        self._wall_mask_cache.clear()
+        self._water_mask_cache.clear()
+        self._fov_cache.clear()
+        self._visible_cache_key = None
+        invalidate_surface = getattr(self.renderer, "invalidate_map_surface", None)
+        if callable(invalidate_surface):
+            invalidate_surface()
+
     def process(self, action: str | None = None) -> None:
         r = self.renderer
         r.clear()
+
+        self._invalidate_map_caches_if_changed()
 
         entity_lookup: dict[tuple[int, int], tuple[str, str]] = {}
         player_pos: Position | None = None
@@ -1667,7 +2211,7 @@ class RenderProcessor(esper.Processor):
             draw_overlay(_NIGHT_TINT, overlay_alpha)
 
         draw_text_clipped = getattr(r, "draw_text_clipped", None)
-        time_text = f"{time_phase(clock)}  "
+        time_text = f"{format_datetime(clock)}  "
         needs_text = ""
         if player_ent is not None and esper.has_component(player_ent, Needs):
             needs = esper.component_for_entity(player_ent, Needs)

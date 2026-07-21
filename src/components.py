@@ -119,6 +119,25 @@ class Tree:
 
 
 @dataclass
+class Sapling:
+    """A young plant seeded on open ground. ``planted_turn`` is the world-clock
+    turn it sprouted; after one year (112 days) it matures. ``kind`` decides what
+    it becomes -- ``"tree"`` -> ``Tree``, ``"bush"`` -> ``BerryBush``. Saplings
+    don't block movement or yield anything yet."""
+    planted_turn: int = 0
+    kind: str = "tree"
+
+
+@dataclass
+class BerryBush:
+    """A mature berry bush. When ripe (``has_berries``) its berries can be
+    picked; once taken they regrow 7 days later. ``harvested_turn`` records when
+    they were last taken (``None`` while ripe)."""
+    has_berries: bool = True
+    harvested_turn: int | None = None
+
+
+@dataclass
 class Well:
     """Tag component: a renewable water source the player can drink from."""
 
@@ -162,6 +181,36 @@ class Asleep:
     """Tag: the character is sleeping. Sleepers skip their turn while their
     tiredness recovers; ``in_camp`` marks a camp to break on waking."""
     in_camp: bool = False
+
+
+@dataclass
+class Chest:
+    """Tag component: a storage container. Pairs with ``Inventory`` to hold
+    items the player (or an NPC) can loot, like a corpse's inventory."""
+
+
+@dataclass
+class Furniture:
+    """Decorative house furnishing (``"table"``, ``"wardrobe"``, ``"bookshelf"``,
+    ...). Purely for flavour/occupancy; functional pieces use their own tags
+    (``Bed``, ``Stove``, ``Chest``)."""
+    kind: str = "furniture"
+
+
+@dataclass
+class Resident:
+    """Tag component: an NPC that wants to live in a house -- it will claim an
+    unowned house or, failing that, build one from a preset design."""
+
+
+@dataclass
+class BuildPlan:
+    """A house a resident NPC is constructing from a preset design. ``remaining``
+    is the list of ``(x, y, tile)`` still to place; ``interior`` are the inside
+    floor tiles to furnish and ``bed`` the tile it will sleep on once done."""
+    remaining: list[tuple[int, int, str]] = field(default_factory=list)
+    interior: list[tuple[int, int]] = field(default_factory=list)
+    bed: tuple[int, int] = (0, 0)
 
 
 @dataclass
