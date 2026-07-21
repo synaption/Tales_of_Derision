@@ -12,7 +12,7 @@ import time
 import esper
 
 from components import Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Diet, Enemy, Equipment, Fish, Friendly, Furniture, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Owned, Player, Position, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
-from game_map import GameMap
+from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from renderer.base import Renderer
 
@@ -91,10 +91,20 @@ def pick_berries(bush_ent: int, clock: WorldClock | None) -> bool:
     _set_bush_appearance(bush_ent, False)
     return True
 
-# A section must be at least this big for the 3x3 section camera to engage;
-# below it (tiny test maps) the renderer keeps its plain centred camera.
+# A section must be at least this big for the section camera to engage; below it
+# (tiny test maps) the renderer keeps its plain centred camera.
 _MIN_SECTION_W = 12
 _MIN_SECTION_H = 8
+
+# Two nested tilings over the world:
+#  * the render section (40x20) -- only the one the player stands in is drawn;
+#  * the simulation area (120x60, a 3x3 block of render sections) -- the whole
+#    area the player stands in is fully simulated each turn, the rest only in the
+#    background (see FishAiProcessor).
+_RENDER_SECTION_W = LAND_WIDTH // 3   # 40
+_RENDER_SECTION_H = LAND_HEIGHT // 3  # 20
+_SIM_AREA_W = LAND_WIDTH   # 120
+_SIM_AREA_H = LAND_HEIGHT  # 60
 
 # --- Status identifier animation -------------------------------------------
 # A character's rendered tile cycles through its own glyph followed by an
@@ -712,10 +722,12 @@ _FEED_RESTORE = 60.0
 # notice a frond and start swimming toward it.
 _FISH_GRAZE_RESTORE = 40.0
 _FISH_SIGHT = 12
-# Only fish within this many tiles of the player are simulated each turn; the
-# rest of the ocean sits frozen and cost-free (a "simulation bubble") so a
-# distant shoal never blocks input. Comfortably larger than the on-screen area.
-_FISH_SIM_RADIUS = 28
+# Wall-clock budget (seconds) a turn may spend nudging non-current simulation
+# areas along in the background -- kept tiny so ocean work can never stall input.
+_FISH_BACKGROUND_BUDGET = 0.0015
+# Cap on catch-up steps run when the player enters a stale area, so "bring it up
+# to date" stays bounded no matter how long the area sat dormant.
+_FISH_CATCHUP_STEPS = 20
 # Chance a fish drifts to a random neighbouring water tile on an idle turn, so
 # the shoals mill about gently instead of holding perfectly still.
 _FISH_WANDER_CHANCE = 0.6
@@ -1232,53 +1244,109 @@ class FishAiProcessor(esper.Processor):
     ``NPC``, so the land AI ignores them entirely.
     """
 
-    def __init__(self, game_map: GameMap, rng: Callable[[], float] | None = None):
+    def __init__(
+        self,
+        game_map: GameMap,
+        rng: Callable[[], float] | None = None,
+        clock: Callable[[], float] | None = None,
+    ):
         self.game_map = game_map
         self._rng = rng if rng is not None else random.random
+        self._wall_clock = clock if clock is not None else time.monotonic
+        # The simulation area (120x60) grid over the world. The player's own area
+        # is fully simulated every turn; the rest only in the background.
+        self._area_w = max(1, min(_SIM_AREA_W, game_map.width))
+        self._area_h = max(1, min(_SIM_AREA_H, game_map.height))
+        self._cols = max(1, game_map.width // self._area_w)
+        self._rows = max(1, game_map.height // self._area_h)
+        # Turn each area was last simulated, so the background pass can favour the
+        # stalest, and an area is caught up when the player first enters it.
+        self._last_sim_turn: dict[tuple[int, int], int] = {}
+        self._last_player_area: tuple[int, int] | None = None
 
-    def _player_pos(self) -> tuple[int, int] | None:
+    def _area_of(self, x: int, y: int) -> tuple[int, int]:
+        return (
+            min(self._cols - 1, max(0, x // self._area_w)),
+            min(self._rows - 1, max(0, y // self._area_h)),
+        )
+
+    def _player_area(self) -> tuple[int, int] | None:
         for _ent, (pos, _player) in esper.get_components(Position, Player):
-            return (pos.x, pos.y)
+            return self._area_of(pos.x, pos.y)
         return None
 
     def process(self, action: str | None = None) -> None:
         # Fish move only on real turns -- never on idle/menu ticks -- so the
-        # animation loop's rapid ``process(None)`` calls can never block on ocean
-        # work.
+        # animation loop's rapid ``process(None)`` calls can never block.
         if action not in _TURN_ACTIONS:
             return
 
-        # A simulation bubble: only the shoal within reach of the player swims;
-        # the rest of the ocean stays frozen and cost-free until the player nears
-        # it. This bounds the per-turn work to what's on (or just off) screen, on
-        # land and at sea alike. With no player (tests) every fish swims.
-        player = self._player_pos()
+        clock = world_clock()
+        turn = clock.turn if clock is not None else 0
 
-        movers = [
-            (ent, pos)
-            for ent, (pos, _f) in esper.get_components(Position, Fish)
-            if player is None or _chebyshev((pos.x, pos.y), player) <= _FISH_SIM_RADIUS
-        ]
-        if not movers:
-            return  # player is inland, far from any fish -- nothing to do
-
-        # Fish avoid stacking on each other; the player and other creatures don't
-        # block them (a fish just darts underneath). ``occupied`` spans every fish
-        # so an in-bubble one never swims onto a resting neighbour.
+        # Bucket fish and seaweed by simulation area once; each area is then
+        # simulated against its own (small) sets, independent of the world's total.
+        fish_by_area: dict[tuple[int, int], list[tuple[int, Position]]] = {}
+        for ent, (pos, _f) in esper.get_components(Position, Fish):
+            fish_by_area.setdefault(self._area_of(pos.x, pos.y), []).append((ent, pos))
+        # Shared so a fish never swims onto a resting neighbour, even one in an
+        # area we're not simulating this turn.
         occupied = {
             (pos.x, pos.y): ent for ent, (pos, _f) in esper.get_components(Position, Fish)
         }
-        # Only the seaweed a local fish could reach; the far ocean's fronds are
-        # skipped so the scan stays small no matter how much seaweed exists.
-        reach = _FISH_SIM_RADIUS + _FISH_SIGHT
-        seaweed = [
-            ((pos.x, pos.y), ent)
-            for ent, (pos, _s) in esper.get_components(Position, Seaweed)
-            if player is None or _chebyshev((pos.x, pos.y), player) <= reach
-        ]
-        seaweed_at = {xy: sw_ent for xy, sw_ent in seaweed}
+        seaweed_by_area: dict[tuple[int, int], list[tuple[tuple[int, int], int]]] = {}
+        for ent, (pos, _s) in esper.get_components(Position, Seaweed):
+            seaweed_by_area.setdefault(self._area_of(pos.x, pos.y), []).append(
+                ((pos.x, pos.y), ent)
+            )
 
-        for ent, pos in movers:
+        player_area = self._player_area()
+
+        if player_area is None:
+            # No player (tests): simulate every area once.
+            for area, fish in fish_by_area.items():
+                self._simulate_area(fish, seaweed_by_area.get(area, []), occupied)
+                self._last_sim_turn[area] = turn
+            return
+
+        # 1. The player's current 120x60 area is fully simulated every turn.
+        if player_area in fish_by_area:
+            self._simulate_area(fish_by_area[player_area], seaweed_by_area.get(player_area, []), occupied)
+
+        # 1b. Just crossed into a new area? Bring it up to date with a bounded
+        # burst of catch-up steps (never perfect, never a hang).
+        if player_area != self._last_player_area:
+            stale = turn - self._last_sim_turn.get(player_area, turn)
+            for _ in range(min(stale, _FISH_CATCHUP_STEPS)):
+                self._simulate_area(
+                    fish_by_area.get(player_area, []), seaweed_by_area.get(player_area, []), occupied
+                )
+        self._last_sim_turn[player_area] = turn
+        self._last_player_area = player_area
+
+        # 2. Background: spend a small time budget nudging the stalest other
+        # areas along, oldest first, "if there is time". Bounded, so it can never
+        # stall input; areas it doesn't reach are caught up when entered (step 1b).
+        deadline = self._wall_clock() + _FISH_BACKGROUND_BUDGET
+        other = sorted(
+            (a for a in fish_by_area if a != player_area),
+            key=lambda a: self._last_sim_turn.get(a, -1),
+        )
+        for area in other:
+            if self._wall_clock() >= deadline:
+                break
+            self._simulate_area(fish_by_area[area], seaweed_by_area.get(area, []), occupied)
+            self._last_sim_turn[area] = turn
+
+    def _simulate_area(
+        self,
+        fish: list[tuple[int, Position]],
+        seaweed: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> None:
+        """Swim one area's fish for a single step against that area's seaweed."""
+        seaweed_at = {xy: sw_ent for xy, sw_ent in seaweed}
+        for ent, pos in fish:
             if not esper.entity_exists(ent):
                 continue
             needs = (
@@ -1765,13 +1833,13 @@ class RenderProcessor(esper.Processor):
             tuple[int | None, int, int],
             tuple[set[tuple[int, int]], tuple[int, int, int, int] | None, tuple[tuple[int, int], ...]],
         ] = {}
-        # The world is a 3x3 grid of sections. Only the section the player stands
-        # in is rendered (the whole map keeps simulating); the camera snaps to it
-        # and the view/FOV are clipped to its bounds. Sectioning only engages on a
-        # map big enough for the grid to be meaningful (the real 120x60 world);
-        # smaller maps (e.g. tests) keep the plain centred camera.
-        self._section_w = max(1, game_map.width // 3)
-        self._section_h = max(1, game_map.height // 3)
+        # Only the fixed-size render section (40x20) the player stands in is
+        # drawn; the camera snaps to it and the view/FOV are clipped to its
+        # bounds. The map is a grid of these sections (a 120x60 world is 3x3 of
+        # them; the 360x180 ocean world is 9x9). Sectioning only engages on a map
+        # big enough for it to matter; tiny test maps keep the centred camera.
+        self._section_w = _RENDER_SECTION_W
+        self._section_h = _RENDER_SECTION_H
         self._sections_enabled = (
             game_map.width >= 3 * _MIN_SECTION_W and game_map.height >= 3 * _MIN_SECTION_H
         )
@@ -2314,7 +2382,7 @@ class RenderProcessor(esper.Processor):
         return (vx, vy)
 
     def _apply_section_camera(self, player_pos: Position | None) -> None:
-        """Lock the camera to the 3x3 section the player occupies. Sets
+        """Lock the camera to the render section the player occupies. Sets
         ``_section_bounds`` (used to clip FOV) and clamps the view origin inside
         that section, so only the current section is ever drawn. Emits a log line
         when the player crosses into a new section."""
@@ -2323,13 +2391,15 @@ class RenderProcessor(esper.Processor):
             return
 
         sw, sh = self._section_w, self._section_h
-        col = min(2, max(0, player_pos.x // sw))
-        row = min(2, max(0, player_pos.y // sh))
+        cols = max(1, self.game_map.width // sw)
+        rows = max(1, self.game_map.height // sh)
+        col = min(cols - 1, max(0, player_pos.x // sw))
+        row = min(rows - 1, max(0, player_pos.y // sh))
         sec_ox, sec_oy = col * sw, row * sh
-        # The bottom/right sections absorb any remainder when the map isn't
-        # evenly divisible by 3, so the whole map is covered.
-        sec_w = self.game_map.width - sec_ox if col == 2 else sw
-        sec_h = self.game_map.height - sec_oy if row == 2 else sh
+        # The last column/row absorbs any remainder when the map isn't evenly
+        # divisible by the section size, so the whole map stays covered.
+        sec_w = self.game_map.width - sec_ox if col == cols - 1 else sw
+        sec_h = self.game_map.height - sec_oy if row == rows - 1 else sh
         self._section_bounds = (sec_ox, sec_oy, sec_w, sec_h)
 
         if self._current_section is not None and self._current_section != (col, row):
