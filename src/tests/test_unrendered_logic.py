@@ -22,6 +22,32 @@ def test_gamemap_has_walls_on_border_and_floor_inside() -> None:
     assert game_map.tile_at(1, 1) == game_map.FLOOR
 
 
+def test_world_map_sets_land_island_in_a_vast_ocean() -> None:
+    # A map twice the land in each dimension becomes the ocean world: a centred
+    # 120x60 land island ringed by open sea (the eight surrounding sections).
+    game_map = GameMap(360, 180)
+
+    assert game_map.has_ocean is True
+    assert (game_map.land_x0, game_map.land_y0) == (120, 60)
+    assert (game_map.land_w, game_map.land_h) == (120, 60)
+
+    # Land centre is dry ground; the sea far outside the island is open ocean.
+    assert game_map.tile_at(180, 90) == game_map.FLOOR
+    assert game_map.is_ocean(10, 10) is True
+    # The island's edge is a water coastline (not ocean, since it's inside the
+    # land rectangle), and only the map's outermost ring stays wall.
+    assert game_map.tile_at(120, 90) == game_map.WATER
+    assert game_map.is_ocean(120, 90) is False
+    assert game_map.tile_at(0, 0) == game_map.WALL
+
+
+def test_small_maps_stay_a_plain_walled_room() -> None:
+    game_map = GameMap(40, 20)
+    assert game_map.has_ocean is False
+    assert game_map.tile_at(0, 0) == game_map.WALL
+    assert game_map.tile_at(20, 10) == game_map.FLOOR
+
+
 def test_movement_processor_moves_player_without_renderer() -> None:
     game_map = GameMap(10, 6)
     player_pos = Position(3, 3)

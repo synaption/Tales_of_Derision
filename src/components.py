@@ -97,6 +97,21 @@ class Deer:
 
 
 @dataclass
+class Fish:
+    """Tag component: a fish that roams the open sea. It swims on water only (its
+    own AI in ``systems.FishAiProcessor``, never the land pathfinder) and grazes
+    seaweed when hungry, the aquatic mirror of a deer grazing trees."""
+
+
+@dataclass
+class Seaweed:
+    """An underwater plant rooted on an open-sea tile. Fish graze it like deer
+    graze trees; ``food`` is how many bites remain before it is eaten bare and
+    removed. Fresh fronds sprout again over time (``TreeGrowthProcessor``)."""
+    food: int = 3
+
+
+@dataclass
 class Diet:
     """What an NPC eats when hungry. ``"herbivore"`` grazes trees; ``"carnivore"``
     hunts prey. Drives the needs-based AI in ``systems.NpcAiProcessor``."""

@@ -6,6 +6,23 @@ render path.
 """
 from collections import deque
 
+# The habitable land is a fixed-size island; a "world" map that is comfortably
+# larger than this gets the land dropped in its centre and the rest flooded into
+# open ocean (see ``world_land_rect``). Small maps (tests, legacy plain rooms)
+# stay a single walled room.
+LAND_WIDTH = 120
+LAND_HEIGHT = 60
+
+
+def world_land_rect(width: int, height: int) -> tuple[int, int, int, int] | None:
+    """The centred land rectangle for a world map, or ``None`` for a map too
+    small to be the ocean world. A map at least twice the land in each dimension
+    is treated as the world (land island ringed by a vast ocean); anything
+    smaller is a plain walled room, so tiny test maps keep the classic layout."""
+    if width >= 2 * LAND_WIDTH and height >= 2 * LAND_HEIGHT:
+        return ((width - LAND_WIDTH) // 2, (height - LAND_HEIGHT) // 2, LAND_WIDTH, LAND_HEIGHT)
+    return None
+
 
 class GameMap:
     WALL = "#"
@@ -14,7 +31,13 @@ class GameMap:
     DOOR = "+"  # passable + transparent gap in a wall; marks a house entrance
     WINDOW = "o"  # blocks movement but is transparent (see-through) like a wall gap
 
-    def __init__(self, width: int, height: int):
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        land_rect: tuple[int, int, int, int] | None | str = "auto",
+    ):
         self.width = width
         self.height = height
         # ``revision`` bumps whenever a tile changes at runtime (building a wall,
@@ -23,16 +46,54 @@ class GameMap:
         self.revision = 0
         self._regions: dict[tuple[int, int], int] = {}
         self._regions_revision = -1
-        # Bordered room: walls around the edge, floor inside.
-        self.tiles = [
-            [
-                self.WALL
-                if x == 0 or y == 0 or x == width - 1 or y == height - 1
-                else self.FLOOR
-                for x in range(width)
+        # Tiles changed since the renderer last refreshed its cached map surface.
+        # The renderer consumes these to repaint just the changed cells instead
+        # of re-rendering the whole (large) world surface on every edit.
+        self._dirty_tiles: set[tuple[int, int]] = set()
+
+        # ``land_rect="auto"`` (the default) lets a big enough map become the
+        # ocean world automatically -- so a map loaded from a save reconstructs
+        # the same island without the save needing to record the layout. Pass an
+        # explicit rect to force it, or ``None`` to force a plain walled room.
+        if land_rect == "auto":
+            land_rect = world_land_rect(width, height)
+
+        if land_rect is None:
+            # Classic single room: walls around the edge, floor inside. The whole
+            # map is "land".
+            self.land_x0, self.land_y0 = 0, 0
+            self.land_w, self.land_h = width, height
+            self.has_ocean = False
+            self.tiles = [
+                [
+                    self.WALL
+                    if x == 0 or y == 0 or x == width - 1 or y == height - 1
+                    else self.FLOOR
+                    for x in range(width)
+                ]
+                for y in range(height)
             ]
-            for y in range(height)
-        ]
+        else:
+            # An island in a vast ocean: everything is water except the central
+            # land rectangle, whose own edge is a water coastline (so the land is
+            # bounded by sea, not a wall). Only the map's outermost ring stays
+            # wall, a hard boundary far out at the edge of the world.
+            lx, ly, lw, lh = land_rect  # type: ignore[misc]
+            self.land_x0, self.land_y0 = lx, ly
+            self.land_w, self.land_h = lw, lh
+            self.has_ocean = True
+            self.tiles = [[self.WATER for _ in range(width)] for _ in range(height)]
+            for x in range(width):
+                self.tiles[0][x] = self.WALL
+                self.tiles[height - 1][x] = self.WALL
+            for y in range(height):
+                self.tiles[y][0] = self.WALL
+                self.tiles[y][width - 1] = self.WALL
+            for y in range(ly, ly + lh):
+                for x in range(lx, lx + lw):
+                    on_coast = x in (lx, lx + lw - 1) or y in (ly, ly + lh - 1)
+                    self.tiles[y][x] = self.WATER if on_coast else self.FLOOR
+
         self._add_default_buildings()
         self._add_water_features()
 
@@ -59,30 +120,37 @@ class GameMap:
             self.tiles[door_y][door_x] = self.DOOR
 
     def _add_default_buildings(self) -> None:
-        if self.width < 30 or self.height < 16:
+        if self.land_w < 30 or self.land_h < 16:
             return
 
-        self._carve_building(left=4, top=3, right=12, bottom=8, door=(8, 8))
+        lx, ly = self.land_x0, self.land_y0
+        land_right = lx + self.land_w
+        self._carve_building(left=lx + 4, top=ly + 3, right=lx + 12, bottom=ly + 8, door=(lx + 8, ly + 8))
         self._carve_building(
-            left=self.width - 14,
-            top=5,
-            right=self.width - 5,
-            bottom=11,
-            door=(self.width - 10, 11),
+            left=land_right - 14,
+            top=ly + 5,
+            right=land_right - 5,
+            bottom=ly + 11,
+            door=(land_right - 10, ly + 11),
         )
 
     def _spawn_safe_zone(self) -> tuple[int, int, int, int]:
-        """A rectangle around the map centre kept clear of water so the player
-        (who spawns near the centre) never starts stuck in a lake or river.
-        Returns (min_x, min_y, max_x, max_y)."""
-        cx, cy = self.width // 2, self.height // 2
+        """A rectangle around the land centre kept clear of water so the player
+        (who spawns there) never starts stuck in a lake or river. Returns
+        (min_x, min_y, max_x, max_y)."""
+        cx = self.land_x0 + self.land_w // 2
+        cy = self.land_y0 + self.land_h // 2
         return (cx - 6, cy - 4, cx + 6, cy + 4)
 
     def _carve_lake(self, cx: int, cy: int, rx: int, ry: int) -> None:
         """Flood an ellipse of interior floor into water."""
         sx0, sy0, sx1, sy1 = self._spawn_safe_zone()
-        for y in range(max(1, cy - ry), min(self.height - 1, cy + ry + 1)):
-            for x in range(max(1, cx - rx), min(self.width - 1, cx + rx + 1)):
+        y_lo = max(self.land_y0 + 1, cy - ry)
+        y_hi = min(self.land_y0 + self.land_h - 1, cy + ry + 1)
+        x_lo = max(self.land_x0 + 1, cx - rx)
+        x_hi = min(self.land_x0 + self.land_w - 1, cx + rx + 1)
+        for y in range(y_lo, y_hi):
+            for x in range(x_lo, x_hi):
                 if sx0 <= x <= sx1 and sy0 <= y <= sy1:
                     continue
                 nx = (x - cx) / max(1, rx)
@@ -95,13 +163,13 @@ class GameMap:
         central spawn zone so it never seals the player in."""
         sx0, sy0, sx1, sy1 = self._spawn_safe_zone()
         x = start_x
-        for y in range(1, self.height - 1):
+        for y in range(self.land_y0 + 1, self.land_y0 + self.land_h - 1):
             # Deterministic gentle meander (no RNG so maps stay reproducible).
             if (y // 3) % 2 == 0:
                 x += 1
             else:
                 x -= 1
-            x = max(2, min(self.width - 3, x))
+            x = max(self.land_x0 + 2, min(self.land_x0 + self.land_w - 3, x))
             for wx in range(x, x + width):
                 if sx0 <= wx <= sx1 and sy0 <= y <= sy1:
                     continue
@@ -109,11 +177,12 @@ class GameMap:
                     self.tiles[y][wx] = self.WATER
 
     def _add_water_features(self) -> None:
-        if self.width < 24 or self.height < 14:
+        if self.land_w < 24 or self.land_h < 14:
             return
-        self._carve_lake(cx=int(self.width * 0.22), cy=int(self.height * 0.72), rx=6, ry=4)
-        self._carve_lake(cx=int(self.width * 0.80), cy=int(self.height * 0.28), rx=7, ry=5)
-        self._carve_river(start_x=int(self.width * 0.62))
+        lx, ly = self.land_x0, self.land_y0
+        self._carve_lake(cx=lx + int(self.land_w * 0.22), cy=ly + int(self.land_h * 0.72), rx=6, ry=4)
+        self._carve_lake(cx=lx + int(self.land_w * 0.80), cy=ly + int(self.land_h * 0.28), rx=7, ry=5)
+        self._carve_river(start_x=lx + int(self.land_w * 0.62))
 
     def clear_water_around(self, x: int, y: int, radius: int = 1) -> None:
         """Turn any water in a square around (x, y) back into floor. Used as a
@@ -134,6 +203,17 @@ class GameMap:
 
     def is_water(self, x: int, y: int) -> bool:
         return self.in_bounds(x, y) and self.tiles[y][x] == self.WATER
+
+    def is_ocean(self, x: int, y: int) -> bool:
+        """A water tile out in the open sea -- water that lies outside the central
+        land rectangle. This is where seaweed grows and fish roam; interior lakes
+        and the coastline ring around the land do not count."""
+        if not self.is_water(x, y):
+            return False
+        return not (
+            self.land_x0 <= x < self.land_x0 + self.land_w
+            and self.land_y0 <= y < self.land_y0 + self.land_h
+        )
 
     def is_passable(self, x: int, y: int) -> bool:
         """Can a *swimming* actor (the player) move here? Everything but walls and
@@ -157,7 +237,16 @@ class GameMap:
             return False
         self.tiles[y][x] = tile
         self.revision += 1
+        self._dirty_tiles.add((x, y))
         return True
+
+    def consume_dirty_tiles(self) -> set[tuple[int, int]]:
+        """Return (and clear) the tiles edited since the last call. The renderer
+        uses this to repaint just the changed cells of its cached map surface
+        rather than re-rendering the whole world on every edit."""
+        dirty = self._dirty_tiles
+        self._dirty_tiles = set()
+        return dirty
 
     def _compute_regions(self) -> dict[tuple[int, int], int]:
         """Label every walkable tile with a connected-region id (8-connectivity,

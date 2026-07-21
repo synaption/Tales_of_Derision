@@ -8,13 +8,14 @@ import asyncio
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import random
 import sys
 import time
 from typing import Any
 
 import esper
 
-from components import Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Resident, Stove, Tree, Vision, Well, WorldClock
+from components import Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Fish, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
 from game_map import GameMap
 from items import (
     BERRIES,
@@ -41,12 +42,15 @@ from persistence import (
 )
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, furnish_house, go_to_sleep, pick_berries, player_is_animated, queue_message, set_bed_owner, status_label, wake_up, world_clock
+from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, furnish_house, go_to_sleep, pick_berries, player_is_animated, queue_message, set_bed_owner, status_label, wake_up, world_clock
 
-# The world is a 3x3 expansion of the original 40x20 room, giving room for
-# lakes, rivers, and roaming wildlife.
-MAP_WIDTH = 120
-MAP_HEIGHT = 60
+# The world is a 3x3 grid of 120x60 sections: the habitable island sits in the
+# centre section, ringed by a coastline, and the surrounding eight sections are
+# open ocean full of fish and seaweed. The land itself is the old 120x60 world.
+LAND_WIDTH = 120
+LAND_HEIGHT = 60
+MAP_WIDTH = LAND_WIDTH * 3
+MAP_HEIGHT = LAND_HEIGHT * 3
 
 _CARDINAL_ACTION_DELTAS = {
     "move_up": (0, -1),
@@ -437,6 +441,12 @@ _STOVE_IRON = (120, 120, 128)
 _DEER_TAN = (176, 132, 92)
 _BED_WOOD = (156, 116, 72)
 _BERRY_RED = (200, 74, 96)
+_SEAWEED_GREEN = (54, 148, 116)
+_FISH_SILVER = (210, 224, 236)
+# Ocean creatures/plants render with a water-blue cell background so they blend
+# into the sea instead of punching a black hole through the water tile (the
+# fallback glyph sheet fills a solid background). Matches systems._WATER_BLUE.
+_OCEAN_WATER_BG = (64, 118, 190)
 _HUMAN_SKIN_TONES: list[tuple[int, int, int]] = [
     (255, 238, 220),
     (248, 227, 208),
@@ -2431,6 +2441,8 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     )
 
     _spawn_environment_features(game_map, player_position)
+    if getattr(game_map, "has_ocean", False):
+        _spawn_ocean_life(game_map)
 
     # Furnish the pre-built houses (bed, oven, chest, table, wardrobe,
     # bookshelf). Residents claim these unowned houses as homes at runtime.
@@ -2438,6 +2450,39 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         furnish_house(game_map, interior)
 
     return 1
+
+
+def _spawn_ocean_life(game_map: GameMap) -> None:
+    """Scatter seaweed and fish across the open sea that surrounds the island.
+    Fish graze the seaweed (see ``FishAiProcessor``). Placement uses a fixed seed
+    so the ocean looks the same every run, matching the RNG-free land layout."""
+    rng = random.Random(0x0C_EA_11)
+    occupied = {(pos.x, pos.y) for _ent, (pos,) in esper.get_components(Position)}
+
+    for y in range(1, game_map.height - 1):
+        for x in range(1, game_map.width - 1):
+            if not game_map.is_ocean(x, y) or (x, y) in occupied:
+                continue
+            roll = rng.random()
+            if roll < 0.028:
+                esper.create_entity(
+                    Position(x, y),
+                    Renderable('"', fg=_SEAWEED_GREEN, bg=_OCEAN_WATER_BG),
+                    Name("Seaweed"),
+                    Seaweed(),
+                )
+                occupied.add((x, y))
+            elif roll < 0.028 + 0.001:
+                esper.create_entity(
+                    Position(x, y),
+                    Renderable("f", fg=_FISH_SILVER, bg=_OCEAN_WATER_BG),
+                    Name("Fish"),
+                    Fish(),
+                    # Fish never go thirsty (they live in water); their only drive
+                    # is hunger, which sends them grazing seaweed.
+                    Needs(hunger=25.0, thirst=0.0, thirst_rate=0.0, tiredness_rate=0.0),
+                )
+                occupied.add((x, y))
 
 
 def _spawn_deer(game_map: GameMap, x: int, y: int) -> None:
@@ -2587,6 +2632,7 @@ async def main() -> None:
             # can start heading there this turn.
             esper.add_processor(HousingProcessor(game_map), priority=0)
             esper.add_processor(NpcAiProcessor(game_map), priority=0)
+            esper.add_processor(FishAiProcessor(game_map), priority=0)
             esper.add_processor(NeedsProcessor(), priority=0)
             esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)

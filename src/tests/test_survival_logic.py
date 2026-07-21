@@ -44,8 +44,8 @@ from main import (
     _find_interaction_creature,
     _harvest_bush,
 )
-from components import Deer, Diet, Friendly, OnFire
-from systems import MovementProcessor, NeedsProcessor, NpcAiProcessor, WAIT_ACTION, _pull_turn_events
+from components import Deer, Diet, Fish, Friendly, OnFire, Seaweed
+from systems import FishAiProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, WAIT_ACTION, _pull_turn_events
 
 pytestmark = pytest.mark.unrendered
 
@@ -334,6 +334,53 @@ def test_hungry_deer_grazes_adjacent_tree_and_depletes_it() -> None:
     processor.process("move_up")
     assert esper.component_for_entity(deer, Needs).hunger < 90.0
     assert esper.component_for_entity(tree, Tree).wood == 1
+
+
+def _pond(game_map: GameMap, y: int, x0: int, x1: int) -> None:
+    """Flood a horizontal strip of interior floor into water, so fish and their
+    seaweed have somewhere to swim on an otherwise dry test map."""
+    for x in range(x0, x1):
+        game_map.tiles[y][x] = GameMap.WATER
+
+
+def test_hungry_fish_grazes_adjacent_seaweed_and_depletes_it() -> None:
+    game_map = GameMap(24, 14)
+    _pond(game_map, 6, 9, 13)
+    processor = FishAiProcessor(game_map)
+    frond = esper.create_entity(Position(11, 6), Seaweed(food=2))
+    fish = esper.create_entity(Position(10, 6), Fish(), Needs(hunger=90.0, thirst=0.0))
+
+    processor.process("wait")
+
+    assert esper.component_for_entity(fish, Needs).hunger < 90.0
+    assert esper.component_for_entity(frond, Seaweed).food == 1
+
+
+def test_fish_eats_the_last_of_a_seaweed_and_it_disappears() -> None:
+    game_map = GameMap(24, 14)
+    _pond(game_map, 6, 9, 13)
+    processor = FishAiProcessor(game_map)
+    frond = esper.create_entity(Position(11, 6), Seaweed(food=1))
+    esper.create_entity(Position(10, 6), Fish(), Needs(hunger=90.0, thirst=0.0))
+
+    processor.process("wait")
+
+    assert not esper.entity_exists(frond)  # grazed bare
+
+
+def test_hungry_fish_swims_toward_distant_seaweed_and_stays_in_water() -> None:
+    game_map = GameMap(24, 14)
+    _pond(game_map, 6, 5, 16)
+    processor = FishAiProcessor(game_map)
+    esper.create_entity(Position(14, 6), Seaweed())
+    fish = esper.create_entity(Position(6, 6), Fish(), Needs(hunger=90.0, thirst=0.0))
+
+    processor.process("wait")
+
+    pos = esper.component_for_entity(fish, Position)
+    assert (pos.x, pos.y) != (6, 6)  # it set off toward the seaweed
+    assert pos.x > 6  # ...in the right direction
+    assert game_map.is_water(pos.x, pos.y)  # ...never stranding itself ashore
 
 
 def test_hungry_carnivore_hunts_adjacent_deer_into_meat() -> None:

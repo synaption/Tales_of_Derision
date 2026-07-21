@@ -1185,6 +1185,27 @@ class PygameRenderer(Renderer):
     def invalidate_map_surface(self) -> None:
         self._map_surface = None
 
+    def redraw_map_cells(self, cells, draw_cell) -> bool:
+        """Repaint just ``cells`` (world (x, y) tuples) on the cached map surface,
+        leaving the rest untouched. ``draw_cell(wx, wy)`` renders one tile at its
+        world cell. Cheap incremental update for a handful of edited tiles, versus
+        rebuilding the whole world surface. No-op (returns False) if no surface is
+        cached yet."""
+        if self._pygame is None or self._map_surface is None:
+            return False
+        saved_screen = self._screen
+        self._screen = self._map_surface
+        try:
+            for wx, wy in cells:
+                rect = self._pygame.Rect(
+                    wx * self._cell_w, wy * self._cell_h, self._cell_w, self._cell_h
+                )
+                self._map_surface.fill(self._bg, rect)
+                draw_cell(wx, wy)
+        finally:
+            self._screen = saved_screen
+        return True
+
     def blit_map_region(
         self,
         world_x: int,

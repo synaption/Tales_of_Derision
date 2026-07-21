@@ -11,7 +11,7 @@ import time
 
 import esper
 
-from components import Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Furniture, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Owned, Player, Position, Renderable, Resident, Sapling, Stove, Tree, Vision, WorldClock
+from components import Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Diet, Enemy, Equipment, Fish, Friendly, Furniture, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Owned, Player, Position, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
 from game_map import GameMap
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from renderer.base import Renderer
@@ -63,6 +63,7 @@ _WINDOW_CYAN = (128, 186, 206)
 _TREE_GREEN = (58, 138, 66)
 _SAPLING_GREEN = (120, 176, 90)
 _BUSH_GREEN = (86, 140, 78)   # a bush that has been picked bare
+_SEAWEED_GREEN = (54, 148, 116)  # must match the ocean seaweed spawned in main
 _BERRY_RED = (200, 74, 96)    # a bush heavy with ripe berries
 _BUSH_GLYPH = "%"
 
@@ -707,6 +708,17 @@ _FORAGE_THRESHOLD = 55.0
 _GRAZE_RESTORE = 45.0
 _DRINK_RESTORE = 100.0
 _FEED_RESTORE = 60.0
+# How much hunger a fish recovers from one bite of seaweed, and how far it will
+# notice a frond and start swimming toward it.
+_FISH_GRAZE_RESTORE = 40.0
+_FISH_SIGHT = 12
+# Only fish within this many tiles of the player are simulated each turn; the
+# rest of the ocean sits frozen and cost-free (a "simulation bubble") so a
+# distant shoal never blocks input. Comfortably larger than the on-screen area.
+_FISH_SIM_RADIUS = 28
+# Chance a fish drifts to a random neighbouring water tile on an idle turn, so
+# the shoals mill about gently instead of holding perfectly still.
+_FISH_WANDER_CHANCE = 0.6
 
 
 def _chebyshev(a: tuple[int, int], b: tuple[int, int]) -> int:
@@ -1209,6 +1221,158 @@ class NpcAiProcessor(esper.Processor):
                 self._chase_player(ent, pos, player_xy, occupied)
 
 
+class FishAiProcessor(esper.Processor):
+    """Swims the fish each turn. A fish is the aquatic mirror of a grazing deer:
+    when hungry it eats seaweed it is next to, otherwise it drifts toward the
+    nearest seaweed it can see, and failing that mills about at random.
+
+    Fish move on water tiles only, so -- unlike the land creatures the
+    ``NpcAiProcessor`` drives with ``find_path`` -- they step greedily between
+    adjacent water cells and never strand themselves ashore. They are not tagged
+    ``NPC``, so the land AI ignores them entirely.
+    """
+
+    def __init__(self, game_map: GameMap, rng: Callable[[], float] | None = None):
+        self.game_map = game_map
+        self._rng = rng if rng is not None else random.random
+
+    def _player_pos(self) -> tuple[int, int] | None:
+        for _ent, (pos, _player) in esper.get_components(Position, Player):
+            return (pos.x, pos.y)
+        return None
+
+    def process(self, action: str | None = None) -> None:
+        # Fish move only on real turns -- never on idle/menu ticks -- so the
+        # animation loop's rapid ``process(None)`` calls can never block on ocean
+        # work.
+        if action not in _TURN_ACTIONS:
+            return
+
+        # A simulation bubble: only the shoal within reach of the player swims;
+        # the rest of the ocean stays frozen and cost-free until the player nears
+        # it. This bounds the per-turn work to what's on (or just off) screen, on
+        # land and at sea alike. With no player (tests) every fish swims.
+        player = self._player_pos()
+
+        movers = [
+            (ent, pos)
+            for ent, (pos, _f) in esper.get_components(Position, Fish)
+            if player is None or _chebyshev((pos.x, pos.y), player) <= _FISH_SIM_RADIUS
+        ]
+        if not movers:
+            return  # player is inland, far from any fish -- nothing to do
+
+        # Fish avoid stacking on each other; the player and other creatures don't
+        # block them (a fish just darts underneath). ``occupied`` spans every fish
+        # so an in-bubble one never swims onto a resting neighbour.
+        occupied = {
+            (pos.x, pos.y): ent for ent, (pos, _f) in esper.get_components(Position, Fish)
+        }
+        # Only the seaweed a local fish could reach; the far ocean's fronds are
+        # skipped so the scan stays small no matter how much seaweed exists.
+        reach = _FISH_SIM_RADIUS + _FISH_SIGHT
+        seaweed = [
+            ((pos.x, pos.y), ent)
+            for ent, (pos, _s) in esper.get_components(Position, Seaweed)
+            if player is None or _chebyshev((pos.x, pos.y), player) <= reach
+        ]
+        seaweed_at = {xy: sw_ent for xy, sw_ent in seaweed}
+
+        for ent, pos in movers:
+            if not esper.entity_exists(ent):
+                continue
+            needs = (
+                esper.component_for_entity(ent, Needs)
+                if esper.has_component(ent, Needs)
+                else None
+            )
+            hungry = needs is not None and needs.hunger >= _FORAGE_THRESHOLD
+
+            if hungry:
+                bite = next(
+                    (
+                        (nx, ny)
+                        for nx, ny in self.game_map.neighbors_8(pos.x, pos.y)
+                        if (nx, ny) in seaweed_at
+                    ),
+                    None,
+                )
+                if bite is not None:
+                    self._graze_seaweed(seaweed_at[bite], bite, needs, seaweed_at, occupied)
+                    continue
+                target = self._nearest_seaweed(pos, seaweed)
+                if target is not None and self._step_toward(ent, pos, target, occupied):
+                    continue
+
+            self._wander(ent, pos, occupied)
+
+    def _water_neighbors(
+        self, x: int, y: int, occupied: dict[tuple[int, int], int]
+    ) -> list[tuple[int, int]]:
+        return [
+            (nx, ny)
+            for nx, ny in self.game_map.neighbors_8(x, y)
+            if self.game_map.is_water(nx, ny) and (nx, ny) not in occupied
+        ]
+
+    def _nearest_seaweed(
+        self, pos: Position, seaweed: list[tuple[tuple[int, int], int]]
+    ) -> tuple[int, int] | None:
+        best: tuple[int, int] | None = None
+        best_dist: int | None = None
+        for xy, _ent in seaweed:
+            dist = _chebyshev((pos.x, pos.y), xy)
+            if dist > _FISH_SIGHT:
+                continue
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = xy
+        return best
+
+    def _step_toward(
+        self, ent: int, pos: Position, goal: tuple[int, int], occupied: dict[tuple[int, int], int]
+    ) -> bool:
+        """Greedily step to the open water neighbour nearest the goal."""
+        options = self._water_neighbors(pos.x, pos.y, occupied)
+        if not options:
+            return False
+        nx, ny = min(options, key=lambda xy: _chebyshev(xy, goal))
+        self._move(ent, pos, nx, ny, occupied)
+        return True
+
+    def _wander(self, ent: int, pos: Position, occupied: dict[tuple[int, int], int]) -> None:
+        if self._rng() >= _FISH_WANDER_CHANCE:
+            return
+        options = self._water_neighbors(pos.x, pos.y, occupied)
+        if not options:
+            return
+        nx, ny = options[min(len(options) - 1, int(self._rng() * len(options)))]
+        self._move(ent, pos, nx, ny, occupied)
+
+    def _graze_seaweed(
+        self,
+        sw_ent: int,
+        xy: tuple[int, int],
+        needs: Needs,
+        seaweed_at: dict[tuple[int, int], int],
+        occupied: dict[tuple[int, int], int],
+    ) -> None:
+        needs.hunger = max(0.0, needs.hunger - _FISH_GRAZE_RESTORE)
+        if esper.entity_exists(sw_ent) and esper.has_component(sw_ent, Seaweed):
+            frond = esper.component_for_entity(sw_ent, Seaweed)
+            frond.food -= 1
+            if frond.food <= 0:
+                esper.delete_entity(sw_ent, immediate=True)  # eaten bare
+                seaweed_at.pop(xy, None)
+
+    def _move(
+        self, ent: int, pos: Position, nx: int, ny: int, occupied: dict[tuple[int, int], int]
+    ) -> None:
+        occupied.pop((pos.x, pos.y), None)
+        pos.x, pos.y = nx, ny
+        occupied[(nx, ny)] = ent
+
+
 class HousingProcessor(esper.Processor):
     """Settles residents into homes. Houses belong to people: a resident who owns
     one is left alone. A resident who owns none **claims the nearest unowned
@@ -1288,6 +1452,9 @@ class HousingProcessor(esper.Processor):
 _DAILY_SPROUT_CHANCE = 0.0001       # 0.01% per outdoor ground tile per day (trees)
 _DAILY_BUSH_SPROUT_CHANCE = 0.00004  # bushes are rarer than trees
 _DAILY_DEATH_CHANCE = 0.00005       # 0.005% per plant per day (half the sprout rate)
+# Fresh seaweed sprouts faster than land flora so grazing fish never strip the
+# ocean bare (they only eat what they swim past).
+_DAILY_SEAWEED_SPROUT_CHANCE = 0.0006
 # Days after a bush's berries are picked before a fresh crop ripens.
 _BERRY_REGROW_DAYS = 7
 
@@ -1307,11 +1474,20 @@ class TreeGrowthProcessor(esper.Processor):
     def __init__(self, game_map: GameMap, rng: Callable[[], float] | None = None):
         self.game_map = game_map
         self._rng = rng if rng is not None else random.random
-        self._cap = max(40, (game_map.width * game_map.height) // 20)
+        # Flora fills the land, so its soft cap scales to the land area (not the
+        # whole map -- otherwise the ocean's tiles would inflate the tree budget).
+        land_area = getattr(game_map, "land_w", game_map.width) * getattr(
+            game_map, "land_h", game_map.height
+        )
+        self._cap = max(40, land_area // 20)
+        # Seaweed fills the open sea; its cap scales to the ocean area.
+        ocean_area = max(0, (game_map.width * game_map.height) - land_area)
+        self._seaweed_cap = ocean_area // 28
         self._last_day: int | None = None
-        # Cached list of outdoor ground tiles (floor, not inside a house),
-        # rebuilt only when the map changes.
+        # Cached lists of outdoor ground tiles (floor, not inside a house) and of
+        # open-sea tiles, rebuilt only when the map changes.
         self._ground_cache: dict = {}
+        self._ocean_cache: dict = {}
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
@@ -1330,6 +1506,8 @@ class TreeGrowthProcessor(esper.Processor):
         self._kill_flora()
         self._regrow_berries(clock)
         self._sprout_saplings(clock)
+        if getattr(self.game_map, "has_ocean", False):
+            self._sprout_seaweed()
 
     def _mature_saplings(self, clock: WorldClock) -> None:
         mature_age = _DAYS_PER_YEAR * max(1, clock.day_length)
@@ -1421,6 +1599,41 @@ class TreeGrowthProcessor(esper.Processor):
             )
             occupied.add((x, y))
             total += 1
+
+    def _ocean_tiles(self) -> list[tuple[int, int]]:
+        """Every open-sea tile (water outside the land). Cached until the map
+        changes; the ocean is static so this is built at most once."""
+        revision = getattr(self.game_map, "revision", 0)
+        if self._ocean_cache.get("revision") != revision:
+            tiles = [
+                (x, y)
+                for y in range(1, self.game_map.height - 1)
+                for x in range(1, self.game_map.width - 1)
+                if self.game_map.is_ocean(x, y)
+            ]
+            self._ocean_cache = {"revision": revision, "tiles": tiles}
+        return self._ocean_cache["tiles"]
+
+    def _sprout_seaweed(self) -> None:
+        """Grow fresh seaweed on open water so grazing fish keep the sea fed."""
+        total = sum(1 for _e, _c in esper.get_components(Seaweed))
+        if total >= self._seaweed_cap:
+            return
+        occupied = {(pos.x, pos.y) for _e, (pos,) in esper.get_components(Position)}
+        for x, y in self._ocean_tiles():
+            if total >= self._seaweed_cap:
+                break
+            if (x, y) in occupied:
+                continue
+            if self._rng() < _DAILY_SEAWEED_SPROUT_CHANCE:
+                esper.create_entity(
+                    Position(x, y),
+                    Renderable('"', fg=_SEAWEED_GREEN, bg=_WATER_BLUE),
+                    Name("Seaweed"),
+                    Seaweed(),
+                )
+                occupied.add((x, y))
+                total += 1
 
 
 # Hunger/thirst thresholds (percent of max) that emit an escalating warning the
@@ -1848,11 +2061,7 @@ class RenderProcessor(esper.Processor):
         visible.sort(key=lambda item: (item[4], item[5], item[3]))
         return visible
 
-    def _draw_sidebar(
-        self,
-        player_pos: Position | None,
-        _entity_lookup: dict[tuple[int, int], tuple[str, str]],
-    ) -> None:
+    def _draw_sidebar(self, player_pos: Position | None) -> None:
         r = self.renderer
         draw_text_clipped = getattr(r, "draw_text_clipped", None)
         draw_text_tinted = getattr(r, "draw_text_tinted", None)
@@ -2174,16 +2383,52 @@ class RenderProcessor(esper.Processor):
         return last[0], last[1], last[3]
 
     def _invalidate_map_caches_if_changed(self) -> None:
-        """Drop map-derived caches when the map has been edited since last frame,
-        so a newly built wall/door/window shows up immediately."""
+        """Refresh map-derived caches when the map has been edited since last
+        frame, so a newly built wall/door/window shows up immediately.
+
+        Field-of-view can change anywhere, so its memo is always dropped. The
+        cached map *surface*, though, is repainted incrementally -- only the
+        edited cells (and their neighbours, whose autotile masks depend on them)
+        -- because re-rendering the whole world surface on every single tile edit
+        is hundreds of milliseconds on a large map (an NPC building a house edits
+        many tiles in quick succession)."""
         revision = getattr(self.game_map, "revision", 0)
         if revision == self._map_revision:
             return
         self._map_revision = revision
-        self._wall_mask_cache.clear()
-        self._water_mask_cache.clear()
         self._fov_cache.clear()
         self._visible_cache_key = None
+
+        consume = getattr(self.game_map, "consume_dirty_tiles", None)
+        redraw = getattr(self.renderer, "redraw_map_cells", None)
+        has_surface = getattr(self.renderer, "has_map_surface", None)
+        dirty = consume() if callable(consume) else None
+
+        if dirty and callable(redraw) and callable(has_surface) and has_surface():
+            # An edited cell and its 8 neighbours are the only cells whose drawn
+            # appearance can change (autotile masks read neighbours).
+            affected: set[tuple[int, int]] = set()
+            for x, y in dirty:
+                for nx in (x - 1, x, x + 1):
+                    for ny in (y - 1, y, y + 1):
+                        if self.game_map.in_bounds(nx, ny):
+                            affected.add((nx, ny))
+            for cell in affected:
+                self._wall_mask_cache.pop(cell, None)
+                self._water_mask_cache.pop(cell, None)
+            draw_autotile_variant = getattr(self.renderer, "draw_autotile_variant", None)
+            redraw(
+                affected,
+                lambda wx, wy: self._draw_map_tile(
+                    self.renderer, wx, wy, wx, wy, draw_autotile_variant
+                ),
+            )
+            return
+
+        # No incremental path (test double, or surface not built yet): fall back
+        # to a full invalidate and let the next frame rebuild.
+        self._wall_mask_cache.clear()
+        self._water_mask_cache.clear()
         invalidate_surface = getattr(self.renderer, "invalidate_map_surface", None)
         if callable(invalidate_surface):
             invalidate_surface()
@@ -2194,18 +2439,15 @@ class RenderProcessor(esper.Processor):
 
         self._invalidate_map_caches_if_changed()
 
-        entity_lookup: dict[tuple[int, int], tuple[str, str]] = {}
+        # Just locate the player; a whole-world position/name index was built
+        # here every frame but nothing read it -- a needless full-entity scan
+        # that hurt once the ocean added a couple thousand fish/seaweed.
         player_pos: Position | None = None
         player_ent: int | None = None
-
-        for ent, (pos, rend) in esper.get_components(Position, Renderable):
-            name = "Unknown"
-            if esper.has_component(ent, Name):
-                name = esper.component_for_entity(ent, Name).value
-            entity_lookup[(pos.x, pos.y)] = (rend.glyph, name)
-            if esper.has_component(ent, Player):
-                player_pos = pos
-                player_ent = ent
+        for ent, (pos, _player) in esper.get_components(Position, Player):
+            player_pos = pos
+            player_ent = ent
+            break
 
         if player_pos is not None and self._last_player_pos is None:
             self._last_player_pos = (player_pos.x, player_pos.y)
@@ -2291,7 +2533,7 @@ class RenderProcessor(esper.Processor):
                 fg=player_draw[4], bg=player_draw[5], force_glyph=player_draw[6],
             )
 
-        self._draw_sidebar(player_pos, entity_lookup)
+        self._draw_sidebar(player_pos)
 
         # Dim the world when night draws in (a translucent wash over everything
         # already drawn). Skipped on renderers without the overlay hook (tests).
