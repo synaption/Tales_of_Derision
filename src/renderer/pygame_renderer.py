@@ -62,6 +62,7 @@ _DEFAULT_ACTION_KEYBINDS: dict[str, list[str]] = {
     "open_menu": ["tab"],
     "open_inventory": ["i"],
     "open_status": ["c"],
+    "look": ["l"],
     "sleep": ["r"],
     "open_pause_menu": ["esc"],
     "tile_scale_up": ["equals", "kp_plus"],
@@ -1236,6 +1237,111 @@ class PygameRenderer(Renderer):
             return
         rect = self._pygame.Rect(vx * self._cell_w, vy * self._cell_h, self._cell_w, self._cell_h)
         self._screen.fill(self._bg, rect)
+
+    def draw_cursor(
+        self,
+        vx: int,
+        vy: int,
+        color: tuple[int, int, int] = (255, 236, 100),
+    ) -> None:
+        """Outline a single map cell to mark the "look" cursor. Non-destructive
+        (an outline box), so whatever occupies the cell stays visible inside it."""
+        if self._pygame is None or self._screen is None:
+            return
+        rect = self._pygame.Rect(vx * self._cell_w, vy * self._cell_h, self._cell_w, self._cell_h)
+        thickness = max(2, self._cell_w // 8)
+        self._pygame.draw.rect(self._screen, color, rect, width=thickness)
+
+    def _bubble_dims(self, text: str, indicator: str) -> tuple[int, int, int, int, int, int, int, int, int]:
+        """Geometry for a speech bubble holding ``text`` (+ optional ``indicator``):
+        ``(body_w, body_h, tail, pad_x, pad_y, border, gap, text_w, text_h)`` in
+        world pixels. Shared by ``measure_world_label`` (layout) and
+        ``draw_world_label`` (drawing) so the two never drift."""
+        tw, th = self._font.size(text) if self._font is not None else (len(text) * 6, 10)
+        iw = self._font.size(indicator)[0] if (indicator and self._font is not None) else 0
+        gap = max(3, self._font.size(" ")[0]) if (indicator and self._font is not None) else 0
+        pad_x = max(4, self._cell_w // 5)
+        pad_y = max(3, self._cell_h // 6)
+        border = max(2, self._cell_w // 14)
+        tail = max(4, self._cell_h // 5)
+        body_w = tw + gap + iw + pad_x * 2
+        body_h = th + pad_y * 2
+        return body_w, body_h, tail, pad_x, pad_y, border, gap, tw, th
+
+    def measure_world_label(self, text: str, indicator: str = "") -> tuple[int, int, int]:
+        """The ``(body_w, body_h, tail)`` pixel footprint of a bubble, so the caller
+        can lay bubbles out without overlap before drawing them."""
+        body_w, body_h, tail, *_ = self._bubble_dims(text, indicator)
+        return body_w, body_h, tail
+
+    def draw_world_label(
+        self,
+        vx: int,
+        vy: int,
+        text: str,
+        fg: tuple[int, int, int] | None = None,
+        indicator: str = "",
+        indicator_color: tuple[int, int, int] | None = None,
+        lift: int = 0,
+        bg: tuple[int, int, int] = (40, 40, 46),
+    ) -> None:
+        """Draw a speech bubble (translucent dark-gray body, dark outline, a tail
+        near the bubble's corner pointing down at the character) centred above map
+        cell ``(vx, vy)``, in world/tile pixel space so it aligns with the character
+        on that tile (the UI text grid is a different size).
+
+        ``text`` is the white gibberish; ``indicator`` (e.g. ``"++"``) trails it in
+        ``indicator_color``. ``lift`` raises the whole bubble by that many pixels, so
+        the caller can stack bubbles that would otherwise overlap (a newer bubble is
+        drawn lower and shoves older ones up)."""
+        pygame = self._pygame
+        if pygame is None or self._screen is None or self._font is None or not text:
+            return
+
+        outline = (18, 18, 22, 225)
+        fill = (*_coerce_rgb(bg, (40, 40, 46)), 175)  # translucent dark gray
+        text_surf = self._font.render(text, True, _coerce_rgb(fg, (245, 245, 245)))  # white gibberish
+        ind_surf = None
+        if indicator:
+            ind_surf = self._font.render(indicator, True, _coerce_rgb(indicator_color, (245, 245, 245)))
+
+        body_w, body_h, tail, pad_x, pad_y, border, gap, tw, _th = self._bubble_dims(text, indicator)
+        radius = max(3, self._cell_w // 8)
+
+        cx = vx * self._cell_w + self._cell_w // 2
+        bx = cx - body_w // 2
+        by = vy * self._cell_h - body_h - tail - lift  # always above the tile, raised by lift
+
+        # Compose on a per-pixel-alpha surface so the bubble is translucent, then
+        # blit it in one go. Local coords leave a margin plus room for the tail.
+        margin = border + 1
+        surf = pygame.Surface((body_w + margin * 2, body_h + tail + margin * 2), pygame.SRCALPHA)
+        body = pygame.Rect(margin, margin, body_w, body_h)
+
+        # Tail sits near the bubble's lower-left corner and points down at the tile.
+        tail_x = margin + min(body_w - tail - border, tail + border * 2)
+        tip = (tail_x, margin + body_h + tail)
+        base_y = margin + body_h - border
+        fill_base_y = margin + body_h - border * 2
+        fill_tip = (tip[0], tip[1] - border)
+
+        # 1. dark outline (tail then body), 2. translucent fill (body then tail),
+        # so the fills merge across the tail base with no visible seam.
+        pygame.draw.polygon(surf, outline, [tip, (tail_x - tail, base_y), (tail_x + tail, base_y)])
+        pygame.draw.rect(surf, outline, body, border_radius=radius)
+        pygame.draw.rect(
+            surf, fill, body.inflate(-border * 2, -border * 2),
+            border_radius=max(2, radius - border),
+        )
+        pygame.draw.polygon(
+            surf, fill,
+            [fill_tip, (tail_x - tail + border, fill_base_y), (tail_x + tail - border, fill_base_y)],
+        )
+
+        self._screen.blit(surf, (bx - margin, by - margin))
+        self._screen.blit(text_surf, (bx + pad_x, by + pad_y))
+        if ind_surf is not None:
+            self._screen.blit(ind_surf, (bx + pad_x + tw + gap, by + pad_y))
 
     def set_map_clip(self, w_cells: int, h_cells: int) -> None:
         """Restrict drawing to the map viewport (top-left w_cells x h_cells) so a

@@ -6,10 +6,10 @@
   "melee_attack_sfx": "audio/sfx/swipe.wav",
   "death_sfx": "audio/sfx/splat_quick.wav",
   "keybinds": {
-    "up": ["w", "k", "up"],
-    "down": ["s", "j", "down"],
-    "left": ["a", "h", "left"],
-    "right": ["d", "l", "right"],
+    "up": ["w", "up"],
+    "down": ["s", "down"],
+    "left": ["a", "left"],
+    "right": ["d", "right"],
     "save": ["p"],
     "quit": ["q", "esc"]
   }

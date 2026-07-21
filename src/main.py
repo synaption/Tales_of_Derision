@@ -15,7 +15,7 @@ from typing import Any
 
 import esper
 
-from components import Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Fish, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
+from components import Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Fish, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
 from game_map import GameMap
 from items import (
     BERRIES,
@@ -42,7 +42,7 @@ from persistence import (
 )
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, furnish_house, go_to_sleep, pick_berries, player_is_animated, queue_message, set_bed_owner, status_label, wake_up, world_clock
+from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, bubbles_active, friendship, furnish_house, go_to_sleep, interact, pick_berries, player_is_animated, queue_message, set_bed_owner, slay_entity, spawn_speech_bubble, status_label, wake_up, world_clock
 
 # The world is a 3x3 grid of 120x60 sections: the habitable island sits in the
 # centre section, ringed by a coastline, and the surrounding eight sections are
@@ -1126,6 +1126,37 @@ def _disposition_of(ent: int) -> str:
     return "Neutral"
 
 
+def _friendship_label(score: float) -> str:
+    """A word for a friendship score, for status/dialogue screens."""
+    if score >= 60:
+        return "Close friend"
+    if score >= 25:
+        return "Friend"
+    if score >= 5:
+        return "Friendly"
+    if score <= -60:
+        return "Enemy"
+    if score <= -25:
+        return "Disliked"
+    if score <= -5:
+        return "Cold"
+    return "Stranger"
+
+
+def _player_talk(player_ent: int, npc_ent: int) -> str:
+    """The player chats with a villager: nudge friendship both ways (via the same
+    ``systems.interact`` the NPC social AI uses), pop a speech bubble above them,
+    and return a one-line outcome for the dialogue footer."""
+    clock = world_clock()
+    turn = clock.turn if clock is not None else 0
+    _delta_player, delta_npc = interact(player_ent, npc_ent, turn)
+    score = 0.0
+    if esper.has_component(player_ent, Relationships):
+        score = friendship(esper.component_for_entity(player_ent, Relationships), npc_ent)
+    indicator = "++" if delta_npc > 0 else ("--" if delta_npc < 0 else "~")
+    return f"{indicator} friendship now {int(score)} ({_friendship_label(score)})"
+
+
 def _creature_status_lines(game_map: GameMap, ent: int) -> list[str]:
     """Human-readable status block for any creature (the player, an NPC, a mob):
     name, disposition, needs, and active statuses."""
@@ -1133,6 +1164,14 @@ def _creature_status_lines(game_map: GameMap, ent: int) -> list[str]:
         f"Name: {_entity_name(ent, fallback='Unknown')}",
         f"Disposition: {_disposition_of(ent)}",
     ]
+    if esper.has_component(ent, Personality):
+        traits = esper.component_for_entity(ent, Personality).traits
+        lines.append("Traits: " + (", ".join(traits) if traits else "None"))
+        player_ent = _first_player_entity()
+        if player_ent is not None and esper.has_component(ent, Relationships):
+            rel = esper.component_for_entity(ent, Relationships)
+            score = friendship(rel, player_ent)
+            lines.append(f"Friendship: {int(score)} ({_friendship_label(score)})")
     if esper.has_component(ent, Needs):
         needs = esper.component_for_entity(ent, Needs)
         lines.append(f"Hunger: {int(needs.hunger)}%")
@@ -1899,6 +1938,301 @@ async def _draw_info_screen(
             return "close"
 
 
+# How far the "look" cursor's interactions reach. Trade and melee need the two
+# characters to be next to each other (Chebyshev distance 1); talking carries a
+# few tiles; viewing someone's status can be done from anywhere on screen.
+_LOOK_TALK_RANGE = 5
+_LOOK_TRADE_RANGE = 1
+_LOOK_MELEE_RANGE = 1
+
+
+def _chebyshev_from_player(player_pos: Position, x: int, y: int) -> int:
+    return max(abs(x - player_pos.x), abs(y - player_pos.y))
+
+
+def _creature_at_xy(x: int, y: int) -> int | None:
+    """The character (NPC or the player) standing on world cell (x, y)."""
+    for ent, (pos, _npc) in esper.get_components(Position, NPC):
+        if (pos.x, pos.y) == (x, y):
+            return ent
+    for ent, (pos, _player) in esper.get_components(Position, Player):
+        if (pos.x, pos.y) == (x, y):
+            return ent
+    return None
+
+
+def _renderable_at_xy(x: int, y: int, skip: int | None = None) -> int | None:
+    """Any drawable entity on (x, y) other than ``skip`` (a tree, corpse, item,
+    well, ...). Used to name whatever the look cursor rests on."""
+    for ent, (pos, _rend) in esper.get_components(Position, Renderable):
+        if ent == skip:
+            continue
+        if (pos.x, pos.y) == (x, y):
+            return ent
+    return None
+
+
+def _terrain_name(game_map: GameMap, x: int, y: int) -> str:
+    tile = game_map.tile_at(x, y)
+    return {
+        game_map.WALL: "a wall",
+        game_map.WATER: "water",
+        game_map.DOOR: "a door",
+        game_map.WINDOW: "a window",
+        game_map.FLOOR: "open ground",
+    }.get(tile, "the ground")
+
+
+def _look_available_actions(target_ent: int, dist: int) -> list[str]:
+    """The interaction verbs the look cursor offers for ``target_ent`` at the
+    given distance. Status is always offered; talking reaches a few tiles; trade
+    and melee only work when standing right next to the target."""
+    if esper.has_component(target_ent, Player):
+        return ["Status"]
+
+    options: list[str] = []
+    if dist <= _LOOK_TALK_RANGE and esper.has_component(target_ent, Dialogue):
+        options.append("Talk")
+    if dist <= _LOOK_TRADE_RANGE and esper.has_component(target_ent, Friendly):
+        options.append("Trade")
+    if dist <= _LOOK_MELEE_RANGE and (
+        esper.has_component(target_ent, Enemy) or esper.has_component(target_ent, Deer)
+    ):
+        options.append("Attack")
+    options.append("Status")
+    return options
+
+
+def _look_info_line(
+    game_map: GameMap,
+    player_pos: Position,
+    x: int,
+    y: int,
+    visible: bool,
+    creature_ent: int | None,
+) -> str:
+    footer = "[dir] move   [Enter] interact   [Esc/L] done"
+    if not visible:
+        return f"Look: you can't make out that spot.   {footer}"
+
+    dist = _chebyshev_from_player(player_pos, x, y)
+    if creature_ent is not None:
+        name = _entity_name(creature_ent, fallback="someone")
+        if esper.has_component(creature_ent, Player):
+            return f"Look: {name} (you).   [Enter] status   [Esc/L] done"
+        verbs = ", ".join(_look_available_actions(creature_ent, dist)).lower()
+        return f"Look: {name} - {dist} away.   [Enter] {verbs}   [Esc/L] done"
+
+    feature_ent = _renderable_at_xy(x, y)
+    if feature_ent is not None:
+        name = _entity_name(feature_ent, fallback="something")
+        return f"Look: {name} - {dist} away.   [Enter] examine   [Esc/L] done"
+
+    return f"Look: {_terrain_name(game_map, x, y)}.   {footer}"
+
+
+def _perform_look_attack(target_ent: int) -> None:
+    """Strike an adjacent huntable creature from look mode, reusing the movement
+    processor's melee/death sfx so it feels like a normal attack, then let a turn
+    pass so the world reacts."""
+    name = _entity_name(target_ent, fallback="the creature")
+    movement = esper.get_processor(MovementProcessor)
+    queue_message(f"You attack {name}.")
+    if movement is not None and movement.on_melee_attack is not None:
+        movement.on_melee_attack()
+    slay_entity(target_ent)
+    if movement is not None and movement.on_enemy_death is not None:
+        movement.on_enemy_death()
+    esper.process(WAIT_ACTION)
+
+
+async def _draw_look_action_menu(
+    renderer: Renderer,
+    game_map: GameMap,
+    target_ent: int,
+    options: list[str],
+) -> str:
+    """A compact action menu for the creature under the look cursor, offering only
+    the verbs its distance allows. Mirrors the dialogue menu's controls."""
+    selected = 0
+    talk_line = ""
+    while True:
+        if not esper.entity_exists(target_ent):
+            return "close"
+        name = _entity_name(target_ent, fallback="Creature")
+        menu_options = options + ["Leave"]
+        footer = talk_line if talk_line else "[W/S] move   [Enter] select   [Esc] close"
+        x, y, width, _height = _draw_menu_shell(
+            renderer,
+            title=f"LOOK - {name}",
+            subtitle="Interaction",
+            footer=footer,
+            width=72,
+            height=20,
+            overlay_game=True,
+        )
+        info_lines = _creature_status_lines(game_map, target_ent)
+        for idx, line in enumerate(info_lines):
+            _draw_ui_text(renderer, x + 3, y + 5 + idx, line, _MENU_TEXT_COLOR, width - 6)
+        option_y = y + 5 + len(info_lines) + 2
+        _draw_menu_options(renderer, x + 3, option_y, width - 6, menu_options, selected)
+        renderer.present()
+
+        action = await _await_action(renderer)
+        if action == "quit":
+            return "quit"
+        if action in {"open_pause_menu", "look"}:
+            return "close"
+        if action == "move_up":
+            selected = (selected - 1) % len(menu_options)
+            continue
+        if action == "move_down":
+            selected = (selected + 1) % len(menu_options)
+            continue
+        if action in {"menu_select", "confirm_action"}:
+            choice = menu_options[selected]
+            if choice == "Leave":
+                return "close"
+            if choice == "Talk":
+                if esper.has_component(target_ent, Dialogue):
+                    line = esper.component_for_entity(target_ent, Dialogue).line
+                    talk_line = f"{name}: \"{line}\""
+                else:
+                    talk_line = f"{name} has nothing to say."
+                continue
+            if choice == "Trade":
+                if await _draw_trade_menu(renderer, target_ent) == "quit":
+                    return "quit"
+                talk_line = ""
+                continue
+            if choice == "Status":
+                if await _draw_info_screen(
+                    renderer,
+                    title=f"STATUS - {name}",
+                    lines=_creature_status_lines(game_map, target_ent),
+                    subtitle="What you can tell about them",
+                ) == "quit":
+                    return "quit"
+                talk_line = ""
+                continue
+            if choice == "Attack":
+                _perform_look_attack(target_ent)
+                return "close"
+
+
+async def _look_interact(renderer: Renderer, game_map: GameMap, x: int, y: int) -> str:
+    """Resolve an Enter press on the look cursor: interact with a creature there,
+    loot an adjacent corpse, or just describe whatever the cursor rests on."""
+    player_ent = _first_player_entity()
+    if player_ent is None or not esper.has_component(player_ent, Position):
+        return "close"
+    player_pos = esper.component_for_entity(player_ent, Position)
+    dist = _chebyshev_from_player(player_pos, x, y)
+
+    creature_ent = _creature_at_xy(x, y)
+    if creature_ent is not None:
+        if creature_ent == player_ent:
+            return await _draw_info_screen(
+                renderer,
+                title="STATUS - You",
+                lines=_creature_status_lines(game_map, player_ent),
+                subtitle="How you're holding up",
+            )
+        options = _look_available_actions(creature_ent, dist)
+        return await _draw_look_action_menu(renderer, game_map, creature_ent, options)
+
+    feature_ent = _renderable_at_xy(x, y)
+    if feature_ent is not None:
+        if (
+            dist <= 1
+            and esper.has_component(feature_ent, Corpse)
+            and _entity_has_tradeable_items(feature_ent)
+        ):
+            return await _draw_loot_menu(renderer, feature_ent)
+        name = _entity_name(feature_ent, fallback="something")
+        return await _draw_info_screen(
+            renderer,
+            title="LOOK",
+            lines=[f"You see {name}.", f"Distance: {dist}."],
+            subtitle="",
+        )
+
+    return await _draw_info_screen(
+        renderer,
+        title="LOOK",
+        lines=[f"You see {_terrain_name(game_map, x, y)}."],
+        subtitle="",
+    )
+
+
+def _clear_look_overlay(render: RenderProcessor | None) -> None:
+    if render is not None:
+        render.look_cursor = None
+        render.look_info = None
+
+
+async def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
+    """Drive the look cursor: it starts on the player, moves with the direction
+    keys, and Enter interacts with whatever it rests on. Returns "quit" if the
+    player quit the game while looking, otherwise "close"."""
+    player_ent = _first_player_entity()
+    if player_ent is None or not esper.has_component(player_ent, Position):
+        return "close"
+    player_pos = esper.component_for_entity(player_ent, Position)
+    cursor_x, cursor_y = player_pos.x, player_pos.y
+
+    render = esper.get_processor(RenderProcessor)
+
+    while True:
+        # Keep the cursor inside the drawn viewport so it's always visible; on the
+        # first pass (before any look render) fall back to the whole map.
+        if render is not None:
+            ox, oy, vw, vh = render.view_bounds()
+            cursor_x = min(max(cursor_x, ox), ox + vw - 1)
+            cursor_y = min(max(cursor_y, oy), oy + vh - 1)
+        else:
+            cursor_x = min(max(cursor_x, 0), game_map.width - 1)
+            cursor_y = min(max(cursor_y, 0), game_map.height - 1)
+
+        on_player = (cursor_x, cursor_y) == (player_pos.x, player_pos.y)
+        visible = on_player or render is None or render.tile_is_visible(cursor_x, cursor_y)
+        creature_ent = _creature_at_xy(cursor_x, cursor_y) if visible else None
+
+        if render is not None:
+            render.look_cursor = (cursor_x, cursor_y)
+            render.look_info = _look_info_line(
+                game_map, player_pos, cursor_x, cursor_y, visible, creature_ent
+            )
+        esper.process(None)
+
+        action = await _await_action(renderer)
+        if action == "quit":
+            _clear_look_overlay(render)
+            return "quit"
+        if action in {"open_pause_menu", "look"}:
+            break
+        if action in _CARDINAL_ACTION_DELTAS:
+            dx, dy = _CARDINAL_ACTION_DELTAS[action]
+            cursor_x += dx
+            cursor_y += dy
+            continue
+        if action in {"menu_select", "confirm_action"}:
+            if not visible:
+                continue
+            # The interaction menu draws its own frames, so drop the cursor
+            # overlay while it's open, then restore it on return.
+            _clear_look_overlay(render)
+            result = await _look_interact(renderer, game_map, cursor_x, cursor_y)
+            if result == "quit":
+                _clear_look_overlay(render)
+                return "quit"
+            continue
+
+    _clear_look_overlay(render)
+    esper.process(None)
+    return "close"
+
+
 async def _draw_dialogue_menu(renderer: Renderer, game_map: GameMap, npc_ent: int) -> str:
     selected = 0
     options = ["Talk", "Trade", "Status", "Leave"]
@@ -1951,6 +2285,13 @@ async def _draw_dialogue_menu(renderer: Renderer, game_map: GameMap, npc_ent: in
                     talk_line = f"{npc_name}: \"{line}\""
                 else:
                     talk_line = f"{npc_name} has nothing to say."
+                # Chatting with a sentient villager builds friendship (Sims-like);
+                # show the outcome and refresh the info block's Friendship line.
+                player_ent = _first_player_entity()
+                if player_ent is not None and esper.has_component(npc_ent, Personality):
+                    outcome = _player_talk(player_ent, npc_ent)
+                    talk_line = f"{talk_line}  [{outcome}]"
+                    info_lines = _npc_info_lines(game_map, npc_ent)
                 continue
             if choice == "Trade":
                 trade_choice = await _draw_trade_menu(renderer, npc_ent)
@@ -2350,7 +2691,6 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     player_name = "You"
     villager_name = "Friendly Villager"
     player_skin = _human_skin_tone(player_name)
-    villager_skin = _human_skin_tone(villager_name, offset=7)
 
     player_equipment = _default_equipment_slots()
     player_equipment["main hand"] = "Rusty Sword"
@@ -2382,12 +2722,10 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
                 rats_spawned += 1
         return rats_spawned
 
-    villager_pos = Position(max(2, player_position.x - 2), player_position.y + 1)
-    villager2_pos = Position(max(2, player_position.x - 3), player_position.y + 2)
     guard_pos = Position(max(2, player_position.x - 5), player_position.y)
     rat_pos = Position(min(game_map.width - 3, player_position.x + 6), max(2, player_position.y - 2))
 
-    def spawn_villager(pos: Position, name: str, skin: tuple[int, int, int]) -> None:
+    def spawn_villager(pos: Position, name: str, skin: tuple[int, int, int], traits: list[str]) -> None:
         esper.create_entity(
             pos,
             Renderable("v", fg=skin),
@@ -2405,10 +2743,28 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
             # Residents seek out an unowned house to live in (claiming it as their
             # home), and build a cabin of their own if none is free.
             Resident(),
+            # A named personality drives who they befriend and how they socialise.
+            Personality(traits=list(traits)),
+            Relationships(),
         )
 
-    spawn_villager(villager_pos, villager_name, villager_skin)
-    spawn_villager(villager2_pos, "Villager Mara", _human_skin_tone("Villager Mara", offset=13))
+    # A small cast of villagers with contrasting personalities, so the social AI
+    # produces both warming (++) and souring (--) interactions. Placement is a
+    # deterministic loose cluster near the player, clamped inside the map.
+    villager_roster: list[tuple[str, list[str]]] = [
+        (villager_name, ["Cheerful", "Outgoing"]),
+        ("Villager Mara", ["Kind", "Shy"]),
+        ("Villager Bran", ["Grumpy"]),
+        ("Villager Elda", ["Playful", "Kind"]),
+        ("Villager Tomas", ["Aloof"]),
+        ("Villager Sena", ["Outgoing", "Playful"]),
+    ]
+    villager_offsets = [(-2, 1), (-3, 2), (-4, 1), (-2, 3), (-5, 2), (-3, 3)]
+    for (vname, traits), (dx, dy) in zip(villager_roster, villager_offsets):
+        vx = min(game_map.width - 3, max(2, player_position.x + dx))
+        vy = min(game_map.height - 3, max(2, player_position.y + dy))
+        spawn_villager(Position(vx, vy), vname, _human_skin_tone(vname, offset=7), traits)
+
     goblin_equipment = _default_equipment_slots()
     goblin_equipment["main hand"] = "Jagged Dagger"
     esper.create_entity(
@@ -2662,7 +3018,7 @@ async def main() -> None:
                 # fire, ...), poll on a short timeout and re-render on each idle
                 # tick so the identifiers cycle without input; otherwise keep the
                 # efficient blocking wait (desktop truly idles).
-                if player_is_animated(game_map):
+                if player_is_animated(game_map) or bubbles_active():
                     action = await _await_action_or_idle(renderer, _STATUS_ANIM_POLL_SECONDS)
                     if action is None:
                         esper.process(None)
@@ -2703,6 +3059,13 @@ async def main() -> None:
                             esper.process(None)
                     else:
                         await _sleep_player(renderer, in_camp=True)
+                    continue
+                if action == "look":
+                    held_directions.clear()
+                    look_choice = await _look_mode(renderer, game_map)
+                    if look_choice == "quit":
+                        break
+                    esper.process(None)
                     continue
                 if action in _CARDINAL_ACTION_DELTAS:
                     held_directions.add(action)

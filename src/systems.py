@@ -5,13 +5,14 @@ process() receives whatever args are passed to esper.process().
 """
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 import random
 import textwrap
 import time
 
 import esper
 
-from components import Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Diet, Enemy, Equipment, Fish, Friendly, Furniture, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Owned, Player, Position, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
+from components import Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Diet, Enemy, Equipment, Fish, Friendly, Furniture, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Owned, Personality, Player, Position, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from renderer.base import Renderer
@@ -737,6 +738,232 @@ def _chebyshev(a: tuple[int, int], b: tuple[int, int]) -> int:
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
 
 
+def _rects_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    """Whether two ``(x0, y0, x1, y1)`` rectangles intersect."""
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+# --- Personalities, friendships, and social interactions -------------------
+# Sentient beings (villagers) carry a Personality of one or more named traits.
+# Each trait contributes:
+#   * sociability -- how strongly it drives the being to seek out company;
+#   * warmth      -- how pleasant the being is in an interaction. Positive warmth
+#                    makes chats build friendship; negative warmth (Grumpy/Aloof)
+#                    can turn an interaction sour (a "--").
+@dataclass(frozen=True)
+class _Trait:
+    sociability: float
+    warmth: float
+
+
+_TRAITS: dict[str, _Trait] = {
+    "Cheerful": _Trait(sociability=1.0, warmth=1.6),
+    "Kind":     _Trait(sociability=0.6, warmth=1.4),
+    "Outgoing": _Trait(sociability=1.6, warmth=0.6),
+    "Playful":  _Trait(sociability=1.1, warmth=1.0),
+    "Shy":      _Trait(sociability=-1.0, warmth=0.2),
+    "Aloof":    _Trait(sociability=-1.4, warmth=-0.6),
+    "Grumpy":   _Trait(sociability=-0.4, warmth=-1.6),
+}
+
+# Baseline warmth of any interaction: two neutral strangers chatting still drift
+# gently friendlier, so relationships build over repeated contact.
+_INTERACTION_BASE = 1.4
+# Each being's own warmth and its partner's both feed the friendship change.
+_SELF_WARMTH_WEIGHT = 0.7
+_OTHER_WARMTH_WEIGHT = 0.7
+# A single interaction never moves friendship more than this, so it stays gradual.
+_INTERACTION_STEP_CAP = 6.0
+# Friendship bounds.
+_FRIENDSHIP_MIN = -100.0
+_FRIENDSHIP_MAX = 100.0
+
+# Turns a being waits between voluntary interactions (so villagers don't chatter
+# every single turn), how far it looks for company, and how much each tile of
+# distance counts against a candidate when weighed against friendship.
+_SOCIAL_COOLDOWN = 6
+_SOCIAL_SIGHT = 8
+_SOCIAL_DISTANCE_PENALTY = 2.0
+
+
+def personality_warmth(traits: list[str]) -> float:
+    """Sum of the warmth of a being's traits (0.0 for a being with none)."""
+    return sum(_TRAITS[name].warmth for name in traits if name in _TRAITS)
+
+
+def trait_sociability(traits: list[str]) -> float:
+    """Sum of the sociability of a being's traits."""
+    return sum(_TRAITS[name].sociability for name in traits if name in _TRAITS)
+
+
+def interaction_delta(self_traits: list[str], other_traits: list[str]) -> float:
+    """How much one interaction shifts a being's friendship toward a partner,
+    given both personalities. Positive warms the relationship (``++``), negative
+    sours it (``--``). Deterministic (no RNG) so outcomes are testable/stable."""
+    raw = (
+        _INTERACTION_BASE
+        + _SELF_WARMTH_WEIGHT * personality_warmth(self_traits)
+        + _OTHER_WARMTH_WEIGHT * personality_warmth(other_traits)
+    )
+    return max(-_INTERACTION_STEP_CAP, min(_INTERACTION_STEP_CAP, raw))
+
+
+def friendship(rel: Relationships | None, other: int) -> float:
+    """The friendship score in ``rel`` toward ``other`` (0.0 for a stranger or a
+    being with no Relationships component)."""
+    if rel is None:
+        return 0.0
+    return rel.scores.get(other, 0.0)
+
+
+def _relationships(ent: int) -> Relationships:
+    if esper.has_component(ent, Relationships):
+        return esper.component_for_entity(ent, Relationships)
+    rel = Relationships()
+    esper.add_component(ent, rel)
+    return rel
+
+
+def adjust_friendship(ent: int, other: int, delta: float) -> float:
+    """Move ``ent``'s friendship toward ``other`` by ``delta`` (clamped to the
+    friendship bounds), creating a Relationships component if needed. Returns the
+    new score."""
+    rel = _relationships(ent)
+    current = rel.scores.get(other, 0.0)
+    updated = max(_FRIENDSHIP_MIN, min(_FRIENDSHIP_MAX, current + delta))
+    rel.scores[other] = updated
+    return updated
+
+
+# --- Speech bubbles --------------------------------------------------------
+# Floating labels drawn above a character for a short wall-clock time, so they
+# linger and fade across idle animation ticks (mirroring the _TURN_EVENTS log
+# queue, but positional and self-expiring). The RenderProcessor draws whatever is
+# live each frame; the turn loop keeps re-rendering while any are active.
+_BUBBLE_TTL = 2.5  # seconds a bubble stays on screen
+# A busy tile stacks bubbles upward (newest nearest the character); the oldest
+# scroll off once the stack is this tall.
+_MAX_BUBBLES_PER_CELL = 3
+
+# The ``++``/``--``/``+``/``-`` indicator that trails a bubble's gibberish. Its
+# strength scales with how much the interaction moved friendship, and small
+# interactions get no indicator at all. Green warms, red sours.
+_INDICATOR_MIN = 0.5      # below this |delta|, no indicator is shown
+_INDICATOR_STRONG = 2.5   # at/above this |delta|, the doubled form (++ / --)
+_INDICATOR_GREEN = (110, 215, 120)
+_INDICATOR_RED = (232, 96, 96)
+
+_GIBBERISH_TOKENS = (
+    "ba", "zo", "ki", "mu", "lo", "ta", "wu", "ne", "ry", "sh", "gorp", "bl", "eek", "mm",
+)
+_gibberish_rng = random.Random()
+
+
+@dataclass
+class _Bubble:
+    x: int
+    y: int
+    text: str
+    indicator: str = ""
+    indicator_color: tuple[int, int, int] | None = None
+    born: float = 0.0
+    ttl: float = _BUBBLE_TTL
+
+
+_SPEECH_BUBBLES: list[_Bubble] = []
+
+
+def gibberish(words: int = 2) -> str:
+    """A short nonsense utterance in the beings' 'language' -- a couple of made-up
+    syllable clusters (e.g. ``"bazo ki!"``). Cosmetic only."""
+    parts: list[str] = []
+    for _ in range(max(1, words)):
+        syllables = _gibberish_rng.randint(1, 2)
+        parts.append("".join(_gibberish_rng.choice(_GIBBERISH_TOKENS) for _ in range(syllables)))
+    return " ".join(parts) + _gibberish_rng.choice(("", "?", "!", "..."))
+
+
+def spawn_speech_bubble(
+    x: int,
+    y: int,
+    text: str,
+    indicator: str = "",
+    indicator_color: tuple[int, int, int] | None = None,
+    ttl: float = _BUBBLE_TTL,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Pop a floating bubble above world cell ``(x, y)`` for ``ttl`` seconds. Keeps
+    at most ``_MAX_BUBBLES_PER_CELL`` bubbles per cell (oldest dropped) so a chatty
+    character can't spawn an unbounded column. Overlap between neighbouring bubbles
+    is resolved at draw time (newer bubbles shove older ones up).
+    ``indicator``/``indicator_color`` render as a coloured suffix."""
+    _SPEECH_BUBBLES.append(
+        _Bubble(x, y, text, indicator, indicator_color, born=clock(), ttl=ttl)
+    )
+    at_cell = [b for b in _SPEECH_BUBBLES if b.x == x and b.y == y]
+    for stale in at_cell[:-_MAX_BUBBLES_PER_CELL]:
+        _SPEECH_BUBBLES.remove(stale)
+
+
+def active_bubbles(now: float | None = None) -> list[_Bubble]:
+    """Prune expired bubbles and return the live ones (used by the renderer)."""
+    current = now if now is not None else time.monotonic()
+    live = [b for b in _SPEECH_BUBBLES if current - b.born < b.ttl]
+    if len(live) != len(_SPEECH_BUBBLES):
+        _SPEECH_BUBBLES[:] = live
+    return live
+
+
+def bubbles_active(now: float | None = None) -> bool:
+    """True while any speech bubble is still on screen, so the turn loop keeps
+    re-rendering to fade them out even with no input."""
+    return bool(active_bubbles(now))
+
+
+def _social_indicator(delta: float) -> tuple[str, tuple[int, int, int] | None]:
+    """The ``(text, colour)`` indicator for a friendship change: green ``+``/``++``
+    for a warming interaction, red ``-``/``--`` for a souring one, doubled once the
+    change is strong. A near-zero interaction gets no indicator (``("", None)``)."""
+    magnitude = abs(delta)
+    if magnitude < _INDICATOR_MIN:
+        return "", None
+    if delta > 0:
+        return ("++" if magnitude >= _INDICATOR_STRONG else "+"), _INDICATOR_GREEN
+    return ("--" if magnitude >= _INDICATOR_STRONG else "-"), _INDICATOR_RED
+
+
+def _traits_of(ent: int) -> list[str]:
+    if esper.has_component(ent, Personality):
+        return esper.component_for_entity(ent, Personality).traits
+    return []
+
+
+def interact(a: int, b: int, turn: int, clock: Callable[[], float] = time.monotonic) -> tuple[float, float]:
+    """Run one social interaction between beings ``a`` and ``b``: adjust each
+    one's friendship toward the other by its personality-driven delta, stamp the
+    cooldown on both, and pop a gibberish speech bubble + ``++``/``--`` indicator
+    above each. Returns ``(delta_a, delta_b)``. Shared by the NPC social AI and
+    the player's Talk action."""
+    a_traits = _traits_of(a)
+    b_traits = _traits_of(b)
+    delta_a = interaction_delta(a_traits, b_traits)
+    delta_b = interaction_delta(b_traits, a_traits)
+    adjust_friendship(a, b, delta_a)
+    adjust_friendship(b, a, delta_b)
+
+    for ent, delta in ((a, delta_a), (b, delta_b)):
+        if esper.has_component(ent, Personality):
+            esper.component_for_entity(ent, Personality).last_social_turn = turn
+        if esper.has_component(ent, Position):
+            pos = esper.component_for_entity(ent, Position)
+            indicator, indicator_color = _social_indicator(delta)
+            spawn_speech_bubble(
+                pos.x, pos.y, gibberish(),
+                indicator=indicator, indicator_color=indicator_color, clock=clock,
+            )
+    return delta_a, delta_b
+
+
 class NpcAiProcessor(esper.Processor):
     """Drives NPC behaviour each turn.
 
@@ -1164,6 +1391,65 @@ class NpcAiProcessor(esper.Processor):
             return False  # adjacent: hold (player-facing combat is player-driven)
         return self._step_toward(ent, pos, player_xy, occupied)
 
+    def _pick_social_partner(
+        self,
+        ent: int,
+        pos: Position,
+        sentients: list[tuple[int, Position]],
+    ) -> tuple[int, Position] | None:
+        """Who ``ent`` would most like to approach: the nearest awake, reachable
+        being it can see, weighted so higher current friendship wins over a
+        slightly closer stranger. Returns ``(entity, position)`` or ``None``."""
+        rel = (
+            esper.component_for_entity(ent, Relationships)
+            if esper.has_component(ent, Relationships)
+            else None
+        )
+        best: tuple[int, Position] | None = None
+        best_score: float | None = None
+        for other, other_pos in sentients:
+            if other == ent or esper.has_component(other, Asleep):
+                continue
+            dist = _chebyshev((pos.x, pos.y), (other_pos.x, other_pos.y))
+            if dist > _SOCIAL_SIGHT:
+                continue
+            if not self.game_map.same_region((pos.x, pos.y), (other_pos.x, other_pos.y)):
+                continue
+            # Prefer friends: friendship pulls the score up, distance pushes it
+            # down. A stranger (0 friendship) is still chosen when nobody
+            # closer or friendlier is around.
+            score = friendship(rel, other) - dist * _SOCIAL_DISTANCE_PENALTY
+            if best_score is None or score > best_score:
+                best_score = score
+                best = (other, other_pos)
+        return best
+
+    def _socialize(
+        self,
+        ent: int,
+        pos: Position,
+        occupied: dict[tuple[int, int], int],
+        sentients: list[tuple[int, Position]],
+        turn: int,
+    ) -> bool:
+        """A being seeks out someone to talk to, preferring beings it already
+        likes. Interacts when adjacent (adjusting friendship + popping bubbles),
+        otherwise steps toward the chosen partner. Honours a per-being cooldown so
+        villagers don't chatter every turn."""
+        personality = esper.component_for_entity(ent, Personality)
+        if turn - personality.last_social_turn < _SOCIAL_COOLDOWN:
+            return False
+
+        partner = self._pick_social_partner(ent, pos, sentients)
+        if partner is None:
+            return False
+        partner_ent, partner_pos = partner
+
+        if _chebyshev((pos.x, pos.y), (partner_pos.x, partner_pos.y)) == 1:
+            interact(ent, partner_ent, turn)
+            return True
+        return self._step_toward(ent, pos, (partner_pos.x, partner_pos.y), occupied)
+
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
             return
@@ -1184,6 +1470,11 @@ class NpcAiProcessor(esper.Processor):
             if any(is_raw_meat(item) or is_cooked_meat(item) for item in inv.items)
         ]
         stoves = [((pos.x, pos.y), ent) for ent, (pos, _s) in esper.get_components(Position, Stove)]
+        # Sentient beings the social AI can approach (positions snapshotted once).
+        sentients = [(ent, pos) for ent, (pos, _p) in esper.get_components(Position, Personality)]
+
+        clock = world_clock()
+        turn = clock.turn if clock is not None else 0
 
         # Materialise the list: a predator can kill (delete) another NPC mid-loop
         # via _seek_food, so we snapshot up front and skip anything already gone.
@@ -1221,10 +1512,20 @@ class NpcAiProcessor(esper.Processor):
                         # Villager: cooks meat before eating (multi-turn plan).
                         acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
 
-            # Building a house is the lowest-priority drive: a resident works its
-            # BuildPlan only once fed, watered, and rested.
+            # Building a house is the lowest-priority survival drive: a resident
+            # works its BuildPlan only once fed, watered, and rested.
             if not acted and esper.has_component(ent, BuildPlan):
                 acted = self._build(ent, pos, trees, occupied)
+
+            # Leisure: a fed, rested, non-hostile being with a personality seeks
+            # out company -- preferring beings it already likes. Lowest priority
+            # of all, so survival and building always come first.
+            if (
+                not acted
+                and esper.has_component(ent, Personality)
+                and esper.has_component(ent, Friendly)
+            ):
+                acted = self._socialize(ent, pos, occupied, sentients, turn)
 
             if acted:
                 continue
@@ -1808,6 +2109,11 @@ class RenderProcessor(esper.Processor):
         self._view_origin_y = 0
         self._view_width = game_map.width
         self._view_height = game_map.height
+        # "Look" mode overlay: a world-cell cursor to outline and a status line to
+        # show while examining. Both are None during normal play (set/cleared by
+        # the turn loop's look handler).
+        self.look_cursor: tuple[int, int] | None = None
+        self.look_info: str | None = None
         self._status_y = game_map.height
         self._message_log: list[str] = ["You enter the area."]
         self._max_log_lines = 200
@@ -2381,6 +2687,15 @@ class RenderProcessor(esper.Processor):
             return None
         return (vx, vy)
 
+    def view_bounds(self) -> tuple[int, int, int, int]:
+        """(origin_x, origin_y, width, height) of the currently drawn viewport in
+        world cells. Used by the look cursor to stay on-screen."""
+        return (self._view_origin_x, self._view_origin_y, self._view_width, self._view_height)
+
+    def tile_is_visible(self, x: int, y: int) -> bool:
+        """Whether world cell (x, y) is in the player's current field of view."""
+        return (x, y) in self._visible_tiles
+
     def _apply_section_camera(self, player_pos: Position | None) -> None:
         """Lock the camera to the render section the player occupies. Sets
         ``_section_bounds`` (used to clip FOV) and clamps the view origin inside
@@ -2613,6 +2928,63 @@ class RenderProcessor(esper.Processor):
         if overlay_alpha > 0 and callable(draw_overlay):
             draw_overlay(_NIGHT_TINT, overlay_alpha)
 
+        # Speech bubbles float above characters in world space (aligned to the
+        # tile grid, not the UI text grid), drawn on top of the night wash so they
+        # stay legible. Skipped on renderers without the hook (the test double).
+        draw_world_label = getattr(r, "draw_world_label", None)
+        measure_world_label = getattr(r, "measure_world_label", None)
+        get_cell_px = getattr(r, "get_tile_cell_size_px", None)
+        if callable(draw_world_label):
+            bubbles = active_bubbles(self._clock())
+            if callable(measure_world_label) and callable(get_cell_px):
+                # Lay bubbles out newest-first: each one takes the lowest vertical
+                # slot (nearest its character) that doesn't overlap an already-placed
+                # bubble, lifting up a row at a time until it fits. So a newer bubble
+                # sits below and shoves older/neighbouring ones up -- no two overlap.
+                cell_w, cell_h = get_cell_px()
+                cell_w, cell_h = max(1, cell_w), max(1, cell_h)
+                placed: list[tuple[int, int, int, int]] = []
+                for bubble in reversed(bubbles):
+                    view = self._world_to_view(bubble.x, bubble.y)
+                    if view is None:
+                        continue
+                    vx, vy = view
+                    body_w, body_h, tail = measure_world_label(bubble.text, bubble.indicator)
+                    step = body_h + max(2, cell_h // 8)
+                    x0 = vx * cell_w + cell_w // 2 - body_w // 2
+                    lift = 0
+                    for _ in range(64):  # bounded so a dense pile can't spin forever
+                        top = vy * cell_h - body_h - tail - lift
+                        rect = (x0, top, x0 + body_w, top + body_h)
+                        if not any(_rects_overlap(rect, other) for other in placed):
+                            break
+                        lift += step
+                    placed.append(rect)
+                    draw_world_label(
+                        vx, vy, bubble.text,
+                        indicator=bubble.indicator,
+                        indicator_color=bubble.indicator_color,
+                        lift=lift,
+                    )
+            else:
+                # No measurement hook (test double): draw without overlap layout.
+                for bubble in bubbles:
+                    view = self._world_to_view(bubble.x, bubble.y)
+                    if view is not None:
+                        draw_world_label(
+                            view[0], view[1], bubble.text,
+                            indicator=bubble.indicator,
+                            indicator_color=bubble.indicator_color,
+                        )
+
+        # The look cursor rides on top of the night wash so it stays bright while
+        # examining. Only drawn when the cursor cell is inside the viewport.
+        if self.look_cursor is not None:
+            draw_cursor = getattr(r, "draw_cursor", None)
+            cursor_view = self._world_to_view(*self.look_cursor)
+            if cursor_view is not None and callable(draw_cursor):
+                draw_cursor(cursor_view[0], cursor_view[1])
+
         draw_text_clipped = getattr(r, "draw_text_clipped", None)
         time_text = f"{format_datetime(clock)}  "
         needs_text = ""
@@ -2622,7 +2994,12 @@ class RenderProcessor(esper.Processor):
                 f"Hunger {int(needs.hunger)}%  Thirst {int(needs.thirst)}%  "
                 f"Tired {int(needs.tiredness)}%    "
             )
-        status_line = f"{time_text}{needs_text}I inv  C status  R sleep  Esc menu"
+        # While looking, the examine line replaces the usual hint bar so the
+        # player can read what's under the cursor and which actions it affords.
+        if self.look_info:
+            status_line = self.look_info
+        else:
+            status_line = f"{time_text}{needs_text}I inv  C status  L look  R sleep  Esc menu"
         if callable(draw_text_clipped):
             draw_text_clipped(0, self._status_y, status_line, self._grid_w)
         else:

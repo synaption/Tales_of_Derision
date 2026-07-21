@@ -238,6 +238,31 @@ class BuildPlan:
 
 
 @dataclass
+class Personality:
+    """A sentient being's named personality traits (e.g. ``"Cheerful"``,
+    ``"Grumpy"``, ``"Shy"``), drawn from ``systems._TRAITS``. Traits drive how
+    sociable the being is and whether a given interaction warms or sours a
+    relationship.
+
+    ``last_social_turn`` is bookkeeping for the social cooldown: the world-clock
+    turn this being last interacted with someone, so it doesn't chatter every
+    turn. It lives here (rather than a module global) so it clears with the ECS
+    database between games/tests.
+    """
+    traits: list[str] = field(default_factory=list)
+    last_social_turn: int = -10_000
+
+
+@dataclass
+class Relationships:
+    """Sims-like friendship scores toward other beings. ``scores`` maps another
+    entity id -> friendship in ``[-100, 100]``; 0 is a stranger, positive a
+    friend, negative a rival. Missing entries read as 0. Repeated interactions
+    nudge the score up or down gradually (see ``systems.interact``)."""
+    scores: dict[int, float] = field(default_factory=dict)
+
+
+@dataclass
 class Inventory:
     items: list[str] = field(default_factory=list)
 

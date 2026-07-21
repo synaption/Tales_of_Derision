@@ -38,13 +38,15 @@ from main import (
     _apply_consumable,
     _chop_tree,
     _cook_at_stove,
+    _creature_at_xy,
     _creature_status_lines,
     _drink_from_well,
     _find_adjacent_feature,
     _find_interaction_creature,
     _harvest_bush,
+    _look_available_actions,
 )
-from components import Deer, Diet, Fish, Friendly, OnFire, Seaweed
+from components import Deer, Dialogue, Diet, Fish, Friendly, OnFire, Seaweed
 from systems import FishAiProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, WAIT_ACTION, _pull_turn_events
 
 pytestmark = pytest.mark.unrendered
@@ -491,6 +493,42 @@ def test_find_interaction_creature_targets_any_faced_creature() -> None:
     # Unlike _find_interaction_npc, this finds hostiles too (for examine).
     assert _find_interaction_creature("move_up") == enemy
     assert _find_interaction_creature("move_down") is None
+
+
+def test_creature_at_xy_finds_npcs_and_the_player() -> None:
+    player = esper.create_entity(Position(5, 5), Player(), Name("You"))
+    villager = esper.create_entity(Position(8, 5), NPC(), Friendly(), Name("Villager"))
+    assert _creature_at_xy(5, 5) == player
+    assert _creature_at_xy(8, 5) == villager
+    assert _creature_at_xy(6, 5) is None
+
+
+def test_look_actions_gate_trade_and_melee_to_adjacent() -> None:
+    friendly = esper.create_entity(
+        NPC(), Friendly(), Dialogue("hi"), Name("Villager")
+    )
+    # Right next to the player: trade, talk, and status are all on offer.
+    adjacent = _look_available_actions(friendly, dist=1)
+    assert "Trade" in adjacent
+    assert "Talk" in adjacent
+    assert "Status" in adjacent
+    # A few tiles away: still within talking range, but no trading.
+    talk_range = _look_available_actions(friendly, dist=4)
+    assert "Talk" in talk_range
+    assert "Trade" not in talk_range
+    # Far off: only their status can be read.
+    assert _look_available_actions(friendly, dist=20) == ["Status"]
+
+
+def test_look_actions_offer_attack_only_next_to_a_hostile() -> None:
+    enemy = esper.create_entity(NPC(), Enemy(), Name("Goblin"))
+    assert "Attack" in _look_available_actions(enemy, dist=1)
+    assert "Attack" not in _look_available_actions(enemy, dist=2)
+
+
+def test_look_actions_on_the_player_are_status_only() -> None:
+    player = esper.create_entity(Player(), Name("You"))
+    assert _look_available_actions(player, dist=0) == ["Status"]
 
 
 def test_cook_villager_gathers_cooks_then_eats_cooked_meat() -> None:
