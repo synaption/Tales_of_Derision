@@ -15,7 +15,7 @@ from typing import Any
 
 import esper
 
-from components import Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Gender, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
+from components import Age, Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Gender, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
 from onymancer import make_onymancer
 from game_map import GameMap
 from items import (
@@ -43,7 +43,7 @@ from persistence import (
 )
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, bubbles_active, friendship, furnish_house, go_to_sleep, interact, pick_berries, player_is_animated, queue_message, set_bed_owner, slay_entity, spawn_speech_bubble, status_label, wake_up, world_clock
+from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, ReproductionProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, born_turn_for_age, bubbles_active, friendship, furnish_house, go_to_sleep, interact, pick_berries, player_is_animated, queue_message, set_bed_owner, slay_entity, spawn_speech_bubble, status_label, wake_up, world_clock
 
 # The world is a 3x3 grid of 120x60 sections: the habitable island sits in the
 # centre section, ringed by a coastline, and the surrounding eight sections are
@@ -2706,6 +2706,7 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         # Placeholder until character creation lets the player choose; the future
         # reproduction system reads this.
         Gender("male"),
+        Age(born_turn_for_age(start_clock, 25.0)),
         Player(),
         Vision(10),
         BlocksMovement(),
@@ -2732,7 +2733,7 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     guard_pos = Position(max(2, player_position.x - 5), player_position.y)
     rat_pos = Position(min(game_map.width - 3, player_position.x + 6), max(2, player_position.y - 2))
 
-    def spawn_villager(pos: Position, gender: str, traits: list[str], surname: str) -> int:
+    def spawn_villager(pos: Position, gender: str, traits: list[str], surname: str, age_years: float) -> int:
         # The onymancer coins the given name (flavoured by gender) and joins it to
         # the family surname. Skin tone still seeds off the final name so it stays
         # stable across runs.
@@ -2742,6 +2743,9 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
             Renderable("v", fg=_human_skin_tone(full, offset=7)),
             Name(full),
             Gender(gender),
+            # Born far enough in the past to be their starting age now; parents are
+            # adults, the children too young to marry or reproduce until they grow.
+            Age(born_turn_for_age(start_clock, age_years)),
             # Links (spouse/parents/children) are wired reciprocally after the
             # whole household is spawned.
             Family(surname=surname),
@@ -2773,40 +2777,39 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     # so relationships include spouses, parents/children, and siblings from the
     # outset. Traits are the original contrasting personalities -- so the social AI
     # still produces both warming (++) and souring (--) interactions -- while names,
-    # genders, and family ties are new. Each entry is (gender, traits, offset);
-    # placement stays a deterministic loose cluster near the player.
-    households: list[tuple[
-        tuple[str, list[str], tuple[int, int]],       # father
-        tuple[str, list[str], tuple[int, int]],       # mother
-        list[tuple[str, list[str], tuple[int, int]]],  # children
-    ]] = [
+    # genders, ages, and family ties are new. Each entry is
+    # (gender, traits, offset, age_years): the parents are adults, the children too
+    # young to marry or reproduce until they grow up. Placement stays a
+    # deterministic loose cluster near the player.
+    Person = tuple[str, list[str], tuple[int, int], float]
+    households: list[tuple[Person, Person, list[Person]]] = [
         (
-            ("male", ["Cheerful", "Outgoing"], (-2, 1)),
-            ("female", ["Kind", "Shy"], (-3, 2)),
+            ("male", ["Cheerful", "Outgoing"], (-2, 1), 34.0),
+            ("female", ["Kind", "Shy"], (-3, 2), 31.0),
             [
-                ("male", ["Grumpy"], (-4, 1)),
-                ("female", ["Playful", "Kind"], (-2, 3)),
+                ("male", ["Grumpy"], (-4, 1), 9.0),
+                ("female", ["Playful", "Kind"], (-2, 3), 6.0),
             ],
         ),
         (
-            ("male", ["Aloof"], (-5, 2)),
-            ("female", ["Outgoing", "Playful"], (-3, 3)),
+            ("male", ["Aloof"], (-5, 2), 28.0),
+            ("female", ["Outgoing", "Playful"], (-3, 3), 26.0),
             [],
         ),
     ]
 
     for father_spec, mother_spec, child_specs in households:
         surname = onymancer.surname()
-        fg, ftraits, foff = father_spec
-        mg, mtraits, moff = mother_spec
-        father = spawn_villager(_place(foff), fg, ftraits, surname)
-        mother = spawn_villager(_place(moff), mg, mtraits, surname)
+        fg, ftraits, foff, fage = father_spec
+        mg, mtraits, moff, mage = mother_spec
+        father = spawn_villager(_place(foff), fg, ftraits, surname, fage)
+        mother = spawn_villager(_place(moff), mg, mtraits, surname, mage)
         father_fam = esper.component_for_entity(father, Family)
         mother_fam = esper.component_for_entity(mother, Family)
         father_fam.spouse = mother
         mother_fam.spouse = father
-        for cg, ctraits, coff in child_specs:
-            child = spawn_villager(_place(coff), cg, ctraits, surname)
+        for cg, ctraits, coff, cage in child_specs:
+            child = spawn_villager(_place(coff), cg, ctraits, surname, cage)
             child_fam = esper.component_for_entity(child, Family)
             child_fam.parents = [father, mother]
             father_fam.children.append(child)
@@ -2950,9 +2953,8 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
     def plant_bush(x: int, y: int) -> None:
         place_at(x, y, Renderable("%", fg=_BERRY_RED), Name("Berry Bush"), BerryBush(), BlocksMovement())
 
-    # A few starter trees within reach, plus deterministic forest stands spread
-    # across the map so both the player and grazing deer have wood/food. Twice
-    # the trees of the old world -- ten per stand, ten starters.
+    # A few starter trees within reach, plus a forest scattered across the land
+    # so both the player and grazing deer have wood/food.
     for tree_dx, tree_dy in (
         (-3, -2), (-4, -2), (-3, 3), (5, 3), (6, 3),
         (-5, -2), (-4, 3), (6, 4), (-5, 2), (5, 4),
@@ -2963,18 +2965,25 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
     for bush_dx, bush_dy in ((-2, 3), (4, -2)):
         plant_bush(player_position.x + bush_dx, player_position.y + bush_dy)
 
+    # Scatter flora across the land so starting tree cover is roughly 10% of
+    # walkable land tiles, with a sparser sprinkling of berry bushes for
+    # foragers. Randomised each new world.
+    _TREE_COVER = 0.10
+    _BUSH_COVER = 0.01
+    for y in range(game_map.land_y0, game_map.land_y0 + game_map.land_h):
+        for x in range(game_map.land_x0, game_map.land_x0 + game_map.land_w):
+            if not game_map.is_walkable(x, y):
+                continue
+            roll = random.random()
+            if roll < _TREE_COVER:
+                plant_tree(x, y)
+            elif roll < _TREE_COVER + _BUSH_COVER:
+                plant_bush(x, y)
+
     stand_centers = [
         (int(game_map.width * fx), int(game_map.height * fy))
         for fx, fy in ((0.15, 0.25), (0.4, 0.8), (0.7, 0.6), (0.85, 0.75), (0.55, 0.2))
     ]
-    for cx, cy in stand_centers:
-        for tx, ty in (
-            (0, 0), (1, 0), (0, 1), (2, 1), (1, 2),
-            (2, 2), (3, 0), (0, 3), (3, 2), (2, 3),
-        ):
-            plant_tree(cx + tx, cy + ty)
-        # Each stand also carries a berry bush for foragers.
-        plant_bush(cx + 1, cy + 1)
 
     # Deer near the tree stands / water so they can graze and drink.
     for cx, cy in stand_centers:
@@ -3038,6 +3047,7 @@ async def main() -> None:
             esper.add_processor(FishAiProcessor(game_map), priority=0)
             esper.add_processor(NeedsProcessor(), priority=0)
             esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
+            esper.add_processor(ReproductionProcessor(), priority=0)
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame

@@ -12,9 +12,10 @@ import time
 
 import esper
 
-from components import Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Diet, Enemy, Equipment, Fish, Friendly, Furniture, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Owned, Personality, Player, Position, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
+from components import Age, Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, OnFire, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
+from onymancer import make_onymancer
 from renderer.base import Renderer
 
 _ACTION_DELTAS = {
@@ -242,6 +243,43 @@ def format_datetime(clock: WorldClock | None) -> str:
         return "Day"
     year, month, week, day, hour, minute = calendar(clock)
     return f"Y{year} M{month} W{week} D{day} {hour:02d}:{minute:02d} {time_phase(clock)}"
+
+
+def current_day(clock: WorldClock | None) -> int:
+    """The absolute day number the clock is on (0-based, counting from turn 0).
+    Used to gate once-per-day behaviour like a man's mating cooldown."""
+    if clock is None:
+        return 0
+    return clock.turn // max(1, clock.day_length)
+
+
+# --- Aging -----------------------------------------------------------------
+# A person is an adult (may court, marry, and reproduce) from this age on. Age is
+# derived from ``Age.born_turn`` and the clock, so nobody is ticked each turn.
+_ADULT_AGE_YEARS = 16
+
+
+def age_years(ent: int, clock: WorldClock | None) -> float:
+    """A person's age in years, from their ``Age.born_turn`` and the world clock.
+    Returns 0.0 for a being with no ``Age`` or no clock."""
+    if clock is None or not esper.has_component(ent, Age):
+        return 0.0
+    born = esper.component_for_entity(ent, Age).born_turn
+    turns_per_year = _DAYS_PER_YEAR * max(1, clock.day_length)
+    return max(0.0, (clock.turn - born) / turns_per_year)
+
+
+def is_adult(ent: int, clock: WorldClock | None) -> bool:
+    """Whether ``ent`` has reached adulthood (``_ADULT_AGE_YEARS``)."""
+    return age_years(ent, clock) >= _ADULT_AGE_YEARS
+
+
+def born_turn_for_age(clock: WorldClock | None, age: float) -> int:
+    """The ``Age.born_turn`` that makes someone ``age`` years old right now -- used
+    to give the starting cast their ages (adults and children alike)."""
+    turn = clock.turn if clock is not None else 0
+    day_length = clock.day_length if clock is not None else 240
+    return int(turn - age * _DAYS_PER_YEAR * max(1, day_length))
 
 
 def night_overlay_alpha(clock: WorldClock | None) -> int:
@@ -785,6 +823,24 @@ _SOCIAL_COOLDOWN = 6
 _SOCIAL_SIGHT = 8
 _SOCIAL_DISTANCE_PENALTY = 2.0
 
+# --- Courtship, mating, and marriage ---------------------------------------
+# Two adults of opposite gender grow from friends to lovers to spouses as their
+# mutual friendship climbs. Lovers may have sex (in private); a very close pair
+# marries and shares a bed. Thresholds are on the [-100, 100] friendship scale.
+_LOVERS_FRIENDSHIP = 60.0     # mutual friendship at which a pair may have sex
+_MARRIAGE_FRIENDSHIP = 85.0   # mutual friendship at which a pair weds
+# Sex happens only when nobody else is watching: no other person may stand within
+# this many tiles of either partner.
+_MATING_PRIVACY_RADIUS = 6
+# The odds a single act of sex results in pregnancy.
+_PREGNANCY_CHANCE = 0.01
+# Gestation: "9 months" read as 3/4 of this world's 112-day year (a full 9 of the
+# 28-day months would run past a year). Measured in days; scaled to turns in use.
+_GESTATION_DAYS = 84
+# The heart that floats over a couple who have just been intimate.
+_HEART = "♥"
+_HEART_PINK = (235, 110, 150)
+
 
 def personality_warmth(traits: list[str]) -> float:
     """Sum of the warmth of a being's traits (0.0 for a being with none)."""
@@ -1008,6 +1064,196 @@ def interact(
     return delta_a, delta_b
 
 
+# --- Courtship: lovers, sex, and marriage ----------------------------------
+
+
+def _gender_of(ent: int) -> str | None:
+    if esper.has_component(ent, Gender):
+        return esper.component_for_entity(ent, Gender).value
+    return None
+
+
+def _family(ent: int) -> Family:
+    """The entity's ``Family`` component, created (with an empty surname) if it
+    somehow lacks one -- so marriage can always record a spouse."""
+    if esper.has_component(ent, Family):
+        return esper.component_for_entity(ent, Family)
+    fam = Family(surname="")
+    esper.add_component(ent, fam)
+    return fam
+
+
+def _surname_of(name: str) -> str:
+    """The trailing surname of a ``"Given Surname"`` display name (or the whole
+    string if it has no space)."""
+    return name.rsplit(" ", 1)[-1]
+
+
+def are_courtship_eligible(a: int, b: int, clock: WorldClock | None) -> bool:
+    """Whether ``a`` and ``b`` could be a romantic couple at all: two different,
+    living, adult, opposite-gender, friendly beings. Friendship level (lovers vs
+    spouses) is checked separately by the callers."""
+    if a == b or not esper.entity_exists(a) or not esper.entity_exists(b):
+        return False
+    if not (is_adult(a, clock) and is_adult(b, clock)):
+        return False
+    ga, gb = _gender_of(a), _gender_of(b)
+    if ga is None or gb is None or ga == gb:
+        return False
+    return esper.has_component(a, Friendly) and esper.has_component(b, Friendly)
+
+
+def _mutual_friendship(a: int, b: int) -> float:
+    """The weaker of the two friendship scores -- courtship needs both to feel it,
+    so we gate on the lower direction."""
+    rel_a = esper.component_for_entity(a, Relationships) if esper.has_component(a, Relationships) else None
+    rel_b = esper.component_for_entity(b, Relationships) if esper.has_component(b, Relationships) else None
+    return min(friendship(rel_a, b), friendship(rel_b, a))
+
+
+def is_private(a: int, b: int, sentients: list[tuple[int, Position]]) -> bool:
+    """True when no third person stands within ``_MATING_PRIVACY_RADIUS`` of either
+    partner -- the couple is alone enough to be intimate. ``sentients`` is the
+    per-turn snapshot of everyone with a ``Personality``."""
+    if not (esper.has_component(a, Position) and esper.has_component(b, Position)):
+        return False
+    pa = esper.component_for_entity(a, Position)
+    pb = esper.component_for_entity(b, Position)
+    for other, opos in sentients:
+        if other == a or other == b:
+            continue
+        if (_chebyshev((pa.x, pa.y), (opos.x, opos.y)) <= _MATING_PRIVACY_RADIUS
+                or _chebyshev((pb.x, pb.y), (opos.x, opos.y)) <= _MATING_PRIVACY_RADIUS):
+            return False
+    return True
+
+
+def try_marry(a: int, b: int, clock: WorldClock | None) -> bool:
+    """Wed ``a`` and ``b`` if they are courtship-eligible, both currently single,
+    and their mutual friendship has reached ``_MARRIAGE_FRIENDSHIP``. The wife
+    takes the husband's surname (her display name updates to match), the couple
+    come to share a home, and the wedding is logged. Returns True if they married."""
+    if not are_courtship_eligible(a, b, clock):
+        return False
+    fam_a, fam_b = _family(a), _family(b)
+    if fam_a.spouse is not None or fam_b.spouse is not None:
+        return False
+    if _mutual_friendship(a, b) < _MARRIAGE_FRIENDSHIP:
+        return False
+
+    fam_a.spouse = b
+    fam_b.spouse = a
+
+    # The wife adopts the husband's family name so they -- and their children --
+    # share one surname.
+    husband = a if _gender_of(a) == "male" else b
+    wife = b if husband == a else a
+    surname = _family(husband).surname or _surname_of(_entity_display_name(husband))
+    _adopt_surname(wife, surname)
+
+    # Share a bed: whoever already has a home takes the other in.
+    _merge_homes(husband, wife)
+
+    _push_turn_event(f"{_entity_display_name(a)} and {_entity_display_name(b)} are wed.")
+    return True
+
+
+def try_mate(
+    a: int,
+    b: int,
+    turn: int,
+    clock: WorldClock | None,
+    sentients: list[tuple[int, Position]],
+    rng: Callable[[], float] = random.random,
+    bubble_clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """A private moment between lovers. If ``a`` and ``b`` are courtship-eligible,
+    their mutual friendship is at least ``_LOVERS_FRIENDSHIP``, they are alone
+    (``is_private``), and the man hasn't already mated today (women are unbounded),
+    they have sex: both get a mating timestamp, a heart floats over each, and with
+    probability ``_PREGNANCY_CHANCE`` the woman (if not already pregnant) conceives.
+    Returns True if the act happened."""
+    if not are_courtship_eligible(a, b, clock):
+        return False
+    if _mutual_friendship(a, b) < _LOVERS_FRIENDSHIP:
+        return False
+    if not is_private(a, b, sentients):
+        return False
+
+    man = a if _gender_of(a) == "male" else b
+    woman = b if man == a else a
+
+    # Men may only mate once per day; women as often as they like.
+    man_mating = _mating(man)
+    if current_day_for_turn(man_mating.last_turn, clock) >= current_day(clock):
+        return False
+
+    man_mating.last_turn = turn
+    _mating(woman).last_turn = turn
+
+    for person in (man, woman):
+        if esper.has_component(person, Position):
+            pos = esper.component_for_entity(person, Position)
+            spawn_speech_bubble(pos.x, pos.y, _HEART, clock=bubble_clock)
+    _push_turn_event(f"{_entity_display_name(a)} and {_entity_display_name(b)} slip away together.")
+
+    if rng() < _PREGNANCY_CHANCE and not esper.has_component(woman, Pregnant):
+        esper.add_component(woman, Pregnant(conceived_turn=turn, father=man))
+    return True
+
+
+def _mating(ent: int) -> Mating:
+    if esper.has_component(ent, Mating):
+        return esper.component_for_entity(ent, Mating)
+    m = Mating()
+    esper.add_component(ent, m)
+    return m
+
+
+def current_day_for_turn(turn: int, clock: WorldClock | None) -> int:
+    """The day number a given ``turn`` falls on -- for comparing a past mating turn
+    against today. A never-mated sentinel (large negative) lands on a past day."""
+    if clock is None:
+        return turn
+    return turn // max(1, clock.day_length)
+
+
+def _entity_display_name(ent: int) -> str:
+    if esper.has_component(ent, Name):
+        return esper.component_for_entity(ent, Name).value
+    return "Someone"
+
+
+def _adopt_surname(ent: int, surname: str) -> None:
+    """Give ``ent`` the family ``surname``, updating both its ``Family`` record and
+    the surname shown in its display ``Name``."""
+    _family(ent).surname = surname
+    if esper.has_component(ent, Name):
+        name = esper.component_for_entity(ent, Name)
+        given = name.value.rsplit(" ", 1)[0] if " " in name.value else name.value
+        name.value = f"{given} {surname}"
+
+
+def _merge_homes(husband: int, wife: int) -> None:
+    """Bring a newly-wed couple under one roof so they share a bed. Whoever already
+    has a home hosts; if only one does, the other moves in; if neither, nothing to
+    do yet (the housing system settles them later, spouse-aware)."""
+    h_home = esper.component_for_entity(husband, Home) if esper.has_component(husband, Home) else None
+    w_home = esper.component_for_entity(wife, Home) if esper.has_component(wife, Home) else None
+    if h_home is not None:
+        _set_home(wife, (h_home.x, h_home.y))
+    elif w_home is not None:
+        _set_home(husband, (w_home.x, w_home.y))
+
+
+def _set_home(ent: int, xy: tuple[int, int]) -> None:
+    if esper.has_component(ent, Home):
+        home = esper.component_for_entity(ent, Home)
+        home.x, home.y = xy
+    else:
+        esper.add_component(ent, Home(xy[0], xy[1]))
+
+
 class NpcAiProcessor(esper.Processor):
     """Drives NPC behaviour each turn.
 
@@ -1122,6 +1368,27 @@ class NpcAiProcessor(esper.Processor):
                 if tree.wood <= 0:
                     esper.delete_entity(target_ent, immediate=True)  # grazed bare
                     occupied.pop(target_xy, None)
+            return True
+        return self._step_toward(ent, pos, target_xy, occupied)
+
+    def _forage_berries(
+        self,
+        ent: int,
+        pos: Position,
+        needs: Needs,
+        bushes: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        """Head to the nearest ripe berry bush and pick it clean. Bushes block
+        their tile, so the forager eats from an adjacent one; the bush regrows a
+        fresh crop days later (see ``TreeGrowthProcessor``)."""
+        bushes = self._reachable(pos, bushes)
+        if not bushes:
+            return False
+        target_xy, target_ent = min(bushes, key=lambda item: _chebyshev((pos.x, pos.y), item[0]))
+        if _chebyshev((pos.x, pos.y), target_xy) == 1:
+            if pick_berries(target_ent, world_clock()):
+                needs.hunger = max(0.0, needs.hunger - _GRAZE_RESTORE)
             return True
         return self._step_toward(ent, pos, target_xy, occupied)
 
@@ -1491,6 +1758,13 @@ class NpcAiProcessor(esper.Processor):
 
         if _chebyshev((pos.x, pos.y), (partner_pos.x, partner_pos.y)) == 1:
             interact(ent, partner_ent, turn)
+            # Growing close turns friends into lovers and lovers into spouses: a
+            # very close single pair weds; a close pair alone together may be
+            # intimate. Both are no-ops unless the pair is adult, opposite-sex,
+            # and friendly enough, so this fires only for genuine couples.
+            clock = world_clock()
+            try_marry(ent, partner_ent, clock)
+            try_mate(ent, partner_ent, turn, clock, sentients)
             return True
         return self._step_toward(ent, pos, (partner_pos.x, partner_pos.y), occupied)
 
@@ -1514,6 +1788,12 @@ class NpcAiProcessor(esper.Processor):
             if any(is_raw_meat(item) or is_cooked_meat(item) for item in inv.items)
         ]
         stoves = [((pos.x, pos.y), ent) for ent, (pos, _s) in esper.get_components(Position, Stove)]
+        # Ripe berry bushes -- a quick, ready-to-eat food NPCs forage when hungry.
+        bushes = [
+            ((pos.x, pos.y), ent)
+            for ent, (pos, bush) in esper.get_components(Position, BerryBush)
+            if bush.has_berries
+        ]
         # Sentient beings the social AI can approach (positions snapshotted once).
         sentients = [(ent, pos) for ent, (pos, _p) in esper.get_components(Position, Personality)]
 
@@ -1548,13 +1828,18 @@ class NpcAiProcessor(esper.Processor):
                     if self._eat_from_inventory(ent, needs):
                         acted = True
                     elif diet_kind == "herbivore":
-                        acted = self._graze(ent, pos, needs, trees, occupied)
+                        # Ripe berries first (quick food); else graze a tree.
+                        acted = self._forage_berries(ent, pos, needs, bushes, occupied)
+                        if not acted:
+                            acted = self._graze(ent, pos, needs, trees, occupied)
                     elif diet_kind == "carnivore":
                         # Predator: eats raw meat on the spot.
                         acted = self._seek_food(ent, pos, needs, prey, corpses, occupied)
                     elif diet_kind == "cook":
-                        # Villager: cooks meat before eating (multi-turn plan).
-                        acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
+                        # Villager: pick ripe berries when handy, else cook meat.
+                        acted = self._forage_berries(ent, pos, needs, bushes, occupied)
+                        if not acted:
+                            acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
 
             # Building a house is the lowest-priority survival drive: a resident
             # works its BuildPlan only once fed, watered, and rested.
@@ -1811,9 +2096,37 @@ class HousingProcessor(esper.Processor):
                 continue  # already owns a house -- never re-claim or rebuild
             if esper.has_component(ent, BuildPlan):
                 continue  # already building its own home
+            if self._handle_spouse_housing(ent):
+                continue  # married couples settle into one shared home
             if self._claim_unowned_house(ent, houses):
                 continue
             self._start_build(ent)
+
+    def _handle_spouse_housing(self, ent: int) -> bool:
+        """Keep a married couple under one roof. Returns True (handled: skip
+        claiming/building) when ``ent`` has a spouse and either:
+          * the spouse already owns a home -- move in and share the bed, or
+          * the spouse is the one settling the household (building, or simply the
+            designated partner) -- wait this turn and move in once it's ready.
+        Returns False only when ``ent`` itself should go get the home, so exactly
+        one spouse ever claims or builds."""
+        if not esper.has_component(ent, Family):
+            return False
+        spouse = esper.component_for_entity(ent, Family).spouse
+        if spouse is None or not esper.entity_exists(spouse):
+            return False
+
+        if owned_bed_of(spouse) is not None and esper.has_component(spouse, Home):
+            home = esper.component_for_entity(spouse, Home)
+            _set_home(ent, (home.x, home.y))
+            return True
+
+        # Neither owns a home yet. Let just one partner do the settling so they
+        # don't raise two separate cabins: the lower entity id is the settler; the
+        # other waits. If the settler is already building, wait for it either way.
+        if esper.has_component(spouse, BuildPlan):
+            return True
+        return ent > spouse
 
     def _claim_unowned_house(self, ent: int, houses: list[frozenset[tuple[int, int]]]) -> bool:
         pos = esper.component_for_entity(ent, Position) if esper.has_component(ent, Position) else None
@@ -1892,7 +2205,7 @@ class TreeGrowthProcessor(esper.Processor):
         land_area = getattr(game_map, "land_w", game_map.width) * getattr(
             game_map, "land_h", game_map.height
         )
-        self._cap = max(40, land_area // 20)
+        self._cap = max(40, land_area * 3 // 10)
         # Seaweed fills the open sea; its cap scales to the ocean area.
         ocean_area = max(0, (game_map.width * game_map.height) - land_area)
         self._seaweed_cap = ocean_area // 28
@@ -2047,6 +2360,120 @@ class TreeGrowthProcessor(esper.Processor):
                 )
                 occupied.add((x, y))
                 total += 1
+
+
+# The glyph/colour a newborn villager shares with the adult cast.
+_VILLAGER_GLYPH = "v"
+_BABY_SKIN = (222, 184, 156)
+
+
+class ReproductionProcessor(esper.Processor):
+    """Delivers babies. Once a day (a cheap day-boundary pass, like the flora)
+    it checks every pregnant woman: when the gestation period has elapsed a child
+    is born beside her -- named by the onymancer, sharing the family surname, and
+    wired to both parents. Newborns live at the mother's home and grow up on the
+    world clock; they are not ``Resident`` (a baby doesn't build its own cabin)."""
+
+    def __init__(self) -> None:
+        self._last_day: int | None = None
+        # A private onymancer for naming newborns. Births are already
+        # non-deterministic (they hinge on random pregnancy rolls), so a fixed
+        # seed here just gives a stable stream of fresh given names.
+        self._onymancer = make_onymancer(0xBA_B1_E5)
+
+    def process(self, action: str | None = None) -> None:
+        if action not in _TURN_ACTIONS:
+            return
+        clock = world_clock()
+        if clock is None:
+            return
+        day = current_day(clock)
+        if self._last_day is None:
+            self._last_day = day
+            return
+        if day == self._last_day:
+            return
+        self._last_day = day
+        self._deliver_due_pregnancies(clock)
+
+    def _deliver_due_pregnancies(self, clock: WorldClock) -> None:
+        term = _GESTATION_DAYS * max(1, clock.day_length)
+        for mother, (pregnant,) in list(esper.get_components(Pregnant)):
+            if clock.turn - pregnant.conceived_turn < term:
+                continue
+            esper.remove_component(mother, Pregnant)
+            self._give_birth(mother, pregnant.father, clock)
+
+    def _give_birth(self, mother: int, father: int, clock: WorldClock) -> None:
+        if not esper.entity_exists(mother):
+            return
+        birth_xy = self._birth_tile(mother)
+        surname = _family(mother).surname or _surname_of(_entity_display_name(mother))
+        gender = self._rng_gender()
+        given = self._onymancer.given_name(gender)
+        full = f"{given} {surname}"
+
+        traits = random.sample(list(_TRAITS), k=random.randint(1, 2))
+        baby = esper.create_entity(
+            Position(*birth_xy),
+            Renderable(_VILLAGER_GLYPH, fg=_BABY_SKIN),
+            Name(full),
+            Age(born_turn=clock.turn),
+            Gender(gender),
+            Family(surname=surname, parents=[father, mother]),
+            NPC(),
+            Friendly(),
+            Dialogue("##!/$*~# GH01^@"),
+            BlocksMovement(),
+            Inventory(items=[]),
+            Equipment(slots={}),
+            Diet("cook"),
+            Needs(),
+            Personality(traits=traits),
+            Relationships(),
+        )
+
+        # Record the child on both parents (siblings are derived from shared
+        # parents, so nothing else to link).
+        for parent in (father, mother):
+            if esper.entity_exists(parent):
+                _family(parent).children.append(baby)
+
+        # The baby lives with its mother.
+        if esper.has_component(mother, Home):
+            home = esper.component_for_entity(mother, Home)
+            _set_home(baby, (home.x, home.y))
+
+        _push_turn_event(
+            f"A child, {full}, is born to {_entity_display_name(father)} and {_entity_display_name(mother)}."
+        )
+
+    @staticmethod
+    def _rng_gender() -> str:
+        return random.choice(("male", "female"))
+
+    def _birth_tile(self, mother: int) -> tuple[int, int]:
+        """The mother's own tile if we can't do better; otherwise a free adjacent
+        tile so the newborn doesn't share a cell (it blocks movement)."""
+        if not esper.has_component(mother, Position):
+            return (0, 0)
+        mpos = esper.component_for_entity(mother, Position)
+        occupied = {
+            (pos.x, pos.y) for _e, (pos, _b) in esper.get_components(Position, BlocksMovement)
+        }
+        for nx, ny in _neighbours_8(mpos.x, mpos.y):
+            if (nx, ny) not in occupied:
+                return (nx, ny)
+        return (mpos.x, mpos.y)
+
+
+def _neighbours_8(x: int, y: int) -> list[tuple[int, int]]:
+    return [
+        (x + dx, y + dy)
+        for dy in (-1, 0, 1)
+        for dx in (-1, 0, 1)
+        if not (dx == 0 and dy == 0)
+    ]
 
 
 # Hunger/thirst thresholds (percent of max) that emit an escalating warning the

@@ -53,6 +53,35 @@ class Family:
 
 
 @dataclass
+class Age:
+    """A person's age, stored as the world-clock ``turn`` they were born on. Age
+    in years is derived from the current clock (see ``systems.age_years``), so
+    nobody has to be ticked each turn -- the same trick flora maturity uses.
+    Members of the starting cast are given a ``born_turn`` in the past (often
+    negative) so they begin as adults or children of a chosen age."""
+    born_turn: int
+
+
+@dataclass
+class Pregnant:
+    """Carried by a woman from conception until the baby is born. ``conceived_turn``
+    is the world-clock turn sex resulted in pregnancy; ``father`` is the other
+    parent's entity id. ``systems.ReproductionProcessor`` delivers the child once
+    the gestation period has elapsed and then removes this component."""
+    conceived_turn: int
+    father: int
+
+
+@dataclass
+class Mating:
+    """Bookkeeping for reproduction cooldowns: ``last_turn`` is the world-clock
+    turn this person last had sex. Men may only mate once per day (the day is
+    derived from the turn); women are unbounded, so the rule is applied per gender
+    in ``systems.try_mate`` rather than baked in here."""
+    last_turn: int = -10_000
+
+
+@dataclass
 class NPC:
     """Tag component: marks an entity controlled by AI."""
 
