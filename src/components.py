@@ -31,6 +31,28 @@ class Name:
 
 
 @dataclass
+class Gender:
+    """A person's gender. ``"male"`` or ``"female"`` for now; the onymancer and
+    (future) reproduction read it. Left as a free string so a future monogender
+    race can carry a single value of its own."""
+    value: str
+
+
+@dataclass
+class Family:
+    """A person's place in a family. ``surname`` is shared by the whole household;
+    ``spouse`` and the ``parents``/``children`` lists hold other people's entity
+    ids. Kept reciprocal by whoever wires the family (spouses point at each other,
+    parents and children point back). Siblings are derived from shared parents, so
+    they aren't stored. The future reproduction system fills these in for newborns.
+    """
+    surname: str
+    spouse: int | None = None
+    parents: list[int] = field(default_factory=list)
+    children: list[int] = field(default_factory=list)
+
+
+@dataclass
 class NPC:
     """Tag component: marks an entity controlled by AI."""
 

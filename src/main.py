@@ -15,7 +15,8 @@ from typing import Any
 
 import esper
 
-from components import Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Fish, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
+from components import Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Gender, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
+from onymancer import make_onymancer
 from game_map import GameMap
 from items import (
     BERRIES,
@@ -2688,8 +2689,11 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     start_clock.turn = int(start_clock.day_length * 0.2)
     esper.create_entity(start_clock)
 
+    # The onymancer names every villager procedurally. A fixed seed keeps the
+    # starting village identical run to run, like the rest of the world layout.
+    onymancer = make_onymancer(0x0A_15_15)
+
     player_name = "You"
-    villager_name = "Friendly Villager"
     player_skin = _human_skin_tone(player_name)
 
     player_equipment = _default_equipment_slots()
@@ -2699,6 +2703,9 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         player_position,
         Renderable("@", fg=player_skin),
         Name(player_name),
+        # Placeholder until character creation lets the player choose; the future
+        # reproduction system reads this.
+        Gender("male"),
         Player(),
         Vision(10),
         BlocksMovement(),
@@ -2725,11 +2732,19 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     guard_pos = Position(max(2, player_position.x - 5), player_position.y)
     rat_pos = Position(min(game_map.width - 3, player_position.x + 6), max(2, player_position.y - 2))
 
-    def spawn_villager(pos: Position, name: str, skin: tuple[int, int, int], traits: list[str]) -> None:
-        esper.create_entity(
+    def spawn_villager(pos: Position, gender: str, traits: list[str], surname: str) -> int:
+        # The onymancer coins the given name (flavoured by gender) and joins it to
+        # the family surname. Skin tone still seeds off the final name so it stays
+        # stable across runs.
+        _given, _surname, full = onymancer.full_name(gender, surname)
+        return esper.create_entity(
             pos,
-            Renderable("v", fg=skin),
-            Name(name),
+            Renderable("v", fg=_human_skin_tone(full, offset=7)),
+            Name(full),
+            Gender(gender),
+            # Links (spouse/parents/children) are wired reciprocally after the
+            # whole household is spawned.
+            Family(surname=surname),
             NPC(),
             Friendly(),
             Dialogue("##!/$*~# GH01^@"),
@@ -2748,22 +2763,54 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
             Relationships(),
         )
 
-    # A small cast of villagers with contrasting personalities, so the social AI
-    # produces both warming (++) and souring (--) interactions. Placement is a
-    # deterministic loose cluster near the player, clamped inside the map.
-    villager_roster: list[tuple[str, list[str]]] = [
-        (villager_name, ["Cheerful", "Outgoing"]),
-        ("Villager Mara", ["Kind", "Shy"]),
-        ("Villager Bran", ["Grumpy"]),
-        ("Villager Elda", ["Playful", "Kind"]),
-        ("Villager Tomas", ["Aloof"]),
-        ("Villager Sena", ["Outgoing", "Playful"]),
-    ]
-    villager_offsets = [(-2, 1), (-3, 2), (-4, 1), (-2, 3), (-5, 2), (-3, 3)]
-    for (vname, traits), (dx, dy) in zip(villager_roster, villager_offsets):
+    def _place(offset: tuple[int, int]) -> Position:
+        dx, dy = offset
         vx = min(game_map.width - 3, max(2, player_position.x + dx))
         vy = min(game_map.height - 3, max(2, player_position.y + dy))
-        spawn_villager(Position(vx, vy), vname, _human_skin_tone(vname, offset=7), traits)
+        return Position(vx, vy)
+
+    # The starting cast forms two households (a full family of four and a couple),
+    # so relationships include spouses, parents/children, and siblings from the
+    # outset. Traits are the original contrasting personalities -- so the social AI
+    # still produces both warming (++) and souring (--) interactions -- while names,
+    # genders, and family ties are new. Each entry is (gender, traits, offset);
+    # placement stays a deterministic loose cluster near the player.
+    households: list[tuple[
+        tuple[str, list[str], tuple[int, int]],       # father
+        tuple[str, list[str], tuple[int, int]],       # mother
+        list[tuple[str, list[str], tuple[int, int]]],  # children
+    ]] = [
+        (
+            ("male", ["Cheerful", "Outgoing"], (-2, 1)),
+            ("female", ["Kind", "Shy"], (-3, 2)),
+            [
+                ("male", ["Grumpy"], (-4, 1)),
+                ("female", ["Playful", "Kind"], (-2, 3)),
+            ],
+        ),
+        (
+            ("male", ["Aloof"], (-5, 2)),
+            ("female", ["Outgoing", "Playful"], (-3, 3)),
+            [],
+        ),
+    ]
+
+    for father_spec, mother_spec, child_specs in households:
+        surname = onymancer.surname()
+        fg, ftraits, foff = father_spec
+        mg, mtraits, moff = mother_spec
+        father = spawn_villager(_place(foff), fg, ftraits, surname)
+        mother = spawn_villager(_place(moff), mg, mtraits, surname)
+        father_fam = esper.component_for_entity(father, Family)
+        mother_fam = esper.component_for_entity(mother, Family)
+        father_fam.spouse = mother
+        mother_fam.spouse = father
+        for cg, ctraits, coff in child_specs:
+            child = spawn_villager(_place(coff), cg, ctraits, surname)
+            child_fam = esper.component_for_entity(child, Family)
+            child_fam.parents = [father, mother]
+            father_fam.children.append(child)
+            mother_fam.children.append(child)
 
     goblin_equipment = _default_equipment_slots()
     goblin_equipment["main hand"] = "Jagged Dagger"
