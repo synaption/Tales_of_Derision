@@ -22,6 +22,7 @@ from systems import (
     WAIT_ACTION,
     active_bubbles,
     adjust_friendship,
+    bubble_alpha,
     bubbles_active,
     friendship,
     gibberish,
@@ -132,6 +133,21 @@ def test_gibberish_is_non_empty() -> None:
     assert gibberish().strip() != ""
 
 
+def test_bubble_fades_out_near_end_of_life() -> None:
+    systems._SPEECH_BUBBLES.clear()
+    born = 200.0
+    spawn_speech_bubble(2, 2, "fading", clock=lambda: born)
+    bubble = active_bubbles(now=born)[0]
+
+    # Full opacity early in life, partial during the fade window, gone at the end.
+    assert bubble_alpha(bubble, born) == 255
+    fade_start = born + bubble.ttl - systems._BUBBLE_FADE_SECONDS
+    assert bubble_alpha(bubble, fade_start) == 255
+    mid_fade = bubble_alpha(bubble, fade_start + systems._BUBBLE_FADE_SECONDS / 2)
+    assert 0 < mid_fade < 255
+    assert bubble_alpha(bubble, born + bubble.ttl) == 0
+
+
 def test_bubbles_cap_per_cell_and_keep_newest() -> None:
     systems._SPEECH_BUBBLES.clear()
     now = 500.0
@@ -149,17 +165,34 @@ def test_bubbles_cap_per_cell_and_keep_newest() -> None:
     assert any((b.x, b.y) == (9, 9) for b in active_bubbles(now=now))
 
 
-def test_social_indicator_scales_with_magnitude() -> None:
-    strong_text, strong_color = systems._social_indicator(4.0)
-    mild_text, mild_color = systems._social_indicator(1.0)
-    sour_text, sour_color = systems._social_indicator(-1.0)
-    none_text, none_color = systems._social_indicator(0.2)
+def test_react_stays_silent_until_it_accumulates_a_milestone() -> None:
+    rel = Relationships()
+    other = 42
+    never = lambda: 1.0  # never trip the random mid-chat branch
 
-    assert (strong_text, strong_color) == ("++", systems._INDICATOR_GREEN)
-    assert (mild_text, mild_color) == ("+", systems._INDICATOR_GREEN)
-    assert (sour_text, sour_color) == ("-", systems._INDICATOR_RED)
-    # A near-zero interaction shows no indicator at all.
-    assert (none_text, none_color) == ("", None)
+    # Below the milestone: no indicator, but the reaction accumulates.
+    assert systems._react(rel, other, 3.5, never) == ("", None)
+    assert systems._react(rel, other, 3.5, never) == ("", None)
+    assert rel.pending[other] == 7.0
+    # Crossing the milestone surfaces a "+" and resets the pending total.
+    text, color = systems._react(rel, other, 3.5, never)  # total 10.5
+    assert (text, color) == ("+", systems._INDICATOR_GREEN)
+    assert rel.pending[other] == 0.0
+
+
+def test_react_doubles_when_strong_and_reddens_when_negative() -> None:
+    rel = Relationships()
+    never = lambda: 1.0
+    assert systems._react(rel, 7, 16.0, never) == ("++", systems._INDICATOR_GREEN)
+    assert systems._react(rel, 7, -16.0, never) == ("--", systems._INDICATOR_RED)
+
+
+def test_react_can_surface_a_mild_indicator_mid_conversation() -> None:
+    rel = Relationships()
+    # Pending is above the floor but below the milestone; force the random branch.
+    assert systems._react(rel, 7, 1.0, lambda: 0.0) == ("+", systems._INDICATOR_GREEN)
+    # Without the random trip it would have stayed silent.
+    assert systems._react(rel, 8, 1.0, lambda: 1.0) == ("", None)
 
 
 # --- Player Talk ------------------------------------------------------------

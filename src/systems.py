@@ -841,15 +841,22 @@ def adjust_friendship(ent: int, other: int, delta: float) -> float:
 # queue, but positional and self-expiring). The RenderProcessor draws whatever is
 # live each frame; the turn loop keeps re-rendering while any are active.
 _BUBBLE_TTL = 2.5  # seconds a bubble stays on screen
+# A bubble fades to nothing over its final ``_BUBBLE_FADE_SECONDS`` instead of
+# vanishing abruptly.
+_BUBBLE_FADE_SECONDS = 0.8
 # A busy tile stacks bubbles upward (newest nearest the character); the oldest
 # scroll off once the stack is this tall.
 _MAX_BUBBLES_PER_CELL = 3
 
-# The ``++``/``--``/``+``/``-`` indicator that trails a bubble's gibberish. Its
-# strength scales with how much the interaction moved friendship, and small
-# interactions get no indicator at all. Green warms, red sours.
-_INDICATOR_MIN = 0.5      # below this |delta|, no indicator is shown
-_INDICATOR_STRONG = 2.5   # at/above this |delta|, the doubled form (++ / --)
+# The ``++``/``--``/``+``/``-`` indicator that trails a bubble's gibberish. Most
+# bubbles show none: friendship keeps changing every exchange, but a being's
+# reaction accumulates silently and only surfaces once it reaches a milestone
+# (which tends to fall late in a conversation) or, now and then, at random in the
+# middle. Green warms, red sours; the doubled form marks a big built-up reaction.
+_INDICATOR_MIN = 0.5         # below this |pending|, never show an indicator
+_INDICATOR_MILESTONE = 9.0   # |pending| that reliably surfaces an indicator
+_INDICATOR_DOUBLE = 16.0     # |pending| at/above which it doubles (++ / --)
+_MID_CHAT_INDICATOR_CHANCE = 0.08  # odds of surfacing a mild indicator mid-chat
 _INDICATOR_GREEN = (110, 215, 120)
 _INDICATOR_RED = (232, 96, 96)
 
@@ -920,16 +927,46 @@ def bubbles_active(now: float | None = None) -> bool:
     return bool(active_bubbles(now))
 
 
-def _social_indicator(delta: float) -> tuple[str, tuple[int, int, int] | None]:
-    """The ``(text, colour)`` indicator for a friendship change: green ``+``/``++``
-    for a warming interaction, red ``-``/``--`` for a souring one, doubled once the
-    change is strong. A near-zero interaction gets no indicator (``("", None)``)."""
-    magnitude = abs(delta)
-    if magnitude < _INDICATOR_MIN:
+def bubble_alpha(bubble: _Bubble, now: float) -> int:
+    """A bubble's current opacity (0-255): full for most of its life, then a
+    linear fade to nothing over its final ``_BUBBLE_FADE_SECONDS``."""
+    remaining = bubble.ttl - (now - bubble.born)
+    if remaining <= 0:
+        return 0
+    if remaining >= _BUBBLE_FADE_SECONDS:
+        return 255
+    return max(0, min(255, int(255 * remaining / _BUBBLE_FADE_SECONDS)))
+
+
+def _react(
+    rel: Relationships,
+    other: int,
+    delta: float,
+    rng: Callable[[], float] = random.random,
+) -> tuple[str, tuple[int, int, int] | None]:
+    """Fold ``delta`` into ``rel``'s pending reaction toward ``other`` and decide
+    whether this bubble shows an indicator. Returns the ``(text, colour)`` to draw,
+    or ``("", None)`` for a plain (indicator-less) bubble.
+
+    Most exchanges return nothing: the reaction accumulates. It surfaces once the
+    pending total reaches ``_INDICATOR_MILESTONE`` (so a run of chatting culminates
+    in a ``+``/``-``, doubled past ``_INDICATOR_DOUBLE``) or, occasionally, at random
+    once it is at least ``_INDICATOR_MIN``. Surfacing resets the pending total."""
+    pending = rel.pending.get(other, 0.0) + delta
+    magnitude = abs(pending)
+
+    if magnitude >= _INDICATOR_MILESTONE:
+        show, strong = True, magnitude >= _INDICATOR_DOUBLE
+    elif magnitude >= _INDICATOR_MIN and rng() < _MID_CHAT_INDICATOR_CHANCE:
+        show, strong = True, False
+    else:
+        rel.pending[other] = pending
         return "", None
-    if delta > 0:
-        return ("++" if magnitude >= _INDICATOR_STRONG else "+"), _INDICATOR_GREEN
-    return ("--" if magnitude >= _INDICATOR_STRONG else "-"), _INDICATOR_RED
+
+    rel.pending[other] = 0.0
+    if pending > 0:
+        return ("++" if strong else "+"), _INDICATOR_GREEN
+    return ("--" if strong else "-"), _INDICATOR_RED
 
 
 def _traits_of(ent: int) -> list[str]:
@@ -938,25 +975,32 @@ def _traits_of(ent: int) -> list[str]:
     return []
 
 
-def interact(a: int, b: int, turn: int, clock: Callable[[], float] = time.monotonic) -> tuple[float, float]:
-    """Run one social interaction between beings ``a`` and ``b``: adjust each
-    one's friendship toward the other by its personality-driven delta, stamp the
-    cooldown on both, and pop a gibberish speech bubble + ``++``/``--`` indicator
-    above each. Returns ``(delta_a, delta_b)``. Shared by the NPC social AI and
-    the player's Talk action."""
-    a_traits = _traits_of(a)
-    b_traits = _traits_of(b)
-    delta_a = interaction_delta(a_traits, b_traits)
-    delta_b = interaction_delta(b_traits, a_traits)
+def interact(
+    a: int,
+    b: int,
+    turn: int,
+    clock: Callable[[], float] = time.monotonic,
+    rng: Callable[[], float] = random.random,
+) -> tuple[float, float]:
+    """Run one social interaction between beings ``a`` and ``b``: adjust each one's
+    friendship toward the other by its personality-driven delta, stamp the cooldown
+    on both, and pop a gibberish speech bubble above each -- most bubbles are plain,
+    with a ``+``/``-`` indicator surfacing only now and then (see ``_react``).
+    Returns ``(delta_a, delta_b)``. Shared by the NPC social AI and the player Talk
+    action."""
+    delta_a = interaction_delta(_traits_of(a), _traits_of(b))
+    delta_b = interaction_delta(_traits_of(b), _traits_of(a))
+    rel_a = _relationships(a)
+    rel_b = _relationships(b)
     adjust_friendship(a, b, delta_a)
     adjust_friendship(b, a, delta_b)
 
-    for ent, delta in ((a, delta_a), (b, delta_b)):
+    for ent, other, rel, delta in ((a, b, rel_a, delta_a), (b, a, rel_b, delta_b)):
         if esper.has_component(ent, Personality):
             esper.component_for_entity(ent, Personality).last_social_turn = turn
         if esper.has_component(ent, Position):
             pos = esper.component_for_entity(ent, Position)
-            indicator, indicator_color = _social_indicator(delta)
+            indicator, indicator_color = _react(rel, other, delta, rng)
             spawn_speech_bubble(
                 pos.x, pos.y, gibberish(),
                 indicator=indicator, indicator_color=indicator_color, clock=clock,
@@ -2935,7 +2979,8 @@ class RenderProcessor(esper.Processor):
         measure_world_label = getattr(r, "measure_world_label", None)
         get_cell_px = getattr(r, "get_tile_cell_size_px", None)
         if callable(draw_world_label):
-            bubbles = active_bubbles(self._clock())
+            now = self._clock()
+            bubbles = active_bubbles(now)
             if callable(measure_world_label) and callable(get_cell_px):
                 # Lay bubbles out newest-first: each one takes the lowest vertical
                 # slot (nearest its character) that doesn't overlap an already-placed
@@ -2965,6 +3010,7 @@ class RenderProcessor(esper.Processor):
                         indicator=bubble.indicator,
                         indicator_color=bubble.indicator_color,
                         lift=lift,
+                        alpha=bubble_alpha(bubble, now),
                     )
             else:
                 # No measurement hook (test double): draw without overlap layout.
@@ -2975,6 +3021,7 @@ class RenderProcessor(esper.Processor):
                             view[0], view[1], bubble.text,
                             indicator=bubble.indicator,
                             indicator_color=bubble.indicator_color,
+                            alpha=bubble_alpha(bubble, now),
                         )
 
         # The look cursor rides on top of the night wash so it stays bright while

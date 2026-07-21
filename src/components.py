@@ -258,8 +258,15 @@ class Relationships:
     """Sims-like friendship scores toward other beings. ``scores`` maps another
     entity id -> friendship in ``[-100, 100]``; 0 is a stranger, positive a
     friend, negative a rival. Missing entries read as 0. Repeated interactions
-    nudge the score up or down gradually (see ``systems.interact``)."""
+    nudge the score up or down gradually (see ``systems.interact``).
+
+    ``pending`` accumulates the not-yet-shown reaction toward each other being --
+    friendship keeps changing every exchange, but the ``+``/``-`` indicator only
+    surfaces once this builds to a milestone (or occasionally at random), so most
+    chat bubbles carry no indicator. It resets to 0 whenever an indicator shows.
+    """
     scores: dict[int, float] = field(default_factory=dict)
+    pending: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass

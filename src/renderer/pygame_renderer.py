@@ -1283,19 +1283,21 @@ class PygameRenderer(Renderer):
         indicator: str = "",
         indicator_color: tuple[int, int, int] | None = None,
         lift: int = 0,
+        alpha: int = 255,
         bg: tuple[int, int, int] = (40, 40, 46),
     ) -> None:
         """Draw a speech bubble (translucent dark-gray body, dark outline, a tail
-        near the bubble's corner pointing down at the character) centred above map
-        cell ``(vx, vy)``, in world/tile pixel space so it aligns with the character
-        on that tile (the UI text grid is a different size).
+        pointing down-right at the top-right corner of the speaker's tile) centred
+        above map cell ``(vx, vy)``, in world/tile pixel space so it aligns with the
+        character on that tile (the UI text grid is a different size).
 
         ``text`` is the white gibberish; ``indicator`` (e.g. ``"++"``) trails it in
-        ``indicator_color``. ``lift`` raises the whole bubble by that many pixels, so
+        ``indicator_color``. ``lift`` raises the whole bubble by that many pixels so
         the caller can stack bubbles that would otherwise overlap (a newer bubble is
-        drawn lower and shoves older ones up)."""
+        drawn lower and shoves older ones up). ``alpha`` (0-255) fades the whole
+        bubble uniformly, for a smooth fade-out near end of life."""
         pygame = self._pygame
-        if pygame is None or self._screen is None or self._font is None or not text:
+        if pygame is None or self._screen is None or self._font is None or not text or alpha <= 0:
             return
 
         outline = (18, 18, 22, 225)
@@ -1312,14 +1314,18 @@ class PygameRenderer(Renderer):
         bx = cx - body_w // 2
         by = vy * self._cell_h - body_h - tail - lift  # always above the tile, raised by lift
 
-        # Compose on a per-pixel-alpha surface so the bubble is translucent, then
-        # blit it in one go. Local coords leave a margin plus room for the tail.
+        # Compose on a per-pixel-alpha surface so the bubble is translucent (and can
+        # be faded as a whole), then blit it once. Local coords leave a margin plus
+        # room for the tail below the body.
         margin = border + 1
         surf = pygame.Surface((body_w + margin * 2, body_h + tail + margin * 2), pygame.SRCALPHA)
         body = pygame.Rect(margin, margin, body_w, body_h)
 
-        # Tail sits near the bubble's lower-left corner and points down at the tile.
-        tail_x = margin + min(body_w - tail - border, tail + border * 2)
+        # The tail tip lands on the top-right corner of the speaker's tile; its base
+        # sits on the bubble's bottom edge, so it slants down-right toward the tile.
+        tile_corner_x = (vx + 1) * self._cell_w
+        tail_x = margin + (tile_corner_x - bx)
+        tail_x = max(margin + tail + border, min(margin + body_w - tail - border, tail_x))
         tip = (tail_x, margin + body_h + tail)
         base_y = margin + body_h - border
         fill_base_y = margin + body_h - border * 2
@@ -1338,10 +1344,17 @@ class PygameRenderer(Renderer):
             [fill_tip, (tail_x - tail + border, fill_base_y), (tail_x + tail - border, fill_base_y)],
         )
 
-        self._screen.blit(surf, (bx - margin, by - margin))
-        self._screen.blit(text_surf, (bx + pad_x, by + pad_y))
+        # Text/indicator go onto the same surface so the fade multiply below covers
+        # them too.
+        surf.blit(text_surf, (margin + pad_x, margin + pad_y))
         if ind_surf is not None:
-            self._screen.blit(ind_surf, (bx + pad_x + tw + gap, by + pad_y))
+            surf.blit(ind_surf, (margin + pad_x + tw + gap, margin + pad_y))
+
+        if alpha < 255:
+            # Scale every pixel's alpha by alpha/255, fading the whole bubble evenly.
+            surf.fill((255, 255, 255, alpha), special_flags=pygame.BLEND_RGBA_MULT)
+
+        self._screen.blit(surf, (bx - margin, by - margin))
 
     def set_map_clip(self, w_cells: int, h_cells: int) -> None:
         """Restrict drawing to the map viewport (top-left w_cells x h_cells) so a
