@@ -14,7 +14,7 @@ from typing import Any
 
 import esper
 
-from components import Asleep, Bed, BerryBush, BlocksMovement, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Resident, Stove, Tree, Vision, Well, WorldClock
+from components import Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Player, Position, Renderable, Resident, Stove, Tree, Vision, Well, WorldClock
 from game_map import GameMap
 from items import (
     BERRIES,
@@ -41,7 +41,7 @@ from persistence import (
 )
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, furnish_house, go_to_sleep, pick_berries, player_is_animated, queue_message, status_label, wake_up, world_clock
+from systems import HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, furnish_house, go_to_sleep, pick_berries, player_is_animated, queue_message, set_bed_owner, status_label, wake_up, world_clock
 
 # The world is a 3x3 expansion of the original 40x20 room, giving room for
 # lakes, rivers, and roaming wildlife.
@@ -1382,17 +1382,72 @@ _MIN_SLEEP_TIREDNESS = 1.0
 _SLEEP_MAX_TURNS = 400
 
 
-def _player_near_bed() -> bool:
-    """True when a Bed sits on or beside the player's tile, so the sleep action
-    can bed them down at home rather than pitching a camp."""
+def _bed_near_player() -> int | None:
+    """The nearest Bed on or beside the player's tile (so the sleep action can bed
+    them down rather than pitching a camp), or ``None`` if none is adjacent."""
     player_ent = _first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
-        return False
+        return None
     ppos = esper.component_for_entity(player_ent, Position)
-    for _ent, (pos, _bed) in esper.get_components(Position, Bed):
-        if max(abs(pos.x - ppos.x), abs(pos.y - ppos.y)) <= 1:
-            return True
-    return False
+    best: int | None = None
+    best_dist = 2
+    for ent, (pos, _bed) in esper.get_components(Position, Bed):
+        dist = max(abs(pos.x - ppos.x), abs(pos.y - ppos.y))
+        if dist <= 1 and dist < best_dist:
+            best, best_dist = ent, dist
+    return best
+
+
+async def _confirm_if_owned_by_other(renderer: Renderer, ent: int, noun: str, verb: str) -> bool:
+    """When ``ent`` belongs to someone other than the player, warn whose it is and
+    ask for confirmation. Returns True if the player may go ahead (their own/
+    unowned property proceeds silently; a decline returns False)."""
+    player_ent = _first_player_entity()
+    owner = bed_owner(ent)
+    if owner is None or owner == player_ent:
+        return True
+    owner_name = _entity_name(owner, fallback="someone else")
+    return await _confirm(
+        renderer,
+        title="Not Yours",
+        lines=[
+            f"This {noun} belongs to {owner_name}.",
+            f"Are you sure you want to {verb}?",
+        ],
+    )
+
+
+async def _confirm(renderer: Renderer, title: str, lines: list[str]) -> bool:
+    """A yes/no prompt over the game. Defaults to No; Esc cancels. Returns True
+    only if the player explicitly chooses Yes."""
+    options = ["No", "Yes"]
+    selected = 0
+    while True:
+        x, y, width, height = _draw_menu_shell(
+            renderer,
+            title=title,
+            subtitle=None,
+            footer="[W/S] choose   [Enter] confirm   [Esc] cancel",
+            width=60,
+            height=12,
+            overlay_game=True,
+        )
+        for idx, line in enumerate(lines):
+            _draw_ui_text(renderer, x + 3, y + 3 + idx, line, _MENU_TEXT_COLOR, width - 6)
+        _draw_menu_options(renderer, x + 4, y + 3 + len(lines) + 1, width - 8, options, selected)
+        renderer.present()
+
+        action = await _await_action(renderer)
+        if action in {"quit", "open_pause_menu"}:
+            return False
+        if action == "move_up":
+            selected = (selected - 1) % len(options)
+            continue
+        if action == "move_down":
+            selected = (selected + 1) % len(options)
+            continue
+        if action in {"menu_select", "confirm_action"}:
+            return options[selected] == "Yes"
 
 
 async def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
@@ -2430,8 +2485,16 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
 
     place(2, 2, Renderable("O", fg=_WELL_STONE), Name("Stone Well"), Well(), BlocksMovement())
     place(4, 2, Renderable("#", fg=_STOVE_IRON), Name("Iron Stove"), Stove(), BlocksMovement())
-    # The player's bed: sleep beside it to rest at home instead of camping.
-    place(3, 2, Renderable("=", fg=_BED_WOOD), Name("Bed"), Bed())
+    # The player's bed: sleep beside it to rest at home instead of camping. It
+    # belongs to the player, so villagers never claim it (even if you wall it in).
+    if place(3, 2, Renderable("=", fg=_BED_WOOD), Name("Bed"), Bed()):
+        player_ent = _first_player_entity()
+        bed_xy = (player_position.x + 3, player_position.y + 2)
+        if player_ent is not None:
+            for bed_ent, (bpos, _bed) in esper.get_components(Position, Bed):
+                if (bpos.x, bpos.y) == bed_xy:
+                    set_bed_owner(bed_ent, player_ent)
+                    break
 
     def plant_tree(x: int, y: int) -> None:
         place_at(x, y, Renderable("T", fg=_TREE_GREEN), Name("Tree"), Tree(), BlocksMovement())
@@ -2584,8 +2647,16 @@ async def main() -> None:
                     continue
                 if action == "sleep":
                     held_directions.clear()
-                    # Rest at home when a bed is at hand; otherwise pitch a camp.
-                    await _sleep_player(renderer, in_camp=not _player_near_bed())
+                    # Sleep in a bed if one's at hand (warning first if it's not
+                    # yours); otherwise pitch a camp.
+                    nearby_bed = _bed_near_player()
+                    if nearby_bed is not None:
+                        if await _confirm_if_owned_by_other(renderer, nearby_bed, "bed", "sleep here"):
+                            await _sleep_player(renderer, in_camp=False)
+                        else:
+                            esper.process(None)
+                    else:
+                        await _sleep_player(renderer, in_camp=True)
                     continue
                 if action in _CARDINAL_ACTION_DELTAS:
                     held_directions.add(action)
@@ -2637,6 +2708,16 @@ async def main() -> None:
                         esper.process(None)
                         continue
 
+                    interact_chest = _find_adjacent_feature(interact_action, Chest)
+                    if interact_chest is not None:
+                        held_directions.clear()
+                        if await _confirm_if_owned_by_other(renderer, interact_chest, "chest", "open it"):
+                            loot_choice = await _draw_loot_menu(renderer, interact_chest)
+                            if loot_choice == "quit":
+                                break
+                        esper.process(None)
+                        continue
+
                     # Environment features: chop a faced tree, drink from a faced
                     # well, or cook at a faced stove. Each queues a log line and
                     # refreshes the frame (a free action, like looting).
@@ -2668,7 +2749,11 @@ async def main() -> None:
 
                         interact_bed = _find_adjacent_feature(interact_action, Bed)
                         if interact_bed is not None:
-                            await _sleep_player(renderer, in_camp=False)
+                            held_directions.clear()
+                            if await _confirm_if_owned_by_other(renderer, interact_bed, "bed", "sleep here"):
+                                await _sleep_player(renderer, in_camp=False)
+                            else:
+                                esper.process(None)
                             continue
 
                 if action in {"open_menu", "open_inventory", "open_status"}:

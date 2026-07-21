@@ -240,16 +240,28 @@ Every house is furnished with a **bed**, an **oven** (the cooking stove), a
 **chest**, a **table**, a **wardrobe**, and a **bookshelf**
 (`furnish_house` in [src/systems.py](src/systems.py)).
 
-**Residents move in.** Villagers are *residents*: each turn a homeless villager
-claims the nearest **unowned** house (one with a bed and no other resident living
-there) as its home, walks there to sleep, and cooks at its oven. A house counts
-as owned once a resident's home is inside it, so two villagers never share one.
+**Houses belong to people.** A house is owned via its **bed** and **chest** (an
+`Owned` marker records the owner). Your own bed by the well belongs to *you* from
+the start, so villagers will never claim it — even if you wall it into a proper
+house. A house with no owner (or whose owner no longer exists) is up for grabs.
 
-**Villagers build.** When no unowned house is free, a villager takes a preset
-cabin design, finds a clear spot, gathers **wood**, and raises the walls and door
-one piece at a time over many turns (it still stops to eat, drink, and sleep, so
-a cabin takes a while). When the last piece goes up the cabin is furnished and
-the builder moves in.
+**Respecting property.** Trying to **sleep in someone else's bed** or **open
+someone else's chest** (`n`) pops a *"This belongs to &lt;name&gt;. Are you sure?"*
+prompt (defaults to **No**, `Esc` cancels) — your own and unowned property is used
+without a fuss. Villager chests hold a bit of loot, so you *can* help yourself if
+you're willing to; the game just makes sure it was on purpose.
+
+**Residents move in.** Villagers are *residents*: a villager who owns **no** house
+claims the nearest **unowned** one it can walk to (marking it as theirs), then
+walks there to sleep and cooks at its oven. Once someone owns a house nobody else
+takes it, so two villagers never share one — and a villager who already owns a
+home is left alone (it never re-claims or rebuilds).
+
+**Villagers build.** Only a resident that owns **no** house builds: it takes a
+preset cabin design, finds a clear spot, gathers **wood**, and raises the walls
+and door one piece at a time over many turns (it still stops to eat, drink, and
+sleep, so a cabin takes a while). When the last piece goes up the cabin is
+furnished and the builder becomes its owner.
 
 **You can build too.** Open the **Craft** tab in the `Tab` menu to craft `Wall`,
 `Window`, and `Door` pieces out of `Wood` (walls/windows cost 2, doors 3). The

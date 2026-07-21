@@ -305,6 +305,23 @@ def test_thirsty_deer_drinks_from_adjacent_water() -> None:
     assert esper.component_for_entity(deer, Needs).thirst == 0.0
 
 
+def test_thirsty_creature_uses_a_free_shore_when_the_nearest_is_blocked() -> None:
+    # A tree on the nearest shore tile must not trap a thirsty animal thrashing
+    # on the bank -- it should route to a free shore and drink.
+    game_map = GameMap(20, 12)  # small: no procedural water to interfere
+    game_map.tiles[6][12] = GameMap.WATER
+    processor = NpcAiProcessor(game_map)  # shore tiles precomputed here
+    esper.create_entity(Position(11, 6), Tree(), BlocksMovement())  # blocks the nearest shore
+    deer = esper.create_entity(
+        Position(10, 6), NPC(), Deer(), Diet("herbivore"),
+        Needs(thirst=90.0, hunger=10.0, tiredness=0.0), BlocksMovement(), Name("Deer"),
+    )
+
+    for _ in range(4):
+        processor.process("wait")
+    assert esper.component_for_entity(deer, Needs).thirst < 90.0  # it found water
+
+
 def test_hungry_deer_grazes_adjacent_tree_and_depletes_it() -> None:
     game_map = GameMap(24, 14)
     processor = NpcAiProcessor(game_map)

@@ -28,9 +28,13 @@ from main import _craft_item, _place_buildable_at
 from systems import (
     HousingProcessor,
     NpcAiProcessor,
+    bed_owner,
     furnish_house,
     house_is_owned,
     houses_for,
+    owned_bed_of,
+    set_bed_owner,
+    set_house_ownership,
 )
 
 pytestmark = pytest.mark.unrendered
@@ -102,6 +106,24 @@ def test_a_room_with_no_door_is_not_a_house() -> None:
 # --- Furnishing ------------------------------------------------------------
 
 
+def test_furnish_house_keeps_the_bed_reachable_from_the_door() -> None:
+    # Blocking furniture must never seal the bed off, or a villager could never
+    # walk in to sleep in it.
+    game_map = _map_with_cabin()
+    interior = game_map.find_enclosed_rooms()[0]
+    bed_xy = furnish_house(game_map, interior)
+    assert bed_xy is not None
+
+    blocked = {(p.x, p.y) for _e, (p, _b) in esper.get_components(Position, BlocksMovement)}
+    door_adjacent = [
+        t for t in interior
+        if any(game_map.tile_at(nx, ny) == game_map.DOOR for nx, ny in game_map.neighbors_4(t[0], t[1]))
+    ]
+    start = door_adjacent[0]
+    reachable = start == bed_xy or bool(game_map.find_path(start, bed_xy, blocked_tiles=blocked))
+    assert reachable, "the bed must be reachable from the doorway past the furniture"
+
+
 def test_furnish_house_places_all_furniture_and_returns_the_bed() -> None:
     game_map = _map_with_cabin()
     interior = game_map.find_enclosed_rooms()[0]
@@ -136,6 +158,81 @@ def test_resident_claims_an_unowned_furnished_house() -> None:
     home = esper.component_for_entity(villager, Home)
     assert (home.x, home.y) == bed_xy
     assert house_is_owned(interior)
+
+
+def test_bed_ownership_helpers() -> None:
+    person = esper.create_entity(Name("Person"))
+    bed = esper.create_entity(Position(3, 3), Bed())
+
+    assert bed_owner(bed) is None
+    assert owned_bed_of(person) is None
+
+    set_bed_owner(bed, person)
+    assert bed_owner(bed) == person
+    assert owned_bed_of(person) == bed
+
+    # A house whose owner no longer exists counts as unowned again.
+    esper.delete_entity(person, immediate=True)
+    assert bed_owner(bed) is None
+
+
+def test_set_house_ownership_marks_bed_and_chest_only_inside() -> None:
+    owner = esper.create_entity(Name("Owner"))
+    bed = esper.create_entity(Position(3, 3), Bed())
+    chest = esper.create_entity(Position(4, 3), Chest(), Inventory(items=[]))
+    outside_bed = esper.create_entity(Position(9, 9), Bed())
+
+    set_house_ownership(frozenset({(3, 3), (4, 3)}), owner)
+
+    assert bed_owner(bed) == owner
+    assert bed_owner(chest) == owner  # containers belong to the house owner too
+    assert bed_owner(outside_bed) is None  # a bed outside the house is untouched
+
+
+def test_claiming_a_house_makes_its_bed_and_chest_belong_to_the_resident() -> None:
+    game_map = _map_with_cabin()
+    interior = game_map.find_enclosed_rooms()[0]
+    furnish_house(game_map, interior)  # places a bed and a chest inside
+    villager = esper.create_entity(Position(15, 9), NPC(), Resident(), BlocksMovement(), Name("V"))
+
+    HousingProcessor(game_map).process("wait")
+
+    bed = next(e for e, (p, _b) in esper.get_components(Position, Bed) if (p.x, p.y) in interior)
+    chest = next(e for e, (p, _c) in esper.get_components(Position, Chest) if (p.x, p.y) in interior)
+    assert bed_owner(bed) == villager
+    assert bed_owner(chest) == villager
+
+
+def test_resident_that_already_owns_a_house_is_left_alone() -> None:
+    game_map = _map_with_cabin()
+    interior = game_map.find_enclosed_rooms()[0]
+    furnish_house(game_map, interior)  # an unowned, furnished house is available
+
+    villager = esper.create_entity(Position(3, 2), NPC(), Resident(), BlocksMovement(), Name("V"))
+    own_bed = esper.create_entity(Position(2, 2), Bed())
+    set_bed_owner(own_bed, villager)  # it already owns a home
+
+    HousingProcessor(game_map).process("wait")
+
+    # It neither grabs the free house nor starts building a second one.
+    assert not esper.has_component(villager, BuildPlan)
+    assert not house_is_owned(interior)
+
+
+def test_villager_will_not_claim_a_house_someone_else_owns() -> None:
+    game_map = _map_with_cabin()
+    interior = game_map.find_enclosed_rooms()[0]
+    furnish_house(game_map, interior)
+    bed_ent = next(e for e, (p, _b) in esper.get_components(Position, Bed) if (p.x, p.y) in interior)
+    owner = esper.create_entity(Player(), Name("Owner"))
+    set_bed_owner(bed_ent, owner)  # e.g. the player's house
+
+    villager = esper.create_entity(Position(15, 9), NPC(), Resident(), BlocksMovement(), Name("V"))
+    HousingProcessor(game_map).process("wait")
+
+    assert bed_owner(bed_ent) == owner  # ownership unchanged
+    assert not esper.has_component(villager, Home)  # it didn't move in
+    assert esper.has_component(villager, BuildPlan)  # it builds its own instead
 
 
 def test_two_residents_claim_two_different_houses() -> None:

@@ -167,7 +167,16 @@ class Home:
 
 @dataclass
 class Bed:
-    """Tag component: a place the player interacts with to sleep at home."""
+    """Tag component: a place the player interacts with to sleep at home. A bed
+    stands in for the house around it -- whoever owns the bed owns the house."""
+
+
+@dataclass
+class Owned:
+    """Marks a house (via its ``Bed``) as belonging to a person. ``owner`` is the
+    entity id of the owner. An unowned house has no ``Owned`` on its bed; a house
+    whose owner no longer exists counts as unowned again."""
+    owner: int
 
 
 @dataclass

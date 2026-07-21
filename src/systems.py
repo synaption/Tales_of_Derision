@@ -3,6 +3,7 @@
 esper 3.x uses module-level state and esper.Processor subclasses whose
 process() receives whatever args are passed to esper.process().
 """
+from collections import deque
 from collections.abc import Callable
 import random
 import textwrap
@@ -10,7 +11,7 @@ import time
 
 import esper
 
-from components import Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Furniture, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Player, Position, Renderable, Resident, Sapling, Stove, Tree, Vision, WorldClock
+from components import Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Diet, Enemy, Equipment, Friendly, Furniture, Home, Inventory, Meat, Name, Needs, NPC, OnFire, Owned, Player, Position, Renderable, Resident, Sapling, Stove, Tree, Vision, WorldClock
 from game_map import GameMap
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from renderer.base import Renderer
@@ -343,12 +344,46 @@ def _bed_in_interior(interior: frozenset[tuple[int, int]]) -> int | None:
     return None
 
 
+def bed_owner(bed_ent: int) -> int | None:
+    """The person who owns a bed (and thus the house), or ``None`` if it's
+    unowned. An owner whose entity no longer exists is treated as unowned."""
+    if bed_ent is not None and esper.has_component(bed_ent, Owned):
+        owner = esper.component_for_entity(bed_ent, Owned).owner
+        if esper.entity_exists(owner):
+            return owner
+    return None
+
+
+def set_bed_owner(bed_ent: int, owner: int) -> None:
+    if esper.has_component(bed_ent, Owned):
+        esper.component_for_entity(bed_ent, Owned).owner = owner
+    else:
+        esper.add_component(bed_ent, Owned(owner))
+
+
+def owned_bed_of(ent: int) -> int | None:
+    """The bed a person owns (their house), or ``None`` if they own none."""
+    for bed_ent, (owned, _bed) in esper.get_components(Owned, Bed):
+        if owned.owner == ent and esper.entity_exists(bed_ent):
+            return bed_ent
+    return None
+
+
 def house_is_owned(interior: frozenset[tuple[int, int]]) -> bool:
-    """A house is owned when some resident's home lies inside it."""
-    for _ent, (home, _res) in esper.get_components(Home, Resident):
-        if (home.x, home.y) in interior:
-            return True
-    return False
+    """A house is owned when its bed belongs to someone (a living owner)."""
+    bed_ent = _bed_in_interior(interior)
+    return bed_ent is not None and bed_owner(bed_ent) is not None
+
+
+def set_house_ownership(interior: frozenset[tuple[int, int]], owner: int) -> None:
+    """Assign a house's ownable furnishings -- its bed and any chests -- to
+    ``owner``, so trespassers get warned before using them."""
+    for ent, (pos, _bed) in esper.get_components(Position, Bed):
+        if (pos.x, pos.y) in interior:
+            set_bed_owner(ent, owner)
+    for ent, (pos, _chest) in esper.get_components(Position, Chest):
+        if (pos.x, pos.y) in interior:
+            set_bed_owner(ent, owner)
 
 
 # Furnishing spec: (glyph, colour, name, blocks, factory-for-extra-components).
@@ -357,17 +392,45 @@ def house_is_owned(interior: frozenset[tuple[int, int]]) -> bool:
 _FURNISHINGS: list[tuple[str, tuple[int, int, int], str, bool, Callable[[], list[object]]]] = [
     ("=", (156, 116, 72), "Bed", False, lambda: [Bed()]),
     ("#", (120, 120, 128), "Oven", True, lambda: [Stove()]),
-    ("=", _CHEST_BROWN, "Chest", True, lambda: [Chest(), Inventory(items=[])]),
+    ("n", _CHEST_BROWN, "Chest", True, lambda: [Chest(), Inventory(items=["Bread", "Wood"])]),
     ("T", _FURNITURE_TAN, "Table", True, lambda: [Furniture("table")]),
     ("W", _FURNITURE_TAN, "Wardrobe", True, lambda: [Furniture("wardrobe")]),
     ("B", _BOOKSHELF_RED, "Bookshelf", True, lambda: [Furniture("bookshelf")]),
 ]
 
 
+def _interior_reachable(
+    interior_set: set[tuple[int, int]],
+    seeds: set[tuple[int, int]],
+    blocked: set[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    """Interior tiles reachable (8-connected, matching movement) from the door
+    ``seeds`` without stepping on a ``blocked`` (furniture) tile."""
+    frontier = [t for t in seeds if t not in blocked]
+    seen = set(frontier)
+    queue: deque[tuple[int, int]] = deque(frontier)
+    while queue:
+        cx, cy = queue.popleft()
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                t = (cx + dx, cy + dy)
+                if t in interior_set and t not in blocked and t not in seen:
+                    seen.add(t)
+                    queue.append(t)
+    return seen
+
+
 def furnish_house(game_map: GameMap, interior: frozenset[tuple[int, int]]) -> tuple[int, int] | None:
     """Populate a house interior with a bed, oven, chest, table, wardrobe, and
     bookshelf on distinct floor tiles, keeping the doorway clear. Returns the bed
-    tile (a resident's sleep spot) or ``None`` if the room was too small."""
+    tile (a resident's sleep spot) or ``None`` if the room was too small.
+
+    Blocking furniture is only placed where it keeps the whole interior -- the bed
+    especially -- reachable from the door, so a resident can always walk in and
+    lie down (never sealed behind its own furniture)."""
+    interior_set = set(interior)
     door_adjacent: set[tuple[int, int]] = set()
     for (x, y) in interior:
         if any(game_map.tile_at(nx, ny) == game_map.DOOR for nx, ny in game_map.neighbors_4(x, y)):
@@ -384,7 +447,8 @@ def furnish_house(game_map: GameMap, interior: frozenset[tuple[int, int]]) -> tu
             return 0
         return min(_chebyshev(tile, d) for d in door_adjacent)
 
-    # Bed goes farthest from the door; the rest take the nearest free tiles.
+    # Bed goes farthest from the door (cosy corner); it's non-blocking, so it
+    # never affects whether the room stays connected.
     free = sorted(t for t in interior if t not in occupied)
     if not free:
         return None
@@ -394,17 +458,36 @@ def furnish_house(game_map: GameMap, interior: frozenset[tuple[int, int]]) -> tu
     esper.create_entity(Position(*bed_tile), Renderable(bed_glyph, fg=bed_color), Name(bed_name), *bed_extra())
     occupied.add(bed_tile)
 
-    remaining = [t for t in free if t not in occupied and t not in door_adjacent]
+    # Try to place blocking furniture against the walls first (keeps the middle
+    # open); accept a spot only if it doesn't cut any passable tile off from the
+    # door. Non-blocking pieces (none by default) could go anywhere.
+    def wall_adjacent(tile: tuple[int, int]) -> bool:
+        return any((nx, ny) not in interior_set for nx, ny in game_map.neighbors_4(tile[0], tile[1]))
+
+    candidates = [t for t in free if t != bed_tile and t not in door_adjacent]
+    candidates.sort(key=lambda t: (not wall_adjacent(t), -door_distance(t)))
+    blockers: set[tuple[int, int]] = set()
+    seeds = door_adjacent if door_adjacent else {bed_tile}
+
     for glyph, color, name, blocks, extra in _FURNISHINGS[1:]:
-        if not remaining:
+        chosen: tuple[int, int] | None = None
+        for i, tile in enumerate(candidates):
+            if blocks:
+                trial = blockers | {tile}
+                passable = interior_set - trial
+                if not passable <= _interior_reachable(interior_set, seeds, trial):
+                    continue  # this spot would seal off part of the room
+                blockers.add(tile)
+            chosen = candidates.pop(i)
             break
-        tile = remaining.pop(0)
-        components: list[object] = [Position(*tile), Renderable(glyph, fg=color), Name(name)]
+        if chosen is None:
+            continue  # nowhere safe for this piece; skip it
+        components: list[object] = [Position(*chosen), Renderable(glyph, fg=color), Name(name)]
         if blocks:
             components.append(BlocksMovement())
         components.extend(extra())
         esper.create_entity(*components)
-        occupied.add(tile)
+        occupied.add(chosen)
 
     return bed_tile
 
@@ -711,7 +794,14 @@ class NpcAiProcessor(esper.Processor):
         if any(self.game_map.is_water(nx, ny) for nx, ny in self.game_map.neighbors_8(pos.x, pos.y)):
             needs.thirst = max(0.0, needs.thirst - _DRINK_RESTORE)
             return True
-        reachable = [s for s in self._shore_tiles if self.game_map.same_region((pos.x, pos.y), s)]
+        # Drink from a shore tile we can actually stand on -- skip shores blocked
+        # by a tree/creature (trees cluster by water), or the animal would fixate
+        # on an unreachable spot and thrash on the bank without ever drinking.
+        reachable = [
+            s
+            for s in self._shore_tiles
+            if s not in occupied and self.game_map.same_region((pos.x, pos.y), s)
+        ]
         target = self._nearest((pos.x, pos.y), reachable)
         if target is None:
             return False
@@ -1018,13 +1108,16 @@ class NpcAiProcessor(esper.Processor):
         return moved
 
     def _complete_build(self, ent: int, plan: BuildPlan) -> None:
-        bed = furnish_house(self.game_map, frozenset(plan.interior))
+        interior = frozenset(plan.interior)
+        bed = furnish_house(self.game_map, interior)
         if bed is not None:
             if esper.has_component(ent, Home):
                 home = esper.component_for_entity(ent, Home)
                 home.x, home.y = bed
             else:
                 esper.add_component(ent, Home(bed[0], bed[1]))
+            # The builder owns the house it just raised (bed and chest).
+            set_house_ownership(interior, ent)
         if esper.has_component(ent, BuildPlan):
             esper.remove_component(ent, BuildPlan)
         _push_turn_event("A villager finishes building a new cabin.")
@@ -1117,10 +1210,11 @@ class NpcAiProcessor(esper.Processor):
 
 
 class HousingProcessor(esper.Processor):
-    """Settles residents into homes. Each turn every ``Resident`` without a valid
-    home tries to **claim the nearest unowned house** (one with a bed and no other
-    resident living in it); if none is free it is given a ``BuildPlan`` for a
-    preset cabin, which the NPC AI then constructs over many turns.
+    """Settles residents into homes. Houses belong to people: a resident who owns
+    one is left alone. A resident who owns none **claims the nearest unowned
+    house** it can reach (marking it as theirs); only if none is free does it get
+    a ``BuildPlan`` for a preset cabin, which the NPC AI then builds over many
+    turns and moves into.
 
     House detection is cached and only rebuilt when the map changes, so this is a
     cheap per-turn pass on a static map.
@@ -1136,12 +1230,10 @@ class HousingProcessor(esper.Processor):
         houses = houses_for(self.game_map, self._cache)
 
         for ent, (_res,) in list(esper.get_components(Resident)):
+            if owned_bed_of(ent) is not None:
+                continue  # already owns a house -- never re-claim or rebuild
             if esper.has_component(ent, BuildPlan):
                 continue  # already building its own home
-            if esper.has_component(ent, Home):
-                home = esper.component_for_entity(ent, Home)
-                if any((home.x, home.y) in interior for interior in houses):
-                    continue  # home still stands and is theirs
             if self._claim_unowned_house(ent, houses):
                 continue
             self._start_build(ent)
@@ -1150,11 +1242,9 @@ class HousingProcessor(esper.Processor):
         pos = esper.component_for_entity(ent, Position) if esper.has_component(ent, Position) else None
         candidates: list[tuple[frozenset[tuple[int, int]], tuple[int, int]]] = []
         for interior in houses:
-            if house_is_owned(interior):
-                continue
             bed_ent = _bed_in_interior(interior)
-            if bed_ent is None:
-                continue
+            if bed_ent is None or bed_owner(bed_ent) is not None:
+                continue  # no bed, or already someone's house
             bed_pos = esper.component_for_entity(bed_ent, Position)
             candidates.append((interior, (bed_pos.x, bed_pos.y)))
         if not candidates:
@@ -1162,12 +1252,13 @@ class HousingProcessor(esper.Processor):
         if pos is not None:
             candidates.sort(key=lambda c: _chebyshev((pos.x, pos.y), c[1]))
 
-        for _interior, bed_xy in candidates:
+        for interior, bed_xy in candidates:
             # Only claim a house the villager can actually walk to -- otherwise it
             # would strand itself commuting to a home across water/walls and never
             # get back to foraging. If none are reachable, it builds one instead.
             if pos is not None and (pos.x, pos.y) != bed_xy and not self.game_map.same_region((pos.x, pos.y), bed_xy):
                 continue
+            set_house_ownership(interior, ent)  # bed + chests now belong to them
             if esper.has_component(ent, Home):
                 home = esper.component_for_entity(ent, Home)
                 home.x, home.y = bed_xy
