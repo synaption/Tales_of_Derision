@@ -14,7 +14,8 @@ from typing import Any
 
 import esper
 
-from components import Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Gender, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
+from action import BASE_ACTION_COST
+from components import Age, Asleep, Attributes, Bed, BerryBush, Blueprint, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Gender, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
 from onymancer import make_onymancer
 from game_map import GameMap
 from items import (
@@ -739,7 +740,11 @@ def _pump_background_regions(budget_seconds: float) -> None:
             if player_xy is not None
             else None
         )
-        processor.scheduler.pump_background(budget_seconds, player_region, clock.turn, time.monotonic)
+        # The scheduler counts in whole region-turns; the clock is in TU.
+        target_region_turn = clock.turn // BASE_ACTION_COST
+        processor.scheduler.pump_background(
+            budget_seconds, player_region, target_region_turn, time.monotonic
+        )
 
 
 async def _draw_title_screen(renderer: Renderer) -> bool:
@@ -1592,9 +1597,10 @@ async def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
     # catch up gradually in the background.
     clock = world_clock()
     if clock is not None:
+        target_region_turn = clock.turn // BASE_ACTION_COST
         for processor in (esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor)):
             if processor is not None:
-                processor.scheduler.catch_up_all(clock.turn)
+                processor.scheduler.catch_up_all(target_region_turn)
                 await asyncio.sleep(0)
 
     esper.process(None)
@@ -2806,6 +2812,9 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
         Player(),
         Vision(10),
         BlocksMovement(),
+        # Average attributes for now; dexterity drives how long the player's
+        # actions take in the action economy (see action.action_cost).
+        Attributes(),
         # Some starting wood so the player can craft walls/doors/windows right
         # away (Crafting tab in the Tab menu, then place from the inventory).
         Inventory(items=["Bandage", "Torch", "Apple", WOOD, WOOD, WOOD, WOOD, WOOD]),

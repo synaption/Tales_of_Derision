@@ -10,7 +10,8 @@ import esper
 import pytest
 
 from action import BASE_ACTION_COST, action_cost, action_weight, actor_speed
-from components import Attributes
+from components import Attributes, Needs, Player, WorldClock
+from systems import NeedsProcessor, TimeProcessor, world_clock
 
 pytestmark = pytest.mark.unrendered
 
@@ -54,3 +55,44 @@ def test_speed_has_a_floor_so_cost_stays_positive() -> None:
 def test_action_weight_defaults_to_one() -> None:
     assert action_weight("anything") == 1.0
     assert action_weight(None) == 1.0
+
+
+# --- End-to-end: the clock advances by the player's action cost -------------
+
+def test_baseline_player_advances_clock_by_base_cost_per_action() -> None:
+    esper.create_entity(WorldClock(turn=0))
+    esper.create_entity(Player(), Attributes(dexterity=10))
+    time_proc = TimeProcessor()
+
+    for _ in range(5):
+        time_proc.process("move_up")
+
+    # Baseline cadence preserved: 5 actions == 5 * BASE_ACTION_COST of world time.
+    assert world_clock().turn == 5 * BASE_ACTION_COST
+
+
+def test_quicker_player_consumes_less_world_time_per_action() -> None:
+    esper.create_entity(WorldClock(turn=0))
+    esper.create_entity(Player(), Attributes(dexterity=25))
+
+    TimeProcessor().process("move_up")
+
+    # A nimble player's action still passes time, but less than a baseline turn.
+    assert 0 < world_clock().turn < BASE_ACTION_COST
+
+
+def test_baseline_needs_accrue_one_rate_per_baseline_turn() -> None:
+    esper.create_entity(WorldClock(turn=0))
+    esper.create_entity(Player(), Attributes(dexterity=10))
+    ent = esper.create_entity(Needs(hunger=0.0, hunger_rate=1.0))
+
+    time_proc = TimeProcessor()
+    needs_proc = NeedsProcessor()
+    turns = 4
+    for _ in range(turns):
+        time_proc.process("move_up")   # advance world time by the action's cost
+        needs_proc.process("move_up")  # accrue needs for the elapsed span
+
+    # Needs are time-based, but a baseline turn accrues exactly the old per-turn
+    # amount, so the switch is invisible at baseline speed.
+    assert esper.component_for_entity(ent, Needs).hunger == pytest.approx(turns * 1.0)

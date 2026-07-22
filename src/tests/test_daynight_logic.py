@@ -4,6 +4,7 @@ from __future__ import annotations
 import esper
 import pytest
 
+from action import BASE_ACTION_COST
 from components import (
     Asleep,
     BlocksMovement,
@@ -41,13 +42,14 @@ def test_time_processor_advances_clock_only_on_turn_actions() -> None:
     esper.create_entity(WorldClock(turn=0, day_length=100))
     processor = TimeProcessor()
 
+    # With no player entity the action cost falls back to one baseline action.
     processor.process("move_up")
-    assert world_clock().turn == 1
+    assert world_clock().turn == BASE_ACTION_COST
 
     # A menu refresh (None) or a non-turn action must not advance time.
     processor.process(None)
     processor.process("open_inventory")
-    assert world_clock().turn == 1
+    assert world_clock().turn == BASE_ACTION_COST
 
 
 def test_phase_and_night_track_the_day_fraction() -> None:
@@ -90,7 +92,10 @@ def test_tiredness_rises_faster_at_night() -> None:
 
     clock.turn = 80  # now night
     night_ent = esper.create_entity(Needs(tiredness=0.0))
-    processor.process("move_up")
+    # A fresh processor so this is a clean one-baseline-turn tick (needs now accrue
+    # per elapsed TU, and reusing the day processor would only charge the 50-TU
+    # gap between turn 30 and 80).
+    NeedsProcessor().process("move_up")
     night_gain = esper.component_for_entity(night_ent, Needs).tiredness
 
     assert night_gain > day_gain > 0.0

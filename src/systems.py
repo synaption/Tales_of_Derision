@@ -14,6 +14,7 @@ import esper
 from components import Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Camp, Chest, ConstructionSite, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, OnFire, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
+from action import BASE_ACTION_COST, action_cost
 from onymancer import make_onymancer
 from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin
 from renderer.base import Renderer
@@ -187,6 +188,20 @@ def _current_turn() -> int:
     return clock.turn if clock is not None else 0
 
 
+def _player_entity() -> int | None:
+    for ent, (_player,) in esper.get_components(Player):
+        return ent
+    return None
+
+
+def _current_region_turn() -> int:
+    """The world clock (in TU) as a count of whole baseline turns -- the unit the
+    region scheduler steps in. One region-turn == ``BASE_ACTION_COST`` TU, so a
+    baseline player action (100 TU) advances every region by exactly one turn,
+    preserving the old lockstep cadence."""
+    return _current_turn() // BASE_ACTION_COST
+
+
 def day_fraction(clock: WorldClock) -> float:
     """Where we are in the current day, in ``[0.0, 1.0)``."""
     if clock.day_length <= 0:
@@ -315,7 +330,12 @@ class TimeProcessor(esper.Processor):
         clock = world_clock()
         if clock is None:
             return
-        clock.turn += 1
+        # Advance world time by how long the player's action takes, not a flat 1:
+        # a quicker action costs fewer TU (so the player gets relatively more of
+        # them per day), a slower one costs more. A baseline action is exactly
+        # BASE_ACTION_COST, preserving the old one-turn-per-action cadence.
+        player = _player_entity()
+        clock.turn += action_cost(player, action) if player is not None else BASE_ACTION_COST
         phase = time_phase(clock)
         if phase != self._last_phase:
             if self._last_phase is not None:
@@ -945,10 +965,11 @@ _INTERACTION_STEP_CAP = 6.0
 _FRIENDSHIP_MIN = -100.0
 _FRIENDSHIP_MAX = 100.0
 
-# Turns a being waits between voluntary interactions (so villagers don't chatter
-# every single turn), how far it looks for company, and how much each tile of
-# distance counts against a candidate when weighed against friendship.
-_SOCIAL_COOLDOWN = 6
+# Time (TU) a being waits between voluntary interactions (so villagers don't
+# chatter every single turn), how far it looks for company, and how much each tile
+# of distance counts against a candidate when weighed against friendship. Expressed
+# in TU (6 baseline turns) since social timestamps live on the world clock.
+_SOCIAL_COOLDOWN = 6 * BASE_ACTION_COST
 _SOCIAL_SIGHT = 8
 _SOCIAL_DISTANCE_PENALTY = 2.0
 
@@ -1406,7 +1427,7 @@ class NpcAiProcessor(esper.Processor):
         self.game_map = game_map
         self._shore_tiles: list[tuple[int, int]] = self._compute_shore_tiles()
         self._wall_clock = wall_clock if wall_clock is not None else time.monotonic
-        self.scheduler = RegionScheduler(game_map, _current_turn())
+        self.scheduler = RegionScheduler(game_map, _current_region_turn())
         self.scheduler.register("npc_ai", self._advance_region)
         # A world-wide, region-bucketed snapshot (occupied tiles + every goal
         # kind + every NPC), rebuilt from scratch only every
@@ -2194,7 +2215,10 @@ class NpcAiProcessor(esper.Processor):
         # turn N, N+1, N+2 ... in order, each with its own as-of clock, so
         # turn-stamped state (berry regrowth, courtship cooldowns, ages) reads
         # correctly relative to *this* region's history, not the true "now".
-        logical_turn = self.scheduler.region_turn[region_id] + 1
+        # The scheduler counts in whole region-turns; the world clock and every
+        # turn-stamped value are in TU, so convert (one region-turn == one
+        # baseline action == BASE_ACTION_COST TU) before stamping.
+        logical_turn = (self.scheduler.region_turn[region_id] + 1) * BASE_ACTION_COST
         real_clock = world_clock()
         clock = replace(real_clock, turn=logical_turn) if real_clock is not None else None
 
@@ -2333,7 +2357,7 @@ class NpcAiProcessor(esper.Processor):
                 self.scheduler.advance_region(region_id)
             return
 
-        target_turn = self.scheduler.next_turn_for(player_region, _current_turn())
+        target_turn = self.scheduler.next_turn_for(player_region, _current_region_turn())
 
         # The player's own region is always fully live -- this also covers
         # "just entered a new region": catch_up_region replays every turn the
@@ -2374,7 +2398,7 @@ class FishAiProcessor(esper.Processor):
         self.game_map = game_map
         self._rng = rng if rng is not None else world_rng().stream("ai").random
         self._wall_clock = clock if clock is not None else time.monotonic
-        self.scheduler = RegionScheduler(game_map, _current_turn())
+        self.scheduler = RegionScheduler(game_map, _current_region_turn())
         self.scheduler.register("fish", self._advance_region)
         # Rebuilt from scratch only every _WORLD_SNAPSHOT_REFRESH_CALLS
         # advances rather than on every single one -- see the identical cache
@@ -2429,7 +2453,7 @@ class FishAiProcessor(esper.Processor):
                 self.scheduler.advance_region(region_id)
             return
 
-        target_turn = self.scheduler.next_turn_for(player_region, _current_turn())
+        target_turn = self.scheduler.next_turn_for(player_region, _current_region_turn())
 
         # The player's own region is always fully live -- this also covers
         # "just entered a new region": catch_up_region replays every turn the
@@ -3004,18 +3028,40 @@ def _crossed_warning(
 
 
 class NeedsProcessor(esper.Processor):
-    """Advances hunger/thirst once per real turn (a move, or a ``wait``).
+    """Advances hunger/thirst/tiredness by the *time elapsed* since the last turn.
 
-    Menu refreshes call ``esper.process(None)``; those must not starve the
-    player, so the tick is gated on a turn-advancing action, matching how the
-    NPC AI only reacts on real turns.
+    Needs are a function of world time, not action count: a turn that consumed 200
+    TU accrues twice as much as a baseline 100-TU turn, so a slow action makes you
+    proportionally hungrier. The per-turn rates on ``Needs`` are defined per
+    ``BASE_ACTION_COST`` TU, so a baseline turn accrues exactly the old amount.
+
+    Menu refreshes call ``esper.process(None)``; those must not starve the player,
+    so the tick is gated on a turn-advancing action.
     """
+
+    def __init__(self) -> None:
+        # World-clock TU at the last accrual, so we can charge only the elapsed span.
+        self._last_turn: int | None = None
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
             return
 
-        night = is_night(world_clock())
+        clock = world_clock()
+        now = clock.turn if clock is not None else 0
+        if self._last_turn is None:
+            # First tick: charge exactly one baseline turn (matches old behaviour
+            # and a fresh unit test with no advancing clock).
+            self._last_turn = now - BASE_ACTION_COST
+        elapsed = now - self._last_turn
+        self._last_turn = now
+        # No advancing clock (e.g. a processor driven directly in a unit test):
+        # fall back to one baseline turn's worth so needs still tick per call.
+        if elapsed <= 0:
+            elapsed = BASE_ACTION_COST
+        scale = elapsed / BASE_ACTION_COST
+
+        night = is_night(clock)
         woke: list[int] = []
 
         for ent, (needs,) in esper.get_components(Needs):
@@ -3025,17 +3071,17 @@ class NeedsProcessor(esper.Processor):
             asleep = esper.has_component(ent, Asleep)
 
             # Hunger and thirst creep up whether awake or asleep.
-            needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate)
-            needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate)
+            needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate * scale)
+            needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate * scale)
 
             if asleep:
                 # Sleeping pays down tiredness; waking is handled after the loop.
-                needs.tiredness = max(0.0, needs.tiredness - _SLEEP_RECOVERY)
+                needs.tiredness = max(0.0, needs.tiredness - _SLEEP_RECOVERY * scale)
                 if needs.tiredness <= 0.0:
                     woke.append(ent)
             else:
                 rate = needs.tiredness_rate * (_NIGHT_TIREDNESS_MULTIPLIER if night else 1.0)
-                needs.tiredness = min(needs.max_value, needs.tiredness + rate)
+                needs.tiredness = min(needs.max_value, needs.tiredness + rate * scale)
 
             # Every creature accumulates needs, but only the player's are
             # surfaced as log warnings -- a hungry goblin shouldn't print

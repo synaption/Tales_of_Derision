@@ -216,11 +216,15 @@ class Stove:
 
 @dataclass
 class WorldClock:
-    """Singleton component tracking the passage of time. ``turn`` advances once
-    per real turn; a full day is ``day_length`` turns. ``systems`` derives the
-    time-of-day phase (and whether it is night) from ``turn % day_length``."""
+    """Singleton component tracking the passage of time in **time units (TU)**.
+    ``turn`` advances by an action's *cost* each turn (a baseline action is
+    ``action.BASE_ACTION_COST`` TU), not by 1, so faster/slower actions consume
+    proportionally less/more world time. A full day is ``day_length`` TU;
+    ``systems`` derives the time-of-day phase (and whether it is night) from
+    ``turn % day_length``. The default is 240 baseline actions per day
+    (240 * BASE_ACTION_COST), preserving the old one-action-per-turn day length."""
     turn: int = 0
-    day_length: int = 240
+    day_length: int = 24000
 
 
 @dataclass

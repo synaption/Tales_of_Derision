@@ -11,6 +11,7 @@ import itertools
 import esper
 import pytest
 
+from action import BASE_ACTION_COST
 from components import Diet, NPC, Needs, Player, Position, Tree, WorldClock
 from game_map import GameMap
 from regions import RegionScheduler, all_region_ids, in_region_with_margin, region_at, region_grid_size
@@ -170,8 +171,9 @@ def test_entering_a_new_region_replays_every_missed_turn_at_once() -> None:
     region_b = processor.scheduler.region_at(200, 30)
 
     clock = world_clock()
+    # The clock runs in TU; one region-turn is BASE_ACTION_COST TU.
     for turn in range(1, 6):
-        clock.turn = turn
+        clock.turn = turn * BASE_ACTION_COST
         processor.process("wait")
     assert processor.scheduler.region_turn[region_a] == 5
     assert processor.scheduler.region_turn[region_b] == 0  # never entered yet
@@ -180,7 +182,7 @@ def test_entering_a_new_region_replays_every_missed_turn_at_once() -> None:
     # one call, not a bounded burst.
     player_pos = esper.component_for_entity(player, Position)
     player_pos.x, player_pos.y = 200, 30
-    clock.turn = 6
+    clock.turn = 6 * BASE_ACTION_COST
     processor.process("wait")
 
     assert processor.scheduler.region_turn[region_b] == 6
