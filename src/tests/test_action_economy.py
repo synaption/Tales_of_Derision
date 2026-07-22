@@ -6,14 +6,25 @@ turn model from lockstep to the scheduler is invisible until speeds are tuned.
 """
 from __future__ import annotations
 
+from collections import Counter
+import itertools
+
 import esper
 import pytest
 
 from action import BASE_ACTION_COST, action_cost, action_weight, actor_speed
-from components import Attributes, Needs, Player, WorldClock
-from systems import NeedsProcessor, TimeProcessor, world_clock
+from components import Attributes, NPC, Needs, Player, Position, WorldClock
+from game_map import GameMap
+from systems import NeedsProcessor, NpcAiProcessor, TimeProcessor, world_clock
 
 pytestmark = pytest.mark.unrendered
+
+
+def _expired_wall_clock():
+    """An ever-advancing fake wall clock so a processor's background region pump
+    expires immediately and can't add catch-up work behind the test's back."""
+    counter = itertools.count()
+    return lambda: next(counter) * 1000.0
 
 
 def test_actor_without_attributes_is_baseline_speed() -> None:
@@ -96,3 +107,34 @@ def test_baseline_needs_accrue_one_rate_per_baseline_turn() -> None:
     # Needs are time-based, but a baseline turn accrues exactly the old per-turn
     # amount, so the switch is invisible at baseline speed.
     assert esper.component_for_entity(ent, Needs).hunger == pytest.approx(turns * 1.0)
+
+
+# --- Per-NPC speed: dexterity buys extra actions per region-turn ------------
+
+def test_quicker_npc_acts_more_often_than_a_baseline_npc() -> None:
+    esper.create_entity(WorldClock(turn=0))
+    game_map = GameMap(40, 20)
+    esper.create_entity(Position(20, 10), Player())  # anchors the live region
+    baseline = esper.create_entity(Position(5, 5), NPC())
+    quick = esper.create_entity(Position(6, 6), NPC(), Attributes(dexterity=30))
+
+    processor = NpcAiProcessor(game_map, wall_clock=_expired_wall_clock())
+
+    # Count how many times each NPC actually takes a turn, without running the
+    # real behaviour (which would move them out of the region).
+    calls: Counter[int] = Counter()
+
+    def spy(ent, *args, **kwargs) -> None:
+        calls[ent] += 1
+
+    processor._take_turn = spy
+
+    clock = world_clock()
+    for turn in range(1, 21):
+        clock.turn = turn * BASE_ACTION_COST  # one region-turn per step
+        processor.process("wait")
+
+    # A baseline NPC acts exactly once per region-turn (old cadence preserved);
+    # a nimble one banks its speed surplus and acts more often.
+    assert calls[baseline] == 20
+    assert calls[quick] > calls[baseline]

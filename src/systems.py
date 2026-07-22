@@ -11,7 +11,7 @@ import time
 
 import esper
 
-from components import Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Camp, Chest, ConstructionSite, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, OnFire, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
+from components import Actor, Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Camp, Chest, ConstructionSite, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, OnFire, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from action import BASE_ACTION_COST, action_cost
@@ -629,6 +629,10 @@ _HAUL_BATCH = 4
 # non-entity value the step code reads as "blocked, and not me" works; kept
 # distinct from the -1 used for in-progress blueprint tiles.
 _OSC_GUARD = -2
+
+# Safety cap on how many times a single NPC may act in one region-turn, so a
+# very quick creature (or a rounding edge) can never monopolise the loop.
+_MAX_ACTIONS_PER_REGION_TURN = 4
 
 
 # Flora/remains that must never be sealed inside a wall or a finished house.
@@ -1893,6 +1897,15 @@ class NpcAiProcessor(esper.Processor):
         esper.add_component(ent, inventory)
         return inventory
 
+    def _actor_of(self, ent: int) -> Actor:
+        """This NPC's action-economy bookkeeping (its per-region-turn energy),
+        created on first use so creatures don't need one at spawn."""
+        if esper.has_component(ent, Actor):
+            return esper.component_for_entity(ent, Actor)
+        actor = Actor()
+        esper.add_component(ent, actor)
+        return actor
+
     def _should_build(self, ent: int) -> bool:
         """True when raising a home is this NPC's job right now: a resident that
         owns no bed. Such a villager pitches in on the nearest blueprint -- its
@@ -2261,11 +2274,26 @@ class NpcAiProcessor(esper.Processor):
             if guard is not None:
                 occupied[guard] = _OSC_GUARD
             try:
-                self._take_turn(
-                    ent, pos, occupied, player_xy, diet_buckets=(
-                        trees, prey, corpses, stoves, bushes, sentients
-                    ), logical_turn=logical_turn, clock=clock,
-                )
+                # Action economy: this region-turn is one baseline action's worth
+                # of time, so grant BASE_ACTION_COST energy and let the NPC act as
+                # many times as its speed allows -- a quicker creature (higher
+                # dexterity, lower action cost) banks the surplus and acts again.
+                # A baseline NPC (cost == BASE_ACTION_COST) acts exactly once,
+                # preserving the old one-turn-per-region-turn cadence.
+                actor = self._actor_of(ent)
+                actor.energy += BASE_ACTION_COST
+                cost = action_cost(ent, None)
+                acted = 0
+                while actor.energy >= cost and acted < _MAX_ACTIONS_PER_REGION_TURN:
+                    self._take_turn(
+                        ent, pos, occupied, player_xy, diet_buckets=(
+                            trees, prey, corpses, stoves, bushes, sentients
+                        ), logical_turn=logical_turn, clock=clock,
+                    )
+                    actor.energy -= cost
+                    acted += 1
+                    if not esper.entity_exists(ent):
+                        break
             finally:
                 if guard is not None and occupied.get(guard) == _OSC_GUARD:
                     del occupied[guard]

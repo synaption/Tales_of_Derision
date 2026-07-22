@@ -380,6 +380,12 @@ class Actor:
     the world-clock time unit (TU) at which this entity next gets to act; the
     scheduler always runs whoever has the smallest ``next_time``. ``last_acted`` is
     the TU it last acted, so time-based effects (needs) can accrue the exact
-    elapsed span when it acts again. Every creature that takes turns carries one."""
+    elapsed span when it acts again. Every creature that takes turns carries one.
+
+    ``energy`` is the region-simulation counterpart: NPCs are driven per
+    region-turn rather than by the global ``next_time`` queue, so each region-turn
+    grants ``BASE_ACTION_COST`` energy and the NPC spends its action cost per
+    action -- a quicker creature banks the surplus and acts again."""
     next_time: int = 0
     last_acted: int = 0
+    energy: float = 0.0

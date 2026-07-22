@@ -2770,6 +2770,9 @@ def _spawn_cave_rat(
         BlocksMovement(),
         Meat("Rat Meat"),
         Diet("carnivore"),
+        # Quick, scurrying vermin: high dexterity makes a rat act ~1.2x as often
+        # as a baseline creature in the action economy (see action.actor_speed).
+        Attributes(dexterity=16),
         Needs(),
     ]
     if include_loot:
