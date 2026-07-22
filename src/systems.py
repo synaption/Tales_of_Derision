@@ -256,7 +256,7 @@ def current_day(clock: WorldClock | None) -> int:
 # --- Aging -----------------------------------------------------------------
 # A person is an adult (may court, marry, and reproduce) from this age on. Age is
 # derived from ``Age.born_turn`` and the clock, so nobody is ticked each turn.
-_ADULT_AGE_YEARS = 16
+_ADULT_AGE_YEARS = 17
 
 
 def age_years(ent: int, clock: WorldClock | None) -> float:
