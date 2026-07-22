@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 from collections import deque
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -310,6 +311,13 @@ class PygameRenderer(Renderer):
         self._sidebar_width_ratio = min(0.5, max(0.14, ratio))
 
         fullscreen = bool(self._options.get("fullscreen", False))
+        try:
+            display_index = max(0, int(self._options.get("display_index", 0)))
+        except (TypeError, ValueError):
+            display_index = 0
+        num_displays = self._pygame.display.get_num_displays() if hasattr(self._pygame.display, "get_num_displays") else 1
+        display_index = min(display_index, max(0, num_displays - 1))
+
         if IS_WEB:
             # Browser "fullscreen" isn't a real display mode. Match the surface to
             # the visible canvas so 1 surface px == 1 CSS px; otherwise the browser
@@ -318,11 +326,29 @@ class PygameRenderer(Renderer):
             self._screen = self._pygame.display.set_mode((window_w, window_h))
             _apply_web_canvas_style()
         elif fullscreen:
-            self._screen = self._pygame.display.set_mode((0, 0), self._pygame.FULLSCREEN)
+            self._screen = self._pygame.display.set_mode(
+                (0, 0), self._pygame.FULLSCREEN, display=display_index
+            )
         else:
             window_w = max(640, self._cols * self._cell_w)
             window_h = max(480, self._rows * self._cell_h)
-            self._screen = self._pygame.display.set_mode((window_w, window_h))
+            # Cap to 90% of the target display so the window never spans
+            # multiple monitors and leaves a little breathing room.
+            try:
+                desktop_sizes = self._pygame.display.get_desktop_sizes()
+                if display_index < len(desktop_sizes):
+                    max_w, max_h = desktop_sizes[display_index]
+                    window_w = min(window_w, int(max_w * 0.9))
+                    window_h = min(window_h, int(max_h * 0.9))
+            except AttributeError:
+                info = self._pygame.display.Info()
+                if info.current_w > 0:
+                    window_w = min(window_w, int(info.current_w * 0.9))
+                if info.current_h > 0:
+                    window_h = min(window_h, int(info.current_h * 0.9))
+            self._screen = self._pygame.display.set_mode(
+                (window_w, window_h), display=display_index
+            )
 
         if self._screen is not None:
             screen_w = self._screen.get_width()
@@ -772,6 +798,12 @@ class PygameRenderer(Renderer):
 
     def setup(self) -> None:
         pygame = __import__("pygame")
+
+        # Tell Windows to report real physical pixels per monitor instead of
+        # letting the OS rescale the window (fixes blurry/wrong-sized display
+        # on multi-monitor / high-DPI setups).
+        if not IS_WEB:
+            os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
 
         pygame.init()
         pygame.display.set_caption("Tales of Derision")
