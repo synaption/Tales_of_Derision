@@ -4,7 +4,6 @@ Turn loop: show title/menu, then block for an action, run the systems, repeat.
 The game logic stays renderer-agnostic while the default runtime uses pygame.
 """
 import argparse
-import asyncio
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -90,23 +89,10 @@ AUDIO_SAMPLE_SIZE = -16
 AUDIO_CHANNELS = 2
 AUDIO_BUFFER_SIZES = (16384, 8192, 4096, 2048)
 
-# Pygbag runs the whole program on the browser's single main thread. Any loop
-# that would block (spin on input) must hand control back to the browser with
-# ``await asyncio.sleep(...)`` or the tab freezes, and web audio/display need
-# their own handling. On desktop these paths keep the original behavior.
-IS_WEB = sys.platform == "emscripten"
-
-# Idle input polling cadence on web. A zero-delay spin (asyncio.sleep(0)) pegs
-# the browser's single main thread and starves the audio mixer -> clicks/pops.
-# ~60Hz frees the thread for audio while keeping input latency imperceptible.
-_WEB_IDLE_POLL_SECONDS = 1 / 60
-
-# Web audio buffer (frames). On the single web thread the per-turn render blocks
-# audio mixing; a large buffer keeps enough pre-mixed audio queued to play
-# through that hitch without underrunning. Latency is irrelevant for looping
-# background music, so we bias big. Override per-run with "web_audio_buffer" in
-# options.json to A/B test without editing code.
-WEB_AUDIO_BUFFER = 16384
+# How often the idle/animation poll loop re-checks for input while waiting, so a
+# genuinely idle wait (status animations, background catch-up) doesn't busy-spin
+# the CPU. ~60Hz keeps input latency imperceptible.
+_IDLE_POLL_INTERVAL = 1 / 60
 
 
 def _audio_driver_order() -> list[str | None]:
@@ -154,10 +140,7 @@ def _audio_buffer_order(options: dict | None) -> list[int]:
     return list(AUDIO_BUFFER_SIZES)
 
 
-def _pick_music_track(
-    music_dir: Path,
-    preferred_suffixes: tuple[str, ...] | None = None,
-) -> Path | None:
+def _pick_music_track(music_dir: Path) -> Path | None:
     if not music_dir.exists() or not music_dir.is_dir():
         return None
 
@@ -170,63 +153,7 @@ def _pick_music_track(
     if not candidates:
         return None
 
-    if preferred_suffixes:
-        # Prefer formats the target runtime can actually decode (e.g. the web
-        # build can't rely on mp3), then fall back to name order.
-        def _rank(path: Path) -> int:
-            suffix = path.suffix.lower()
-            if suffix in preferred_suffixes:
-                return preferred_suffixes.index(suffix)
-            return len(preferred_suffixes)
-
-        candidates.sort(key=lambda path: (_rank(path), path.name))
-
     return candidates[0]
-
-
-def _web_audio_buffer_order(options: dict | None) -> list[int]:
-    configured = None
-    if isinstance(options, dict):
-        configured = options.get("web_audio_buffer")
-
-    first = configured if isinstance(configured, int) and configured > 0 else WEB_AUDIO_BUFFER
-    ordered: list[int] = []
-    for size in (first, 16384, 8192, 4096, 2048):
-        if size > 0 and size not in ordered:
-            ordered.append(size)
-    return ordered
-
-
-def _init_web_mixer(pygame: Any, options: dict | None) -> Any | None:
-    # Let SDL open the device at the browser AudioContext's native rate
-    # (AUDIO_ALLOW_FREQUENCY_CHANGE) instead of forcing 44100Hz. Forcing a rate
-    # the browser doesn't use makes SDL resample every audio callback on the busy
-    # main thread, which crackles; matching the device rate resamples each Sound
-    # once at load instead. Paired with a moderate buffer (not the desktop ~3s).
-    allowed = getattr(pygame, "AUDIO_ALLOW_FREQUENCY_CHANGE", 1)
-    last_error: Exception | None = None
-    for buffer_size in _web_audio_buffer_order(options):
-        try:
-            pygame.mixer.quit()
-            pygame.mixer.init(
-                frequency=AUDIO_SAMPLE_RATE,
-                size=AUDIO_SAMPLE_SIZE,
-                channels=AUDIO_CHANNELS,
-                buffer=buffer_size,
-                allowedchanges=allowed,
-            )
-            init = pygame.mixer.get_init()
-            print(f"Web audio: buffer={buffer_size}, init={init}", file=sys.stderr)
-            return pygame
-        except Exception as exc:
-            last_error = exc
-            try:
-                pygame.mixer.quit()
-            except Exception:
-                pass
-    if last_error is not None:
-        print(f"Audio disabled: {last_error}", file=sys.stderr)
-    return None
 
 
 def _init_pygame_mixer(options: dict | None = None) -> Any | None:
@@ -237,11 +164,6 @@ def _init_pygame_mixer(options: dict | None = None) -> Any | None:
 
     if pygame.mixer.get_init() is not None:
         return pygame
-
-    if IS_WEB:
-        # The desktop driver-probing dance below is meaningless in the browser
-        # (one audio backend) and its huge buffer is the wrong default for web.
-        return _init_web_mixer(pygame, options)
 
     original_driver = os.environ.get("SDL_AUDIODRIVER")
     last_error: Exception | None = None
@@ -286,37 +208,12 @@ def _init_pygame_mixer(options: dict | None = None) -> Any | None:
     return None
 
 
-# Keeps the web music Sound + channel alive (Sound is garbage-collected
-# otherwise) and lets teardown stop the loop.
-_web_music_state: dict[str, Any] = {}
-
-
 def _start_background_music(options: dict | None = None) -> Any | None:
     pygame = _init_pygame_mixer(options)
     if pygame is None:
         return None
 
     music_dir = Path(__file__).resolve().parent.parent / "audio" / "music"
-
-    if IS_WEB:
-        # pygbag's SDL_mixer streaming (mixer.music) is unreliable and mp3 often
-        # won't decode, so play music as an in-memory Sound loop -- the same path
-        # the working SFX use. Reserve channel 0 for it so SFX (find_channel)
-        # never steals the music channel.
-        track = _pick_music_track(music_dir, preferred_suffixes=(".ogg", ".wav", ".mp3"))
-        if track is None:
-            return pygame
-        try:
-            pygame.mixer.set_reserved(1)
-            channel = pygame.mixer.Channel(0)
-            sound = pygame.mixer.Sound(str(track))
-            channel.play(sound, loops=-1)
-            _web_music_state["sound"] = sound
-            _web_music_state["channel"] = channel
-        except Exception as exc:
-            print(f"Music disabled: {exc}", file=sys.stderr)
-        return pygame
-
     track = _pick_music_track(music_dir)
     if track is None:
         return pygame
@@ -396,13 +293,6 @@ class _CombatSfxPlayer:
 def _stop_background_music(pygame_module: Any | None) -> None:
     if pygame_module is None:
         return
-    channel = _web_music_state.get("channel")
-    if channel is not None:
-        try:
-            channel.stop()
-        except Exception:
-            pass
-        _web_music_state.clear()
     try:
         pygame_module.mixer.music.stop()
     except Exception:
@@ -646,34 +536,9 @@ def _scroll_start(selected_index: int, total_items: int, visible_rows: int) -> i
     return min(candidate, total_items - visible_rows)
 
 
-async def _await_action(renderer: Renderer) -> str | None:
-    """Return the next input action, yielding to the browser event loop on web.
-
-    Desktop keeps the renderer's blocking poll (unchanged idle behavior). Under
-    pygbag we poll without blocking and sleep a real frame on every empty poll so
-    the browser can pump events, repaint, and service audio between frames.
-    """
-    if not IS_WEB:
-        return renderer.poll_action()
-
-    poll_nonblocking = getattr(renderer, "poll_action_nonblocking", None)
-    while True:
-        if callable(poll_nonblocking):
-            action = poll_nonblocking()
-        else:
-            action = renderer.poll_action()
-        if action is not None:
-            # Sleep a real frame before returning to the heavy, synchronous render
-            # this action triggers. During sustained/held movement actions stream
-            # out back-to-back; asyncio.sleep(0) returns to Python almost
-            # immediately without giving the browser wall-clock time to run the
-            # audio callback, so the buffer drains faster the longer you move and
-            # the music stutters. A real ~16ms yield guarantees audio refill time
-            # between renders (movement is already gated by key-repeat, so this
-            # doesn't slow it) and is imperceptible latency for a single input.
-            await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
-            return action
-        await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
+def _await_action(renderer: Renderer) -> str | None:
+    """Block for the next input action and return it."""
+    return renderer.poll_action()
 
 
 # How often to re-render while the player has an active status animation, so the
@@ -682,22 +547,21 @@ async def _await_action(renderer: Renderer) -> str | None:
 _STATUS_ANIM_POLL_SECONDS = 0.2
 
 
-async def _await_action_or_idle(renderer: Renderer, idle_timeout: float) -> str | None:
+def _await_action_or_idle(renderer: Renderer, idle_timeout: float) -> str | None:
     """Like ``_await_action`` but returns ``None`` after ``idle_timeout`` seconds
-    with no input -- an animation tick. Non-blocking on both desktop and web so
-    idle status animations keep playing while we wait."""
+    with no input -- an animation tick. Polls without blocking so idle status
+    animations keep playing while we wait, sleeping a frame between polls so the
+    wait doesn't busy-spin the CPU."""
     poll_nonblocking = getattr(renderer, "poll_action_nonblocking", None)
     poll = poll_nonblocking if callable(poll_nonblocking) else renderer.poll_action
     deadline = time.monotonic() + idle_timeout
     while True:
         action = poll()
         if action is not None:
-            if IS_WEB:
-                await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
             return action
         if time.monotonic() >= deadline:
             return None
-        await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
+        time.sleep(_IDLE_POLL_INTERVAL)
 
 
 # How often the main loop wakes up with no input at all, so genuinely idle
@@ -747,7 +611,7 @@ def _pump_background_regions(budget_seconds: float) -> None:
         )
 
 
-async def _draw_title_screen(renderer: Renderer) -> bool:
+def _draw_title_screen(renderer: Renderer) -> bool:
     poll_action_nonblocking = getattr(renderer, "poll_action_nonblocking", None)
     splash_seconds = max(0.5, _TITLE_SPLASH_SECONDS)
     end_time = time.monotonic() + splash_seconds
@@ -774,7 +638,7 @@ async def _draw_title_screen(renderer: Renderer) -> bool:
         if callable(poll_action_nonblocking):
             action = poll_action_nonblocking()
         else:
-            action = await _await_action(renderer)
+            action = _await_action(renderer)
 
         if action == "quit":
             return False
@@ -786,13 +650,10 @@ async def _draw_title_screen(renderer: Renderer) -> bool:
             return True
 
         if callable(poll_action_nonblocking):
-            # ~60fps splash tick. asyncio.sleep yields to the browser on web and
-            # keeps CPU low on desktop (unlike time.sleep, which would block the
-            # WASM thread and freeze the page).
-            await asyncio.sleep(0.016)
+            time.sleep(0.016)  # ~60fps splash tick; keeps the wait from busy-spinning
 
 
-async def _draw_main_menu(renderer: Renderer) -> str:
+def _draw_main_menu(renderer: Renderer) -> str:
     options: list[tuple[str, str]] = [
         ("continue", "Continue"),
         ("new_game", "New Game"),
@@ -813,7 +674,7 @@ async def _draw_main_menu(renderer: Renderer) -> str:
         _draw_menu_options(renderer, x + 4, y + 7, width - 8, labels, selected)
         renderer.present()
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action in {"quit", "open_pause_menu"}:
             return "quit"
         if action == "move_up":
@@ -824,7 +685,7 @@ async def _draw_main_menu(renderer: Renderer) -> str:
             return options[selected][0]
 
 
-async def _draw_options_menu(renderer: Renderer, options: dict) -> str:
+def _draw_options_menu(renderer: Renderer, options: dict) -> str:
     def apply_renderer_options() -> None:
         apply_fn = getattr(renderer, "apply_options", None)
         if callable(apply_fn):
@@ -857,7 +718,7 @@ async def _draw_options_menu(renderer: Renderer, options: dict) -> str:
         _draw_menu_options(renderer, x + 4, y + 7, width - 8, items, selected)
         renderer.present()
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action in {"open_pause_menu", "quit"}:
             return "back"
         if action == "move_up":
@@ -902,7 +763,7 @@ async def _draw_options_menu(renderer: Renderer, options: dict) -> str:
                 return "back"
 
 
-async def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
+def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
     menu_items = ["Save Game", "Options", "Quit"]
     selected = 0
 
@@ -919,7 +780,7 @@ async def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
         _draw_menu_options(renderer, x + 4, y + 7, width - 8, menu_items, selected)
         renderer.present()
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action == "open_pause_menu":
             return "resume"
         if action == "quit":
@@ -931,12 +792,12 @@ async def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
         elif action in {"menu_select", "confirm_action"}:
             chosen = menu_items[selected].lower().replace(" ", "_")
             if chosen == "options":
-                await _draw_options_menu(renderer, options)
+                _draw_options_menu(renderer, options)
                 continue
             return chosen
 
 
-async def _run_startup_flow(
+def _run_startup_flow(
     renderer: Renderer,
     requested_save_file: Path | None,
     game_map: GameMap,
@@ -951,10 +812,10 @@ async def _run_startup_flow(
         )
         return (True, loaded_map, loaded_player_position, selected_save_file)
 
-    if not await _draw_title_screen(renderer):
+    if not _draw_title_screen(renderer):
         return (False, game_map, player_position, selected_save_file)
 
-    menu_choice = await _draw_main_menu(renderer)
+    menu_choice = _draw_main_menu(renderer)
     if menu_choice == "quit":
         return (False, game_map, player_position, selected_save_file)
     if menu_choice == "continue":
@@ -1507,7 +1368,7 @@ def _bed_near_player() -> int | None:
     return best
 
 
-async def _confirm_if_owned_by_other(renderer: Renderer, ent: int, noun: str, verb: str) -> bool:
+def _confirm_if_owned_by_other(renderer: Renderer, ent: int, noun: str, verb: str) -> bool:
     """When ``ent`` belongs to someone other than the player, warn whose it is and
     ask for confirmation. Returns True if the player may go ahead (their own/
     unowned property proceeds silently; a decline returns False)."""
@@ -1516,7 +1377,7 @@ async def _confirm_if_owned_by_other(renderer: Renderer, ent: int, noun: str, ve
     if owner is None or owner == player_ent:
         return True
     owner_name = _entity_name(owner, fallback="someone else")
-    return await _confirm(
+    return _confirm(
         renderer,
         title="Not Yours",
         lines=[
@@ -1526,7 +1387,7 @@ async def _confirm_if_owned_by_other(renderer: Renderer, ent: int, noun: str, ve
     )
 
 
-async def _confirm(renderer: Renderer, title: str, lines: list[str]) -> bool:
+def _confirm(renderer: Renderer, title: str, lines: list[str]) -> bool:
     """A yes/no prompt over the game. Defaults to No; Esc cancels. Returns True
     only if the player explicitly chooses Yes."""
     options = ["No", "Yes"]
@@ -1546,7 +1407,7 @@ async def _confirm(renderer: Renderer, title: str, lines: list[str]) -> bool:
         _draw_menu_options(renderer, x + 4, y + 3 + len(lines) + 1, width - 8, options, selected)
         renderer.present()
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action in {"quit", "open_pause_menu"}:
             return False
         if action == "move_up":
@@ -1559,7 +1420,7 @@ async def _confirm(renderer: Renderer, title: str, lines: list[str]) -> bool:
             return options[selected] == "Yes"
 
 
-async def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
+def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
     """Send the player to sleep and fast-forward turns until they wake rested.
 
     The whole world keeps simulating during the rest (NPCs act, needs shift, the
@@ -1585,7 +1446,6 @@ async def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
     while esper.has_component(player_ent, Asleep) and turns < _SLEEP_MAX_TURNS:
         esper.process(WAIT_ACTION)
         turns += 1
-        await asyncio.sleep(0)
 
     # Safety net: never leave the player stuck asleep past the cap.
     if esper.has_component(player_ent, Asleep):
@@ -1601,7 +1461,6 @@ async def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
         for processor in (esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor)):
             if processor is not None:
                 processor.scheduler.catch_up_all(target_region_turn)
-                await asyncio.sleep(0)
 
     esper.process(None)
 
@@ -1684,7 +1543,7 @@ def _work_blueprint(ghost_ent: int, player_ent: int, game_map: GameMap) -> tuple
     return "You raise the piece into place.", True
 
 
-async def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name: str) -> None:
+def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name: str) -> None:
     """Prompt for a direction and build the selected piece on that adjacent tile.
     Any non-direction key cancels and keeps the item."""
     player_ent = _first_player_entity()
@@ -1693,7 +1552,7 @@ async def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name
     queue_message(f"Place the {item_name}: press a direction (Esc/other to cancel).")
     esper.process(None)
 
-    action = await _await_action(renderer)
+    action = _await_action(renderer)
     player_pos = esper.component_for_entity(player_ent, Position)
     target = _direction_target_xy(action, player_pos)
     if target is None:
@@ -1703,7 +1562,7 @@ async def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name
     esper.process(None)
 
 
-async def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
+def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
     player_ent = _first_player_entity()
     if player_ent is None:
         return "close"
@@ -1807,7 +1666,7 @@ async def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
 
         renderer.present()
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action in {"open_pause_menu", "open_inventory"}:
             return "close"
         if action == "quit":
@@ -1846,7 +1705,7 @@ async def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
                 message = _trade_item(player_ent, npc_ent, entry)
 
 
-async def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
+def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
     player_ent = _first_player_entity()
     if player_ent is None:
         return "close"
@@ -1971,7 +1830,7 @@ async def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
 
         renderer.present()
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action in {"open_pause_menu", "open_inventory"}:
             return "close"
         if action == "quit":
@@ -2012,7 +1871,7 @@ async def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
                 continue
 
 
-async def _draw_info_screen(
+def _draw_info_screen(
     renderer: Renderer,
     title: str,
     lines: list[str],
@@ -2034,7 +1893,7 @@ async def _draw_info_screen(
             _draw_ui_text(renderer, x + 3, y + 5 + idx, line, _MENU_TEXT_COLOR, width - 6)
         renderer.present()
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action == "quit":
             return "quit"
         if action in {"open_pause_menu", "open_inventory", "open_status", "menu_select", "confirm_action"}:
@@ -2149,7 +2008,7 @@ def _perform_look_attack(target_ent: int) -> None:
     esper.process(WAIT_ACTION)
 
 
-async def _draw_look_action_menu(
+def _draw_look_action_menu(
     renderer: Renderer,
     game_map: GameMap,
     target_ent: int,
@@ -2181,7 +2040,7 @@ async def _draw_look_action_menu(
         _draw_menu_options(renderer, x + 3, option_y, width - 6, menu_options, selected)
         renderer.present()
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action == "quit":
             return "quit"
         if action in {"open_pause_menu", "look"}:
@@ -2204,12 +2063,12 @@ async def _draw_look_action_menu(
                     talk_line = f"{name} has nothing to say."
                 continue
             if choice == "Trade":
-                if await _draw_trade_menu(renderer, target_ent) == "quit":
+                if _draw_trade_menu(renderer, target_ent) == "quit":
                     return "quit"
                 talk_line = ""
                 continue
             if choice == "Status":
-                if await _draw_info_screen(
+                if _draw_info_screen(
                     renderer,
                     title=f"STATUS - {name}",
                     lines=_creature_status_lines(game_map, target_ent),
@@ -2223,7 +2082,7 @@ async def _draw_look_action_menu(
                 return "close"
 
 
-async def _look_interact(renderer: Renderer, game_map: GameMap, x: int, y: int) -> str:
+def _look_interact(renderer: Renderer, game_map: GameMap, x: int, y: int) -> str:
     """Resolve an Enter press on the look cursor: interact with a creature there,
     loot an adjacent corpse, or just describe whatever the cursor rests on."""
     player_ent = _first_player_entity()
@@ -2235,14 +2094,14 @@ async def _look_interact(renderer: Renderer, game_map: GameMap, x: int, y: int) 
     creature_ent = _creature_at_xy(x, y)
     if creature_ent is not None:
         if creature_ent == player_ent:
-            return await _draw_info_screen(
+            return _draw_info_screen(
                 renderer,
                 title="STATUS - You",
                 lines=_creature_status_lines(game_map, player_ent),
                 subtitle="How you're holding up",
             )
         options = _look_available_actions(creature_ent, dist)
-        return await _draw_look_action_menu(renderer, game_map, creature_ent, options)
+        return _draw_look_action_menu(renderer, game_map, creature_ent, options)
 
     feature_ent = _renderable_at_xy(x, y)
     if feature_ent is not None:
@@ -2251,16 +2110,16 @@ async def _look_interact(renderer: Renderer, game_map: GameMap, x: int, y: int) 
             and esper.has_component(feature_ent, Corpse)
             and _entity_has_tradeable_items(feature_ent)
         ):
-            return await _draw_loot_menu(renderer, feature_ent)
+            return _draw_loot_menu(renderer, feature_ent)
         name = _entity_name(feature_ent, fallback="something")
-        return await _draw_info_screen(
+        return _draw_info_screen(
             renderer,
             title="LOOK",
             lines=[f"You see {name}.", f"Distance: {dist}."],
             subtitle="",
         )
 
-    return await _draw_info_screen(
+    return _draw_info_screen(
         renderer,
         title="LOOK",
         lines=[f"You see {_terrain_name(game_map, x, y)}."],
@@ -2274,7 +2133,7 @@ def _clear_look_overlay(render: RenderProcessor | None) -> None:
         render.look_info = None
 
 
-async def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
+def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
     """Drive the look cursor: it starts on the player, moves with the direction
     keys, and Enter interacts with whatever it rests on. Returns "quit" if the
     player quit the game while looking, otherwise "close"."""
@@ -2308,7 +2167,7 @@ async def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
             )
         esper.process(None)
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action == "quit":
             _clear_look_overlay(render)
             return "quit"
@@ -2325,7 +2184,7 @@ async def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
             # The interaction menu draws its own frames, so drop the cursor
             # overlay while it's open, then restore it on return.
             _clear_look_overlay(render)
-            result = await _look_interact(renderer, game_map, cursor_x, cursor_y)
+            result = _look_interact(renderer, game_map, cursor_x, cursor_y)
             if result == "quit":
                 _clear_look_overlay(render)
                 return "quit"
@@ -2336,7 +2195,7 @@ async def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
     return "close"
 
 
-async def _draw_dialogue_menu(renderer: Renderer, game_map: GameMap, npc_ent: int) -> str:
+def _draw_dialogue_menu(renderer: Renderer, game_map: GameMap, npc_ent: int) -> str:
     selected = 0
     options = ["Talk", "Trade", "Status", "Leave"]
     info_lines = _npc_info_lines(game_map, npc_ent)
@@ -2365,7 +2224,7 @@ async def _draw_dialogue_menu(renderer: Renderer, game_map: GameMap, npc_ent: in
         _draw_menu_options(renderer, x + 3, option_y, width - 6, options, selected)
 
         renderer.present()
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
 
         if action in {"open_pause_menu", "open_inventory"}:
             return "close"
@@ -2397,13 +2256,13 @@ async def _draw_dialogue_menu(renderer: Renderer, game_map: GameMap, npc_ent: in
                     info_lines = _npc_info_lines(game_map, npc_ent)
                 continue
             if choice == "Trade":
-                trade_choice = await _draw_trade_menu(renderer, npc_ent)
+                trade_choice = _draw_trade_menu(renderer, npc_ent)
                 if trade_choice == "quit":
                     return "quit"
                 info_lines = _npc_info_lines(game_map, npc_ent)
                 talk_line = ""
             if choice == "Status":
-                status_choice = await _draw_info_screen(
+                status_choice = _draw_info_screen(
                     renderer,
                     title=f"STATUS - {npc_name}",
                     lines=_creature_status_lines(game_map, npc_ent),
@@ -2688,7 +2547,7 @@ def _draw_tab_bar(renderer: Renderer, x: int, y: int, width: int, active_index: 
         cursor += len(text) + 1
 
 
-async def _draw_player_menu(renderer: Renderer, game_map: GameMap, start_tab: str = "inventory") -> tuple[str, str]:
+def _draw_player_menu(renderer: Renderer, game_map: GameMap, start_tab: str = "inventory") -> tuple[str, str]:
     """Tabbed player menu (Tab cycles tabs; I/C jump to Inventory/Status and
     toggle-close if already there; Esc closes). Returns (result, last_tab) so the
     caller can reopen on the tab you left on."""
@@ -2726,7 +2585,7 @@ async def _draw_player_menu(renderer: Renderer, game_map: GameMap, start_tab: st
 
         renderer.present()
 
-        action = await _await_action(renderer)
+        action = _await_action(renderer)
         if action == "quit":
             return "quit", current_key
         if action == "open_pause_menu":
@@ -3118,7 +2977,7 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
             _spawn_deer(game_map, cx + dxy[0], cy + dxy[1])
 
 
-async def main() -> None:
+def main() -> None:
     args = _parse_args()
     bootstrap_files(MAP_WIDTH, MAP_HEIGHT)
     options = load_options()
@@ -3146,7 +3005,7 @@ async def main() -> None:
 
     try:
         with PygameRenderer(options=options) as renderer:
-            startup_ok, game_map, player_position, selected_save_file = await _run_startup_flow(
+            startup_ok, game_map, player_position, selected_save_file = _run_startup_flow(
                 renderer,
                 startup_save_file,
                 game_map,
@@ -3209,7 +3068,7 @@ async def main() -> None:
                 # fire, ...), poll on a short timeout and re-render on each idle
                 # tick so the identifiers cycle without input.
                 if player_is_animated(game_map) or bubbles_active():
-                    action = await _await_action_or_idle(renderer, _STATUS_ANIM_POLL_SECONDS)
+                    action = _await_action_or_idle(renderer, _STATUS_ANIM_POLL_SECONDS)
                     if action is None:
                         _pump_background_regions(_IDLE_PUMP_BASE_BUDGET)
                         esper.process(None)
@@ -3220,7 +3079,7 @@ async def main() -> None:
                     # or away from the keyboard) is exactly when there's the most
                     # spare time to pay down region simulation debt in the
                     # background, ramping up the longer nothing happens.
-                    action = await _await_action_or_idle(renderer, _IDLE_POLL_SECONDS)
+                    action = _await_action_or_idle(renderer, _IDLE_POLL_SECONDS)
                     if action is None:
                         idle_ticks += 1
                         _pump_background_regions(_idle_pump_budget(idle_ticks))
@@ -3254,16 +3113,16 @@ async def main() -> None:
                     # yours); otherwise pitch a camp.
                     nearby_bed = _bed_near_player()
                     if nearby_bed is not None:
-                        if await _confirm_if_owned_by_other(renderer, nearby_bed, "bed", "sleep here"):
-                            await _sleep_player(renderer, in_camp=False)
+                        if _confirm_if_owned_by_other(renderer, nearby_bed, "bed", "sleep here"):
+                            _sleep_player(renderer, in_camp=False)
                         else:
                             esper.process(None)
                     else:
-                        await _sleep_player(renderer, in_camp=True)
+                        _sleep_player(renderer, in_camp=True)
                     continue
                 if action == "look":
                     held_directions.clear()
-                    look_choice = await _look_mode(renderer, game_map)
+                    look_choice = _look_mode(renderer, game_map)
                     if look_choice == "quit":
                         break
                     esper.process(None)
@@ -3294,11 +3153,11 @@ async def main() -> None:
                         held_directions.clear()
                         if esper.has_component(interact_creature, Friendly):
                             # Friendlies: full dialogue (which shows their status).
-                            choice = await _draw_dialogue_menu(renderer, game_map, interact_creature)
+                            choice = _draw_dialogue_menu(renderer, game_map, interact_creature)
                         else:
                             # Wild/hostile creatures: read-only examine of status.
                             name = _entity_name(interact_creature, fallback="Creature")
-                            choice = await _draw_info_screen(
+                            choice = _draw_info_screen(
                                 renderer,
                                 title=f"EXAMINE - {name}",
                                 lines=_creature_status_lines(game_map, interact_creature),
@@ -3311,7 +3170,7 @@ async def main() -> None:
 
                     interact_corpse = _find_interaction_corpse(interact_action)
                     if interact_corpse is not None:
-                        loot_choice = await _draw_loot_menu(renderer, interact_corpse)
+                        loot_choice = _draw_loot_menu(renderer, interact_corpse)
                         held_directions.clear()
                         if loot_choice == "quit":
                             break
@@ -3321,8 +3180,8 @@ async def main() -> None:
                     interact_chest = _find_adjacent_feature(interact_action, Chest)
                     if interact_chest is not None:
                         held_directions.clear()
-                        if await _confirm_if_owned_by_other(renderer, interact_chest, "chest", "open it"):
-                            loot_choice = await _draw_loot_menu(renderer, interact_chest)
+                        if _confirm_if_owned_by_other(renderer, interact_chest, "chest", "open it"):
+                            loot_choice = _draw_loot_menu(renderer, interact_chest)
                             if loot_choice == "quit":
                                 break
                         esper.process(None)
@@ -3370,8 +3229,8 @@ async def main() -> None:
                         interact_bed = _find_adjacent_feature(interact_action, Bed)
                         if interact_bed is not None:
                             held_directions.clear()
-                            if await _confirm_if_owned_by_other(renderer, interact_bed, "bed", "sleep here"):
-                                await _sleep_player(renderer, in_camp=False)
+                            if _confirm_if_owned_by_other(renderer, interact_bed, "bed", "sleep here"):
+                                _sleep_player(renderer, in_camp=False)
                             else:
                                 esper.process(None)
                             continue
@@ -3384,19 +3243,19 @@ async def main() -> None:
                         start_tab = "status"
                     else:
                         start_tab = last_menu_tab
-                    menu_choice, last_menu_tab = await _draw_player_menu(renderer, game_map, start_tab)
+                    menu_choice, last_menu_tab = _draw_player_menu(renderer, game_map, start_tab)
                     held_directions.clear()
                     if menu_choice == "quit":
                         break
                     if menu_choice.startswith("place:"):
                         # The player chose a buildable in the inventory; ask for a
                         # direction and build it on that tile.
-                        await _place_from_inventory(renderer, game_map, menu_choice[len("place:"):])
+                        _place_from_inventory(renderer, game_map, menu_choice[len("place:"):])
                         continue
                     esper.process(None)
                     continue
                 if action == "open_pause_menu":
-                    pause_choice = await _draw_pause_menu(renderer, options)
+                    pause_choice = _draw_pause_menu(renderer, options)
                     held_directions.clear()
                     if pause_choice == "save_game":
                         player_pos = first_player_position() or player_position
@@ -3411,8 +3270,8 @@ async def main() -> None:
 
 
 def run() -> None:
-    """Synchronous entry point for desktop runs (`python3 src/main.py`)."""
-    asyncio.run(main())
+    """Entry point for desktop runs (`python3 src/main.py`)."""
+    main()
 
 
 if __name__ == "__main__":

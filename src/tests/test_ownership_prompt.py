@@ -2,7 +2,6 @@
 used when sleeping in a bed or opening a chest that isn't yours."""
 from __future__ import annotations
 
-import asyncio
 from collections import deque
 
 import esper
@@ -27,8 +26,10 @@ class ScriptedRenderer(FakeRenderer):
         return self._actions.popleft() if self._actions else "open_pause_menu"
 
 
-def _run(coro):
-    return asyncio.run(coro)
+def _run(result):
+    # The menu helpers are now plain synchronous calls; kept as a thin wrapper so
+    # the call sites below read unchanged.
+    return result
 
 
 def test_confirm_defaults_to_no() -> None:

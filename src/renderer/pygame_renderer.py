@@ -11,46 +11,8 @@ from collections import deque
 import json
 import os
 from pathlib import Path
-import sys
 
 from .base import MEMORY_DESATURATE, MEMORY_DIM, Renderer, memory_color
-
-
-# Under pygbag the browser canvas fills the page via CSS (width/height: 100%),
-# so the pygame surface resolution must match the visible canvas or the browser
-# scales it and the game looks wrong-sized.
-IS_WEB = sys.platform == "emscripten"
-
-
-def _apply_web_canvas_style() -> None:
-    """Tell the browser to scale the canvas with nearest-neighbor sampling.
-
-    The canvas is CSS-scaled to fit the page; the browser's default smoothing
-    blurs upscaled pixels and text. `image-rendering: pixelated` keeps them crisp.
-    """
-    try:
-        import platform as _platform  # pygbag-injected; has .window.canvas on web
-
-        _platform.window.canvas.style.imageRendering = "pixelated"
-    except Exception:
-        pass
-
-
-def _web_display_size(default: tuple[int, int] = (1280, 720)) -> tuple[int, int]:
-    """Visible browser canvas size (CSS pixels) for the pygbag build.
-
-    Falls back to a sane default off-web or if the JS bridge is unavailable.
-    """
-    try:
-        import platform as _platform  # pygbag injects a `window` proxy here
-
-        width = int(_platform.window.innerWidth)
-        height = int(_platform.window.innerHeight)
-        if width > 0 and height > 0:
-            return (width, height)
-    except Exception:
-        pass
-    return default
 
 
 _DEFAULT_ACTION_KEYBINDS: dict[str, list[str]] = {
@@ -325,14 +287,7 @@ class PygameRenderer(Renderer):
         num_displays = self._pygame.display.get_num_displays() if hasattr(self._pygame.display, "get_num_displays") else 1
         display_index = min(display_index, max(0, num_displays - 1))
 
-        if IS_WEB:
-            # Browser "fullscreen" isn't a real display mode. Match the surface to
-            # the visible canvas so 1 surface px == 1 CSS px; otherwise the browser
-            # rescales an oversized surface and the whole game looks tiny.
-            window_w, window_h = _web_display_size()
-            self._screen = self._pygame.display.set_mode((window_w, window_h))
-            _apply_web_canvas_style()
-        elif fullscreen:
+        if fullscreen:
             self._screen = self._pygame.display.set_mode(
                 (0, 0), self._pygame.FULLSCREEN, display=display_index
             )
@@ -811,8 +766,7 @@ class PygameRenderer(Renderer):
         # Tell Windows to report real physical pixels per monitor instead of
         # letting the OS rescale the window (fixes blurry/wrong-sized display
         # on multi-monitor / high-DPI setups).
-        if not IS_WEB:
-            os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
+        os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
 
         pygame.init()
         pygame.display.set_caption("Tales of Derision")

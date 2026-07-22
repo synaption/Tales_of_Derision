@@ -2,7 +2,6 @@
 inventory actions inside a tab). Driven headlessly with a scripted renderer."""
 from __future__ import annotations
 
-import asyncio
 from collections import deque
 
 import esper
@@ -41,7 +40,7 @@ def _player(items: list[str] | None = None, main_hand: str | None = None) -> int
 
 def _run(actions: list[str | None], start_tab: str = "inventory") -> tuple[str, str]:
     renderer = ScriptedRenderer(actions)
-    return asyncio.run(_draw_player_menu(renderer, GameMap(24, 14), start_tab))
+    return _draw_player_menu(renderer, GameMap(24, 14), start_tab)
 
 
 def test_tab_cycles_and_close_reports_the_current_tab() -> None:
