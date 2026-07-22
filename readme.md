@@ -257,18 +257,51 @@ walks there to sleep and cooks at its oven. Once someone owns a house nobody els
 takes it, so two villagers never share one — and a villager who already owns a
 home is left alone (it never re-claims or rebuilds).
 
-**Villagers build.** Only a resident that owns **no** house builds: it takes a
-preset cabin design, finds a clear spot, gathers **wood**, and raises the walls
-and door one piece at a time over many turns (it still stops to eat, drink, and
-sleep, so a cabin takes a while). When the last piece goes up the cabin is
-furnished and the builder becomes its owner.
+**Blueprints are shared building sites (blueprint → haul → raise).** Building
+happens in three visible stages, and a blueprint is a **world object anybody can
+work on**, not one villager's private project:
 
-**You can build too.** Open the **Craft** tab in the `Tab` menu to craft `Wall`,
-`Window`, and `Door` pieces out of `Wood` (walls/windows cost 2, doors 3). The
-crafted pieces go into your pack; switch to the **Inventory** tab, select a
-piece, and press a **direction** to place it on that adjacent tile -- seal off a
-room with four walls and a door and you've built a house of your own. Recipes and
-the item/tile mapping live in [src/items.py](src/items.py).
+1. **Stake out a blueprint.** A homeless resident picks a preset cabin design and
+   a clear spot, then lays the whole footprint out as **blue-tinted ghost tiles**
+   — a preview of every wall and the door before a single one is real. Ghost
+   tiles don't block movement; you can walk right through a proto-structure.
+2. **Haul the materials in.** Workers gather **wood** from trees and carry it to
+   the site in batches, dropping it off at the blueprint. Each piece's ghost
+   **brightens from a dim outline to a solid blue** as its wood arrives, so you
+   can watch the proto-structure "fill up" with materials.
+3. **Raise it chunk by chunk.** Once a piece is stocked, a worker turns it from a
+   ghost into a real wall or door, **one chunk per turn**. When the last chunk of
+   a cabin goes up it is furnished and left **unowned** — the nearest homeless
+   resident then claims it as home.
+
+**Anybody can work a blueprint.** A staked-out site belongs to no one: **every
+homeless resident** whose immediate needs (food, water, sleep) are met walks to
+the nearest reachable blueprint and pitches in — so several villagers **share the
+labour** on one cabin (a barn-raising) instead of each starting their own. If no
+reachable site exists yet, one villager stakes a fresh one out. The `Blueprint`
+and `ConstructionSite` components and the shared haul/raise logic live in
+[src/systems.py](src/systems.py) (`create_construction_site`, `raise_blueprint`,
+`NpcAiProcessor._work_blueprints`).
+
+**Nothing gets sealed into a wall.** Building never traps flora or remains:
+sites are staked out clear of trees, corpses, saplings, and other blueprints, and
+if anything is on a tile when its wall goes up (or ends up enclosed when a cabin
+completes) it is cleared out first — so trees and corpses no longer get stuck in
+walls or left inside finished houses.
+
+**You build with blueprints too.** Open the **Craft** tab in the `Tab` menu to
+craft `Wall`, `Window`, and `Door` pieces out of `Wood` (walls/windows cost 2,
+doors 3). Switch to the **Inventory** tab, select a piece, and press a
+**direction** to **lay out a blueprint** on that adjacent tile — the crafted
+piece is spent as its materials, so the ghost drops in already **stocked and
+ready to raise** (bright blue). Then **face the ghost and press the interact key
+(Enter)** to raise it into the real tile — or leave it for a passing builder to
+raise for you. Facing an *unstocked* ghost with `Wood` in your pack and pressing
+Enter hauls a piece of wood in to stock it. Building is **labour that takes
+time**: each successful haul or raise **spends a turn** (the world simulates a
+step), so a wall goes up one chunk at a time just as it does for villagers. Seal
+off a room with four walls and a door and you've built a house of your own.
+Recipes and the item/tile mapping live in [src/items.py](src/items.py).
 
 **The world is a living ecosystem.** The map is a **3×3 grid of sections**. You
 are only ever in one section at a time: the camera shows just your current

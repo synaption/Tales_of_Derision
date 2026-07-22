@@ -279,11 +279,36 @@ class Resident:
 
 
 @dataclass
-class BuildPlan:
-    """A house a resident NPC is constructing from a preset design. ``remaining``
-    is the list of ``(x, y, tile)`` still to place; ``interior`` are the inside
-    floor tiles to furnish and ``bed`` the tile it will sleep on once done."""
-    remaining: list[tuple[int, int, str]] = field(default_factory=list)
+class Blueprint:
+    """A single ghost tile of a structure under construction: a blue-tinted
+    preview of the ``tile`` it will eventually become. ``stocked`` flips True
+    once the wood for this piece has been hauled in (its tint brightens); any
+    worker then raises stocked ghosts into real tiles one at a time.
+
+    ``site`` is the ``ConstructionSite`` entity this piece belongs to, or
+    ``None`` for a loose piece a player staked out on its own. A ghost is a plain
+    world entity, so **anybody** -- a villager or the player -- can walk up and
+    work it."""
+    tile: str = "#"
+    stocked: bool = False
+    site: int | None = None
+
+
+@dataclass
+class ConstructionSite:
+    """A staked-out structure being raised from blue-tinted ``Blueprint`` ghosts.
+
+    It is a **world** entity, owned by no one: the whole footprint is first laid
+    out as ghost tiles, workers haul wood to it (lighting each ghost up as its
+    materials arrive), and finally raise the stocked ghosts into real tiles one
+    chunk at a time. Any build-minded villager -- or the player -- can pitch in;
+    when the last piece goes up the cabin is furnished and left unowned for the
+    nearest homeless resident to claim.
+
+    ``pieces`` maps each ``(x, y)`` build coordinate -> its ``Blueprint`` ghost
+    entity; ``interior`` are the inside floor tiles furnished on completion and
+    ``bed`` the tile the eventual resident sleeps on."""
+    pieces: dict[tuple[int, int], int] = field(default_factory=dict)
     interior: list[tuple[int, int]] = field(default_factory=list)
     bed: tuple[int, int] = (0, 0)
 

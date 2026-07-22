@@ -7,8 +7,9 @@ import pytest
 
 from components import (
     Bed,
+    Blueprint,
     BlocksMovement,
-    BuildPlan,
+    ConstructionSite,
     Chest,
     Furniture,
     Home,
@@ -29,7 +30,9 @@ from systems import (
     HousingProcessor,
     NpcAiProcessor,
     bed_owner,
+    create_construction_site,
     furnish_house,
+    raise_blueprint,
     house_is_owned,
     houses_for,
     owned_bed_of,
@@ -215,7 +218,7 @@ def test_resident_that_already_owns_a_house_is_left_alone() -> None:
     HousingProcessor(game_map).process("wait")
 
     # It neither grabs the free house nor starts building a second one.
-    assert not esper.has_component(villager, BuildPlan)
+    assert not list(esper.get_components(ConstructionSite))
     assert not house_is_owned(interior)
 
 
@@ -232,7 +235,7 @@ def test_villager_will_not_claim_a_house_someone_else_owns() -> None:
 
     assert bed_owner(bed_ent) == owner  # ownership unchanged
     assert not esper.has_component(villager, Home)  # it didn't move in
-    assert esper.has_component(villager, BuildPlan)  # it builds its own instead
+    assert list(esper.get_components(ConstructionSite))  # it stakes out its own instead
 
 
 def test_two_residents_claim_two_different_houses() -> None:
@@ -260,71 +263,102 @@ def test_two_residents_claim_two_different_houses() -> None:
     assert (home1.x, home1.y) != (home2.x, home2.y)  # they took different beds
 
 
-def test_homeless_resident_with_no_house_gets_a_build_plan() -> None:
+def test_homeless_resident_stakes_out_a_construction_site() -> None:
     game_map = GameMap(30, 18)  # blank, no carved buildings survive detection anyway
     for y in range(1, game_map.height - 1):
         for x in range(1, game_map.width - 1):
             game_map.tiles[y][x] = game_map.FLOOR
-    villager = esper.create_entity(
-        Position(15, 9), NPC(), Resident(), BlocksMovement(), Name("Builder")
-    )
+    esper.create_entity(Position(15, 9), NPC(), Resident(), BlocksMovement(), Name("Builder"))
 
     HousingProcessor(game_map).process("wait")
-    assert esper.has_component(villager, BuildPlan)
-    plan = esper.component_for_entity(villager, BuildPlan)
-    assert plan.remaining  # has pieces to build
-    assert plan.interior  # and an interior to furnish later
+    sites = [comp for _e, (comp,) in esper.get_components(ConstructionSite)]
+    assert len(sites) == 1  # a world-level site, not a per-builder component
+    site = sites[0]
+    assert site.pieces  # has ghost pieces to build
+    assert site.interior  # and an interior to furnish later
+    # Every piece is staked out as a blue-tinted, not-yet-stocked ghost tile.
+    for ghost in site.pieces.values():
+        assert esper.has_component(ghost, Blueprint)
+        assert not esper.component_for_entity(ghost, Blueprint).stocked
 
 
-def test_npc_builds_a_piece_when_it_has_wood_and_is_adjacent() -> None:
+def test_homeless_residents_share_a_single_construction_site() -> None:
+    game_map = GameMap(30, 18)
+    for y in range(1, game_map.height - 1):
+        for x in range(1, game_map.width - 1):
+            game_map.tiles[y][x] = game_map.FLOOR
+    # Two homeless residents in the same region: they should pool their labour on
+    # one site, not each stake out a separate cabin.
+    esper.create_entity(Position(8, 9), NPC(), Resident(), BlocksMovement(), Name("A"))
+    esper.create_entity(Position(20, 9), NPC(), Resident(), BlocksMovement(), Name("B"))
+
+    HousingProcessor(game_map).process("wait")
+    sites = [comp for _e, (comp,) in esper.get_components(ConstructionSite)]
+    assert len(sites) == 1
+
+
+def test_npc_hauls_wood_then_raises_a_stocked_piece() -> None:
     game_map = GameMap(30, 18)
     for y in range(1, game_map.height - 1):
         for x in range(1, game_map.width - 1):
             game_map.tiles[y][x] = game_map.FLOOR
     processor = NpcAiProcessor(game_map)
 
-    # A builder standing next to a single pending wall piece, holding wood.
+    # A homeless resident builder next to a single loose ghost wall, holding wood.
+    # First turn it hauls the wood in (lighting the ghost up); a later turn raises
+    # it -- a worker builds any reachable ghost, not just its own site's.
+    esper.create_entity(
+        Position(11, 10), Renderable(game_map.WALL), Name("Blueprint"),
+        Blueprint(tile=game_map.WALL),
+    )
     villager = esper.create_entity(
-        Position(10, 10), NPC(), Needs(hunger=0.0, thirst=0.0, tiredness=0.0),
+        Position(10, 10), NPC(), Resident(), Needs(hunger=0.0, thirst=0.0, tiredness=0.0),
         Inventory(items=[WOOD]), BlocksMovement(), Name("Builder"),
-        BuildPlan(remaining=[(11, 10, game_map.WALL)], interior=[(12, 10)], bed=(12, 10)),
     )
 
     processor.process("wait")
-    assert game_map.tile_at(11, 10) == game_map.WALL  # placed the wall
-    assert esper.component_for_entity(villager, Inventory).items == []  # spent the wood
-    assert not esper.has_component(villager, BuildPlan)  # plan complete -> furnished
-    assert esper.has_component(villager, Home)  # and moved in
+    ghost = next(g for g, _c in esper.get_components(Blueprint))
+    # The wood was delivered, stocking the ghost (no wall yet).
+    assert esper.component_for_entity(ghost, Blueprint).stocked
+    assert esper.component_for_entity(villager, Inventory).items == []
+
+    for _ in range(20):
+        if game_map.tile_at(11, 10) == game_map.WALL:
+            break
+        processor.process("wait")
+    assert game_map.tile_at(11, 10) == game_map.WALL  # ghost raised into a real wall
+    assert not list(esper.get_components(Blueprint))  # ghost consumed
 
 
-def test_npc_builds_a_whole_cabin_from_a_blueprint() -> None:
-    from systems import _blueprint_tiles
-
+def test_builders_raise_a_whole_cabin_from_a_blueprint() -> None:
     game_map = GameMap(30, 20)
     for y in range(1, game_map.height - 1):
         for x in range(1, game_map.width - 1):
             game_map.tiles[y][x] = game_map.FLOOR
-    processor = NpcAiProcessor(game_map)
+    npc_ai = NpcAiProcessor(game_map)
 
-    build, interior = _blueprint_tiles(game_map, 12, 8)
-    # A builder with ample wood and no competing needs (all rates zeroed).
+    # A world site plus a builder with ample wood and no competing needs (all
+    # rates zeroed) so it can haul and raise without stopping to gather/eat/sleep.
+    site_ent = create_construction_site(game_map, (12, 8))
     builder = esper.create_entity(
         Position(6, 10), NPC(), Resident(),
         Needs(hunger=0.0, thirst=0.0, tiredness=0.0, hunger_rate=0.0, thirst_rate=0.0, tiredness_rate=0.0),
         Inventory(items=[WOOD] * 40), BlocksMovement(), Name("Builder"),
-        BuildPlan(remaining=list(build), interior=list(interior), bed=interior[0]),
     )
 
     for _ in range(400):
-        processor.process("wait")
-        if not esper.has_component(builder, BuildPlan):
+        npc_ai.process("wait")
+        if not esper.entity_exists(site_ent):
             break
 
-    # The cabin got built (an enclosed house now exists), the builder moved in,
-    # and it did not self-trap: it never got stuck holding an unfinishable plan.
-    assert not esper.has_component(builder, BuildPlan)
-    assert esper.has_component(builder, Home)
+    # The cabin got raised (site consumed, an enclosed house now exists) with no
+    # leftover ghosts, and it did not self-trap on an unfinishable piece.
+    assert not esper.entity_exists(site_ent)
     assert len(game_map.find_enclosed_rooms()) == 1
+    assert not list(esper.get_components(Blueprint))
+    # The finished cabin is left unowned; the nearest resident then claims it.
+    HousingProcessor(game_map).process("wait")
+    assert esper.has_component(builder, Home)
 
 
 # --- Player crafting / placement -------------------------------------------
@@ -347,14 +381,23 @@ def test_craft_item_refuses_without_enough_wood() -> None:
     assert "need" in message.lower()
 
 
-def test_place_buildable_sets_the_tile_and_consumes_the_item() -> None:
+def test_place_buildable_stakes_a_stocked_ghost_and_consumes_the_item() -> None:
     game_map = GameMap(24, 14)
     player = esper.create_entity(Position(5, 5), Player(), Inventory(items=[WOOD_WALL]))
 
     message = _place_buildable_at(player, game_map, WOOD_WALL, (6, 5))
-    assert game_map.tile_at(6, 5) == game_map.WALL
+    # Placing now lays a stocked (ready-to-raise) blueprint ghost, not a wall.
+    assert game_map.tile_at(6, 5) == game_map.FLOOR
+    ghost = next(g for g, _c in esper.get_components(Blueprint))
+    bp = esper.component_for_entity(ghost, Blueprint)
+    assert bp.tile == game_map.WALL and bp.stocked
     assert esper.component_for_entity(player, Inventory).items == []
-    assert "build" in message.lower()
+    assert "blueprint" in message.lower()
+
+    # Raising it (as the player or a builder would) turns it into the real wall.
+    raise_blueprint(game_map, ghost)
+    assert game_map.tile_at(6, 5) == game_map.WALL
+    assert not list(esper.get_components(Blueprint))
 
 
 def test_place_buildable_refuses_an_occupied_tile() -> None:
@@ -408,7 +451,7 @@ def test_villager_will_not_claim_a_house_across_water() -> None:
 
     # It couldn't reach the far-bank house, so it starts building instead.
     assert not esper.has_component(villager, Home)
-    assert esper.has_component(villager, BuildPlan)
+    assert list(esper.get_components(ConstructionSite))
 
 
 def test_houses_for_caches_until_the_map_changes() -> None:

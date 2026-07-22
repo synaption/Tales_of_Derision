@@ -15,7 +15,7 @@ from typing import Any
 
 import esper
 
-from components import Age, Asleep, Bed, BerryBush, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Gender, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
+from components import Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Gender, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
 from onymancer import make_onymancer
 from game_map import GameMap
 from items import (
@@ -43,7 +43,7 @@ from persistence import (
 )
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, ReproductionProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, born_turn_for_age, bubbles_active, friendship, furnish_house, go_to_sleep, interact, pick_berries, player_is_animated, queue_message, set_bed_owner, slay_entity, spawn_speech_bubble, status_label, wake_up, world_clock
+from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, ReproductionProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, born_turn_for_age, bubbles_active, friendship, furnish_house, go_to_sleep, interact, pick_berries, player_is_animated, queue_message, raise_blueprint, set_bed_owner, slay_entity, spawn_speech_bubble, status_label, stock_blueprint, wake_up, world_clock
 
 # The world is a 3x3 grid of 120x60 sections: the habitable island sits in the
 # centre section, ringed by a coastline, and the surrounding eight sections are
@@ -1612,8 +1612,10 @@ def _craft_item(player_ent: int, item_name: str) -> str:
 def _place_buildable_at(
     player_ent: int, game_map: GameMap, item_name: str, target_xy: tuple[int, int]
 ) -> str:
-    """Place a buildable piece onto ``target_xy``, turning it into the matching
-    map tile and consuming the item. Returns a log message."""
+    """Stake out a buildable piece onto ``target_xy`` as a **blueprint ghost**,
+    consuming the item as its materials (the ghost is placed already-stocked, a
+    bright blue "ready to raise" preview). Anybody -- you or a passing builder --
+    then raises it into the real tile. Returns a log message."""
     tile = placed_tile(item_name)
     if tile is None:
         return f"You can't place the {item_name}."
@@ -1631,10 +1633,38 @@ def _place_buildable_at(
     inventory = _ensure_inventory(player_ent)
     if item_name not in inventory.items:
         return f"You have no {item_name} to place."
-    if not game_map.set_tile(tx, ty, tile):
-        return "You can't build there."
     inventory.items.remove(item_name)
-    return f"You build a {item_name}."
+    esper.create_entity(
+        Position(tx, ty),
+        Renderable(tile, fg=_BLUEPRINT_READY_BLUE),
+        Name("Blueprint"),
+        Blueprint(tile=tile, stocked=True, site=None),
+    )
+    return f"You lay out a {item_name} blueprint. Face it and interact to raise it."
+
+
+# The bright blue of a stocked, ready-to-raise ghost (mirrors systems' palette).
+_BLUEPRINT_READY_BLUE = (96, 158, 240)
+
+
+def _work_blueprint(ghost_ent: int, player_ent: int, game_map: GameMap) -> tuple[str, bool]:
+    """The player works the blueprint they're facing: deposit a Wood to stock an
+    unstocked ghost, or raise a stocked one into its real tile (finishing a cabin
+    if it was the last piece). Building is labour, so a successful haul or raise
+    **spends a turn** -- returns ``(message, took_turn)`` and only the no-op
+    failures (nothing to build, or no wood to haul) come back free."""
+    if not esper.has_component(ghost_ent, Blueprint):
+        return "There is nothing to build here.", False
+    bp = esper.component_for_entity(ghost_ent, Blueprint)
+    if not bp.stocked:
+        inventory = _ensure_inventory(player_ent)
+        if WOOD not in inventory.items:
+            return "You need Wood to stock this blueprint.", False
+        inventory.items.remove(WOOD)
+        stock_blueprint(ghost_ent)
+        return "You haul wood to the blueprint. It's ready to raise.", True
+    raise_blueprint(game_map, ghost_ent)
+    return "You raise the piece into place.", True
 
 
 async def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name: str) -> None:
@@ -3273,6 +3303,16 @@ async def main() -> None:
                     # refreshes the frame (a free action, like looting).
                     player_ent = _first_player_entity()
                     if player_ent is not None:
+                        # A faced blueprint ghost: haul wood into it, or raise it.
+                        # Building is labour -- a successful haul/raise spends a
+                        # turn (the world simulates a step); a no-op stays free.
+                        interact_ghost = _find_adjacent_feature(interact_action, Blueprint)
+                        if interact_ghost is not None:
+                            message, took_turn = _work_blueprint(interact_ghost, player_ent, game_map)
+                            queue_message(message)
+                            esper.process(WAIT_ACTION if took_turn else None)
+                            continue
+
                         interact_tree = _find_adjacent_feature(interact_action, Tree)
                         if interact_tree is not None:
                             queue_message(_chop_tree(interact_tree, player_ent))

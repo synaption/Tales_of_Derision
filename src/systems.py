@@ -12,7 +12,7 @@ import time
 
 import esper
 
-from components import Age, Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, Camp, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, OnFire, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
+from components import Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Camp, Chest, ConstructionSite, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, OnFire, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from onymancer import make_onymancer
@@ -596,6 +596,110 @@ def _site_is_clear(game_map: GameMap, ox: int, oy: int, occupied: set[tuple[int,
             if (x, y) in occupied:
                 return False
     return True
+
+
+# A blueprint ghost previews the tile it will become in blue: a dim outline
+# while it still needs materials, a brighter fill once its wood has been hauled
+# in and it is ready to be raised. How many wood a builder carries per haul trip.
+_BLUEPRINT_BLUE_DIM = (72, 108, 168)
+_BLUEPRINT_BLUE = (96, 158, 240)
+_HAUL_BATCH = 4
+
+
+# Flora/remains that must never be sealed inside a wall or a finished house.
+# When a ghost is raised (or a cabin completes) any of these on the affected
+# tiles are cleared so nothing ends up "stuck" in a wall or trapped indoors.
+_OBSTRUCTION_COMPONENTS = (Tree, Corpse, BerryBush, Sapling)
+
+
+def _spawn_blueprint(x: int, y: int, tile: str, site: int | None = None, stocked: bool = False) -> int:
+    """Place a single blue-tinted ghost tile that previews ``tile`` at (x, y).
+    Ghosts carry no ``BlocksMovement`` -- workers and passers-by walk right
+    through a proto-structure until its walls are actually raised. ``site`` links
+    it to a cabin ``ConstructionSite`` (``None`` for a loose player-placed piece)."""
+    return esper.create_entity(
+        Position(x, y),
+        Renderable(tile, fg=_BLUEPRINT_BLUE if stocked else _BLUEPRINT_BLUE_DIM),
+        Name("Blueprint"),
+        Blueprint(tile=tile, stocked=stocked, site=site),
+    )
+
+
+def _set_blueprint_stocked(ghost_ent: int, stocked: bool) -> None:
+    """Flip a ghost between "needs materials" (dim) and "ready to raise" (bright)."""
+    if not esper.has_component(ghost_ent, Blueprint):
+        return
+    esper.component_for_entity(ghost_ent, Blueprint).stocked = stocked
+    if esper.has_component(ghost_ent, Renderable):
+        rend = esper.component_for_entity(ghost_ent, Renderable)
+        rend.fg = _BLUEPRINT_BLUE if stocked else _BLUEPRINT_BLUE_DIM
+
+
+def stock_blueprint(ghost_ent: int) -> None:
+    """Mark a ghost's materials as delivered (public hook for the player)."""
+    _set_blueprint_stocked(ghost_ent, True)
+
+
+def _clear_tile_obstructions(x: int, y: int) -> None:
+    """Delete any tree/corpse/bush/sapling sitting on (x, y) so it can't get
+    sealed into a wall or trapped inside a house being raised over it."""
+    for ent, (pos,) in list(esper.get_components(Position)):
+        if (pos.x, pos.y) != (x, y):
+            continue
+        if any(esper.has_component(ent, comp) for comp in _OBSTRUCTION_COMPONENTS):
+            esper.delete_entity(ent, immediate=True)
+
+
+def create_construction_site(game_map: GameMap, origin: tuple[int, int]) -> int:
+    """Stake out a cabin blueprint at ``origin`` (its top-left corner): a world
+    ``ConstructionSite`` entity plus a ghost tile for every wall/door piece.
+    Returns the site entity. Anybody can then haul wood to the ghosts and raise
+    them; the last piece furnishes the cabin (see ``raise_blueprint``)."""
+    build, interior = _blueprint_tiles(game_map, origin[0], origin[1])
+    bed = interior[0] if interior else origin
+    site_ent = esper.create_entity(ConstructionSite(interior=list(interior), bed=bed))
+    site = esper.component_for_entity(site_ent, ConstructionSite)
+    for (x, y, tile) in build:
+        site.pieces[(x, y)] = _spawn_blueprint(x, y, tile, site=site_ent)
+    return site_ent
+
+
+def _complete_site(game_map: GameMap, site_ent: int) -> None:
+    """Finish a cabin whose every ghost has been raised: clear anything trapped
+    inside, furnish it, and leave it **unowned** for the nearest homeless
+    resident to claim (the founder no longer owns the labour)."""
+    if not esper.has_component(site_ent, ConstructionSite):
+        return
+    site = esper.component_for_entity(site_ent, ConstructionSite)
+    interior = frozenset(site.interior)
+    for (ix, iy) in interior:
+        _clear_tile_obstructions(ix, iy)  # nothing gets trapped indoors
+    furnish_house(game_map, interior)
+    esper.delete_entity(site_ent, immediate=True)
+    _push_turn_event("A new cabin is finished.")
+
+
+def raise_blueprint(game_map: GameMap, ghost_ent: int) -> bool:
+    """Raise one stocked ghost into its real tile: clear anything on the tile,
+    set the tile, delete the ghost, and -- if it was the last piece of a cabin
+    ``ConstructionSite`` -- furnish the finished house. Public so the player and
+    the NPC AI raise pieces the same way."""
+    if not esper.has_component(ghost_ent, Blueprint):
+        return False
+    bp = esper.component_for_entity(ghost_ent, Blueprint)
+    pos = esper.component_for_entity(ghost_ent, Position)
+    x, y = pos.x, pos.y
+    _clear_tile_obstructions(x, y)
+    game_map.set_tile(x, y, bp.tile)
+    site_ent = bp.site
+    esper.delete_entity(ghost_ent, immediate=True)
+    if site_ent is not None and esper.entity_exists(site_ent) and esper.has_component(site_ent, ConstructionSite):
+        site = esper.component_for_entity(site_ent, ConstructionSite)
+        site.pieces.pop((x, y), None)
+        if not site.pieces:
+            _complete_site(game_map, site_ent)
+    return True
+
 
 _AUTOTILE_DIRECTION_OFFSETS = {
     1: (-1, -1),
@@ -1407,9 +1511,9 @@ class NpcAiProcessor(esper.Processor):
         # A non-walkable goal can never be reached (find_path can't discover
         # it either -- it's excluded during the BFS itself), so don't spend a
         # full flood or fallback pathfind finding that out the hard way. Comes
-        # up for a stale/duplicate build-blueprint tile that's already the
-        # right type -- see _build's own cleanup -- and cheaply guards any
-        # other goal kind that could end up unreachable the same way.
+        # up for a stale/duplicate blueprint tile that's already the right type
+        # (see ``_reachable_ghosts``) and cheaply guards any other goal kind that
+        # could end up unreachable the same way.
         if not self.game_map.is_walkable(goal[0], goal[1]):
             return False
 
@@ -1753,71 +1857,106 @@ class NpcAiProcessor(esper.Processor):
         esper.add_component(ent, inventory)
         return inventory
 
-    def _build(
+    def _should_build(self, ent: int) -> bool:
+        """True when raising a home is this NPC's job right now: a resident that
+        owns no bed. Such a villager pitches in on the nearest blueprint -- its
+        own staked-out cabin or a neighbour's -- so building is shared labour."""
+        return esper.has_component(ent, Resident) and owned_bed_of(ent) is None
+
+    def _reachable_ghosts(self, pos: Position) -> list[tuple[int, tuple[int, int], Blueprint]]:
+        """Every blueprint ghost in the same walkable region as ``pos`` -- the
+        pieces this worker can actually get to. Anybody's ghosts count, so
+        villagers converge on whatever proto-structure is nearest."""
+        here = (pos.x, pos.y)
+        out: list[tuple[int, tuple[int, int], Blueprint]] = []
+        for g_ent, (g_pos, bp) in esper.get_components(Position, Blueprint):
+            gxy = (g_pos.x, g_pos.y)
+            if self.game_map.tile_at(gxy[0], gxy[1]) == bp.tile:
+                continue  # already raised elsewhere; ignore this stale ghost
+            if here == gxy or self.game_map.same_region(here, gxy):
+                out.append((g_ent, gxy, bp))
+        return out
+
+    def _work_blueprints(
         self,
         ent: int,
         pos: Position,
         trees: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
     ) -> bool:
-        """Advance a resident's ``BuildPlan`` by one step: gather wood if short,
-        place an adjacent pending piece, or walk toward the nearest one. Finishing
-        the last piece furnishes and claims the new house."""
-        plan = esper.component_for_entity(ent, BuildPlan)
-        # Drop any piece that's already the tile it's meant to become -- e.g. a
-        # duplicate blueprint coordinate satisfied when its twin was placed.
-        # There's nothing left to do for it, and leaving it in `remaining`
-        # would have the builder fixate on an already-finished tile forever
-        # (it can become unreachable once the surrounding walls go up).
-        plan.remaining = [
-            (bx, by, tile) for (bx, by, tile) in plan.remaining if self.game_map.tile_at(bx, by) != tile
-        ]
-        if not plan.remaining:
-            self._complete_build(ent, plan)
-            return True
+        """Take one turn of work on the nearest reachable blueprint. While any
+        reachable piece still lacks materials the worker **hauls wood** to it
+        (lighting it up as its wood arrives); once the reachable pieces are all
+        stocked it **raises** them into real tiles, a chunk a turn."""
+        ghosts = self._reachable_ghosts(pos)
+        if not ghosts:
+            return False
+        unstocked = {gxy: g_ent for g_ent, gxy, bp in ghosts if not bp.stocked}
+        if unstocked:
+            return self._haul_to_ghosts(ent, pos, unstocked, trees, occupied)
+        stocked = {gxy: g_ent for g_ent, gxy, _bp in ghosts}
+        return self._raise_nearby_ghost(ent, pos, stocked, occupied)
 
+    def _haul_to_ghosts(
+        self,
+        ent: int,
+        pos: Position,
+        unstocked: dict[tuple[int, int], int],
+        trees: list[tuple[tuple[int, int], int]],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        """Carry wood to the proto-structure: gather a batch, walk it to the
+        nearest ghost lacking materials, and drop it off -- each wood delivered
+        lights one ghost up as "ready"."""
         inventory = self._ensure_inventory(ent)
-        if WOOD not in inventory.items:
+        wood = inventory.items.count(WOOD)
+        batch = min(_HAUL_BATCH, len(unstocked))
+        # Top up the load before making the trip, unless the woods are tapped out.
+        if wood < batch and self._reachable(pos, trees):
             return self._gather_wood(ent, pos, inventory, trees, occupied)
+        if wood == 0:
+            return False  # nothing to carry and no reachable trees -- can't progress
 
-        # Place a piece we're already standing next to.
-        for index, (bx, by, tile) in enumerate(plan.remaining):
-            if _chebyshev((pos.x, pos.y), (bx, by)) == 1:
-                if self.game_map.set_tile(bx, by, tile):
-                    inventory.items.remove(WOOD)
-                plan.remaining.pop(index)
-                if not plan.remaining:
-                    self._complete_build(ent, plan)
+        by_distance = sorted(unstocked, key=lambda xy: _chebyshev((pos.x, pos.y), xy))
+        if _chebyshev((pos.x, pos.y), by_distance[0]) <= 1:
+            stocked_any = False
+            for gxy in by_distance:
+                if WOOD not in inventory.items:
+                    break
+                inventory.items.remove(WOOD)
+                _set_blueprint_stocked(unstocked[gxy], True)
+                stocked_any = True
+            return stocked_any
+        # Ghost tiles don't block, so the worker can walk right up to the site.
+        return self._step_toward(ent, pos, by_distance[0], occupied)
+
+    def _raise_nearby_ghost(
+        self,
+        ent: int,
+        pos: Position,
+        stocked: dict[tuple[int, int], int],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        """Raise a stocked ghost we're standing next to (a chunk a turn); a
+        finished cabin furnishes itself. Otherwise approach the nearest ghost,
+        treating still-standing ghosts as blocked so the worker stops beside them
+        instead of on them (a raised wall's tile is unwalkable anyway)."""
+        for gxy, ghost in stocked.items():
+            if _chebyshev((pos.x, pos.y), gxy) == 1:
+                raise_blueprint(self.game_map, ghost)
                 return True
 
-        # Otherwise approach the nearest pending piece, treating all pending
-        # tiles as blocked so the builder stops beside them instead of on them.
-        target = min(plan.remaining, key=lambda t: _chebyshev((pos.x, pos.y), (t[0], t[1])))
+        target = min(stocked, key=lambda xy: _chebyshev((pos.x, pos.y), xy))
         added: list[tuple[int, int]] = []
-        for bx, by, _tile in plan.remaining:
-            if (bx, by) not in occupied:
-                occupied[(bx, by)] = -1  # sentinel: not a real entity, just blocked
-                added.append((bx, by))
-        moved = self._step_toward(ent, pos, (target[0], target[1]), occupied)
+        for gxy in stocked:
+            if gxy not in occupied:
+                occupied[gxy] = -1  # sentinel: not a real entity, just blocked
+                added.append(gxy)
+        moved = self._step_toward(ent, pos, target, occupied)
         for xy in added:
             if occupied.get(xy) == -1:
                 del occupied[xy]
         return moved
-
-    def _complete_build(self, ent: int, plan: BuildPlan) -> None:
-        interior = frozenset(plan.interior)
-        bed = furnish_house(self.game_map, interior)
-        if bed is not None:
-            if esper.has_component(ent, Home):
-                home = esper.component_for_entity(ent, Home)
-                home.x, home.y = bed
-            else:
-                esper.add_component(ent, Home(bed[0], bed[1]))
-            # The builder owns the house it just raised (bed and chest).
-            set_house_ownership(interior, ent)
-        if esper.has_component(ent, BuildPlan):
-            esper.remove_component(ent, BuildPlan)
-        _push_turn_event("A villager finishes building a new cabin.")
 
     def _chase_player(
         self,
@@ -2065,10 +2204,11 @@ class NpcAiProcessor(esper.Processor):
                         if not acted:
                             acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
 
-            # Building a house is the lowest-priority survival drive: a resident
-            # works its BuildPlan only once fed, watered, and rested.
-            if not acted and esper.has_component(ent, BuildPlan):
-                acted = self._build(ent, pos, trees, occupied)
+            # Building a house is the lowest-priority survival drive: a homeless
+            # resident helps raise the nearest blueprint only once fed, watered,
+            # and rested. Labour is shared -- several villagers can work one site.
+            if not acted and self._should_build(ent):
+                acted = self._work_blueprints(ent, pos, trees, occupied)
 
             # Leisure: a fed, rested, non-hostile being with a personality seeks
             # out company -- preferring beings it already likes. Lowest priority
@@ -2320,9 +2460,10 @@ class FishAiProcessor(esper.Processor):
 class HousingProcessor(esper.Processor):
     """Settles residents into homes. Houses belong to people: a resident who owns
     one is left alone. A resident who owns none **claims the nearest unowned
-    house** it can reach (marking it as theirs); only if none is free does it get
-    a ``BuildPlan`` for a preset cabin, which the NPC AI then builds over many
-    turns and moves into.
+    house** it can reach (marking it as theirs); only if none is free does it
+    **stake out a cabin blueprint** (a world ``ConstructionSite``) -- but only if
+    there isn't already one it can reach, so several homeless villagers share a
+    single site and raise it together rather than each starting their own.
 
     House detection is cached and only rebuilt when the map changes, so this is a
     cheap per-turn pass on a static map.
@@ -2336,17 +2477,16 @@ class HousingProcessor(esper.Processor):
         if action not in _TURN_ACTIONS:
             return
         houses = houses_for(self.game_map, self._cache)
+        sites = [(e, comp) for e, (comp,) in esper.get_components(ConstructionSite)]
 
         for ent, (_res,) in list(esper.get_components(Resident)):
             if owned_bed_of(ent) is not None:
                 continue  # already owns a house -- never re-claim or rebuild
-            if esper.has_component(ent, BuildPlan):
-                continue  # already building its own home
             if self._handle_spouse_housing(ent):
                 continue  # married couples settle into one shared home
             if self._claim_unowned_house(ent, houses):
                 continue
-            self._start_build(ent)
+            self._ensure_site_for(ent, sites)
 
     def _handle_spouse_housing(self, ent: int) -> bool:
         """Keep a married couple under one roof. Returns True (handled: skip
@@ -2368,10 +2508,8 @@ class HousingProcessor(esper.Processor):
             return True
 
         # Neither owns a home yet. Let just one partner do the settling so they
-        # don't raise two separate cabins: the lower entity id is the settler; the
-        # other waits. If the settler is already building, wait for it either way.
-        if esper.has_component(spouse, BuildPlan):
-            return True
+        # don't claim two separate houses: the lower entity id is the settler; the
+        # other waits and moves in once its partner has a home.
         return ent > spouse
 
     def _claim_unowned_house(self, ent: int, houses: list[frozenset[tuple[int, int]]]) -> bool:
@@ -2403,19 +2541,34 @@ class HousingProcessor(esper.Processor):
             return True
         return False
 
-    def _start_build(self, ent: int) -> None:
+    def _ensure_site_for(self, ent: int, sites: list[tuple[int, ConstructionSite]]) -> None:
+        """Make sure this homeless resident has a blueprint to work on. If one it
+        can reach already exists, leave it -- the NPC AI will send the villager to
+        help raise it. Otherwise stake out a fresh cabin site nearby."""
         if not esper.has_component(ent, Position):
             return
         pos = esper.component_for_entity(ent, Position)
-        occupied = {
-            (p.x, p.y) for _e, (p, _b) in esper.get_components(Position, BlocksMovement)
-        }
-        origin = choose_build_site(self.game_map, (pos.x, pos.y), occupied)
+        here = (pos.x, pos.y)
+        for _site_ent, site in sites:
+            if site.pieces and self._site_reachable(here, site):
+                return  # a neighbour already staked one out -- go help build it
+
+        occupied = {(p.x, p.y) for _e, (p, _b) in esper.get_components(Position, BlocksMovement)}
+        # Non-blocking things must not be walled in either -- keep new sites off
+        # corpses, saplings, and other blueprints.
+        for comp in (Corpse, Sapling, Blueprint):
+            occupied |= {(p.x, p.y) for _e, (p, _c) in esper.get_components(Position, comp)}
+        origin = choose_build_site(self.game_map, here, occupied)
         if origin is None:
             return
-        build, interior = _blueprint_tiles(self.game_map, origin[0], origin[1])
-        bed = interior[0] if interior else origin
-        esper.add_component(ent, BuildPlan(remaining=build, interior=interior, bed=bed))
+        site_ent = create_construction_site(self.game_map, origin)
+        sites.append((site_ent, esper.component_for_entity(site_ent, ConstructionSite)))
+        _push_turn_event("A villager stakes out a blueprint for a new cabin.")
+
+    def _site_reachable(self, here: tuple[int, int], site: ConstructionSite) -> bool:
+        for gxy in site.pieces:
+            return here == gxy or self.game_map.same_region(here, gxy)
+        return False
 
 
 # Daily, per-tile odds that shape the flora. A sapling can sprout on any open
