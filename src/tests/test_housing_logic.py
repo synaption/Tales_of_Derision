@@ -397,6 +397,46 @@ def test_builder_with_too_little_wood_raises_what_it_can_and_does_not_deadlock()
     assert 0 < len(remaining) < total_pieces
 
 
+def test_ensure_site_backs_off_until_the_villager_moves_or_the_area_changes(monkeypatch) -> None:
+    """The build-site search is expensive, and a homeless villager with nowhere to
+    build used to re-run it every single turn. Now a failed search is memoised
+    per (region cell, terrain revision): while the villager stays put and nothing
+    around it changes, the search is skipped -- but a tile edit in its region (or,
+    in the full game, stepping into a new cell) re-arms it, since either could
+    open a spot."""
+    import systems
+
+    # A map too short for any cabin footprint (a site needs 7 clear rows; only 6
+    # interior rows exist), so choose_build_site can never succeed -- exactly the
+    # stuck-builder case the back-off targets.
+    game_map = GameMap(30, 8)
+    for y in range(1, game_map.height - 1):
+        for x in range(1, game_map.width - 1):
+            game_map.tiles[y][x] = game_map.FLOOR
+
+    hp = HousingProcessor(game_map)
+    resident = esper.create_entity(Position(15, 4), NPC(), Resident(), Name("Homeless"))
+
+    calls = {"n": 0}
+    real = systems.choose_build_site
+
+    def counting(gm, near, occupied):
+        calls["n"] += 1
+        return real(gm, near, occupied)
+
+    monkeypatch.setattr(systems, "choose_build_site", counting)
+
+    hp._ensure_site_for(resident, [])  # searches, fails, memoises the empty result
+    hp._ensure_site_for(resident, [])  # same cell + revision -> skipped
+    assert calls["n"] == 1
+
+    # A tile edit in the resident's region bumps its edit-revision, so the memo no
+    # longer matches and the next pass searches afresh.
+    assert game_map.set_tile(5, 3, game_map.WALL)
+    hp._ensure_site_for(resident, [])
+    assert calls["n"] == 2
+
+
 # --- Player crafting / placement -------------------------------------------
 
 

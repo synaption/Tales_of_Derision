@@ -16,7 +16,7 @@ from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from action import BASE_ACTION_COST, action_cost
 from onymancer import make_onymancer
-from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin
+from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin, region_at
 from renderer.base import Renderer, memory_color
 from rng import world_rng
 
@@ -623,13 +623,39 @@ def choose_build_site(game_map: GameMap, near: tuple[int, int], occupied: set[tu
     """Find a clear top-left corner for a cabin near ``near``: a WxH block of
     open floor tiles (no water, walls, borders, or occupants) with a one-tile
     margin so cabins don't fuse. Searches outward in rings; returns ``None`` if
-    nowhere fits within range."""
+    nowhere fits within range.
+
+    The innermost radius sweeps a solid block; every larger radius then only
+    tests the *fresh perimeter ring*, because a tile the loop already rejected on
+    a smaller radius (with the same map and ``occupied``) can't pass on a larger
+    one. This visits the same candidate corners in the same order a full
+    per-radius square scan would -- so the chosen site is identical -- while
+    touching each tile once instead of re-testing the whole interior at every
+    radius (~10x fewer ``_site_is_clear`` calls out at the far rings)."""
     nx, ny = near
-    for radius in range(3, 22):
-        for oy in range(ny - radius, ny + radius + 1):
-            for ox in range(nx - radius, nx + radius + 1):
-                if _site_is_clear(game_map, ox, oy, occupied):
-                    return (ox, oy)
+    # Innermost solid block (radius 3): nothing was scanned before it.
+    for oy in range(ny - 3, ny + 4):
+        for ox in range(nx - 3, nx + 4):
+            if _site_is_clear(game_map, ox, oy, occupied):
+                return (ox, oy)
+    # Wider radii: only the tiles newly reachable at this radius -- the ring. Its
+    # cells are visited top row (left->right), then each middle row's left then
+    # right edge, then bottom row (left->right): the exact order a full row-major
+    # square scan meets these same cells, so ties resolve identically.
+    for radius in range(4, 22):
+        top, bottom = ny - radius, ny + radius
+        left, right = nx - radius, nx + radius
+        for ox in range(left, right + 1):  # top edge
+            if _site_is_clear(game_map, ox, top, occupied):
+                return (ox, top)
+        for oy in range(top + 1, bottom):  # side columns of the middle rows
+            if _site_is_clear(game_map, left, oy, occupied):
+                return (left, oy)
+            if _site_is_clear(game_map, right, oy, occupied):
+                return (right, oy)
+        for ox in range(left, right + 1):  # bottom edge
+            if _site_is_clear(game_map, ox, bottom, occupied):
+                return (ox, bottom)
     return None
 
 
@@ -2645,6 +2671,13 @@ class HousingProcessor(esper.Processor):
     def __init__(self, game_map: GameMap):
         self.game_map = game_map
         self._cache: dict = {}
+        # Back-off memo for the (expensive) build-site search: entity -> the
+        # (region cell, that region's edit-count) at which its last search found
+        # nowhere to build. While the villager stays in that cell and no tile in
+        # it has changed, re-running the ~thousand-check search would just fail
+        # again, so we skip it until it moves to a new cell or the terrain there
+        # changes (either of which could open a spot). See ``_ensure_site_for``.
+        self._no_site: dict[int, tuple[RegionId, int]] = {}
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
@@ -2724,7 +2757,18 @@ class HousingProcessor(esper.Processor):
         here = (pos.x, pos.y)
         for _site_ent, site in sites:
             if site.pieces and self._site_reachable(here, site):
+                self._no_site.pop(ent, None)  # a site exists now -- drop any back-off
                 return  # a neighbour already staked one out -- go help build it
+
+        # Back off if we already searched from this same region cell at this same
+        # terrain revision and came up empty: nothing there fits and nothing has
+        # changed, so re-running the whole outward scan (and rebuilding the
+        # occupied set) would only fail again. Moving to a new cell or any tile
+        # edit in this one clears the memo below by yielding a different key.
+        cell = region_at(self.game_map, pos.x, pos.y)
+        rev = self.game_map.region_edit_revision(pos.x, pos.y)
+        if self._no_site.get(ent) == (cell, rev):
+            return
 
         occupied = {(p.x, p.y) for _e, (p, _b) in esper.get_components(Position, BlocksMovement)}
         # Non-blocking things must not be walled in either -- keep new sites off
@@ -2733,7 +2777,9 @@ class HousingProcessor(esper.Processor):
             occupied |= {(p.x, p.y) for _e, (p, _c) in esper.get_components(Position, comp)}
         origin = choose_build_site(self.game_map, here, occupied)
         if origin is None:
+            self._no_site[ent] = (cell, rev)  # remember: nowhere here, for now
             return
+        self._no_site.pop(ent, None)
         site_ent = create_construction_site(self.game_map, origin)
         sites.append((site_ent, esper.component_for_entity(site_ent, ConstructionSite)))
         _push_turn_event("A villager stakes out a blueprint for a new cabin.")

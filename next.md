@@ -10,3 +10,4 @@ change name to Seeds of Derision?
 make sure people don't get stuck.  
 
 can tcod help?
+- pathfinding?

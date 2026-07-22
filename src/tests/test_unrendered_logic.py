@@ -179,6 +179,67 @@ def test_find_path_routes_around_obstacle() -> None:
     assert (4, 3) not in path
 
 
+def _bfs_path_len(game_map: GameMap, start, goal) -> int:
+    """Reference shortest 8-way path length via plain BFS -- the ground truth A*
+    must match. Kept local to the test so it can't drift from the production
+    heuristic search it's checking."""
+    from collections import deque
+
+    if start == goal:
+        return 0
+    seen = {start: 0}
+    q = deque([start])
+    while q:
+        cur = q.popleft()
+        if cur == goal:
+            return seen[cur]
+        for nxt in game_map.neighbors_8(*cur):
+            if nxt not in seen and game_map.is_walkable(*nxt):
+                seen[nxt] = seen[cur] + 1
+                q.append(nxt)
+    return seen.get(goal, -1)
+
+
+def test_find_path_is_optimal_like_bfs_through_a_maze() -> None:
+    # A* must return a path of the *same length* BFS would; the heuristic and the
+    # tie-break only change which equal-length route is chosen, never its cost.
+    import random
+
+    rng = random.Random(1234)
+    game_map = GameMap(30, 20)
+    for _ in range(120):  # scatter interior walls to force real routing
+        x, y = rng.randint(1, 28), rng.randint(1, 18)
+        if (x, y) not in ((1, 1), (28, 18)):
+            game_map.tiles[y][x] = game_map.WALL
+
+    start, goal = (1, 1), (28, 18)
+    path = game_map.find_path(start, goal)
+    expected = _bfs_path_len(game_map, start, goal)
+
+    if expected == -1:
+        assert path == []
+    else:
+        assert path and path[-1] == goal
+        assert start not in path
+        assert len(path) == expected  # optimal, matches BFS
+
+
+def test_find_path_takes_diagonals_at_unit_cost() -> None:
+    # Open ground: (1,1)->(5,5) is four diagonal steps, so a shortest path is
+    # length 4 (Chebyshev), not the 8 a 4-directional search would need.
+    game_map = GameMap(9, 9)
+    path = game_map.find_path((1, 1), (5, 5))
+    assert len(path) == 4
+    assert path[-1] == (5, 5)
+
+
+def test_find_path_returns_empty_when_goal_is_walled_off() -> None:
+    game_map = GameMap(9, 7)
+    for y in range(1, 6):  # wall off the right half completely
+        game_map.tiles[y][5] = game_map.WALL
+    assert game_map.find_path((2, 3), (7, 3)) == []
+
+
 def test_large_default_map_contains_buildings() -> None:
     game_map = GameMap(40, 20)
 

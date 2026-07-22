@@ -4,6 +4,7 @@ A tile is just a character for now ('#' wall, '.' floor). Later this can grow
 into a Tile dataclass (walkable, transparent, colours) without touching the
 render path.
 """
+import heapq
 from collections import deque
 
 # The habitable land is a fixed-size island; a "world" map that is comfortably
@@ -440,34 +441,78 @@ class GameMap:
         goal: tuple[int, int],
         blocked_tiles: set[tuple[int, int]] | None = None,
     ) -> list[tuple[int, int]]:
-        """Find a shortest 8-way path from start to goal using BFS.
+        """Find a shortest 8-way path from start to goal using A*.
 
         Returns a list of coordinates excluding start and including goal.
         Returns [] when no path exists.
+
+        Movement is 8-directional at unit cost (a diagonal step costs the same as
+        a cardinal one), so the fewest-steps distance across open ground is the
+        Chebyshev distance ``max(|dx|, |dy|)``. That makes Chebyshev an admissible
+        *and* consistent heuristic: A* returns a path of the same length a plain
+        BFS would, but expands far fewer tiles because it walks toward the goal
+        instead of flooding outward in all directions. The neighbour scan, bounds
+        test and walkability test are inlined here (rather than going through
+        ``neighbors_8``/``is_walkable``) because this is the hot loop -- it avoids
+        building a fresh candidate list and a method call per tile touched.
         """
         if start == goal:
             return []
-        if not self.in_bounds(start[0], start[1]) or not self.in_bounds(goal[0], goal[1]):
+        sx, sy = start
+        gx, gy = goal
+        width, height = self.width, self.height
+        if not (0 <= sx < width and 0 <= sy < height):
+            return []
+        if not (0 <= gx < width and 0 <= gy < height):
             return []
 
-        blocked = blocked_tiles or set()
-        queue: deque[tuple[int, int]] = deque([start])
-        came_from: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        blocked = blocked_tiles or ()
+        tiles = self.tiles
+        WALL, WATER, WINDOW = self.WALL, self.WATER, self.WINDOW
 
-        while queue:
-            current = queue.popleft()
+        # Priority queue of (f = g + heuristic, -g, tile). ``g_score`` doubles as
+        # the visited set and supports the lazy "decrease-key" (a tile popped with
+        # a g worse than its recorded best is a stale duplicate and is skipped).
+        # The second key is ``-g`` so that, among tiles with equal f, the one with
+        # the *larger* g (deeper, i.e. nearer the goal) is expanded first. Unit-cost
+        # 8-way movement produces wide plateaus of equal-f tiles; breaking ties
+        # toward the goal collapses them and cuts expansions by roughly another 10x.
+        # It never changes the path's cost -- we stop at the first pop of the goal
+        # and the heuristic is consistent -- only which equal-length route is
+        # chosen and how few tiles get touched getting there.
+        open_heap: list[tuple[int, int, tuple[int, int]]] = [
+            (max(abs(sx - gx), abs(sy - gy)), 0, start)
+        ]
+        came_from: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        g_score: dict[tuple[int, int], int] = {start: 0}
+
+        while open_heap:
+            _f, neg_g, current = heapq.heappop(open_heap)
             if current == goal:
                 break
-
-            for nxt in self.neighbors_8(current[0], current[1]):
-                if nxt in came_from:
+            g = -neg_g
+            if g > g_score[current]:
+                continue  # stale entry left behind by a later, cheaper push
+            cx, cy = current
+            ng = g + 1
+            for nx, ny in (
+                (cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1),
+                (cx + 1, cy + 1), (cx + 1, cy - 1), (cx - 1, cy + 1), (cx - 1, cy - 1),
+            ):
+                if not (0 <= nx < width and 0 <= ny < height):
                     continue
-                if not self.is_walkable(nxt[0], nxt[1]):
+                t = tiles[ny][nx]
+                if t == WALL or t == WATER or t == WINDOW:
                     continue
+                nxt = (nx, ny)
                 if nxt in blocked and nxt != goal:
                     continue
+                prev = g_score.get(nxt)
+                if prev is not None and prev <= ng:
+                    continue
+                g_score[nxt] = ng
                 came_from[nxt] = current
-                queue.append(nxt)
+                heapq.heappush(open_heap, (ng + max(abs(nx - gx), abs(ny - gy)), -ng, nxt))
 
         if goal not in came_from:
             return []
