@@ -137,6 +137,58 @@ def test_felled_tree_clears_its_memory_while_still_in_view() -> None:
     assert renderer.glyphs[(4, 2)] == _game_map.FLOOR
 
 
+def _setup_open_room() -> tuple[GameMap, FakeRenderer, Position]:
+    """Just a player (short vision) in an open room -- no NPC on the test tile."""
+    game_map = GameMap(25, 5)
+    renderer = FakeRenderer()
+    esper.add_processor(MovementProcessor(game_map), priority=1)
+    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+    player_pos = Position(3, 2)
+    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(2), BlocksMovement())
+    return game_map, renderer, player_pos
+
+
+def test_wall_built_out_of_sight_is_not_remembered() -> None:
+    game_map, renderer, _player_pos = _setup_open_room()
+
+    esper.process(None)  # see the floor at (5, 2)
+    assert renderer.glyphs[(5, 2)] == game_map.FLOOR
+
+    esper.process("move_left")
+    esper.process("move_left")  # (5, 2) is now remembered floor, out of sight
+
+    # A villager raises a wall on that tile while the player can't see it.
+    assert game_map.set_tile(5, 2, game_map.WALL)
+    esper.process(None)
+
+    proc = _render_processor()
+    assert (5, 2) not in proc._visible_tiles
+    # Memory still shows the floor last seen there, not the freshly built wall.
+    assert renderer.glyphs[(5, 2)] == game_map.FLOOR
+    assert ((5, 2), game_map.FLOOR) in proc._memory_terrain_overrides
+
+
+def test_remembered_terrain_updates_once_the_change_is_seen() -> None:
+    game_map, renderer, _player_pos = _setup_open_room()
+
+    esper.process(None)
+    esper.process("move_left")
+    esper.process("move_left")
+    game_map.set_tile(5, 2, game_map.WALL)  # built out of sight
+    esper.process(None)
+    assert renderer.glyphs[(5, 2)] == game_map.FLOOR  # still remembered as floor
+
+    # Walk back until the wall is actually in view again.
+    esper.process("move_right")
+    esper.process("move_right")
+
+    proc = _render_processor()
+    assert (5, 2) in proc._visible_tiles
+    assert renderer.glyphs[(5, 2)] == game_map.WALL  # now seen -> memory catches up
+    assert proc._seen_terrain[(5, 2)] == game_map.WALL
+    assert not proc._memory_terrain_overrides
+
+
 def _render_processor() -> RenderProcessor:
     proc = esper.get_processor(RenderProcessor)
     assert proc is not None, "no RenderProcessor registered"

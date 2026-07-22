@@ -3196,10 +3196,16 @@ class RenderProcessor(esper.Processor):
             tuple[int, int],
             tuple[str, str, tuple[int, int, int] | None, tuple[int, int, int] | None],
         ] = {}
+        # Last-seen terrain char per explored tile. The living world edits the map
+        # out of sight (villagers raise walls, etc.); remembered terrain must show
+        # what the player last *saw*, not the current map, so a wall built in an
+        # unseen area doesn't appear in memory until it's actually seen.
+        self._seen_terrain: dict[tuple[int, int], str] = {}
         # Per-view memory geometry, recomputed whenever the player moves (mirrors
         # the FOV memo below): the desaturated region to blit, the never-seen
-        # holes inside it to black out, the explored-but-unseen cells, and the
-        # remembered scenery to overlay on them.
+        # holes inside it to black out, the explored-but-unseen cells, the
+        # remembered scenery to overlay on them, and the terrain overrides (cells
+        # whose live terrain has since diverged from what was last seen).
         self._memory_bbox: tuple[int, int, int, int] | None = None
         self._memory_holes: tuple[tuple[int, int], ...] = ()
         self._memory_cells: frozenset[tuple[int, int]] = frozenset()
@@ -3207,6 +3213,7 @@ class RenderProcessor(esper.Processor):
             tuple[tuple[int, int], tuple[str, str, tuple[int, int, int] | None, tuple[int, int, int] | None]],
             ...,
         ] = ()
+        self._memory_terrain_overrides: tuple[tuple[tuple[int, int], str], ...] = ()
         # Render caches (big win on web, where every re-render is main-thread work
         # that can stutter audio). Field-of-view only changes when the player
         # moves; wall autotile masks never change on a static map.
@@ -3439,6 +3446,7 @@ class RenderProcessor(esper.Processor):
             self._memory_holes = ()
             self._memory_cells = frozenset()
             self._memory_scenery = ()
+            self._memory_terrain_overrides = ()
             return
 
         xs = [c[0] for c in explored_in_view]
@@ -3461,14 +3469,26 @@ class RenderProcessor(esper.Processor):
             for cell in memory_cells
             if cell in self._tile_memory
         )
+        # Terrain overrides: unseen cells whose live terrain has diverged from
+        # what was last seen (e.g. a villager raised a wall out of sight). These
+        # get overdrawn with the remembered char so memory shows the old terrain.
+        overrides: list[tuple[tuple[int, int], str]] = []
+        for cell in memory_cells:
+            seen = self._seen_terrain.get(cell)
+            if seen is not None and seen != self.game_map.tile_at(cell[0], cell[1]):
+                overrides.append((cell, seen))
+        self._memory_terrain_overrides = tuple(overrides)
 
     def _update_tile_memory(self, seen_scenery: dict[tuple[int, int], tuple]) -> None:
         """Fold this frame's field of view into the persistent tile memory: mark
-        every visible tile explored, then for each visible tile record the static
-        scenery seen there (from ``seen_scenery``, gathered during the entity draw
-        pass) or clear stale memory if the scenery is gone (e.g. a felled tree)."""
+        every visible tile explored, record its current terrain char (so memory
+        tracks what was last seen, not later out-of-sight edits), then record the
+        static scenery seen there (from ``seen_scenery``, gathered during the
+        entity draw pass) or clear stale memory if it is gone (e.g. a felled tree).
+        """
         self._explored_tiles |= self._visible_tiles
         for cell in self._visible_tiles:
+            self._seen_terrain[cell] = self.game_map.tile_at(cell[0], cell[1])
             appearance = seen_scenery.get(cell)
             if appearance is not None:
                 self._tile_memory[cell] = appearance
@@ -3476,15 +3496,26 @@ class RenderProcessor(esper.Processor):
                 self._tile_memory.pop(cell, None)
 
     def _draw_map_tile(
-        self, r, vx: int, vy: int, wx: int, wy: int, draw_autotile_variant, dim: bool = False
+        self,
+        r,
+        vx: int,
+        vy: int,
+        wx: int,
+        wy: int,
+        draw_autotile_variant,
+        dim: bool = False,
+        tile_char: str | None = None,
     ) -> None:
         """Draw the base terrain tile at world cell (wx, wy) to view cell (vx, vy).
         With ``dim`` the tile is toned into its remembered (desaturated) colour --
         used by renderers that can't composite a whole desaturated map surface
         (the test double); the pygame path desaturates the cached surface instead.
+        ``tile_char`` overrides the terrain char (last-seen terrain for remembered
+        cells the live map has since changed); autotile masks still read the live
+        neighbours, which is fine for the rare divergent cell.
         """
         tone = _memory_color if dim else (lambda colour: colour)
-        tile = self.game_map.tile_at(wx, wy)
+        tile = tile_char if tile_char is not None else self.game_map.tile_at(wx, wy)
         if tile == self.game_map.WALL and callable(draw_autotile_variant):
             wall_mask = self._wall_mask_cache.get((wx, wy))
             if wall_mask is None:
@@ -3536,8 +3567,11 @@ class RenderProcessor(esper.Processor):
 
     def _draw_memory_tile(self, r, vx: int, vy: int, wx: int, wy: int, draw_autotile_variant) -> None:
         """Draw one remembered tile (used by the per-tile fallback path): the
-        desaturated terrain, then any static scenery last seen there."""
-        self._draw_map_tile(r, vx, vy, wx, wy, draw_autotile_variant, dim=True)
+        desaturated last-seen terrain, then any static scenery last seen there."""
+        self._draw_map_tile(
+            r, vx, vy, wx, wy, draw_autotile_variant, dim=True,
+            tile_char=self._seen_terrain.get((wx, wy)),
+        )
         appearance = self._tile_memory.get((wx, wy))
         if appearance is not None:
             glyph, classification, fg, bg = appearance
@@ -3625,7 +3659,23 @@ class RenderProcessor(esper.Processor):
             if clipped:
                 clear_clip()
 
-        # 3. Remembered scenery (trees, furniture, ...) overlaid on the
+        # 3. Terrain overrides: the region blit above showed *live* terrain, so
+        #    unseen cells the map has since changed (a wall raised out of sight)
+        #    are redrawn from the last-seen char and faded, hiding the change
+        #    until the tile is actually seen again.
+        if can_remember:
+            for (wx, wy), seen_char in self._memory_terrain_overrides:
+                if (wx, wy) in self._visible_tiles:
+                    continue
+                view_xy = self._world_to_view(wx, wy)
+                if view_xy is None:
+                    continue
+                self._draw_map_tile(
+                    r, view_xy[0], view_xy[1], wx, wy, draw_autotile_variant, tile_char=seen_char
+                )
+                apply_memory_fade(view_xy[0], view_xy[1], 1, 1)
+
+        # 4. Remembered scenery (trees, furniture, ...) overlaid on the
         #    desaturated terrain. Every cell is inside the viewport by
         #    construction, so this is safe outside the map clip.
         for (wx, wy), appearance in self._memory_scenery:
