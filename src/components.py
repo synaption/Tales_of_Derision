@@ -353,3 +353,29 @@ class Inventory:
 @dataclass
 class Equipment:
     slots: dict[str, str | None] = field(default_factory=dict)
+
+
+@dataclass
+class Attributes:
+    """Morrowind-style core attributes (see the readme's leveling design). For now
+    only ``dexterity`` is read -- it drives how quickly an actor takes its turns in
+    the action economy (see ``action.actor_speed``) -- but the full set is here so
+    skills/leveling and future derived stats have a home. 10 is the human average.
+    """
+    strength: int = 10
+    dexterity: int = 10
+    constitution: int = 10
+    intelligence: int = 10
+    wisdom: int = 10
+    charisma: int = 10
+
+
+@dataclass
+class Actor:
+    """Scheduling bookkeeping for the time-based action economy. ``next_time`` is
+    the world-clock time unit (TU) at which this entity next gets to act; the
+    scheduler always runs whoever has the smallest ``next_time``. ``last_acted`` is
+    the TU it last acted, so time-based effects (needs) can accrue the exact
+    elapsed span when it acts again. Every creature that takes turns carries one."""
+    next_time: int = 0
+    last_acted: int = 0

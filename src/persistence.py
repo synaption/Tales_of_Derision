@@ -104,12 +104,37 @@ def save_options(options: dict) -> None:
     _write_json(WORKING_OPTIONS_FILE, options)
 
 
-def save_game(game_map: GameMap, save_file: Path, player_pos: Position) -> None:
+def save_game(
+    game_map: GameMap,
+    save_file: Path,
+    player_pos: Position,
+    seed: int | None = None,
+) -> None:
     save_data = {
         "map": {"width": game_map.width, "height": game_map.height},
         "player": {"x": player_pos.x, "y": player_pos.y},
     }
+    # The world regenerates from its seed each session, so storing the seed makes
+    # a reloaded save reproduce the same world (see src/rng.py).
+    if seed is not None:
+        save_data["seed"] = int(seed)
     _write_json(save_file, save_data)
+
+
+def load_seed(save_file: Path) -> int | None:
+    """The stored world seed for a save, or ``None`` for a missing/seedless file
+    (older saves predate seeding)."""
+    if not save_file.exists():
+        return None
+    try:
+        with save_file.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    seed = payload.get("seed")
+    return int(seed) if isinstance(seed, int) else None
 
 
 def load_game(save_file: Path, fallback_width: int, fallback_height: int) -> tuple[GameMap, Position]:

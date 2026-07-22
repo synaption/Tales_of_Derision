@@ -8,7 +8,6 @@ import asyncio
 from dataclasses import dataclass
 import os
 from pathlib import Path
-import random
 import sys
 import time
 from typing import Any
@@ -41,6 +40,7 @@ from persistence import (
     save_game,
     save_options,
 )
+from rng import new_seed, set_world_rng, world_rng
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
 from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, ReproductionProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, born_turn_for_age, bubbles_active, friendship, furnish_house, go_to_sleep, interact, pick_berries, player_is_animated, queue_message, raise_blueprint, set_bed_owner, slay_entity, spawn_speech_bubble, status_label, stock_blueprint, wake_up, world_clock
@@ -52,6 +52,10 @@ LAND_WIDTH = 120
 LAND_HEIGHT = 60
 MAP_WIDTH = LAND_WIDTH * 3
 MAP_HEIGHT = LAND_HEIGHT * 3
+
+# Fixed world seed for a new game with no --seed, so every new game regenerates
+# the same world for now. (Swap to rng.new_seed() when we want randomized worlds.)
+DEFAULT_WORLD_SEED = 0x7A1E5  # "TALES"
 
 _CARDINAL_ACTION_DELTAS = {
     "move_up": (0, -1),
@@ -424,6 +428,13 @@ def _parse_args() -> argparse.Namespace:
         "--rat-flood",
         action="store_true",
         help="spawn cave rats on every walkable tile for stress testing",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="world seed for a new game (same seed -> identical world); a loaded "
+        "save uses its stored seed instead",
     )
     return parser.parse_args()
 
@@ -949,7 +960,7 @@ async def _run_startup_flow(
         )
         return (True, loaded_map, loaded_player_position, selected_save_file)
     if menu_choice == "new_game":
-        save_game(game_map, DEFAULT_SAVE_FILE, player_position)
+        save_game(game_map, DEFAULT_SAVE_FILE, player_position, seed=world_rng().seed)
         return (True, game_map, player_position, selected_save_file)
 
     return (False, game_map, player_position, selected_save_file)
@@ -2774,9 +2785,9 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     start_clock.turn = int(start_clock.day_length * 0.2)
     esper.create_entity(start_clock)
 
-    # The onymancer names every villager procedurally. A fixed seed keeps the
-    # starting village identical run to run, like the rest of the world layout.
-    onymancer = make_onymancer(0x0A_15_15)
+    # The onymancer names every villager procedurally, seeded off the world seed
+    # so the same seed always conjures the same starting village.
+    onymancer = make_onymancer(world_rng().int_seed("names_startup"))
 
     player_name = "You"
     player_skin = _human_skin_tone(player_name)
@@ -2945,9 +2956,9 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
 
 def _spawn_ocean_life(game_map: GameMap) -> None:
     """Scatter seaweed and fish across the open sea that surrounds the island.
-    Fish graze the seaweed (see ``FishAiProcessor``). Placement uses a fixed seed
-    so the ocean looks the same every run, matching the RNG-free land layout."""
-    rng = random.Random(0x0C_EA_11)
+    Fish graze the seaweed (see ``FishAiProcessor``). Placement draws from the
+    world seed so the ocean is reproducible for a given seed."""
+    rng = world_rng().stream("worldgen_ocean")
     occupied = {(pos.x, pos.y) for _ent, (pos,) in esper.get_components(Position)}
 
     for y in range(1, game_map.height - 1):
@@ -3054,7 +3065,8 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
     # roughly 10% of the walkable land in trees while leaving open clearings
     # between the stands so villagers can still find room to raise cabins. Each
     # stand is a dense core that thins toward its edges, with the odd ripe berry
-    # bush mixed in for foragers. Randomised each new world.
+    # bush mixed in for foragers. Reproducible per world seed.
+    rng = world_rng().stream("worldgen_env")
     walkable = [
         (x, y)
         for y in range(game_map.land_y0, game_map.land_y0 + game_map.land_h)
@@ -3066,8 +3078,8 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
     guard = 0
     while walkable and planted < tree_target and guard < tree_target * 50:
         guard += 1
-        cx, cy = random.choice(walkable)
-        radius = random.randint(2, 6)
+        cx, cy = rng.choice(walkable)
+        radius = rng.randint(2, 6)
         for dy in range(-radius, radius + 1):
             for dx in range(-radius, radius + 1):
                 if planted >= tree_target:
@@ -3076,9 +3088,9 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
                 if dist > radius:
                     continue
                 # Denser at the core, thinning out toward the stand's edge.
-                if random.random() < dist / (radius + 1):
+                if rng.random() < dist / (radius + 1):
                     continue
-                if random.random() < 0.04:
+                if rng.random() < 0.04:
                     plant_bush(cx + dx, cy + dy)
                 elif plant_tree(cx + dx, cy + dy):
                     planted += 1
@@ -3113,6 +3125,12 @@ async def main() -> None:
     startup_save_file = args.save_file
     if args.screenshot is not None and startup_save_file is None:
         startup_save_file = DEFAULT_SAVE_FILE
+
+    # Install the world seed before any worldgen. For now the whole game uses one
+    # fixed seed -- every game (new or loaded) regenerates the same world -- unless
+    # --seed overrides it. Saves still record the seed for when we later restore
+    # per-save worlds; that stored seed is intentionally ignored for now.
+    set_world_rng(args.seed if args.seed is not None else DEFAULT_WORLD_SEED)
 
     try:
         with PygameRenderer(options=options) as renderer:
@@ -3370,7 +3388,7 @@ async def main() -> None:
                     held_directions.clear()
                     if pause_choice == "save_game":
                         player_pos = first_player_position() or player_position
-                        save_game(game_map, selected_save_file, player_pos)
+                        save_game(game_map, selected_save_file, player_pos, seed=world_rng().seed)
                     elif pause_choice == "quit":
                         break
                     esper.process(None)

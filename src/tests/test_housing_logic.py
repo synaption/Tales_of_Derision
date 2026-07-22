@@ -361,6 +361,42 @@ def test_builders_raise_a_whole_cabin_from_a_blueprint() -> None:
     assert esper.has_component(builder, Home)
 
 
+def test_builder_with_too_little_wood_raises_what_it_can_and_does_not_deadlock() -> None:
+    """Regression: a site that can't be fully stocked used to deadlock the
+    builder forever -- raising was gated on *every* piece being stocked, so the
+    ones it had managed to stock never went up and it froze beside the site
+    (sometimes stranded standing on one of its own stocked ghosts). Now it
+    raises whatever it stocked and then drops out of build mode."""
+    game_map = GameMap(30, 20)
+    for y in range(1, game_map.height - 1):
+        for x in range(1, game_map.width - 1):
+            game_map.tiles[y][x] = game_map.FLOOR
+    npc_ai = NpcAiProcessor(game_map)
+
+    # A full cabin site, but the builder carries only a handful of wood and there
+    # are no trees anywhere to fell -- so it can never stock every piece.
+    site_ent = create_construction_site(game_map, (12, 8))
+    total_pieces = len(esper.component_for_entity(site_ent, ConstructionSite).pieces)
+    builder = esper.create_entity(
+        Position(6, 10), NPC(), Resident(),
+        Needs(hunger=0.0, thirst=0.0, tiredness=0.0, hunger_rate=0.0, thirst_rate=0.0, tiredness_rate=0.0),
+        Inventory(items=[WOOD] * 5), BlocksMovement(), Name("Builder"),
+    )
+
+    for _ in range(200):
+        npc_ai.process("wait")
+
+    # The site could not be finished (fewer than every piece got wood), so some
+    # ghosts remain -- but none is left stocked-yet-unraised: everything the
+    # builder managed to stock actually went up as a real wall.
+    remaining = list(esper.get_components(Blueprint))
+    assert remaining, "expected an unfinishable site to still have ghosts"
+    assert not any(bp.stocked for _g, (bp,) in remaining), "stocked pieces were never raised (deadlock)"
+    # Real walls did rise (ghosts consumed) -- progress was made, not a freeze --
+    # but the site is still short of its full complement of pieces.
+    assert 0 < len(remaining) < total_pieces
+
+
 # --- Player crafting / placement -------------------------------------------
 
 

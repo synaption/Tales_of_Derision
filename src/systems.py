@@ -6,7 +6,6 @@ process() receives whatever args are passed to esper.process().
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-import random
 import textwrap
 import time
 
@@ -18,6 +17,7 @@ from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is
 from onymancer import make_onymancer
 from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin
 from renderer.base import Renderer
+from rng import world_rng
 
 _ACTION_DELTAS = {
     "move_up": (0, -1),
@@ -1048,7 +1048,6 @@ _INDICATOR_RED = (232, 96, 96)
 _GIBBERISH_TOKENS = (
     "ba", "zo", "ki", "mu", "lo", "ta", "wu", "ne", "ry", "sh", "gorp", "bl", "eek", "mm",
 )
-_gibberish_rng = random.Random()
 
 
 @dataclass
@@ -1068,11 +1067,12 @@ _SPEECH_BUBBLES: list[_Bubble] = []
 def gibberish(words: int = 2) -> str:
     """A short nonsense utterance in the beings' 'language' -- a couple of made-up
     syllable clusters (e.g. ``"bazo ki!"``). Cosmetic only."""
+    rng = world_rng().stream("gibberish")
     parts: list[str] = []
     for _ in range(max(1, words)):
-        syllables = _gibberish_rng.randint(1, 2)
-        parts.append("".join(_gibberish_rng.choice(_GIBBERISH_TOKENS) for _ in range(syllables)))
-    return " ".join(parts) + _gibberish_rng.choice(("", "?", "!", "..."))
+        syllables = rng.randint(1, 2)
+        parts.append("".join(rng.choice(_GIBBERISH_TOKENS) for _ in range(syllables)))
+    return " ".join(parts) + rng.choice(("", "?", "!", "..."))
 
 
 def spawn_speech_bubble(
@@ -1127,7 +1127,7 @@ def _react(
     rel: Relationships,
     other: int,
     delta: float,
-    rng: Callable[[], float] = random.random,
+    rng: Callable[[], float] | None = None,
 ) -> tuple[str, tuple[int, int, int] | None]:
     """Fold ``delta`` into ``rel``'s pending reaction toward ``other`` and decide
     whether this bubble shows an indicator. Returns the ``(text, colour)`` to draw,
@@ -1137,6 +1137,8 @@ def _react(
     pending total reaches ``_INDICATOR_MILESTONE`` (so a run of chatting culminates
     in a ``+``/``-``, doubled past ``_INDICATOR_DOUBLE``) or, occasionally, at random
     once it is at least ``_INDICATOR_MIN``. Surfacing resets the pending total."""
+    if rng is None:
+        rng = world_rng().stream("social").random
     pending = rel.pending.get(other, 0.0) + delta
     magnitude = abs(pending)
 
@@ -1165,7 +1167,7 @@ def interact(
     b: int,
     turn: int,
     clock: Callable[[], float] = time.monotonic,
-    rng: Callable[[], float] = random.random,
+    rng: Callable[[], float] | None = None,
 ) -> tuple[float, float]:
     """Run one social interaction between beings ``a`` and ``b``: adjust each one's
     friendship toward the other by its personality-driven delta, stamp the cooldown
@@ -1173,6 +1175,8 @@ def interact(
     with a ``+``/``-`` indicator surfacing only now and then (see ``_react``).
     Returns ``(delta_a, delta_b)``. Shared by the NPC social AI and the player Talk
     action."""
+    if rng is None:
+        rng = world_rng().stream("social").random
     delta_a = interaction_delta(_traits_of(a), _traits_of(b))
     delta_b = interaction_delta(_traits_of(b), _traits_of(a))
     rel_a = _relationships(a)
@@ -1293,7 +1297,7 @@ def try_mate(
     turn: int,
     clock: WorldClock | None,
     sentients: list[tuple[int, Position]],
-    rng: Callable[[], float] = random.random,
+    rng: Callable[[], float] | None = None,
     bubble_clock: Callable[[], float] = time.monotonic,
 ) -> bool:
     """A private moment between lovers. If ``a`` and ``b`` are courtship-eligible,
@@ -1302,6 +1306,8 @@ def try_mate(
     they have sex: both get a mating timestamp, a heart floats over each, and with
     probability ``_PREGNANCY_CHANCE`` the woman (if not already pregnant) conceives.
     Returns True if the act happened."""
+    if rng is None:
+        rng = world_rng().stream("repro").random
     if not are_courtship_eligible(a, b, clock):
         return False
     if _mutual_friendship(a, b) < _LOVERS_FRIENDSHIP:
@@ -1896,15 +1902,30 @@ class NpcAiProcessor(esper.Processor):
         """Take one turn of work on the nearest reachable blueprint. While any
         reachable piece still lacks materials the worker **hauls wood** to it
         (lighting it up as its wood arrives); once the reachable pieces are all
-        stocked it **raises** them into real tiles, a chunk a turn."""
+        stocked it **raises** them into real tiles, a chunk a turn.
+
+        Returns False when there's nothing this worker can actually do on the
+        site right now -- no wood to haul *and* nothing stocked left to raise --
+        so a builder who's run the woods dry drops out of build mode and gets on
+        with other things instead of freezing beside a site it can't advance.
+        Any pieces it already stocked still get raised (below), so the labour
+        isn't wasted and the shell keeps rising as far as the materials reached;
+        an unstocked piece stays a walkable gap, so raising the stocked ones
+        never seals off the rest.
+        """
         ghosts = self._reachable_ghosts(pos)
         if not ghosts:
             return False
         unstocked = {gxy: g_ent for g_ent, gxy, bp in ghosts if not bp.stocked}
-        if unstocked:
-            return self._haul_to_ghosts(ent, pos, unstocked, trees, occupied)
-        stocked = {gxy: g_ent for g_ent, gxy, _bp in ghosts}
-        return self._raise_nearby_ghost(ent, pos, stocked, occupied)
+        # Keep hauling while the woods can still supply the unfinished pieces;
+        # _haul_to_ghosts returns False once there's no wood on hand and nothing
+        # reachable to fell, at which point we raise whatever is already stocked.
+        if unstocked and self._haul_to_ghosts(ent, pos, unstocked, trees, occupied):
+            return True
+        stocked = {gxy: g_ent for g_ent, gxy, bp in ghosts if bp.stocked}
+        if stocked:
+            return self._raise_nearby_ghost(ent, pos, stocked, occupied)
+        return False
 
     def _haul_to_ghosts(
         self,
@@ -1950,12 +1971,30 @@ class NpcAiProcessor(esper.Processor):
         finished cabin furnishes itself. Otherwise approach the nearest ghost,
         treating still-standing ghosts as blocked so the worker stops beside them
         instead of on them (a raised wall's tile is unwalkable anyway)."""
+        here = (pos.x, pos.y)
         for gxy, ghost in stocked.items():
-            if _chebyshev((pos.x, pos.y), gxy) == 1:
+            if _chebyshev(here, gxy) == 1:
                 raise_blueprint(self.game_map, ghost)
                 return True
 
-        target = min(stocked, key=lambda xy: _chebyshev((pos.x, pos.y), xy))
+        # Standing *on* a stocked ghost with none adjacent (it delivered wood to
+        # this piece from here): a wall can't be raised under our own feet, so
+        # step off onto any open tile and raise it from beside next turn. Without
+        # this the nearest ghost is the one we're on -- distance 0 -- and every
+        # "approach" below is a no-op step toward our own tile, pinning the
+        # builder there for good.
+        if here in stocked:
+            for nxy in self.game_map.neighbors_8(here[0], here[1]):
+                if (
+                    nxy not in occupied
+                    and nxy not in stocked
+                    and self.game_map.is_walkable(nxy[0], nxy[1])
+                ):
+                    self._commit_step(ent, pos, nxy, occupied)
+                    return True
+            return False  # boxed in on our own ghost; nothing to do this turn
+
+        target = min(stocked, key=lambda xy: _chebyshev(here, xy))
         added: list[tuple[int, int]] = []
         for gxy in stocked:
             if gxy not in occupied:
@@ -2333,7 +2372,7 @@ class FishAiProcessor(esper.Processor):
         clock: Callable[[], float] | None = None,
     ):
         self.game_map = game_map
-        self._rng = rng if rng is not None else random.random
+        self._rng = rng if rng is not None else world_rng().stream("ai").random
         self._wall_clock = clock if clock is not None else time.monotonic
         self.scheduler = RegionScheduler(game_map, _current_turn())
         self.scheduler.register("fish", self._advance_region)
@@ -2650,7 +2689,7 @@ class TreeGrowthProcessor(esper.Processor):
 
     def __init__(self, game_map: GameMap, rng: Callable[[], float] | None = None):
         self.game_map = game_map
-        self._rng = rng if rng is not None else random.random
+        self._rng = rng if rng is not None else world_rng().stream("flora").random
         # Flora fills the land, so its soft cap scales to the land area (not the
         # whole map -- otherwise the ocean's tiles would inflate the tree budget).
         land_area = getattr(game_map, "land_w", game_map.width) * getattr(
@@ -2827,10 +2866,10 @@ class ReproductionProcessor(esper.Processor):
 
     def __init__(self) -> None:
         self._last_day: int | None = None
-        # A private onymancer for naming newborns. Births are already
-        # non-deterministic (they hinge on random pregnancy rolls), so a fixed
-        # seed here just gives a stable stream of fresh given names.
-        self._onymancer = make_onymancer(0xBA_B1_E5)
+        # A private onymancer for naming newborns, seeded off the world seed so
+        # the whole reproduction chain (conception -> birth -> name) is
+        # reproducible for a given seed.
+        self._onymancer = make_onymancer(world_rng().int_seed("names_newborn"))
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
@@ -2864,7 +2903,8 @@ class ReproductionProcessor(esper.Processor):
         given = self._onymancer.given_name(gender)
         full = f"{given} {surname}"
 
-        traits = random.sample(list(_TRAITS), k=random.randint(1, 2))
+        repro_rng = world_rng().stream("repro")
+        traits = repro_rng.sample(list(_TRAITS), k=repro_rng.randint(1, 2))
         baby = esper.create_entity(
             Position(*birth_xy),
             Renderable(_VILLAGER_GLYPH, fg=_BABY_SKIN),
@@ -2901,7 +2941,7 @@ class ReproductionProcessor(esper.Processor):
 
     @staticmethod
     def _rng_gender() -> str:
-        return random.choice(("male", "female"))
+        return world_rng().stream("repro").choice(("male", "female"))
 
     def _birth_tile(self, mother: int) -> tuple[int, int]:
         """The mother's own tile if we can't do better; otherwise a free adjacent
