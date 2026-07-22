@@ -290,6 +290,9 @@ class PygameRenderer(Renderer):
         # Remembered ("fog of war") tiles: terrain is faded in place per on-screen
         # region (see apply_memory_fade -- cheap, no per-mutation cost); scenery
         # sprites reuse this per-tile cache of the same desaturate+dim transform.
+        # ``_memory_cache`` holds the whole rendered remembered layer for the
+        # current view so idle frames blit it instead of re-fading every frame.
+        self._memory_cache = None
         self._desaturated_tiles: dict[int, object] = {}
 
     def apply_options(self, options: dict) -> None:
@@ -376,6 +379,7 @@ class PygameRenderer(Renderer):
         # wrong size / cell scale.
         self._backdrop_snapshot = None
         self._map_surface = None
+        self._memory_cache = None
         self._desaturated_tiles = {}
         self._load_tileset_config()
 
@@ -1328,6 +1332,48 @@ class PygameRenderer(Renderer):
         # Dim: multiply every channel (black stays black, no washed-out lift).
         dim = max(0, min(255, int(round(255 * MEMORY_DIM))))
         self._screen.fill((dim, dim, dim), rect, special_flags=self._pygame.BLEND_RGB_MULT)
+
+    def capture_memory_layer(self, w_cells: int, h_cells: int, draw_callback) -> None:
+        """Render the remembered-tile layer once into an off-screen, viewport-sized
+        surface (world-to-view offset already baked into ``draw_callback``'s
+        coords). Mirrors ``build_map_surface``: redirect the draw target, run the
+        callback, restore. The layer only changes when the player moves or the map
+        is edited, so caching it turns the per-frame grayscale fade -- the dominant
+        remembered-tile cost -- into a cheap blit (see ``blit_memory_cache``)."""
+        if self._pygame is None:
+            return
+        w_px = max(1, w_cells * self._cell_w)
+        h_px = max(1, h_cells * self._cell_h)
+        cache = self._memory_cache
+        if cache is None or cache.get_width() != w_px or cache.get_height() != h_px:
+            cache = self._pygame.Surface((w_px, h_px))
+            self._memory_cache = cache
+        cache.fill(self._bg)
+        saved_screen = self._screen
+        self._screen = cache
+        try:
+            draw_callback()
+        finally:
+            self._screen = saved_screen
+
+    def has_memory_cache(self) -> bool:
+        return self._memory_cache is not None
+
+    def blit_memory_cache(self) -> None:
+        """Blit the whole cached remembered-tile layer to the screen (it is aligned
+        to the viewport, so no offset)."""
+        if self._screen is None or self._memory_cache is None:
+            return
+        self._screen.blit(self._memory_cache, (0, 0))
+
+    def blit_memory_cache_cell(self, vx: int, vy: int) -> None:
+        """Blit a single cell of the cached remembered layer back onto the screen
+        (restores a shadow cell the lit-FOV region blit painted over)."""
+        if self._screen is None or self._memory_cache is None:
+            return
+        x = vx * self._cell_w
+        y = vy * self._cell_h
+        self._screen.blit(self._memory_cache, (x, y), self._pygame.Rect(x, y, self._cell_w, self._cell_h))
 
     def _desaturate_tile(self, tile: object):
         """Cached desaturated copy of a resolved sprite tile, for remembered

@@ -3214,6 +3214,11 @@ class RenderProcessor(esper.Processor):
             ...,
         ] = ()
         self._memory_terrain_overrides: tuple[tuple[tuple[int, int], str], ...] = ()
+        # The rendered remembered-tile layer is cached in the renderer (a viewport
+        # blit per frame instead of a grayscale fade). It only needs rebuilding
+        # when the memory geometry changes (move / map edit) or the view resizes.
+        self._memory_cache_dirty = True
+        self._memory_cache_dims: tuple[int, int] | None = None
         # Render caches (big win on web, where every re-render is main-thread work
         # that can stutter audio). Field-of-view only changes when the player
         # moves; wall autotile masks never change on a static map.
@@ -3447,6 +3452,7 @@ class RenderProcessor(esper.Processor):
             self._memory_cells = frozenset()
             self._memory_scenery = ()
             self._memory_terrain_overrides = ()
+            self._memory_cache_dirty = True
             return
 
         xs = [c[0] for c in explored_in_view]
@@ -3478,6 +3484,8 @@ class RenderProcessor(esper.Processor):
             if seen is not None and seen != self.game_map.tile_at(cell[0], cell[1]):
                 overrides.append((cell, seen))
         self._memory_terrain_overrides = tuple(overrides)
+        # The remembered layer's contents just changed, so its render cache is stale.
+        self._memory_cache_dirty = True
 
     def _update_tile_memory(self, seen_scenery: dict[tuple[int, int], tuple]) -> None:
         """Fold this frame's field of view into the persistent tile memory: mark
@@ -3618,66 +3626,108 @@ class RenderProcessor(esper.Processor):
         if self._visible_bbox is None and self._memory_bbox is None:
             return
 
-        # Remembered terrain reuses the lit map surface and is faded to its memory
-        # tone in place, per on-screen region (no per-mutation full-surface
-        # greyscale). Feature-detected so renderers without it just fall back to
+        # The remembered-tile layer (faded terrain + holes + overrides + scenery)
+        # is expensive to draw (a grayscale fade) but only changes on move / map
+        # edit, so it is rendered once into a viewport-sized cache and blitted each
+        # frame. Feature-detected: renderers lacking the cache just fall back to
         # black beyond the FOV.
         apply_memory_fade = getattr(r, "apply_memory_fade", None)
-        can_remember = callable(apply_memory_fade)
+        capture_memory_layer = getattr(r, "capture_memory_layer", None)
+        has_memory_cache = getattr(r, "has_memory_cache", None)
+        blit_memory_cache = getattr(r, "blit_memory_cache", None)
+        blit_memory_cache_cell = getattr(r, "blit_memory_cache_cell", None)
+        can_remember = all(
+            callable(fn)
+            for fn in (
+                apply_memory_fade,
+                capture_memory_layer,
+                has_memory_cache,
+                blit_memory_cache,
+                blit_memory_cache_cell,
+            )
+        )
 
-        # Screen was cleared at the top of process(); composite the map in layers
-        # (offset by the scroll origin). Clip to the viewport so a big region blit
-        # can't spill into the sidebar/status area when a box is larger than the
-        # visible map.
+        # Rebuild the cache only when the remembered layer changed, the view
+        # resized, or the renderer dropped the cache (e.g. after a zoom rebuild).
+        vw, vh = self._view_width, self._view_height
+        use_memory_cache = can_remember and self._memory_bbox is not None
+        if use_memory_cache:
+            if (
+                self._memory_cache_dirty
+                or self._memory_cache_dims != (vw, vh)
+                or not has_memory_cache()
+            ):
+                self._memory_cache_dirty = False
+                self._memory_cache_dims = (vw, vh)
+                capture_memory_layer(
+                    vw,
+                    vh,
+                    lambda: self._draw_memory_terrain_layer(
+                        r, blit_map_region, apply_memory_fade, fill_cell_bg, draw_autotile_variant
+                    ),
+                )
+
+        # Screen was cleared at the top of process(); composite the map (offset by
+        # the scroll origin). Clip to the viewport so a big region blit can't spill
+        # into the sidebar/status area when a box is larger than the visible map.
         set_map_clip = getattr(r, "set_map_clip", None)
         clear_clip = getattr(r, "clear_clip", None)
         clipped = callable(set_map_clip) and callable(clear_clip)
         if clipped:
             set_map_clip(self._view_width, self._view_height)
         try:
-            # 1. Remembered terrain: blit the lit map over the explored region,
-            #    fade it to the memory tone, then black out never-seen holes.
-            if can_remember and self._memory_bbox is not None:
-                mbx, mby, mbw, mbh = self._memory_bbox
-                blit_map_region(mbx, mby, mbw, mbh, ox, oy)
-                apply_memory_fade(mbx - ox, mby - oy, mbw, mbh)
-                for wx, wy in self._memory_holes:
-                    fill_cell_bg(wx - ox, wy - oy)
-            # 2. The lit field of view on top of the remembered terrain.
+            # 1. The cached remembered layer (all explored-but-unseen cells).
+            if use_memory_cache:
+                blit_memory_cache()
+            # 2. The lit field of view on top.
             if self._visible_bbox is not None:
                 bx, by, bw, bh = self._visible_bbox
                 blit_map_region(bx, by, bw, bh, ox, oy)
                 # Shadow cells sit inside the FOV box but are blocked from view;
-                # the rectangular blit just painted them lit, so fade the explored
-                # ones back to their remembered look and black out the rest.
+                # the rectangular blit just painted them lit, so restore the
+                # explored ones from the cached memory layer and black out the rest.
                 for wx, wy in self._shadow_cells:
-                    if can_remember and (wx, wy) in self._explored_tiles:
-                        apply_memory_fade(wx - ox, wy - oy, 1, 1)
+                    if use_memory_cache and (wx, wy) in self._explored_tiles:
+                        blit_memory_cache_cell(wx - ox, wy - oy)
                     else:
                         fill_cell_bg(wx - ox, wy - oy)
         finally:
             if clipped:
                 clear_clip()
 
-        # 3. Terrain overrides: the region blit above showed *live* terrain, so
-        #    unseen cells the map has since changed (a wall raised out of sight)
-        #    are redrawn from the last-seen char and faded, hiding the change
-        #    until the tile is actually seen again.
-        if can_remember:
-            for (wx, wy), seen_char in self._memory_terrain_overrides:
-                if (wx, wy) in self._visible_tiles:
-                    continue
-                view_xy = self._world_to_view(wx, wy)
-                if view_xy is None:
-                    continue
-                self._draw_map_tile(
-                    r, view_xy[0], view_xy[1], wx, wy, draw_autotile_variant, tile_char=seen_char
-                )
-                apply_memory_fade(view_xy[0], view_xy[1], 1, 1)
+    def _draw_memory_terrain_layer(
+        self, r, blit_map_region, apply_memory_fade, fill_cell_bg, draw_autotile_variant
+    ) -> None:
+        """Draw the whole remembered-tile layer at view coords: faded last-seen
+        terrain over the explored region, never-seen holes blacked out, terrain
+        overrides (cells the live map changed out of sight) and static scenery.
+        Rendered into the memory cache (see ``capture_memory_layer``); every cell
+        is inside the viewport by construction."""
+        ox, oy = self._view_origin_x, self._view_origin_y
 
-        # 4. Remembered scenery (trees, furniture, ...) overlaid on the
-        #    desaturated terrain. Every cell is inside the viewport by
-        #    construction, so this is safe outside the map clip.
+        # Faded last-seen terrain over the explored region, then black holes.
+        if self._memory_bbox is not None:
+            mbx, mby, mbw, mbh = self._memory_bbox
+            blit_map_region(mbx, mby, mbw, mbh, ox, oy)
+            apply_memory_fade(mbx - ox, mby - oy, mbw, mbh)
+            for wx, wy in self._memory_holes:
+                fill_cell_bg(wx - ox, wy - oy)
+
+        # Terrain overrides: the region blit above showed *live* terrain, so unseen
+        # cells the map has since changed (a wall raised out of sight) are redrawn
+        # from the last-seen char and faded, hiding the change until it is seen.
+        for (wx, wy), seen_char in self._memory_terrain_overrides:
+            if (wx, wy) in self._visible_tiles:
+                continue
+            view_xy = self._world_to_view(wx, wy)
+            if view_xy is None:
+                continue
+            self._draw_map_tile(
+                r, view_xy[0], view_xy[1], wx, wy, draw_autotile_variant, tile_char=seen_char
+            )
+            apply_memory_fade(view_xy[0], view_xy[1], 1, 1)
+
+        # Remembered scenery (trees, furniture, ...) on top of the faded terrain.
         for (wx, wy), appearance in self._memory_scenery:
             view_xy = self._world_to_view(wx, wy)
             if view_xy is None:
