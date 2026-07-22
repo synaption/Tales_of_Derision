@@ -604,6 +604,11 @@ def _site_is_clear(game_map: GameMap, ox: int, oy: int, occupied: set[tuple[int,
 _BLUEPRINT_BLUE_DIM = (72, 108, 168)
 _BLUEPRINT_BLUE = (96, 158, 240)
 _HAUL_BATCH = 4
+# Placeholder "occupant" id parked on the tile an NPC must not immediately
+# reverse onto (see the anti-oscillation guard in ``_advance_region``). Any
+# non-entity value the step code reads as "blocked, and not me" works; kept
+# distinct from the -1 used for in-progress blueprint tiles.
+_OSC_GUARD = -2
 
 
 # Flora/remains that must never be sealed inside a wall or a finished house.
@@ -1412,6 +1417,10 @@ class NpcAiProcessor(esper.Processor):
         # at a (largely static) goal stays valid for any traveller approaching
         # it from anywhere, so many NPCs reuse the one flood.
         self._field_cache: dict[tuple[int, int], tuple[int, int, dict[tuple[int, int], int]]] = {}
+        # ent -> the tile it stood on at the start of its previous turn. Used to
+        # forbid an immediate one-tile reversal (see ``_advance_region``), which
+        # is the only way an NPC ends up flip-flopping between two tiles forever.
+        self._prev_turn_pos: dict[int, tuple[int, int]] = {}
 
     def _compute_shore_tiles(self) -> list[tuple[int, int]]:
         shore: list[tuple[int, int]] = []
@@ -2171,60 +2180,103 @@ class NpcAiProcessor(esper.Processor):
             # Sleepers skip their turn; NeedsProcessor recovers and wakes them.
             if esper.has_component(ent, Asleep):
                 continue
-            acted = False
 
-            if esper.has_component(ent, Needs):
-                needs = esper.component_for_entity(ent, Needs)
-                diet_kind = None
-                if esper.has_component(ent, Diet):
-                    diet_kind = esper.component_for_entity(ent, Diet).kind
+            # Anti-oscillation guard: forbid an immediate one-tile reversal back
+            # onto the tile this NPC started its *previous* turn on. A productive
+            # route never needs to reverse in one step (the flow field is
+            # monotonic toward its goal); a two-tile ping-pong only arises when a
+            # blocked higher drive (say, seeking water walled off by trees the
+            # pathfinder sees straight through) hands off to a lower one pulling
+            # the other way, turn after turn. Blocking that single tile for just
+            # this NPC's turn -- via the same occupant sentinel the step code
+            # already respects -- collapses the jitter into standing still, which
+            # is what an NPC with nowhere better to go should do anyway.
+            start_xy = (pos.x, pos.y)
+            guard = self._prev_turn_pos.get(ent)
+            if guard is not None and (guard == start_xy or guard in occupied):
+                guard = None
+            if guard is not None:
+                occupied[guard] = _OSC_GUARD
+            try:
+                self._take_turn(
+                    ent, pos, occupied, player_xy, diet_buckets=(
+                        trees, prey, corpses, stoves, bushes, sentients
+                    ), logical_turn=logical_turn, clock=clock,
+                )
+            finally:
+                if guard is not None and occupied.get(guard) == _OSC_GUARD:
+                    del occupied[guard]
+                self._prev_turn_pos[ent] = start_xy
 
-                # Sleep is the strongest drive: a spent creature beds down before
-                # it forages, preferring its home over camping.
-                if needs.tiredness >= _SLEEP_THRESHOLD:
-                    acted = self._seek_sleep(ent, pos, needs, occupied)
-                # Thirst wins ties -- a parched animal drinks before it eats.
-                elif needs.thirst >= _FORAGE_THRESHOLD and needs.thirst >= needs.hunger:
-                    acted = self._seek_water(ent, pos, needs, occupied)
-                elif needs.hunger >= _FORAGE_THRESHOLD:
-                    # Eat prepared food already carried; otherwise forage by diet.
-                    if self._eat_from_inventory(ent, needs):
-                        acted = True
-                    elif diet_kind == "herbivore":
-                        # Ripe berries first (quick food); else graze a tree.
-                        acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
-                        if not acted:
-                            acted = self._graze(ent, pos, needs, trees, occupied)
-                    elif diet_kind == "carnivore":
-                        # Predator: eats raw meat on the spot.
-                        acted = self._seek_food(ent, pos, needs, prey, corpses, occupied)
-                    elif diet_kind == "cook":
-                        # Villager: pick ripe berries when handy, else cook meat.
-                        acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
-                        if not acted:
-                            acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
+    def _take_turn(
+        self,
+        ent: int,
+        pos: Position,
+        occupied: dict[tuple[int, int], int],
+        player_xy: tuple[int, int] | None,
+        diet_buckets: tuple,
+        logical_turn: int,
+        clock: "WorldClock | None",
+    ) -> None:
+        """One NPC's single-turn behaviour: the priority ladder of survival
+        drives, then building, then leisure, then hostile pursuit. Split out of
+        ``_advance_region`` so the per-turn anti-oscillation guard there can wrap
+        it cleanly."""
+        trees, prey, corpses, stoves, bushes, sentients = diet_buckets
+        acted = False
 
-            # Building a house is the lowest-priority survival drive: a homeless
-            # resident helps raise the nearest blueprint only once fed, watered,
-            # and rested. Labour is shared -- several villagers can work one site.
-            if not acted and self._should_build(ent):
-                acted = self._work_blueprints(ent, pos, trees, occupied)
+        if esper.has_component(ent, Needs):
+            needs = esper.component_for_entity(ent, Needs)
+            diet_kind = None
+            if esper.has_component(ent, Diet):
+                diet_kind = esper.component_for_entity(ent, Diet).kind
 
-            # Leisure: a fed, rested, non-hostile being with a personality seeks
-            # out company -- preferring beings it already likes. Lowest priority
-            # of all, so survival and building always come first.
-            if (
-                not acted
-                and esper.has_component(ent, Personality)
-                and esper.has_component(ent, Friendly)
-            ):
-                acted = self._socialize(ent, pos, occupied, sentients, logical_turn, clock)
+            # Sleep is the strongest drive: a spent creature beds down before
+            # it forages, preferring its home over camping.
+            if needs.tiredness >= _SLEEP_THRESHOLD:
+                acted = self._seek_sleep(ent, pos, needs, occupied)
+            # Thirst wins ties -- a parched animal drinks before it eats.
+            elif needs.thirst >= _FORAGE_THRESHOLD and needs.thirst >= needs.hunger:
+                acted = self._seek_water(ent, pos, needs, occupied)
+            elif needs.hunger >= _FORAGE_THRESHOLD:
+                # Eat prepared food already carried; otherwise forage by diet.
+                if self._eat_from_inventory(ent, needs):
+                    acted = True
+                elif diet_kind == "herbivore":
+                    # Ripe berries first (quick food); else graze a tree.
+                    acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
+                    if not acted:
+                        acted = self._graze(ent, pos, needs, trees, occupied)
+                elif diet_kind == "carnivore":
+                    # Predator: eats raw meat on the spot.
+                    acted = self._seek_food(ent, pos, needs, prey, corpses, occupied)
+                elif diet_kind == "cook":
+                    # Villager: pick ripe berries when handy, else cook meat.
+                    acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
+                    if not acted:
+                        acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
 
-            if acted:
-                continue
+        # Building a house is the lowest-priority survival drive: a homeless
+        # resident helps raise the nearest blueprint only once fed, watered,
+        # and rested. Labour is shared -- several villagers can work one site.
+        if not acted and self._should_build(ent):
+            acted = self._work_blueprints(ent, pos, trees, occupied)
 
-            if player_xy is not None and esper.has_component(ent, Enemy):
-                self._chase_player(ent, pos, player_xy, occupied)
+        # Leisure: a fed, rested, non-hostile being with a personality seeks
+        # out company -- preferring beings it already likes. Lowest priority
+        # of all, so survival and building always come first.
+        if (
+            not acted
+            and esper.has_component(ent, Personality)
+            and esper.has_component(ent, Friendly)
+        ):
+            acted = self._socialize(ent, pos, occupied, sentients, logical_turn, clock)
+
+        if acted:
+            return
+
+        if player_xy is not None and esper.has_component(ent, Enemy):
+            self._chase_player(ent, pos, player_xy, occupied)
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:

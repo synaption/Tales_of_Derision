@@ -46,8 +46,8 @@ from main import (
     _harvest_bush,
     _look_available_actions,
 )
-from components import Deer, Dialogue, Diet, Fish, Friendly, OnFire, Seaweed
-from systems import FishAiProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, WAIT_ACTION, _pull_turn_events
+from components import Deer, Dialogue, Diet, Fish, Friendly, OnFire, Personality, Relationships, Seaweed
+from systems import FishAiProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, TimeProcessor, WAIT_ACTION, _pull_turn_events
 
 pytestmark = pytest.mark.unrendered
 
@@ -89,6 +89,65 @@ def test_wait_action_passes_a_turn_but_none_does_not() -> None:
     processor.process(WAIT_ACTION)  # waiting in place passes a turn
     assert needs.hunger == pytest.approx(1.0)
     assert needs.thirst == pytest.approx(1.4)
+
+
+def test_foragers_do_not_flip_flop_between_two_tiles_in_dense_trees() -> None:
+    """Regression: NPCs used to get pinned into a two-tile ping-pong forever
+    when a drive's goal was walled off by trees (which the flow field/region
+    graph see straight through -- a tree only blocks via its live occupant, not
+    the map tile). Greedy would step forward, the one-off fallback pathfind
+    would route backward around the blocker, and the pair repeated every turn.
+    A crowd foraging in a dense grove reliably provoked it; assert nobody ends
+    up locked in a strict A,B,A,B cycle."""
+    import random
+
+    random.seed(4)
+    game_map = GameMap(50, 40)
+    esper.create_entity(Position(1, 1), Player())
+    taken: set[tuple[int, int]] = set()
+    for x in range(10, 40, 2):
+        for y in range(5, 35):
+            if y % 5 == 0:
+                continue
+            esper.create_entity(Position(x, y), Tree(), BlocksMovement())
+            taken.add((x, y))
+    beings: list[int] = []
+    for _ in range(18):
+        while True:
+            x, y = random.randrange(9, 41), random.randrange(5, 35)
+            if (x, y) not in taken:
+                break
+        taken.add((x, y))
+        beings.append(esper.create_entity(
+            Position(x, y), NPC(), Needs(hunger=60.0), Diet("herbivore"),
+            Personality(traits=["Kind"]), Relationships(), Friendly(), BlocksMovement(),
+        ))
+
+    proc, needs_proc, time_proc = NpcAiProcessor(game_map), NeedsProcessor(), TimeProcessor()
+    history: dict[int, list[tuple[int, int]]] = {ent: [] for ent in beings}
+    for _ in range(120):
+        for ent in beings:  # keep them foraging so the grove stays contested
+            if esper.entity_exists(ent):
+                esper.component_for_entity(ent, Needs).hunger = 60.0
+                esper.component_for_entity(ent, Needs).tiredness = 0.0
+        time_proc.process(WAIT_ACTION)
+        needs_proc.process(WAIT_ACTION)
+        proc.process(WAIT_ACTION)
+        for ent in beings:
+            if esper.entity_exists(ent):
+                pos = esper.component_for_entity(ent, Position)
+                history[ent].append((pos.x, pos.y))
+
+    def is_two_tile_cycle(path: list[tuple[int, int]]) -> bool:
+        tail = path[-12:]
+        return (
+            len(tail) == 12
+            and len(set(tail)) == 2
+            and all(tail[i] != tail[i + 1] for i in range(len(tail) - 1))
+        )
+
+    stuck = [ent for ent in beings if esper.entity_exists(ent) and is_two_tile_cycle(history[ent])]
+    assert stuck == [], f"{len(stuck)} NPC(s) ping-ponging between two tiles: {stuck}"
 
 
 def test_hungry_npc_eats_food_it_is_carrying() -> None:
