@@ -17,7 +17,7 @@ from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is
 from action import BASE_ACTION_COST, action_cost
 from onymancer import make_onymancer
 from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin
-from renderer.base import Renderer
+from renderer.base import Renderer, memory_color
 from rng import world_rng
 
 _ACTION_DELTAS = {
@@ -64,6 +64,36 @@ _WALL_BROWN = (124, 88, 56)
 _WATER_BLUE = (64, 118, 190)
 _DOOR_BROWN = (150, 106, 58)
 _WINDOW_CYAN = (128, 186, 206)
+
+# Tile memory ("fog of war"): a tile the player has seen but no longer has line
+# of sight to is drawn desaturated (static terrain + scenery), while anything
+# that can move or be picked up (NPCs, corpses, loot) is hidden until seen again.
+# ``memory_color`` and its tuning constants live on the renderer seam so the
+# backend applies the identical transform to whole sprites/surfaces.
+_memory_color = memory_color
+
+
+# Component types that mark an entity as static scenery worth remembering. This
+# is a deliberate positive whitelist: creatures, the player, corpses and loot
+# (chests) are left off so a remembered tile can never lie about where something
+# takeable or moving is *now* -- you only ever remember terrain and fixtures.
+_MEMORABLE_SCENERY: tuple[type, ...] = (
+    Tree,
+    BerryBush,
+    Sapling,
+    Seaweed,
+    Furniture,
+    Bed,
+    Stove,
+    Blueprint,
+)
+
+
+def is_memorable_scenery(ent: int) -> bool:
+    """Whether an entity is static enough to leave an imprint on a tile the
+    player has explored but can no longer see. NPCs, the player, corpses and
+    loot are never memorable (they return ``False``)."""
+    return any(esper.has_component(ent, comp) for comp in _MEMORABLE_SCENERY)
 _TREE_GREEN = (58, 138, 66)
 _SAPLING_GREEN = (120, 176, 90)
 _BUSH_GREEN = (86, 140, 78)   # a bush that has been picked bare
@@ -3156,6 +3186,27 @@ class RenderProcessor(esper.Processor):
         self._last_player_pos: tuple[int, int] | None = None
         self._seen_entity_ids: set[int] = set()
         self._visible_tiles: set[tuple[int, int]] = set()
+        # Tile memory ("fog of war"): every tile ever in view is "explored" and
+        # keeps being drawn -- desaturated -- once it drops out of line of sight.
+        # ``_tile_memory`` remembers the last static scenery (tree, furniture,
+        # ...) seen on a tile so it can be redrawn from memory; NPCs and loot are
+        # deliberately never stored, so they vanish the moment they leave view.
+        self._explored_tiles: set[tuple[int, int]] = set()
+        self._tile_memory: dict[
+            tuple[int, int],
+            tuple[str, str, tuple[int, int, int] | None, tuple[int, int, int] | None],
+        ] = {}
+        # Per-view memory geometry, recomputed whenever the player moves (mirrors
+        # the FOV memo below): the desaturated region to blit, the never-seen
+        # holes inside it to black out, the explored-but-unseen cells, and the
+        # remembered scenery to overlay on them.
+        self._memory_bbox: tuple[int, int, int, int] | None = None
+        self._memory_holes: tuple[tuple[int, int], ...] = ()
+        self._memory_cells: frozenset[tuple[int, int]] = frozenset()
+        self._memory_scenery: tuple[
+            tuple[tuple[int, int], tuple[str, str, tuple[int, int, int] | None, tuple[int, int, int] | None]],
+            ...,
+        ] = ()
         # Render caches (big win on web, where every re-render is main-thread work
         # that can stutter audio). Field-of-view only changes when the player
         # moves; wall autotile masks never change on a static map.
@@ -3356,21 +3407,97 @@ class RenderProcessor(esper.Processor):
         )
         return bbox, shadows
 
-    def _draw_map_tile(self, r, vx: int, vy: int, wx: int, wy: int, draw_autotile_variant) -> None:
+    def _compute_memory_geometry(self) -> None:
+        """Recompute the remembered-tile geometry for the current view. Cheap set
+        work over the viewport (at most one render section), refreshed only when
+        the player moves -- the same cadence as the FOV memo -- so a walking step
+        stays a handful of region blits.
+
+        Uses ``_explored_tiles`` as of the *previous* frame (currently-visible
+        tiles are folded into it after drawing), which is exactly right: a tile
+        only needs remembering once it is no longer lit.
+        """
+        ox, oy = self._view_origin_x, self._view_origin_y
+        vw, vh = self._view_width, self._view_height
+        explored = self._explored_tiles
+        visible = self._visible_tiles
+
+        explored_in_view: list[tuple[int, int]] = []
+        memory_cells: set[tuple[int, int]] = set()
+        for vy in range(vh):
+            wy = oy + vy
+            for vx in range(vw):
+                wx = ox + vx
+                cell = (wx, wy)
+                if cell in explored:
+                    explored_in_view.append(cell)
+                    if cell not in visible:
+                        memory_cells.add(cell)
+
+        if not explored_in_view:
+            self._memory_bbox = None
+            self._memory_holes = ()
+            self._memory_cells = frozenset()
+            self._memory_scenery = ()
+            return
+
+        xs = [c[0] for c in explored_in_view]
+        ys = [c[1] for c in explored_in_view]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        self._memory_bbox = (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+        explored_set = set(explored_in_view)
+        self._memory_holes = tuple(
+            (x, y)
+            for y in range(min_y, max_y + 1)
+            for x in range(min_x, max_x + 1)
+            if (x, y) not in explored_set
+        )
+        self._memory_cells = frozenset(memory_cells)
+        # Precompute the (few) remembered-scenery overlays so the render path
+        # doesn't scan the whole explored region for the handful with scenery.
+        self._memory_scenery = tuple(
+            (cell, self._tile_memory[cell])
+            for cell in memory_cells
+            if cell in self._tile_memory
+        )
+
+    def _update_tile_memory(self, seen_scenery: dict[tuple[int, int], tuple]) -> None:
+        """Fold this frame's field of view into the persistent tile memory: mark
+        every visible tile explored, then for each visible tile record the static
+        scenery seen there (from ``seen_scenery``, gathered during the entity draw
+        pass) or clear stale memory if the scenery is gone (e.g. a felled tree)."""
+        self._explored_tiles |= self._visible_tiles
+        for cell in self._visible_tiles:
+            appearance = seen_scenery.get(cell)
+            if appearance is not None:
+                self._tile_memory[cell] = appearance
+            else:
+                self._tile_memory.pop(cell, None)
+
+    def _draw_map_tile(
+        self, r, vx: int, vy: int, wx: int, wy: int, draw_autotile_variant, dim: bool = False
+    ) -> None:
+        """Draw the base terrain tile at world cell (wx, wy) to view cell (vx, vy).
+        With ``dim`` the tile is toned into its remembered (desaturated) colour --
+        used by renderers that can't composite a whole desaturated map surface
+        (the test double); the pygame path desaturates the cached surface instead.
+        """
+        tone = _memory_color if dim else (lambda colour: colour)
         tile = self.game_map.tile_at(wx, wy)
         if tile == self.game_map.WALL and callable(draw_autotile_variant):
             wall_mask = self._wall_mask_cache.get((wx, wy))
             if wall_mask is None:
                 wall_mask = self._neighbor_mask(wx, wy, self.game_map.WALL)
                 self._wall_mask_cache[(wx, wy)] = wall_mask
-            if bool(draw_autotile_variant(vx, vy, "wall", wall_mask, fg=_WALL_BROWN, bg=None)):
+            if bool(draw_autotile_variant(vx, vy, "wall", wall_mask, fg=tone(_WALL_BROWN), bg=None)):
                 return
         if tile == self.game_map.WATER and callable(draw_autotile_variant):
             water_mask = self._water_mask_cache.get((wx, wy))
             if water_mask is None:
                 water_mask = self._neighbor_mask(wx, wy, self.game_map.WATER)
                 self._water_mask_cache[(wx, wy)] = water_mask
-            if bool(draw_autotile_variant(vx, vy, "water", water_mask, fg=_WATER_BLUE, bg=None)):
+            if bool(draw_autotile_variant(vx, vy, "water", water_mask, fg=tone(_WATER_BLUE), bg=None)):
                 return
         classification = "wall" if tile == self.game_map.WALL else "default"
         if tile == self.game_map.WALL:
@@ -3383,7 +3510,38 @@ class RenderProcessor(esper.Processor):
             tile_fg = _WINDOW_CYAN
         else:
             tile_fg = None
-        r.draw_glyph_classified(vx, vy, tile, classification, fg=tile_fg, bg=None)
+        # ``_memory_color`` maps a colourless floor (None) to a neutral dim grey,
+        # so remembered floor stays faintly visible rather than turning black.
+        draw_fg = _memory_color(tile_fg) if dim else tile_fg
+        r.draw_glyph_classified(vx, vy, tile, classification, fg=draw_fg, bg=None)
+
+    def _draw_memory_glyph(
+        self,
+        r,
+        vx: int,
+        vy: int,
+        glyph: str,
+        classification: str,
+        fg: tuple[int, int, int] | None,
+        bg: tuple[int, int, int] | None,
+    ) -> None:
+        """Draw a remembered scenery glyph desaturated. Prefers the renderer's
+        sprite-aware ``draw_glyph_memory`` (desaturates the whole tile); falls
+        back to a memory-toned foreground for the plain test double."""
+        draw_memory = getattr(r, "draw_glyph_memory", None)
+        if callable(draw_memory):
+            draw_memory(vx, vy, glyph, classification, fg=fg, bg=bg)
+            return
+        r.draw_glyph_classified(vx, vy, glyph, classification, fg=_memory_color(fg), bg=bg)
+
+    def _draw_memory_tile(self, r, vx: int, vy: int, wx: int, wy: int, draw_autotile_variant) -> None:
+        """Draw one remembered tile (used by the per-tile fallback path): the
+        desaturated terrain, then any static scenery last seen there."""
+        self._draw_map_tile(r, vx, vy, wx, wy, draw_autotile_variant, dim=True)
+        appearance = self._tile_memory.get((wx, wy))
+        if appearance is not None:
+            glyph, classification, fg, bg = appearance
+            self._draw_memory_glyph(r, vx, vy, glyph, classification, fg, bg)
 
     def _render_map_layer(self, r, draw_autotile_variant) -> None:
         """Draw the map for the current FOV. When the renderer supports a cached
@@ -3400,13 +3558,17 @@ class RenderProcessor(esper.Processor):
         ox, oy = self._view_origin_x, self._view_origin_y
 
         if not can_composite:
-            # Fallback (e.g. test double renderer): original per-visible-tile draw.
+            # Fallback (e.g. test double renderer): per-tile draw. Lit tiles show
+            # in full colour; explored-but-unseen tiles are drawn from memory
+            # (desaturated terrain + last-seen scenery).
             for vy in range(self._view_height):
                 wy = oy + vy
                 for vx in range(self._view_width):
                     wx = ox + vx
                     if (wx, wy) in self._visible_tiles:
                         self._draw_map_tile(r, vx, vy, wx, wy, draw_autotile_variant)
+                    elif (wx, wy) in self._explored_tiles:
+                        self._draw_memory_tile(r, vx, vy, wx, wy, draw_autotile_variant)
             return
 
         if not has_map_surface():
@@ -3419,25 +3581,59 @@ class RenderProcessor(esper.Processor):
 
             build_map_surface(self.game_map.width, self.game_map.height, _draw_full_map)
 
-        if self._visible_bbox is None:
+        if self._visible_bbox is None and self._memory_bbox is None:
             return
-        # Screen was cleared at the top of process(); blit only the visible FOV
-        # box (offset by the scroll origin) and black out wall-shadowed cells.
-        # Clip to the viewport so the single big blit can't spill into the
-        # sidebar/status area when the FOV box is larger than the visible map.
+
+        # Remembered terrain reuses the lit map surface and is faded to its memory
+        # tone in place, per on-screen region (no per-mutation full-surface
+        # greyscale). Feature-detected so renderers without it just fall back to
+        # black beyond the FOV.
+        apply_memory_fade = getattr(r, "apply_memory_fade", None)
+        can_remember = callable(apply_memory_fade)
+
+        # Screen was cleared at the top of process(); composite the map in layers
+        # (offset by the scroll origin). Clip to the viewport so a big region blit
+        # can't spill into the sidebar/status area when a box is larger than the
+        # visible map.
         set_map_clip = getattr(r, "set_map_clip", None)
         clear_clip = getattr(r, "clear_clip", None)
         clipped = callable(set_map_clip) and callable(clear_clip)
         if clipped:
             set_map_clip(self._view_width, self._view_height)
         try:
-            bx, by, bw, bh = self._visible_bbox
-            blit_map_region(bx, by, bw, bh, ox, oy)
-            for wx, wy in self._shadow_cells:
-                fill_cell_bg(wx - ox, wy - oy)
+            # 1. Remembered terrain: blit the lit map over the explored region,
+            #    fade it to the memory tone, then black out never-seen holes.
+            if can_remember and self._memory_bbox is not None:
+                mbx, mby, mbw, mbh = self._memory_bbox
+                blit_map_region(mbx, mby, mbw, mbh, ox, oy)
+                apply_memory_fade(mbx - ox, mby - oy, mbw, mbh)
+                for wx, wy in self._memory_holes:
+                    fill_cell_bg(wx - ox, wy - oy)
+            # 2. The lit field of view on top of the remembered terrain.
+            if self._visible_bbox is not None:
+                bx, by, bw, bh = self._visible_bbox
+                blit_map_region(bx, by, bw, bh, ox, oy)
+                # Shadow cells sit inside the FOV box but are blocked from view;
+                # the rectangular blit just painted them lit, so fade the explored
+                # ones back to their remembered look and black out the rest.
+                for wx, wy in self._shadow_cells:
+                    if can_remember and (wx, wy) in self._explored_tiles:
+                        apply_memory_fade(wx - ox, wy - oy, 1, 1)
+                    else:
+                        fill_cell_bg(wx - ox, wy - oy)
         finally:
             if clipped:
                 clear_clip()
+
+        # 3. Remembered scenery (trees, furniture, ...) overlaid on the
+        #    desaturated terrain. Every cell is inside the viewport by
+        #    construction, so this is safe outside the map clip.
+        for (wx, wy), appearance in self._memory_scenery:
+            view_xy = self._world_to_view(wx, wy)
+            if view_xy is None:
+                continue
+            glyph, classification, fg, bg = appearance
+            self._draw_memory_glyph(r, view_xy[0], view_xy[1], glyph, classification, fg, bg)
 
     def _update_sighting_events(self, nearby: list[tuple[int, str, str, str, int, int, int, int]]) -> None:
         newly_seen = [item for item in nearby if item[0] not in self._seen_entity_ids]
@@ -3898,6 +4094,10 @@ class RenderProcessor(esper.Processor):
                     cached = (visible, *self._fov_bbox_and_shadows(visible))
                     self._fov_cache[vis_key] = cached
                 self._visible_tiles, self._visible_bbox, self._shadow_cells = cached
+            # Field of view changed, so the remembered region around it has too.
+            # (Unlike FOV this can't be memoized per position: the explored set
+            # keeps growing, so a revisited tile may recall more than last time.)
+            self._compute_memory_geometry()
         draw_autotile_variant = getattr(r, "draw_autotile_variant", None)
 
         self._render_map_layer(r, draw_autotile_variant)
@@ -3906,11 +4106,18 @@ class RenderProcessor(esper.Processor):
         DrawData = tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None, bool]
         player_draw: DrawData | None = None
         character_draws: list[DrawData] = []
+        # Static scenery seen this frame, keyed by tile -- folded into tile memory
+        # after drawing so it can be recalled once the tile leaves view. Gathered
+        # here to piggyback on the entity scan rather than sweep every entity twice.
+        seen_scenery: dict[tuple[int, int], tuple[str, str, tuple[int, int, int] | None, tuple[int, int, int] | None]] = {}
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
             is_player = esper.has_component(ent, Player)
             is_character = is_player or esper.has_component(ent, NPC)
             if (pos.x, pos.y) not in self._visible_tiles and not is_player:
                 continue
+
+            if (pos.x, pos.y) in self._visible_tiles and is_memorable_scenery(ent):
+                seen_scenery[(pos.x, pos.y)] = (rend.glyph, "default", rend.fg, rend.bg)
 
             view_xy = self._world_to_view(pos.x, pos.y)
             if view_xy is None and not is_player:
@@ -3953,6 +4160,11 @@ class RenderProcessor(esper.Processor):
                 player_draw[0], player_draw[1], player_draw[2], player_draw[3],
                 fg=player_draw[4], bg=player_draw[5], force_glyph=player_draw[6],
             )
+
+        # Commit this frame's sightings to tile memory (marks tiles explored and
+        # records/refreshes their scenery), ready to be recalled next time they
+        # fall out of view.
+        self._update_tile_memory(seen_scenery)
 
         self._draw_sidebar(player_pos)
 

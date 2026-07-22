@@ -8,3 +8,5 @@ the game should move everything into memory at start, i.e. sound files, tiles, s
 change name to Seeds of Derision?
 
 make sure people don't get stuck.  
+
+can tcod help?

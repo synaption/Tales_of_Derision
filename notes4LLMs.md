@@ -7,3 +7,4 @@ document everything
 things need to be testable without rendering.  
 make sure there are good comments.  
 keep the gitignore up to date
+use datastructures and algorithems where apropriate

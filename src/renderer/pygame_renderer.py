@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import sys
 
-from .base import Renderer
+from .base import MEMORY_DESATURATE, MEMORY_DIM, Renderer, memory_color
 
 
 # Under pygbag the browser canvas fills the page via CSS (width/height: 100%),
@@ -287,6 +287,10 @@ class PygameRenderer(Renderer):
         # Cached fully-drawn map; walking blits regions of it instead of
         # re-drawing every visible tile (see capture_map_surface).
         self._map_surface = None
+        # Remembered ("fog of war") tiles: terrain is faded in place per on-screen
+        # region (see apply_memory_fade -- cheap, no per-mutation cost); scenery
+        # sprites reuse this per-tile cache of the same desaturate+dim transform.
+        self._desaturated_tiles: dict[int, object] = {}
 
     def apply_options(self, options: dict) -> None:
         self._options = dict(options)
@@ -372,6 +376,7 @@ class PygameRenderer(Renderer):
         # wrong size / cell scale.
         self._backdrop_snapshot = None
         self._map_surface = None
+        self._desaturated_tiles = {}
         self._load_tileset_config()
 
         self._keydown_to_action, self._keyup_to_action = _build_key_mappings(self._pygame, self._options)
@@ -1269,6 +1274,100 @@ class PygameRenderer(Renderer):
             return
         rect = self._pygame.Rect(vx * self._cell_w, vy * self._cell_h, self._cell_w, self._cell_h)
         self._screen.fill(self._bg, rect)
+
+    def _desaturate_surface(self, surface: object) -> object:
+        """A desaturated, dimmed copy of ``surface`` -- the "remembered" tone.
+        Blends the surface toward its greyscale by ``MEMORY_DESATURATE`` then
+        multiplies brightness by ``MEMORY_DIM``, matching ``base.memory_color``.
+
+        Only used on small, cached sprite tiles (remembered scenery). Terrain is
+        NOT desaturated this way: greyscaling the whole world-sized map surface
+        costs hundreds of ms and would have to be redone every time the living
+        world edits a tile, so remembered terrain uses the cheap ``apply_memory
+        _veil`` region wash instead.
+        """
+        result = surface.copy()
+        # Blend toward greyscale (partial desaturation) via a per-surface-alpha
+        # overlay; falls back to no desaturation if the transform is unavailable.
+        grayscale = getattr(self._pygame.transform, "grayscale", None)
+        if callable(grayscale):
+            gray = grayscale(result)
+            gray.set_alpha(int(round(255 * MEMORY_DESATURATE)))
+            result.blit(gray, (0, 0))
+        # Dim: multiply every channel by the brightness factor.
+        dim = max(0, min(255, int(round(255 * MEMORY_DIM))))
+        result.fill((dim, dim, dim), special_flags=self._pygame.BLEND_RGB_MULT)
+        return result
+
+    def apply_memory_fade(self, vx: int, vy: int, w_cells: int, h_cells: int) -> None:
+        """Fade an already-drawn block of lit terrain into its "remembered" tone:
+        desaturate each pixel toward its OWN luminance (a grayscale blend), then
+        dim by a brightness multiply. Operates only on the on-screen region, so it
+        stays cheap (a viewport-sized greyscale, not a whole-map transform), and --
+        unlike a flat grey overlay -- it leaves black backgrounds black and keeps
+        contrast, matching the per-sprite fade used for remembered scenery.
+        ``(vx, vy)`` is the top-left cell in the *view* (scroll offset already
+        applied by the caller)."""
+        if self._pygame is None or self._screen is None:
+            return
+        w_px = max(0, w_cells) * self._cell_w
+        h_px = max(0, h_cells) * self._cell_h
+        if w_px == 0 or h_px == 0:
+            return
+        rect = self._pygame.Rect(vx * self._cell_w, vy * self._cell_h, w_px, h_px)
+        rect = rect.clip(self._screen.get_rect())
+        if rect.width == 0 or rect.height == 0:
+            return
+        grayscale = getattr(self._pygame.transform, "grayscale", None)
+        if callable(grayscale):
+            # Blend the region toward its greyscale by MEMORY_DESATURATE (partial
+            # desaturation toward per-pixel luminance -- keeps relative brightness).
+            gray = grayscale(self._screen.subsurface(rect))
+            gray.set_alpha(max(0, min(255, int(round(255 * MEMORY_DESATURATE)))))
+            self._screen.blit(gray, rect.topleft)
+        # Dim: multiply every channel (black stays black, no washed-out lift).
+        dim = max(0, min(255, int(round(255 * MEMORY_DIM))))
+        self._screen.fill((dim, dim, dim), rect, special_flags=self._pygame.BLEND_RGB_MULT)
+
+    def _desaturate_tile(self, tile: object):
+        """Cached desaturated copy of a resolved sprite tile, for remembered
+        scenery. Keyed by tile identity like ``_tint_tile``."""
+        cached = self._desaturated_tiles.get(id(tile))
+        if cached is not None:
+            return cached
+        desaturated = self._desaturate_surface(tile)
+        self._desaturated_tiles[id(tile)] = desaturated
+        return desaturated
+
+    def draw_glyph_memory(
+        self,
+        x: int,
+        y: int,
+        glyph: str,
+        classification: str,
+        fg: tuple[int, int, int] | None = None,
+        bg: tuple[int, int, int] | None = None,
+    ) -> None:
+        """Draw a glyph in its "remembered" tone: resolve the same sprite
+        ``draw_glyph_classified`` would, then desaturate and dim the whole tile so
+        recalled scenery matches the desaturated terrain around it."""
+        if fg is None:
+            resolved_fg = self._class_colors.get(classification, self._default_fg)
+        else:
+            resolved_fg = _coerce_rgb(fg, self._default_fg)
+        resolved_bg = _coerce_rgb(bg, self._bg)
+
+        tile, source = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
+        if self._screen is not None and tile is not None:
+            draw_tile = tile
+            # Tint first (so a glyph/class sprite keeps its hue) then desaturate,
+            # exactly as the lit path tints -- the memory pass just adds the fade.
+            if fg is not None and source in {"glyph", "class"}:
+                draw_tile = self._tint_tile(tile, resolved_fg)
+            self._blit_world_tile(x, y, self._desaturate_tile(draw_tile), None)
+            return
+
+        self._blit_text(x, y, glyph, memory_color(resolved_fg))
 
     def draw_cursor(
         self,
