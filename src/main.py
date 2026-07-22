@@ -688,6 +688,49 @@ async def _await_action_or_idle(renderer: Renderer, idle_timeout: float) -> str 
         await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)
 
 
+# How often the main loop wakes up with no input at all, so genuinely idle
+# time (the player thinking, or away from the keyboard) can be spent paying
+# down region simulation debt in the background -- desktop used to block here
+# with zero idle CPU use; this trades a little of that for background progress.
+_IDLE_POLL_SECONDS = 0.05
+# Background pump budget (seconds) for a single idle tick: starts tiny (barely
+# more than the per-turn budget already spent inside NpcAiProcessor/
+# FishAiProcessor) and ramps up the longer the player goes without acting, up
+# to a ceiling that still can't turn into a perceptible stall. Resets to the
+# base the instant a real action arrives, so a long idle spell can never dump
+# one big burst onto the player's next turn.
+_IDLE_PUMP_BASE_BUDGET = 0.004
+_IDLE_PUMP_MAX_BUDGET = 0.05
+_IDLE_PUMP_RAMP = 1.4
+
+
+def _idle_pump_budget(idle_ticks: int) -> float:
+    return min(_IDLE_PUMP_MAX_BUDGET, _IDLE_PUMP_BASE_BUDGET * (_IDLE_PUMP_RAMP**idle_ticks))
+
+
+def _pump_background_regions(budget_seconds: float) -> None:
+    """Spend up to ``budget_seconds`` advancing the nearest lagging region for
+    each region-aware processor, closest to the player first. Safe to call
+    often -- with nothing lagging it's just a couple of empty dict scans."""
+    clock = world_clock()
+    if clock is None:
+        return
+    player_xy: tuple[int, int] | None = None
+    for _ent, (pos, _p) in esper.get_components(Position, Player):
+        player_xy = (pos.x, pos.y)
+        break
+    for processor_type in (NpcAiProcessor, FishAiProcessor):
+        processor = esper.get_processor(processor_type)
+        if processor is None:
+            continue
+        player_region = (
+            processor.scheduler.region_at(player_xy[0], player_xy[1])
+            if player_xy is not None
+            else None
+        )
+        processor.scheduler.pump_background(budget_seconds, player_region, clock.turn, time.monotonic)
+
+
 async def _draw_title_screen(renderer: Renderer) -> bool:
     poll_action_nonblocking = getattr(renderer, "poll_action_nonblocking", None)
     splash_seconds = max(0.5, _TITLE_SPLASH_SECONDS)
@@ -1531,6 +1574,18 @@ async def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
     # Safety net: never leave the player stuck asleep past the cap.
     if esper.has_component(player_ent, Asleep):
         wake_up(player_ent)
+
+    # A night's sleep resolves the *whole* world, not just the region the bed
+    # sits in -- region-aware processors otherwise only keep the player's
+    # immediate region fully live turn by turn, leaving everywhere else to
+    # catch up gradually in the background.
+    clock = world_clock()
+    if clock is not None:
+        for processor in (esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor)):
+            if processor is not None:
+                processor.scheduler.catch_up_all(clock.turn)
+                await asyncio.sleep(0)
+
     esper.process(None)
 
 
@@ -3084,6 +3139,7 @@ async def main() -> None:
             # The player menu (Tab) reopens on whatever tab you left it on.
             last_menu_tab = "inventory"
             invalidate_backdrop = getattr(renderer, "invalidate_backdrop", None)
+            idle_ticks = 0
             while True:
                 # Live play has (re)rendered the game, so any menu backdrop
                 # snapshot is stale; the next menu to open will re-capture.
@@ -3091,15 +3147,25 @@ async def main() -> None:
                     invalidate_backdrop()
                 # When the player has an active status animation (swimming, on
                 # fire, ...), poll on a short timeout and re-render on each idle
-                # tick so the identifiers cycle without input; otherwise keep the
-                # efficient blocking wait (desktop truly idles).
+                # tick so the identifiers cycle without input.
                 if player_is_animated(game_map) or bubbles_active():
                     action = await _await_action_or_idle(renderer, _STATUS_ANIM_POLL_SECONDS)
                     if action is None:
+                        _pump_background_regions(_IDLE_PUMP_BASE_BUDGET)
                         esper.process(None)
                         continue
                 else:
-                    action = await _await_action(renderer)
+                    # Otherwise poll on a short timeout too, rather than desktop's
+                    # old fully-blocking wait: true idle time (the player thinking,
+                    # or away from the keyboard) is exactly when there's the most
+                    # spare time to pay down region simulation debt in the
+                    # background, ramping up the longer nothing happens.
+                    action = await _await_action_or_idle(renderer, _IDLE_POLL_SECONDS)
+                    if action is None:
+                        idle_ticks += 1
+                        _pump_background_regions(_idle_pump_budget(idle_ticks))
+                        continue
+                idle_ticks = 0
                 if action == "quit":
                     break
                 if action == "tile_scale_up":

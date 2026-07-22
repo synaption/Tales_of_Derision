@@ -5,7 +5,7 @@ process() receives whatever args are passed to esper.process().
 """
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import random
 import textwrap
 import time
@@ -16,6 +16,7 @@ from components import Age, Asleep, Bed, BerryBush, BlocksMovement, BuildPlan, C
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from onymancer import make_onymancer
+from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin
 from renderer.base import Renderer
 
 _ACTION_DELTAS = {
@@ -98,15 +99,11 @@ def pick_berries(bush_ent: int, clock: WorldClock | None) -> bool:
 _MIN_SECTION_W = 12
 _MIN_SECTION_H = 8
 
-# Two nested tilings over the world:
-#  * the render section (40x20) -- only the one the player stands in is drawn;
-#  * the simulation area (120x60, a 3x3 block of render sections) -- the whole
-#    area the player stands in is fully simulated each turn, the rest only in the
-#    background (see FishAiProcessor).
+# The render section (40x20) -- only the one the player stands in is drawn.
+# The coarser 120x60 simulation region (a 3x3 block of render sections) that
+# region-aware processors use is defined in regions.py.
 _RENDER_SECTION_W = LAND_WIDTH // 3   # 40
 _RENDER_SECTION_H = LAND_HEIGHT // 3  # 20
-_SIM_AREA_W = LAND_WIDTH   # 120
-_SIM_AREA_H = LAND_HEIGHT  # 60
 
 # --- Status identifier animation -------------------------------------------
 # A character's rendered tile cycles through its own glyph followed by an
@@ -183,6 +180,11 @@ def world_clock() -> WorldClock | None:
     for _ent, (clock,) in esper.get_components(WorldClock):
         return clock
     return None
+
+
+def _current_turn() -> int:
+    clock = world_clock()
+    return clock.turn if clock is not None else 0
 
 
 def day_fraction(clock: WorldClock) -> float:
@@ -751,6 +753,26 @@ class MovementProcessor(esper.Processor):
                 _push_turn_event("Something blocks your way.")
 
 
+# How far into a neighbouring region an NPC's goal search still looks, so
+# standing near a simulation-region seam doesn't hide an otherwise-closer
+# resource just across it. Matches ``_SOCIAL_SIGHT`` -- the widest existing
+# "how far can a creature notice something" range in this file.
+_REGION_BORDER_MARGIN = 8
+# Wall-clock budget (seconds) a real turn spends nudging non-current NPC
+# regions along in the background, on top of whatever the main loop's
+# idle-time pump adds -- bounded so a busy world can never stall input.
+_NPC_BACKGROUND_BUDGET = 0.004
+# How many ``_step_toward`` calls a cached goal-rooted distance field is
+# trusted for before it's rebuilt anyway (in case blockers have settled
+# somewhere that changes the *effectively* best route enough to matter, even
+# though the underlying static walkability hasn't).
+_PATH_FIELD_REFRESH_CALLS = 20
+# How many _advance_region calls a cached world snapshot (occupied tiles +
+# goal candidates + NPCs, bucketed by region) is trusted for before it's
+# rebuilt from scratch. A catch-up burst can call _advance_region thousands
+# of times; this bounds how often that costs a full-world scan instead of a
+# region-local lookup.
+_WORLD_SNAPSHOT_REFRESH_CALLS = 25
 # Need level (percent of max) at which an NPC stops what it's doing and forages.
 _FORAGE_THRESHOLD = 55.0
 # How much a single grazing/drinking/feeding action restores.
@@ -761,12 +783,10 @@ _FEED_RESTORE = 60.0
 # notice a frond and start swimming toward it.
 _FISH_GRAZE_RESTORE = 40.0
 _FISH_SIGHT = 12
-# Wall-clock budget (seconds) a turn may spend nudging non-current simulation
-# areas along in the background -- kept tiny so ocean work can never stall input.
-_FISH_BACKGROUND_BUDGET = 0.0015
-# Cap on catch-up steps run when the player enters a stale area, so "bring it up
-# to date" stays bounded no matter how long the area sat dormant.
-_FISH_CATCHUP_STEPS = 20
+# Wall-clock budget (seconds) a real turn spends nudging non-current regions
+# along in the background, on top of whatever the main loop's idle-time pump
+# adds -- bounded so ocean work can never stall input.
+_FISH_BACKGROUND_BUDGET = 0.004
 # Chance a fish drifts to a random neighbouring water tile on an idle turn, so
 # the shoals mill about gently instead of holding perfectly still.
 _FISH_WANDER_CHANCE = 0.6
@@ -1267,9 +1287,27 @@ class NpcAiProcessor(esper.Processor):
     pathfind, not a full-map rescan every turn.
     """
 
-    def __init__(self, game_map: GameMap):
+    def __init__(self, game_map: GameMap, wall_clock: Callable[[], float] | None = None):
         self.game_map = game_map
         self._shore_tiles: list[tuple[int, int]] = self._compute_shore_tiles()
+        self._wall_clock = wall_clock if wall_clock is not None else time.monotonic
+        self.scheduler = RegionScheduler(game_map, _current_turn())
+        self.scheduler.register("npc_ai", self._advance_region)
+        # A world-wide, region-bucketed snapshot (occupied tiles + every goal
+        # kind + every NPC), rebuilt from scratch only every
+        # _WORLD_SNAPSHOT_REFRESH_CALLS advances instead of on every single
+        # one -- a catch-up burst (region-entry, sleep) advances many regions
+        # many turns each, and re-scanning literally every entity in the world
+        # for each of those individual turns is the dominant cost at any real
+        # population (bounded staleness traded for that no longer happening).
+        self._world_snapshot: dict[str, dict] | None = None
+        self._world_snapshot_calls_left = 0
+        # goal xy -> (edit revision near goal when cached, calls left before a
+        # routine refresh, the flow field itself). Shared across every NPC
+        # heading to the same goal, not per-entity -- a distance field rooted
+        # at a (largely static) goal stays valid for any traveller approaching
+        # it from anywhere, so many NPCs reuse the one flood.
+        self._field_cache: dict[tuple[int, int], tuple[int, int, dict[tuple[int, int], int]]] = {}
 
     def _compute_shore_tiles(self) -> list[tuple[int, int]]:
         shore: list[tuple[int, int]] = []
@@ -1297,6 +1335,59 @@ class NpcAiProcessor(esper.Processor):
                 best = cand
         return best
 
+    def _distance_field_for(self, goal: tuple[int, int]) -> dict[tuple[int, int], int]:
+        """A cached flow field to ``goal`` (see ``GameMap.distance_field``),
+        rebuilt only when an edit lands near ``goal`` or the routine refresh
+        interval elapses -- not on every call, and not on an edit anywhere
+        else in the world."""
+        edit_revision = self.game_map.region_edit_revision(goal[0], goal[1])
+        cached = self._field_cache.get(goal)
+        if cached is not None:
+            cached_revision, calls_left, field = cached
+            if cached_revision == edit_revision and calls_left > 0:
+                self._field_cache[goal] = (cached_revision, calls_left - 1, field)
+                return field
+        field = self.game_map.distance_field(goal)
+        self._field_cache[goal] = (edit_revision, _PATH_FIELD_REFRESH_CALLS, field)
+        return field
+
+    def _greedy_step_toward(
+        self,
+        ent: int,
+        xy: tuple[int, int],
+        goal: tuple[int, int],
+        occupied: dict[tuple[int, int], int],
+    ) -> tuple[int, int] | None:
+        """The best available neighbour of ``xy`` toward ``goal`` per the
+        cached flow field, or ``None`` if ``goal`` isn't in it (out of its
+        walkable region, the field hasn't been built for it, or literally
+        every closer neighbour is currently blocked).
+
+        Ranks *every* closer neighbour, not just the single nearest one, and
+        skips ones a live occupant blocks -- so a crowded goal (e.g. a
+        builder's own other, not-yet-placed blueprint pieces sitting right
+        next to this one) doesn't force an expensive fallback pathfind merely
+        because the closest step happens to be taken; the second- or
+        third-closest is usually just as good and is right here in the same
+        cached field.
+        """
+        field = self._distance_field_for(goal)
+        here = field.get(xy)
+        if here is None:
+            return None
+        candidates = [
+            (dist, nxy)
+            for nxy in self.game_map.neighbors_8(xy[0], xy[1])
+            if (dist := field.get(nxy)) is not None and dist < here
+        ]
+        candidates.sort(key=lambda c: c[0])
+        for _dist, nxy in candidates:
+            blocked_by_goal = nxy == goal and nxy in occupied
+            blocked_by_other = nxy in occupied and occupied[nxy] != ent
+            if not blocked_by_goal and not blocked_by_other:
+                return nxy
+        return None
+
     def _step_toward(
         self,
         ent: int,
@@ -1304,9 +1395,32 @@ class NpcAiProcessor(esper.Processor):
         goal: tuple[int, int],
         occupied: dict[tuple[int, int], int],
     ) -> bool:
-        """Move one step along a path to ``goal``. Returns True if it moved."""
-        blocked = {xy for xy, occ_ent in occupied.items() if occ_ent != ent}
-        path = self.game_map.find_path((pos.x, pos.y), goal, blocked_tiles=blocked)
+        """Move one step toward ``goal``. Returns True if it moved.
+
+        The common case is a cheap lookup in a cached, goal-rooted flow field
+        (shared across every NPC currently heading to that goal) instead of a
+        fresh BFS. If the goal is outside the cached field entirely, or every
+        viable step toward it is currently blocked, this falls back to a
+        one-off occupant-aware pathfind -- exactly what ran here before this
+        cache existed.
+        """
+        # A non-walkable goal can never be reached (find_path can't discover
+        # it either -- it's excluded during the BFS itself), so don't spend a
+        # full flood or fallback pathfind finding that out the hard way. Comes
+        # up for a stale/duplicate build-blueprint tile that's already the
+        # right type -- see _build's own cleanup -- and cheaply guards any
+        # other goal kind that could end up unreachable the same way.
+        if not self.game_map.is_walkable(goal[0], goal[1]):
+            return False
+
+        xy = (pos.x, pos.y)
+        step = self._greedy_step_toward(ent, xy, goal, occupied)
+        if step is not None:
+            self._commit_step(ent, pos, step, occupied)
+            return True
+
+        blocked = {xy2 for xy2, occ_ent in occupied.items() if occ_ent != ent}
+        path = self.game_map.find_path(xy, goal, blocked_tiles=blocked)
         if not path:
             return False
         next_x, next_y = path[0]
@@ -1316,11 +1430,17 @@ class NpcAiProcessor(esper.Processor):
             return False
         if (next_x, next_y) in occupied and occupied[(next_x, next_y)] != ent:
             return False
-        old_xy = (pos.x, pos.y)
-        pos.x, pos.y = next_x, next_y
-        occupied.pop(old_xy, None)
-        occupied[(next_x, next_y)] = ent
+        self._commit_step(ent, pos, (next_x, next_y), occupied)
         return True
+
+    @staticmethod
+    def _commit_step(
+        ent: int, pos: Position, next_xy: tuple[int, int], occupied: dict[tuple[int, int], int]
+    ) -> None:
+        old_xy = (pos.x, pos.y)
+        pos.x, pos.y = next_xy
+        occupied.pop(old_xy, None)
+        occupied[next_xy] = ent
 
     def _reachable(
         self, pos: Position, items: list[tuple[tuple[int, int], int]]
@@ -1378,16 +1498,23 @@ class NpcAiProcessor(esper.Processor):
         needs: Needs,
         bushes: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
+        clock: WorldClock | None,
     ) -> bool:
         """Head to the nearest ripe berry bush and pick it clean. Bushes block
         their tile, so the forager eats from an adjacent one; the bush regrows a
-        fresh crop days later (see ``TreeGrowthProcessor``)."""
+        fresh crop days later (see ``TreeGrowthProcessor``).
+
+        Takes ``clock`` rather than calling ``world_clock()`` itself: during a
+        region catch-up burst this is an as-of clock for the turn being
+        replayed, not the true "now" -- using the real clock here would let a
+        bush regrow based on time that, for this region, hasn't happened yet.
+        """
         bushes = self._reachable(pos, bushes)
         if not bushes:
             return False
         target_xy, target_ent = min(bushes, key=lambda item: _chebyshev((pos.x, pos.y), item[0]))
         if _chebyshev((pos.x, pos.y), target_xy) == 1:
-            if pick_berries(target_ent, world_clock()):
+            if pick_berries(target_ent, clock):
                 needs.hunger = max(0.0, needs.hunger - _GRAZE_RESTORE)
             return True
         return self._step_toward(ent, pos, target_xy, occupied)
@@ -1637,6 +1764,14 @@ class NpcAiProcessor(esper.Processor):
         place an adjacent pending piece, or walk toward the nearest one. Finishing
         the last piece furnishes and claims the new house."""
         plan = esper.component_for_entity(ent, BuildPlan)
+        # Drop any piece that's already the tile it's meant to become -- e.g. a
+        # duplicate blueprint coordinate satisfied when its twin was placed.
+        # There's nothing left to do for it, and leaving it in `remaining`
+        # would have the builder fixate on an already-finished tile forever
+        # (it can become unreachable once the surrounding walls go up).
+        plan.remaining = [
+            (bx, by, tile) for (bx, by, tile) in plan.remaining if self.game_map.tile_at(bx, by) != tile
+        ]
         if not plan.remaining:
             self._complete_build(ent, plan)
             return True
@@ -1698,6 +1833,14 @@ class NpcAiProcessor(esper.Processor):
             return False
         if not self.game_map.has_line_of_sight((pos.x, pos.y), player_xy):
             return False
+        # Line of sight crosses water/gaps a walker can't cross (it only blocks
+        # on walls) -- so a hostile that can *see* the player across a river it
+        # can't reach would otherwise retry a full, expensive "no path exists"
+        # pathfind every single turn it keeps watching. Reachability is a
+        # cheap, cached lookup (GameMap.region_of); check it before ever
+        # calling into pathfinding.
+        if not self.game_map.same_region((pos.x, pos.y), player_xy):
+            return False
         if _chebyshev((pos.x, pos.y), player_xy) == 1:
             return False  # adjacent: hold (player-facing combat is player-driven)
         return self._step_toward(ent, pos, player_xy, occupied)
@@ -1742,11 +1885,16 @@ class NpcAiProcessor(esper.Processor):
         occupied: dict[tuple[int, int], int],
         sentients: list[tuple[int, Position]],
         turn: int,
+        clock: WorldClock | None,
     ) -> bool:
         """A being seeks out someone to talk to, preferring beings it already
         likes. Interacts when adjacent (adjusting friendship + popping bubbles),
         otherwise steps toward the chosen partner. Honours a per-being cooldown so
-        villagers don't chatter every turn."""
+        villagers don't chatter every turn.
+
+        ``turn``/``clock`` are an as-of turn number and clock during a region
+        catch-up burst, not necessarily the true "now" -- see ``_forage_berries``.
+        """
         personality = esper.component_for_entity(ent, Personality)
         if turn - personality.last_social_turn < _SOCIAL_COOLDOWN:
             return False
@@ -1762,47 +1910,123 @@ class NpcAiProcessor(esper.Processor):
             # very close single pair weds; a close pair alone together may be
             # intimate. Both are no-ops unless the pair is adult, opposite-sex,
             # and friendly enough, so this fires only for genuine couples.
-            clock = world_clock()
             try_marry(ent, partner_ent, clock)
             try_mate(ent, partner_ent, turn, clock, sentients)
             return True
         return self._step_toward(ent, pos, (partner_pos.x, partner_pos.y), occupied)
 
-    def process(self, action: str | None = None) -> None:
-        if action not in _TURN_ACTIONS:
-            return
-
-        player_xy = self._find_player_position()
-
+    def _build_world_snapshot(self) -> dict[str, dict]:
+        """One full-world scan, bucketed by each entity's *exact* region (no
+        margin -- that's applied at lookup time in ``_region_bucket``). This
+        is the expensive part; ``_advance_region`` reuses the result across
+        many calls instead of repeating it per region-turn."""
+        region_at = self.scheduler.region_at
         occupied = {
             (pos.x, pos.y): ent
             for ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
         }
+        trees: dict[RegionId, list] = {}
+        for ent, (pos, _t) in esper.get_components(Position, Tree):
+            trees.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
+        prey: dict[RegionId, list] = {}
+        for ent, (pos, _d) in esper.get_components(Position, Deer):
+            prey.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
+        corpses: dict[RegionId, list] = {}
+        for ent, (pos, _c, inv) in esper.get_components(Position, Corpse, Inventory):
+            if any(is_raw_meat(item) or is_cooked_meat(item) for item in inv.items):
+                corpses.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
+        stoves: dict[RegionId, list] = {}
+        for ent, (pos, _s) in esper.get_components(Position, Stove):
+            stoves.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
+        bushes: dict[RegionId, list] = {}
+        for ent, (pos, bush) in esper.get_components(Position, BerryBush):
+            if bush.has_berries:
+                bushes.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
+        # Sentients/NPCs keep the live Position object, not a frozen (x, y) --
+        # they move every turn, so a snapshot reused for many calls must keep
+        # reading their *current* position, not the one at snapshot time.
+        sentients: dict[RegionId, list] = {}
+        for ent, (pos, _p) in esper.get_components(Position, Personality):
+            sentients.setdefault(region_at(pos.x, pos.y), []).append((ent, pos))
+        npcs: dict[RegionId, list] = {}
+        for ent, (pos, _npc) in esper.get_components(Position, NPC):
+            npcs.setdefault(region_at(pos.x, pos.y), []).append((ent, pos))
+        return {
+            "occupied": occupied,
+            "trees": trees,
+            "prey": prey,
+            "corpses": corpses,
+            "stoves": stoves,
+            "bushes": bushes,
+            "sentients": sentients,
+            "npcs": npcs,
+        }
 
-        # Snapshot dynamic foraging targets once per turn.
-        trees = [((pos.x, pos.y), ent) for ent, (pos, _t) in esper.get_components(Position, Tree)]
-        prey = [((pos.x, pos.y), ent) for ent, (pos, _d) in esper.get_components(Position, Deer)]
-        corpses = [
-            ((pos.x, pos.y), ent)
-            for ent, (pos, _c, inv) in esper.get_components(Position, Corpse, Inventory)
-            if any(is_raw_meat(item) or is_cooked_meat(item) for item in inv.items)
-        ]
-        stoves = [((pos.x, pos.y), ent) for ent, (pos, _s) in esper.get_components(Position, Stove)]
-        # Ripe berry bushes -- a quick, ready-to-eat food NPCs forage when hungry.
-        bushes = [
-            ((pos.x, pos.y), ent)
-            for ent, (pos, bush) in esper.get_components(Position, BerryBush)
-            if bush.has_berries
-        ]
-        # Sentient beings the social AI can approach (positions snapshotted once).
-        sentients = [(ent, pos) for ent, (pos, _p) in esper.get_components(Position, Personality)]
+    def _world_snapshot_for_this_call(self) -> dict[str, dict]:
+        if self._world_snapshot is None or self._world_snapshot_calls_left <= 0:
+            self._world_snapshot = self._build_world_snapshot()
+            self._world_snapshot_calls_left = _WORLD_SNAPSHOT_REFRESH_CALLS
+        else:
+            self._world_snapshot_calls_left -= 1
+        return self._world_snapshot
 
-        clock = world_clock()
-        turn = clock.turn if clock is not None else 0
+    def _region_bucket(
+        self, buckets: dict[RegionId, list], region_id: RegionId, xy_of: Callable[[object], tuple[int, int]]
+    ) -> list:
+        """This region's own bucketed items, widened by ``_REGION_BORDER_MARGIN``
+        into the (up to 8) neighbouring regions' buckets -- so a creature near a
+        seam still sees a resource one tile into the next region. Only the
+        handful of neighbouring buckets are scanned, never the whole world."""
+        game_map = self.game_map
+        margin = _REGION_BORDER_MARGIN
+        cx, cy = region_id
+        items = list(buckets.get(region_id, ()))
+        for nx in range(cx - 1, cx + 2):
+            for ny in range(cy - 1, cy + 2):
+                if (nx, ny) == region_id:
+                    continue
+                for item in buckets.get((nx, ny), ()):
+                    x, y = xy_of(item)
+                    if in_region_with_margin(game_map, region_id, x, y, margin):
+                        items.append(item)
+        return items
 
-        # Materialise the list: a predator can kill (delete) another NPC mid-loop
-        # via _seek_food, so we snapshot up front and skip anything already gone.
-        for ent, (pos, _npc) in list(esper.get_components(Position, NPC)):
+    def _advance_region(self, region_id: RegionId) -> None:
+        """Run one turn of NPC AI for the NPCs standing in ``region_id``,
+        using a periodically-refreshed world snapshot rather than rescanning
+        every entity in the world on every single call (see
+        ``_world_snapshot_for_this_call``). ``player_xy`` is fetched fresh
+        every call regardless -- it's a single cheap lookup, not a full scan,
+        and hostile-chase distance is short-range enough that staleness here
+        would actually be noticeable.
+        """
+        snapshot = self._world_snapshot_for_this_call()
+        occupied = snapshot["occupied"]
+
+        # This region's own logical turn: during a catch-up burst this replays
+        # turn N, N+1, N+2 ... in order, each with its own as-of clock, so
+        # turn-stamped state (berry regrowth, courtship cooldowns, ages) reads
+        # correctly relative to *this* region's history, not the true "now".
+        logical_turn = self.scheduler.region_turn[region_id] + 1
+        real_clock = world_clock()
+        clock = replace(real_clock, turn=logical_turn) if real_clock is not None else None
+
+        player_xy = self._find_player_position()
+
+        xy_of_pair = lambda item: item[0]  # noqa: E731 -- ((x, y), ent) items
+        xy_of_pos = lambda item: (item[1].x, item[1].y)  # noqa: E731 -- (ent, Position) items
+
+        trees = self._region_bucket(snapshot["trees"], region_id, xy_of_pair)
+        prey = self._region_bucket(snapshot["prey"], region_id, xy_of_pair)
+        corpses = self._region_bucket(snapshot["corpses"], region_id, xy_of_pair)
+        stoves = self._region_bucket(snapshot["stoves"], region_id, xy_of_pair)
+        bushes = self._region_bucket(snapshot["bushes"], region_id, xy_of_pair)
+        sentients = self._region_bucket(snapshot["sentients"], region_id, xy_of_pos)
+
+        # NPCs acting this turn are exactly this region's own bucket (no
+        # margin) -- a border-straddling NPC must belong to exactly one
+        # region's turn, never both, or it would act twice.
+        for ent, pos in list(snapshot["npcs"].get(region_id, ())):
             if not esper.entity_exists(ent):
                 continue
             # Sleepers skip their turn; NeedsProcessor recovers and wakes them.
@@ -1829,7 +2053,7 @@ class NpcAiProcessor(esper.Processor):
                         acted = True
                     elif diet_kind == "herbivore":
                         # Ripe berries first (quick food); else graze a tree.
-                        acted = self._forage_berries(ent, pos, needs, bushes, occupied)
+                        acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
                         if not acted:
                             acted = self._graze(ent, pos, needs, trees, occupied)
                     elif diet_kind == "carnivore":
@@ -1837,7 +2061,7 @@ class NpcAiProcessor(esper.Processor):
                         acted = self._seek_food(ent, pos, needs, prey, corpses, occupied)
                     elif diet_kind == "cook":
                         # Villager: pick ripe berries when handy, else cook meat.
-                        acted = self._forage_berries(ent, pos, needs, bushes, occupied)
+                        acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
                         if not acted:
                             acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
 
@@ -1854,13 +2078,44 @@ class NpcAiProcessor(esper.Processor):
                 and esper.has_component(ent, Personality)
                 and esper.has_component(ent, Friendly)
             ):
-                acted = self._socialize(ent, pos, occupied, sentients, turn)
+                acted = self._socialize(ent, pos, occupied, sentients, logical_turn, clock)
 
             if acted:
                 continue
 
             if player_xy is not None and esper.has_component(ent, Enemy):
                 self._chase_player(ent, pos, player_xy, occupied)
+
+    def process(self, action: str | None = None) -> None:
+        if action not in _TURN_ACTIONS:
+            return
+
+        player_xy = self._find_player_position()
+        player_region = (
+            self.scheduler.region_at(player_xy[0], player_xy[1]) if player_xy is not None else None
+        )
+
+        if player_region is None:
+            # No player (unit tests construct this processor directly): bring
+            # every region up to date once, matching an unpartitioned pass.
+            for region_id in all_region_ids(self.game_map):
+                self.scheduler.advance_region(region_id)
+            return
+
+        target_turn = self.scheduler.next_turn_for(player_region, _current_turn())
+
+        # The player's own region is always fully live -- this also covers
+        # "just entered a new region": catch_up_region replays every turn the
+        # region missed, in order, right here.
+        self.scheduler.catch_up_region(player_region, target_turn)
+
+        # Background: nudge the *nearest* other lagging regions along, closest
+        # to the player first (never the stalest). Bounded, so it can never
+        # stall input; the main loop's idle-time pump tops this up further,
+        # and sleep/region-entry fully resolve everything else.
+        self.scheduler.pump_background(
+            _NPC_BACKGROUND_BUDGET, player_region, target_turn, self._wall_clock
+        )
 
 
 class FishAiProcessor(esper.Processor):
@@ -1872,6 +2127,11 @@ class FishAiProcessor(esper.Processor):
     ``NpcAiProcessor`` drives with ``find_path`` -- they step greedily between
     adjacent water cells and never strand themselves ashore. They are not tagged
     ``NPC``, so the land AI ignores them entirely.
+
+    Uses a ``RegionScheduler`` (see ``regions.py``) so the player's own 120x60
+    region is always fully live, distant regions pay down simulation debt in
+    the background (nearest-to-player first), and either a region-entry or a
+    sleep can force a region -- or the whole world -- fully up to date.
     """
 
     def __init__(
@@ -1883,27 +2143,42 @@ class FishAiProcessor(esper.Processor):
         self.game_map = game_map
         self._rng = rng if rng is not None else random.random
         self._wall_clock = clock if clock is not None else time.monotonic
-        # The simulation area (120x60) grid over the world. The player's own area
-        # is fully simulated every turn; the rest only in the background.
-        self._area_w = max(1, min(_SIM_AREA_W, game_map.width))
-        self._area_h = max(1, min(_SIM_AREA_H, game_map.height))
-        self._cols = max(1, game_map.width // self._area_w)
-        self._rows = max(1, game_map.height // self._area_h)
-        # Turn each area was last simulated, so the background pass can favour the
-        # stalest, and an area is caught up when the player first enters it.
-        self._last_sim_turn: dict[tuple[int, int], int] = {}
-        self._last_player_area: tuple[int, int] | None = None
+        self.scheduler = RegionScheduler(game_map, _current_turn())
+        self.scheduler.register("fish", self._advance_region)
+        # Rebuilt from scratch only every _WORLD_SNAPSHOT_REFRESH_CALLS
+        # advances rather than on every single one -- see the identical cache
+        # on NpcAiProcessor for why a catch-up burst makes this matter.
+        self._world_snapshot: dict[str, dict] | None = None
+        self._world_snapshot_calls_left = 0
 
-    def _area_of(self, x: int, y: int) -> tuple[int, int]:
-        return (
-            min(self._cols - 1, max(0, x // self._area_w)),
-            min(self._rows - 1, max(0, y // self._area_h)),
-        )
+    def _build_world_snapshot(self) -> dict[str, dict]:
+        region_at = self.scheduler.region_at
+        fish_by_region: dict[RegionId, list] = {}
+        occupied: dict[tuple[int, int], int] = {}
+        for ent, (pos, _f) in esper.get_components(Position, Fish):
+            fish_by_region.setdefault(region_at(pos.x, pos.y), []).append((ent, pos))
+            occupied[(pos.x, pos.y)] = ent
+        seaweed_by_region: dict[RegionId, list] = {}
+        for ent, (pos, _s) in esper.get_components(Position, Seaweed):
+            seaweed_by_region.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
+        return {"fish": fish_by_region, "seaweed": seaweed_by_region, "occupied": occupied}
 
-    def _player_area(self) -> tuple[int, int] | None:
-        for _ent, (pos, _player) in esper.get_components(Position, Player):
-            return self._area_of(pos.x, pos.y)
-        return None
+    def _world_snapshot_for_this_call(self) -> dict[str, dict]:
+        if self._world_snapshot is None or self._world_snapshot_calls_left <= 0:
+            self._world_snapshot = self._build_world_snapshot()
+            self._world_snapshot_calls_left = _WORLD_SNAPSHOT_REFRESH_CALLS
+        else:
+            self._world_snapshot_calls_left -= 1
+        return self._world_snapshot
+
+    def _advance_region(self, region_id: RegionId) -> None:
+        snapshot = self._world_snapshot_for_this_call()
+        fish = list(snapshot["fish"].get(region_id, ()))
+        seaweed = list(snapshot["seaweed"].get(region_id, ()))
+        # Shared across the whole world so a fish never swims onto a resting
+        # neighbour, even one in a region we're not simulating right now.
+        occupied = snapshot["occupied"]
+        self._simulate_area(fish, seaweed, occupied)
 
     def process(self, action: str | None = None) -> None:
         # Fish move only on real turns -- never on idle/menu ticks -- so the
@@ -1911,62 +2186,33 @@ class FishAiProcessor(esper.Processor):
         if action not in _TURN_ACTIONS:
             return
 
-        clock = world_clock()
-        turn = clock.turn if clock is not None else 0
+        player_region = None
+        for _ent, (pos, _player) in esper.get_components(Position, Player):
+            player_region = self.scheduler.region_at(pos.x, pos.y)
+            break
 
-        # Bucket fish and seaweed by simulation area once; each area is then
-        # simulated against its own (small) sets, independent of the world's total.
-        fish_by_area: dict[tuple[int, int], list[tuple[int, Position]]] = {}
-        for ent, (pos, _f) in esper.get_components(Position, Fish):
-            fish_by_area.setdefault(self._area_of(pos.x, pos.y), []).append((ent, pos))
-        # Shared so a fish never swims onto a resting neighbour, even one in an
-        # area we're not simulating this turn.
-        occupied = {
-            (pos.x, pos.y): ent for ent, (pos, _f) in esper.get_components(Position, Fish)
-        }
-        seaweed_by_area: dict[tuple[int, int], list[tuple[tuple[int, int], int]]] = {}
-        for ent, (pos, _s) in esper.get_components(Position, Seaweed):
-            seaweed_by_area.setdefault(self._area_of(pos.x, pos.y), []).append(
-                ((pos.x, pos.y), ent)
-            )
-
-        player_area = self._player_area()
-
-        if player_area is None:
-            # No player (tests): simulate every area once.
-            for area, fish in fish_by_area.items():
-                self._simulate_area(fish, seaweed_by_area.get(area, []), occupied)
-                self._last_sim_turn[area] = turn
+        if player_region is None:
+            # No player (unit tests construct this processor directly): bring
+            # every region up to date once, matching an unpartitioned pass.
+            for region_id in all_region_ids(self.game_map):
+                self.scheduler.advance_region(region_id)
             return
 
-        # 1. The player's current 120x60 area is fully simulated every turn.
-        if player_area in fish_by_area:
-            self._simulate_area(fish_by_area[player_area], seaweed_by_area.get(player_area, []), occupied)
+        target_turn = self.scheduler.next_turn_for(player_region, _current_turn())
 
-        # 1b. Just crossed into a new area? Bring it up to date with a bounded
-        # burst of catch-up steps (never perfect, never a hang).
-        if player_area != self._last_player_area:
-            stale = turn - self._last_sim_turn.get(player_area, turn)
-            for _ in range(min(stale, _FISH_CATCHUP_STEPS)):
-                self._simulate_area(
-                    fish_by_area.get(player_area, []), seaweed_by_area.get(player_area, []), occupied
-                )
-        self._last_sim_turn[player_area] = turn
-        self._last_player_area = player_area
+        # The player's own region is always fully live -- this also covers
+        # "just entered a new region": catch_up_region replays every turn the
+        # region missed, in order, right here.
+        self.scheduler.catch_up_region(player_region, target_turn)
 
-        # 2. Background: spend a small time budget nudging the stalest other
-        # areas along, oldest first, "if there is time". Bounded, so it can never
-        # stall input; areas it doesn't reach are caught up when entered (step 1b).
-        deadline = self._wall_clock() + _FISH_BACKGROUND_BUDGET
-        other = sorted(
-            (a for a in fish_by_area if a != player_area),
-            key=lambda a: self._last_sim_turn.get(a, -1),
+        # Background: spend a small time budget nudging the *nearest* other
+        # lagging regions along, closest to the player first. Bounded, so it
+        # can never stall input; regions it doesn't reach get a bigger budget
+        # from the main loop's idle-time pump, and are fully resolved the
+        # moment the player enters them (above) or the player sleeps.
+        self.scheduler.pump_background(
+            _FISH_BACKGROUND_BUDGET, player_region, target_turn, self._wall_clock
         )
-        for area in other:
-            if self._wall_clock() >= deadline:
-                break
-            self._simulate_area(fish_by_area[area], seaweed_by_area.get(area, []), occupied)
-            self._last_sim_turn[area] = turn
 
     def _simulate_area(
         self,

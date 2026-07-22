@@ -50,6 +50,11 @@ class GameMap:
         # The renderer consumes these to repaint just the changed cells instead
         # of re-rendering the whole (large) world surface on every edit.
         self._dirty_tiles: set[tuple[int, int]] = set()
+        # Per-120x60-region edit counters (mirrors the simulation-region grid in
+        # regions.py, kept independent here to avoid a circular import). Lets a
+        # pathfinding cache invalidate only around an edit that actually
+        # touched its region, instead of on any edit anywhere in the world.
+        self._region_edit_revision: dict[tuple[int, int], int] = {}
 
         # ``land_rect="auto"`` (the default) lets a big enough map become the
         # ocean world automatically -- so a map loaded from a save reconstructs
@@ -238,7 +243,48 @@ class GameMap:
         self.tiles[y][x] = tile
         self.revision += 1
         self._dirty_tiles.add((x, y))
+        region = self._edit_region_of(x, y)
+        self._region_edit_revision[region] = self._region_edit_revision.get(region, 0) + 1
         return True
+
+    def _edit_region_of(self, x: int, y: int) -> tuple[int, int]:
+        """The same coarse 120x60 grid cell ``regions.region_at`` would report
+        for ``(x, y)``, computed locally (see ``_region_edit_revision``)."""
+        area_w = max(1, min(LAND_WIDTH, self.width))
+        area_h = max(1, min(LAND_HEIGHT, self.height))
+        cols = max(1, self.width // area_w)
+        rows = max(1, self.height // area_h)
+        return (min(cols - 1, max(0, x // area_w)), min(rows - 1, max(0, y // area_h)))
+
+    def region_edit_revision(self, x: int, y: int) -> int:
+        """How many tile edits have landed in ``(x, y)``'s 120x60 region.
+        A pathfinding cache scoped to that region can compare this over time
+        to know when a *nearby* edit (not just any edit anywhere) invalidates
+        it."""
+        return self._region_edit_revision.get(self._edit_region_of(x, y), 0)
+
+    def distance_field(self, goal: tuple[int, int]) -> dict[tuple[int, int], int]:
+        """BFS distance (8-directional steps) from ``goal`` to every walkable
+        tile that can reach it -- i.e. "how far is this tile from goal" for a
+        whole region, computed once. Ignores dynamic occupants, same as
+        ``find_path`` (a mover re-checks its immediate next step against live
+        occupants before committing). A caller can reuse this "flow field" for
+        many turns and many travellers: from any current position, stepping to
+        the neighbour with the smallest value here always makes progress
+        toward ``goal``, without a fresh pathfind."""
+        if not self.in_bounds(goal[0], goal[1]) or not self.is_walkable(goal[0], goal[1]):
+            return {}
+        distances: dict[tuple[int, int], int] = {goal: 0}
+        queue: deque[tuple[int, int]] = deque([goal])
+        while queue:
+            current = queue.popleft()
+            d = distances[current]
+            for nxt in self.neighbors_8(current[0], current[1]):
+                if nxt in distances or not self.is_walkable(nxt[0], nxt[1]):
+                    continue
+                distances[nxt] = d + 1
+                queue.append(nxt)
+        return distances
 
     def consume_dirty_tiles(self) -> set[tuple[int, int]]:
         """Return (and clear) the tiles edited since the last call. The renderer
