@@ -2,9 +2,13 @@
 
 Systems (esper calls them **processors**) hold all behaviour. Each subclasses
 `esper.Processor` and implements `process(*args)`, receiving whatever was passed to
-`esper.process(...)`. All live in [src/systems.py](../src/systems.py) today (being
-split into a `systems/` package — see [Roadmap](Roadmap.md)), alongside a large set
-of free **helper functions** that the processors and the turn loop share.
+`esper.process(...)`. Most live in [src/systems.py](../src/systems.py) alongside a
+large set of free **helper functions** the processors and turn loop share; the two
+largest were split into siblings — `RenderProcessor` into
+[src/render.py](../src/render.py) and `NpcAiProcessor`/`FishAiProcessor` into
+[src/ai.py](../src/ai.py). Both are re-exported through `systems`, so
+`from systems import RenderProcessor` (etc.) still works; always import them via
+`systems`, never directly, so module-load order stays sound.
 
 Registration and priority are in [Architecture](Architecture.md#the-turn-loop).
 Time-advancing systems tick only on a real action — the movement actions **plus**

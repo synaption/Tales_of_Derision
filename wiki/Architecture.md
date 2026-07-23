@@ -29,23 +29,21 @@ esper 3.x keeps ECS state in **module-level** globals rather than a `World` obje
 ## Layer DAG (imports only point down)
 
 ```
-L0 data/util    components.py · rng.py · action.py · onymancer.py
+L0 data/util    components.py · rng.py · action.py · onymancer.py · config.py · queries.py
 L1 map/topology game_map.py · regions.py · schedule.py
 L2 content      content/ (registry · kits · effects · items · prefabs · loader)
-L3 systems      systems.py  (10 processors + free-function subsystems)
-L4 presentation main.py UI/menu/interaction helpers
-L5 app          main.py entry point + turn loop
+L3 systems      systems.py (core hub) · render.py (RenderProcessor) · ai.py (creature AI)
+L4 logic        interactions.py (renderer-free gameplay logic)
+L5 presentation ui.py (screens/menus/widgets) · audio.py
+L6 app          main.py (entry point + turn loop) · worldgen.py (world setup)
    persistence.py depends only on components + game_map
 ```
 
-Nothing in Data, Map, or Systems imports pygame — the arrows only ever point toward
-data and the `Renderer` interface. `persistence.py`, `regions.py`, `schedule.py`, and
-`rng.py` are small, focused modules the big files build on.
-
-> **Refactor note:** `systems.py` (~4400 lines) and `main.py` (~3300 lines) are being
-> split into `systems/`, `render/`, `ui/`, `interactions.py`, `worldgen.py`, and
-> `audio.py` packages along exactly these layer lines. See the
-> [Roadmap](Roadmap.md).
+Nothing in Data, Map, Content, or Systems imports pygame — the arrows only ever point
+toward data and the `Renderer` interface. Imports point **down**: `ui` may import
+`interactions`, `interactions` may import `systems`, but never the reverse, and
+nothing imports `main`. `render.py`/`ai.py` import their helpers from `systems` and
+are re-exported through it (import them via `systems`).
 
 ## The turn loop
 

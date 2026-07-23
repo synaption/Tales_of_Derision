@@ -28,8 +28,12 @@ Tracked in the plan; each phase keeps the test suite green.
    `audio.py` (music/SFX), `worldgen.py` (setup + spawns), `interactions.py`
    (renderer-free gameplay logic), `ui.py` (screens/menus/widgets), `config.py`
    (shared constants), `queries.py` (shared ECS queries).
-4. [ ] **Split `systems.py`** → a `systems/` package (one module per subsystem) +
-   `render/`.
+4. [x] **Split `systems.py`** (4380 → ~2010 lines) — the two behemoths extracted to
+   sibling modules: `render.py` (`RenderProcessor`) and `ai.py` (`NpcAiProcessor` +
+   `FishAiProcessor`), re-exported via `systems` so imports and internal
+   cross-references are unchanged. `systems.py` remains the core hub (time, sleep,
+   housing, construction, social, family, needs, flora, reproduction, movement,
+   combat, messages); splitting those further is optional future work.
 5. [ ] **Perf/scaling passes** — entity spatial index, verified region catch-up on
    entry/sleep, a cProfile stress harness.
 
