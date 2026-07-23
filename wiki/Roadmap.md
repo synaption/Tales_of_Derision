@@ -24,9 +24,10 @@ Tracked in the plan; each phase keeps the test suite green.
 2. [x] **Content/mod foundation** — the hybrid prefab/kit/effect/item registry
    ([Content & Mods](Content-and-Mods.md)); hand-assembled spawns/items/`OnFire`
    migrated onto it.
-3. [~] **Split `main.py`** — `audio.py` (music/SFX), `worldgen.py` (setup + spawns),
-   and `queries.py` (shared ECS queries) extracted; the `ui/` package and
-   `interactions.py` split still to come.
+3. [x] **Split `main.py`** (3278 → ~490 lines: entry point + turn loop only) —
+   `audio.py` (music/SFX), `worldgen.py` (setup + spawns), `interactions.py`
+   (renderer-free gameplay logic), `ui.py` (screens/menus/widgets), `config.py`
+   (shared constants), `queries.py` (shared ECS queries).
 4. [ ] **Split `systems.py`** → a `systems/` package (one module per subsystem) +
    `render/`.
 5. [ ] **Perf/scaling passes** — entity spatial index, verified region catch-up on
