@@ -655,11 +655,19 @@ class GameMap:
         start: tuple[int, int],
         goal: tuple[int, int],
         blocked_tiles: set[tuple[int, int]] | None = None,
+        max_radius: int | None = None,
     ) -> list[tuple[int, int]]:
         """Find a shortest 8-way path from start to goal using A*.
 
         Returns a list of coordinates excluding start and including goal.
         Returns [] when no path exists.
+
+        ``max_radius`` bounds the search to a Chebyshev window of that many tiles
+        around ``start``: A* never expands past it, so a blocked/faraway goal costs
+        O(radius^2) instead of flooding a whole island. Callers use this to keep the
+        expensive occupant-aware pathfind *local* -- long-range routing is the flow
+        field's job (``distance_field``); this fallback only steers around nearby
+        obstructions, and returns [] (caller waits/re-tries) if none is found close by.
 
         Movement is 8-directional at unit cost (a diagonal step costs the same as
         a cardinal one), so the fewest-steps distance across open ground is the
@@ -716,6 +724,8 @@ class GameMap:
             ):
                 if not (0 <= nx < width and 0 <= ny < height):
                     continue
+                if max_radius is not None and (abs(nx - sx) > max_radius or abs(ny - sy) > max_radius):
+                    continue  # keep the search inside a local window around start
                 t = tiles[ny][nx]
                 if t == WALL or t == WATER or t == WINDOW:
                     continue

@@ -736,13 +736,41 @@ def stock_blueprint(ghost_ent: int) -> None:
     _set_blueprint_stocked(ghost_ent, True)
 
 
+# Per-turn index of obstruction tiles -> the entities on them. During a building
+# burst ``_clear_tile_obstructions`` is called many times (every ghost raised, every
+# finished-house interior tile); scanning every entity per call was a top cost at
+# archipelago scale. Obstructions (trees/bushes/corpses/saplings) never move and none
+# are created before the AI builds within a turn, so one scan per turn serves all of
+# that turn's clears as O(1) tile lookups. The key includes the esper world and the
+# clock turn, so a stale index is never carried across a world switch/clear or into a
+# new turn (which would risk esper's recycled entity ids pointing at the wrong tile).
+_obstruction_index_key: tuple[str, int] | None = None
+_obstruction_index: dict[tuple[int, int], list[int]] = {}
+
+
+def _obstructions_at(x: int, y: int) -> list[int]:
+    global _obstruction_index_key, _obstruction_index
+    clock = world_clock()
+    key = (esper.current_world, clock.turn if clock is not None else -1)
+    if key != _obstruction_index_key:
+        index: dict[tuple[int, int], list[int]] = {}
+        for comp in _OBSTRUCTION_COMPONENTS:
+            for ent, (pos, _c) in esper.get_components(Position, comp):
+                index.setdefault((pos.x, pos.y), []).append(ent)
+        _obstruction_index = index
+        _obstruction_index_key = key
+    return _obstruction_index.get((x, y), [])
+
+
 def _clear_tile_obstructions(x: int, y: int) -> None:
     """Delete any tree/corpse/bush/sapling sitting on (x, y) so it can't get
     sealed into a wall or trapped inside a house being raised over it."""
-    for ent, (pos,) in list(esper.get_components(Position)):
-        if (pos.x, pos.y) != (x, y):
-            continue
-        if any(esper.has_component(ent, comp) for comp in _OBSTRUCTION_COMPONENTS):
+    for ent in _obstructions_at(x, y):
+        # Guard entity_exists: a listed obstruction may have been eaten/cleared
+        # earlier this same turn (the index is a turn-start snapshot).
+        if esper.entity_exists(ent) and any(
+            esper.has_component(ent, comp) for comp in _OBSTRUCTION_COMPONENTS
+        ):
             esper.delete_entity(ent, immediate=True)
 
 
@@ -958,10 +986,16 @@ class MovementProcessor(esper.Processor):
 # resource just across it. Matches ``_SOCIAL_SIGHT`` -- the widest existing
 # "how far can a creature notice something" range in this file.
 _REGION_BORDER_MARGIN = 8
-# Wall-clock budget (seconds) a real turn spends nudging non-current NPC
-# regions along in the background, on top of whatever the main loop's
-# idle-time pump adds -- bounded so a busy world can never stall input.
-_NPC_BACKGROUND_BUDGET = 0.004
+# Wall-clock budget (seconds) a real *active* turn (a keypress) spends nudging
+# non-current NPC regions along in the background. Zero by design: while the
+# player is actively taking turns we simulate only their own region, so a
+# keypress stays cheap and the distant world is free to fall behind. That debt
+# is paid down off the keypress path -- the main loop's idle-time pump advances
+# the nearest lagging regions whenever the player pauses, region entry
+# (``catch_up_region``) forces a cell current the moment the player steps into
+# it, and sleep (``catch_up_all``) brings the whole world up to date. Raise this
+# above zero only to trade keypress latency for less lag during held movement.
+_NPC_BACKGROUND_BUDGET = 0.0
 # How many ``_step_toward`` calls a cached goal-rooted distance field is
 # trusted for before it's rebuilt anyway (in case blockers have settled
 # somewhere that changes the *effectively* best route enough to matter, even
@@ -973,6 +1007,11 @@ _PATH_FIELD_REFRESH_CALLS = 20
 # of times; this bounds how often that costs a full-world scan instead of a
 # region-local lookup.
 _WORLD_SNAPSHOT_REFRESH_CALLS = 25
+# The *static* buckets (trees, stoves) barely change -- trees only grow/die on a
+# day boundary, stoves never move -- so they are scanned far less often than the
+# dynamic buckets (moving prey/NPCs, toggling berries, appearing corpses). This is
+# what keeps the big tree scan (80% of all entities) off the per-turn hot path.
+_STATIC_SNAPSHOT_REFRESH_CALLS = 400
 # Need level (percent of max) at which an NPC stops what it's doing and forages.
 _FORAGE_THRESHOLD = 55.0
 # How much a single grazing/drinking/feeding action restores.
@@ -983,10 +1022,10 @@ _FEED_RESTORE = 60.0
 # notice a frond and start swimming toward it.
 _FISH_GRAZE_RESTORE = 40.0
 _FISH_SIGHT = 12
-# Wall-clock budget (seconds) a real turn spends nudging non-current regions
-# along in the background, on top of whatever the main loop's idle-time pump
-# adds -- bounded so ocean work can never stall input.
-_FISH_BACKGROUND_BUDGET = 0.004
+# Ocean mirror of ``_NPC_BACKGROUND_BUDGET``: zero, so an active turn swims only
+# the player's own region and distant shoals fall behind, catching up via the
+# idle pump / region entry / sleep. See that constant for the full rationale.
+_FISH_BACKGROUND_BUDGET = 0.0
 # Chance a fish drifts to a random neighbouring water tile on an idle turn, so
 # the shoals mill about gently instead of holding perfectly still.
 _FISH_WANDER_CHANCE = 0.6
@@ -1670,11 +1709,23 @@ class TreeGrowthProcessor(esper.Processor):
         # Seaweed fills the open sea; its cap scales to the ocean area.
         ocean_area = max(0, (game_map.width * game_map.height) - land_area)
         self._seaweed_cap = ocean_area // 28
-        self._last_day: int | None = None
+        # The day flora last aged, tracked PER region so growth can lag behind the
+        # world clock and be paid down off the keypress path -- exactly like NPC
+        # region sim (see NpcAiProcessor). ``_baseline_day`` is the day of the
+        # first ``process`` call: a fresh world has no growth history to replay, so
+        # every region starts caught up to "today", not day zero. A region absent
+        # from ``_region_day`` is assumed to sit at the baseline.
+        self._baseline_day: int | None = None
+        self._region_day: dict[RegionId, int] = {}
         # Cached lists of outdoor ground tiles (floor, not inside a house) and of
         # open-sea tiles, rebuilt only when the map changes.
         self._ground_cache: dict = {}
         self._ocean_cache: dict = {}
+        # The same two lists bucketed by simulation region, so a single region's
+        # daily flora pass touches only its own tiles (the whole point of the
+        # region split -- one island's seaweed scan, not the whole sea's).
+        self._ground_by_region: dict = {}
+        self._ocean_by_region: dict = {}
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
@@ -1683,25 +1734,162 @@ class TreeGrowthProcessor(esper.Processor):
         if clock is None:
             return
         day = clock.turn // max(1, clock.day_length)
-        if self._last_day is None:
-            self._last_day = day  # establish a baseline; age the flora from here
+        if self._baseline_day is None:
+            self._baseline_day = day  # establish a baseline; age the flora from here
             return
-        if day == self._last_day:
+        # During live play (a player exists) NO flora ages on the keypress: a
+        # daily growth pass is a whole-world scan, far too heavy to hang off a
+        # turn. It is deferred entirely to spare time (``pump_flora``, which walks
+        # the nearest-to-player region first, so the player's own island greens up
+        # the instant they pause) and to sleep (``catch_up_all_flora``). With no
+        # player at all (unit tests / headless) there is no idle loop to defer to,
+        # so age everything inline, matching the old unpartitioned daily pass.
+        if self._player_region() is not None:
             return
-        self._last_day = day
-        self._mature_saplings(clock)
-        self._kill_flora()
-        self._regrow_berries(clock)
-        self._sprout_saplings(clock)
-        if getattr(self.game_map, "has_ocean", False):
-            self._sprout_seaweed()
+        self._advance_regions_flora(all_region_ids(self.game_map), day, clock)
 
-    def _mature_saplings(self, clock: WorldClock) -> None:
-        mature_age = _DAYS_PER_YEAR * max(1, clock.day_length)
-        blockers = {
-            (pos.x, pos.y) for _e, (pos, _b) in esper.get_components(Position, BlocksMovement)
+    def _player_region(self) -> RegionId | None:
+        for _e, (pos, _p) in esper.get_components(Position, Player):
+            return region_at(self.game_map, pos.x, pos.y)
+        return None
+
+    def pump_flora(
+        self,
+        budget_seconds: float,
+        player_xy: tuple[int, int] | None,
+        wall_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Spend up to ``budget_seconds`` aging the *nearest* region whose flora
+        lags the world clock, closest to the player first -- the flora mirror of
+        ``RegionScheduler.pump_background``. Called from the main loop's idle-time
+        pump, so growth the player never waited on happens in spare cycles."""
+        clock = world_clock()
+        if clock is None or self._baseline_day is None:
+            return
+        day = clock.turn // max(1, clock.day_length)
+        # Cheap early-out for the common idle tick: nothing lags, so no scan.
+        lagging = [
+            r for r in all_region_ids(self.game_map)
+            if self._region_day.get(r, self._baseline_day) < day
+        ]
+        if not lagging:
+            return
+        player_region = (
+            region_at(self.game_map, player_xy[0], player_xy[1]) if player_xy else None
+        )
+        if player_region is not None:
+            lagging.sort(
+                key=lambda r: max(
+                    abs(r[0] - player_region[0]), abs(r[1] - player_region[1])
+                )
+            )
+        # One world scan feeds this whole pump; the time budget then governs how
+        # many nearby regions we advance a day from it (always at least one, so a
+        # scan is never wasted). Regions further behind than one day come back
+        # around on a later pump; the nearest-first order means the player's own
+        # island is always first in line.
+        ctx = self._build_day_context(clock)
+        deadline = wall_clock() + budget_seconds
+        for region_id in lagging:
+            self._run_region_day(region_id, ctx)
+            self._region_day[region_id] = (
+                self._region_day.get(region_id, self._baseline_day) + 1
+            )
+            if wall_clock() >= deadline:
+                break
+
+    def warm_region_caches(self) -> None:
+        """Build the static per-region ocean buckets up front. That scan is a
+        one-off ~0.5s at archipelago scale; doing it here (behind the world-gen
+        screen) keeps it off the first idle pump that would otherwise trigger it."""
+        if getattr(self.game_map, "has_ocean", False):
+            self._ocean_buckets()
+
+    def catch_up_all_flora(self) -> None:
+        """Bring every region's flora fully up to the world clock. Wired to sleep,
+        where the world is expected to jump forward all at once."""
+        clock = world_clock()
+        if clock is None or self._baseline_day is None:
+            return
+        day = clock.turn // max(1, clock.day_length)
+        self._advance_regions_flora(all_region_ids(self.game_map), day, clock)
+
+    def _advance_regions_flora(
+        self, regions: list[RegionId], target_day: int, clock: WorldClock
+    ) -> None:
+        """Age each of ``regions`` one day at a time up to ``target_day``, in
+        strict order so state one day builds is consistent for the next. Flora is
+        bucketed once per day-step and shared across the regions advancing that
+        step, so a whole-world catch-up costs one entity scan per elapsed day, not
+        one per region."""
+        while True:
+            due = [
+                r for r in regions if self._region_day.get(r, self._baseline_day) < target_day
+            ]
+            if not due:
+                return
+            ctx = self._build_day_context(clock)
+            for region_id in due:
+                self._run_region_day(region_id, ctx)
+                self._region_day[region_id] = (
+                    self._region_day.get(region_id, self._baseline_day) + 1
+                )
+
+    def _build_day_context(self, clock: WorldClock) -> dict:
+        """One snapshot of the world the day's flora pass reads from: flora bucketed
+        by region (so each region touches only its own), the occupied/blocker tile
+        sets sprouting and maturation consult, and the running global counts the
+        soft caps compare against."""
+        game_map = self.game_map
+        trees: dict[RegionId, list[int]] = {}
+        bushes: dict[RegionId, list[tuple[int, object]]] = {}
+        saplings: dict[RegionId, list[tuple[int, Position, object]]] = {}
+        occupied: set[tuple[int, int]] = set()
+        blockers: set[tuple[int, int]] = set()
+        for _e, (pos,) in esper.get_components(Position):
+            occupied.add((pos.x, pos.y))
+        for _e, (pos, _b) in esper.get_components(Position, BlocksMovement):
+            blockers.add((pos.x, pos.y))
+        flora_total = 0
+        for ent, (pos, _t) in esper.get_components(Position, Tree):
+            trees.setdefault(region_at(game_map, pos.x, pos.y), []).append(ent)
+            flora_total += 1
+        for ent, (pos, bush) in esper.get_components(Position, BerryBush):
+            bushes.setdefault(region_at(game_map, pos.x, pos.y), []).append((ent, bush))
+            flora_total += 1
+        for ent, (pos, sapling) in esper.get_components(Position, Sapling):
+            saplings.setdefault(region_at(game_map, pos.x, pos.y), []).append(
+                (ent, pos, sapling)
+            )
+            flora_total += 1
+        seaweed_total = sum(1 for _e, _c in esper.get_components(Seaweed))
+        return {
+            "clock": clock,
+            "trees": trees,
+            "bushes": bushes,
+            "saplings": saplings,
+            "occupied": occupied,
+            "blockers": blockers,
+            "flora_total": flora_total,
+            "seaweed_total": seaweed_total,
         }
-        for ent, (pos, sapling) in list(esper.get_components(Position, Sapling)):
+
+    def _run_region_day(self, region_id: RegionId, ctx: dict) -> None:
+        """One region's worth of a single day's growth, reading ``ctx``."""
+        self._mature_saplings(region_id, ctx)
+        self._kill_flora(region_id, ctx)
+        self._regrow_berries(region_id, ctx)
+        self._sprout_saplings(region_id, ctx)
+        if getattr(self.game_map, "has_ocean", False):
+            self._sprout_seaweed(region_id, ctx)
+
+    def _mature_saplings(self, region_id: RegionId, ctx: dict) -> None:
+        clock = ctx["clock"]
+        mature_age = _DAYS_PER_YEAR * max(1, clock.day_length)
+        blockers = ctx["blockers"]
+        for ent, pos, sapling in ctx["saplings"].get(region_id, []):
+            if not esper.entity_exists(ent):
+                continue
             if clock.turn - sapling.planted_turn < mature_age:
                 continue
             if (pos.x, pos.y) in blockers:
@@ -1722,17 +1910,20 @@ class TreeGrowthProcessor(esper.Processor):
                 if esper.has_component(ent, Name):
                     esper.component_for_entity(ent, Name).value = "Tree"
 
-    def _kill_flora(self) -> None:
-        for ent, (_pos, _tree) in list(esper.get_components(Position, Tree)):
-            if self._rng() < _DAILY_DEATH_CHANCE:
+    def _kill_flora(self, region_id: RegionId, ctx: dict) -> None:
+        for ent in ctx["trees"].get(region_id, []):
+            if esper.entity_exists(ent) and self._rng() < _DAILY_DEATH_CHANCE:
                 esper.delete_entity(ent, immediate=True)
-        for ent, (_pos, _bush) in list(esper.get_components(Position, BerryBush)):
-            if self._rng() < _DAILY_DEATH_CHANCE:
+        for ent, _bush in ctx["bushes"].get(region_id, []):
+            if esper.entity_exists(ent) and self._rng() < _DAILY_DEATH_CHANCE:
                 esper.delete_entity(ent, immediate=True)
 
-    def _regrow_berries(self, clock: WorldClock) -> None:
+    def _regrow_berries(self, region_id: RegionId, ctx: dict) -> None:
+        clock = ctx["clock"]
         ready_after = _BERRY_REGROW_DAYS * max(1, clock.day_length)
-        for ent, (bush,) in esper.get_components(BerryBush):
+        for ent, bush in ctx["bushes"].get(region_id, []):
+            if not esper.entity_exists(ent):
+                continue
             if bush.has_berries or bush.harvested_turn is None:
                 continue
             if clock.turn - bush.harvested_turn >= ready_after:
@@ -1757,17 +1948,25 @@ class TreeGrowthProcessor(esper.Processor):
             self._ground_cache = {"revision": revision, "tiles": tiles}
         return self._ground_cache["tiles"]
 
-    def _sprout_saplings(self, clock: WorldClock) -> None:
-        total = (
-            sum(1 for _e, _c in esper.get_components(Tree))
-            + sum(1 for _e, _c in esper.get_components(BerryBush))
-            + sum(1 for _e, _c in esper.get_components(Sapling))
-        )
-        if total >= self._cap:
+    def _ground_buckets(self) -> dict[RegionId, list[tuple[int, int]]]:
+        """``_outdoor_ground`` split by simulation region, rebuilt when the map
+        (house interiors) changes."""
+        revision = getattr(self.game_map, "revision", 0)
+        cache = self._ground_by_region
+        if cache.get("revision") != revision:
+            buckets: dict[RegionId, list[tuple[int, int]]] = {}
+            for x, y in self._outdoor_ground():
+                buckets.setdefault(region_at(self.game_map, x, y), []).append((x, y))
+            self._ground_by_region = {"revision": revision, "buckets": buckets}
+        return self._ground_by_region["buckets"]
+
+    def _sprout_saplings(self, region_id: RegionId, ctx: dict) -> None:
+        if ctx["flora_total"] >= self._cap:
             return
-        occupied = {(pos.x, pos.y) for _e, (pos,) in esper.get_components(Position)}
-        for x, y in self._outdoor_ground():
-            if total >= self._cap:
+        clock = ctx["clock"]
+        occupied = ctx["occupied"]
+        for x, y in self._ground_buckets().get(region_id, []):
+            if ctx["flora_total"] >= self._cap:
                 break
             if (x, y) in occupied:
                 continue
@@ -1785,30 +1984,48 @@ class TreeGrowthProcessor(esper.Processor):
                 Sapling(planted_turn=clock.turn, kind=kind),
             )
             occupied.add((x, y))
-            total += 1
+            ctx["flora_total"] += 1
+
+    def _ocean_buckets(self) -> dict[RegionId, list[tuple[int, int]]]:
+        """``_ocean_tiles`` split by simulation region. Static like its source, so
+        built once -- this is what lets one region's seaweed pass scan its own few
+        thousand sea tiles instead of the whole ~557k-tile ocean every day."""
+        key = (self.game_map.width, self.game_map.height)
+        cache = self._ocean_by_region
+        if cache.get("key") != key:
+            buckets: dict[RegionId, list[tuple[int, int]]] = {}
+            for x, y in self._ocean_tiles():
+                buckets.setdefault(region_at(self.game_map, x, y), []).append((x, y))
+            self._ocean_by_region = {"key": key, "buckets": buckets}
+        return self._ocean_by_region["buckets"]
 
     def _ocean_tiles(self) -> list[tuple[int, int]]:
-        """Every open-sea tile (water outside the land). Cached until the map
-        changes; the ocean is static so this is built at most once."""
-        revision = getattr(self.game_map, "revision", 0)
-        if self._ocean_cache.get("revision") != revision:
+        """Every open-sea tile (water outside the land). Built once and kept: the
+        ocean is genuinely static -- ``is_ocean`` is a pure function of the map's
+        fixed island grid (or land rect), and building only ever edits land tiles,
+        so no open-sea tile can appear or vanish mid-game. Keying this on
+        ``game_map.revision`` (as the outdoor-ground cache must, since houses do
+        change it) would rebuild this ~1.1M-tile scan every in-game day the
+        villagers lay a single wall -- a ~0.5s hitch for a set that never moves."""
+        key = (self.game_map.width, self.game_map.height)
+        if self._ocean_cache.get("key") != key:
             tiles = [
                 (x, y)
                 for y in range(1, self.game_map.height - 1)
                 for x in range(1, self.game_map.width - 1)
                 if self.game_map.is_ocean(x, y)
             ]
-            self._ocean_cache = {"revision": revision, "tiles": tiles}
+            self._ocean_cache = {"key": key, "tiles": tiles}
         return self._ocean_cache["tiles"]
 
-    def _sprout_seaweed(self) -> None:
-        """Grow fresh seaweed on open water so grazing fish keep the sea fed."""
-        total = sum(1 for _e, _c in esper.get_components(Seaweed))
-        if total >= self._seaweed_cap:
+    def _sprout_seaweed(self, region_id: RegionId, ctx: dict) -> None:
+        """Grow fresh seaweed on one region's open water so grazing fish keep the
+        sea fed."""
+        if ctx["seaweed_total"] >= self._seaweed_cap:
             return
-        occupied = {(pos.x, pos.y) for _e, (pos,) in esper.get_components(Position)}
-        for x, y in self._ocean_tiles():
-            if total >= self._seaweed_cap:
+        occupied = ctx["occupied"]
+        for x, y in self._ocean_buckets().get(region_id, []):
+            if ctx["seaweed_total"] >= self._seaweed_cap:
                 break
             if (x, y) in occupied:
                 continue
@@ -1820,7 +2037,7 @@ class TreeGrowthProcessor(esper.Processor):
                     Seaweed(),
                 )
                 occupied.add((x, y))
-                total += 1
+                ctx["seaweed_total"] += 1
 
 
 # The glyph/colour a newborn villager shares with the adult cast.

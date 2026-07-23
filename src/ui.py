@@ -29,8 +29,8 @@ from queries import entity_name, first_player_entity
 from renderer.base import Renderer
 from rng import world_rng
 from systems import (
-    FishAiProcessor, NpcAiProcessor, RenderProcessor, WAIT_ACTION, bed_owner,
-    go_to_sleep, queue_message, wake_up, world_clock,
+    FishAiProcessor, NpcAiProcessor, RenderProcessor, TreeGrowthProcessor, WAIT_ACTION,
+    bed_owner, go_to_sleep, queue_message, wake_up, world_clock,
 )
 from interactions import (
     _CARDINAL_ACTION_DELTAS, _CRAFT_MENU, _apply_consumable, _chebyshev_from_player,
@@ -478,6 +478,60 @@ def _run_startup_flow(
     return (False, game_map, player_position, selected_save_file)
 
 
+def _draw_generation_frame(renderer: Renderer, fraction: float) -> None:
+    """Draw one 'generating world' progress frame."""
+    draw_menu_backdrop = getattr(renderer, "draw_menu_backdrop", None)
+    if callable(draw_menu_backdrop):
+        draw_menu_backdrop()
+    else:
+        renderer.clear()
+
+    cols, rows = _ui_grid_size(renderer)
+    title = "Generating world..."
+    subtitle = "The islands are coming to life."
+    title_y = max(1, (rows - 4) // 2)
+    _draw_ui_text(renderer, max(0, (cols - len(title)) // 2), title_y, title, _MENU_TITLE_COLOR)
+    _draw_ui_text(
+        renderer, max(0, (cols - len(subtitle)) // 2), title_y + 1, subtitle, _MENU_TEXT_COLOR
+    )
+
+    # A simple text progress bar: [####------]  42%
+    bar_cells = max(10, min(40, cols - 8))
+    filled = int(round(fraction * bar_cells))
+    bar = "[" + "#" * filled + "-" * (bar_cells - filled) + "]"
+    pct = f" {int(round(fraction * 100)):3d}%"
+    line = bar + pct
+    _draw_ui_text(renderer, max(0, (cols - len(line)) // 2), title_y + 3, line, _MENU_TEXT_COLOR)
+    renderer.present()
+
+
+def run_world_generation(renderer: Renderer, settle_turns: int) -> bool:
+    """Pre-simulate ``settle_turns`` turns behind a progress screen before play, so
+    the startup 'building boom' (villagers all raising their first homes at once)
+    happens here instead of as lag on the opening turns. Call it after the sim
+    processors are registered but BEFORE the RenderProcessor, so these turns advance
+    the world without drawing the game. Returns False if the player quit."""
+    # Build the flora processor's static per-region caches now, behind this
+    # screen, so their one-off cost never lands on a gameplay idle tick.
+    flora = esper.get_processor(TreeGrowthProcessor)
+    if flora is not None:
+        flora.warm_region_caches()
+    if settle_turns <= 0:
+        return True
+    poll = getattr(renderer, "poll_action_nonblocking", None)
+    # Redraw ~60 frames total, not every turn -- the settle loop is the point, not
+    # the animation; a repaint every turn would just slow generation down.
+    redraw_every = max(1, settle_turns // 60)
+    _draw_generation_frame(renderer, 0.0)
+    for i in range(settle_turns):
+        esper.process(WAIT_ACTION)
+        if i % redraw_every == 0 or i == settle_turns - 1:
+            _draw_generation_frame(renderer, (i + 1) / settle_turns)
+            if callable(poll) and poll() == "quit":
+                return False
+    return True
+
+
 _MIN_SLEEP_TIREDNESS = 1.0
 
 
@@ -577,6 +631,11 @@ def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
         for processor in (esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor)):
             if processor is not None:
                 processor.scheduler.catch_up_all(target_region_turn)
+    # Flora ages per day rather than per turn, and lags the same way; a sleep
+    # brings every region's growth fully current too.
+    flora = esper.get_processor(TreeGrowthProcessor)
+    if flora is not None:
+        flora.catch_up_all_flora()
 
     esper.process(None)
 

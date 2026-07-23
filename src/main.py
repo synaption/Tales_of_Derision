@@ -14,7 +14,7 @@ import esper
 from action import BASE_ACTION_COST
 from components import Bed, BerryBush, Blueprint, Chest, Friendly, Player, Position, Stove, Tree, Well
 from game_map import GameMap
-from config import DEFAULT_WORLD_SEED, MAP_HEIGHT, MAP_WIDTH, WORLD_LAYOUT
+from config import DEFAULT_WORLD_SEED, MAP_HEIGHT, MAP_WIDTH, WORLD_LAYOUT, WORLD_SETTLE_TURNS
 from queries import entity_name, first_player_entity
 from worldgen import _setup_world
 # Used by the turn loop below. Tests import these helpers from ``interactions`` directly.
@@ -55,6 +55,7 @@ from ui import (
     _place_from_inventory,
     _run_startup_flow,
     _sleep_player,
+    run_world_generation,
 )
 from audio import CombatSfxPlayer, start_background_music, stop_background_music
 from content.effects import EffectsProcessor
@@ -171,6 +172,10 @@ def _pump_background_regions(budget_seconds: float) -> None:
         processor.scheduler.pump_background(
             budget_seconds, player_region, target_region_turn, time.monotonic
         )
+    # Flora growth lags the same way and is paid down in the same spare cycles.
+    flora = esper.get_processor(TreeGrowthProcessor)
+    if flora is not None:
+        flora.pump_flora(budget_seconds, player_xy, time.monotonic)
 
 
 def main() -> None:
@@ -239,6 +244,17 @@ def main() -> None:
             esper.add_processor(EffectsProcessor(), priority=0)
             esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
             esper.add_processor(ReproductionProcessor(), priority=0)
+
+            # Pre-simulate the world behind a "Generating world..." screen so the
+            # startup building boom happens during loading, not as lag on the first
+            # turns of play. Runs before the RenderProcessor is registered, so these
+            # settle turns advance the world without drawing the game. Skipped for
+            # screenshot capture (needs an immediate frame) and the rat-flood stress
+            # test (no villagers to settle).
+            if args.screenshot is None and not args.rat_flood:
+                if not run_world_generation(renderer, WORLD_SETTLE_TURNS):
+                    return
+
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame
