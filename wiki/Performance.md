@@ -49,17 +49,29 @@ builds the real 360×180 world and walks the player across section seams under
 cProfile, sim-only by default. `--flood` spawns a cave rat on every walkable tile
 (thousands of NPCs) for the scaling worst case.
 
-Representative results (200 turns, ~2300 entities): **~20 ms/turn**, with cost spread
+Representative results (200 turns, ~2300 entities): **~19 ms/turn**, with cost spread
 across `distance_field` (flow-field builds), `_compute_regions` / `find_enclosed_rooms`
 (recomputed when the living world edits a tile and bumps `revision`), and the AI's
-per-region bucket rebuild (`_region_bucket`). The flood case (~6500 NPCs) is
-pathfinding-bound: `distance_field` + the AI chase/step loop dominate.
+per-region bucket rebuild (`_region_bucket`). The flood case (~6500 NPCs) runs at
+**~118 ms/turn**; after the flow-field-reuse fix below, the AI chase/step loop
+(`_step_toward` greedy lookups + rare fallback pathfinds) dominates, not field builds.
+
+**AI flow-field reuse (done).** Chasers heading to the same goal already share one
+`distance_field` via `NpcAiProcessor._field_cache` (keyed by goal, not per-entity).
+The remaining waste was that the cache's staleness countdown rebuilt that shared field
+every few calls during catch-up bursts even when *nothing had changed* — a profiled
+flood did **357** field builds over 40 turns, **261** of them redundant rebuilds of the
+chase field for a standing-still player. Because `distance_field` is a pure function of
+goal + tiles, the cache now also stores `GameMap.revision` (the global tile-edit
+counter): if it hasn't moved, no tile anywhere changed, so the field is byte-identical
+and is reused indefinitely (no rebuild). Only when the world *has* been edited does it
+fall back to the per-region-revision + countdown hedge. Result: **357 → 13** builds
+(one per distinct goal), flood **~166 → ~118 ms/turn**, behaviour byte-identical (the
+skipped rebuilds would have produced the same field), no regression to the living world.
 
 **Measured, not guessed:** an entity spatial index (per-tile buckets to replace the
 O(n) `get_components(Position)` scans) was on the roadmap, but the profile shows those
-scans are *not* the bottleneck — pathfinding is. So it isn't warranted yet. The next
-real lever is the AI's flow-field reuse (share one `distance_field` toward the player
-across all chasers in a region per turn), not entity lookup.
+scans are *not* the bottleneck — pathfinding is. So it isn't warranted yet.
 
 The BFS hot loops (`distance_field`, `_compute_regions`) inline their neighbour/bounds/
 walkability tests the same way `find_path` does — that alone cut the normal case from
@@ -83,9 +95,9 @@ Remaining per-turn cost is spread thin (no single dominant): per-region bucket r
 
 ## Scaling levers (in profile-justified order)
 
-- **AI flow-field reuse** — the top lever for thousands of NPCs: `distance_field`
-  builds dominate, so share one field toward a common goal (the player) across all
-  chasers in a region per turn instead of rebuilding per creature.
+- **AI flow-field reuse** — *done* (see above): chasers share one goal-rooted
+  `distance_field`, and a global-`revision` cache gate skips rebuilding it while no
+  tile has changed, collapsing catch-up-burst rebuilds (357 → 13 builds in the flood).
 - **Incremental region relabelling** — `_compute_regions` / `find_enclosed_rooms`
   recompute the whole map whenever a single tile edit bumps `revision`; relabel only
   the affected component instead.

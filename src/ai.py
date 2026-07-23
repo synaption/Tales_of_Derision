@@ -66,12 +66,14 @@ class NpcAiProcessor(esper.Processor):
         # population (bounded staleness traded for that no longer happening).
         self._world_snapshot: dict[str, dict] | None = None
         self._world_snapshot_calls_left = 0
-        # goal xy -> (edit revision near goal when cached, calls left before a
-        # routine refresh, the flow field itself). Shared across every NPC
-        # heading to the same goal, not per-entity -- a distance field rooted
-        # at a (largely static) goal stays valid for any traveller approaching
-        # it from anywhere, so many NPCs reuse the one flood.
-        self._field_cache: dict[tuple[int, int], tuple[int, int, dict[tuple[int, int], int]]] = {}
+        # goal xy -> (region edit revision near goal, world edit revision, calls
+        # left before a routine refresh, the flow field itself). Shared across
+        # every NPC heading to the same goal, not per-entity -- a distance field
+        # rooted at a (largely static) goal stays valid for any traveller
+        # approaching it from anywhere, so many NPCs reuse the one flood.
+        self._field_cache: dict[
+            tuple[int, int], tuple[int, int, int, dict[tuple[int, int], int]]
+        ] = {}
         # ent -> the tile it stood on at the start of its previous turn. Used to
         # forbid an immediate one-tile reversal (see ``_advance_region``), which
         # is the only way an NPC ends up flip-flopping between two tiles forever.
@@ -104,19 +106,46 @@ class NpcAiProcessor(esper.Processor):
         return best
 
     def _distance_field_for(self, goal: tuple[int, int]) -> dict[tuple[int, int], int]:
-        """A cached flow field to ``goal`` (see ``GameMap.distance_field``),
-        rebuilt only when an edit lands near ``goal`` or the routine refresh
-        interval elapses -- not on every call, and not on an edit anywhere
-        else in the world."""
-        edit_revision = self.game_map.region_edit_revision(goal[0], goal[1])
+        """A cached flow field to ``goal`` (see ``GameMap.distance_field``).
+
+        ``distance_field`` is a pure function of the goal and the (static-per-
+        turn) tile grid, so a cached field is valid exactly as long as no tile
+        it could cover has changed. Two revisions gate reuse:
+
+        * **World edit revision** (``GameMap.revision``, bumped on *any* tile
+          edit anywhere). If it hasn't moved since the field was built, nothing
+          in the world changed, so the field is provably identical -- reuse it
+          indefinitely, no rebuild. This is the dominant case: during a
+          catch-up burst the player stands still and NPCs edit no tiles, so one
+          flood toward the player serves every chaser across the whole burst
+          instead of being rebuilt dozens of times.
+        * **Region edit revision** near the goal. When the world *has* been
+          edited somewhere, the field spans more than the goal's own region
+          cell, so a per-cell revision can't prove the edit missed it. We then
+          fall back to a bounded-staleness reuse (``calls_left`` refreshes)
+          exactly as before -- no regression for the living, self-editing world.
+        """
+        region_revision = self.game_map.region_edit_revision(goal[0], goal[1])
+        world_revision = self.game_map.revision
         cached = self._field_cache.get(goal)
         if cached is not None:
-            cached_revision, calls_left, field = cached
-            if cached_revision == edit_revision and calls_left > 0:
-                self._field_cache[goal] = (cached_revision, calls_left - 1, field)
-                return field
+            cached_region_rev, cached_world_rev, calls_left, field = cached
+            if cached_region_rev == region_revision:
+                if cached_world_rev == world_revision:
+                    # No tile anywhere edited since the build -> byte-identical.
+                    return field
+                if calls_left > 0:
+                    # Edited somewhere, but not in the goal's cell we can see;
+                    # reuse under the staleness bound (keep the old world rev so
+                    # the countdown still eventually rebuilds to pick it up).
+                    self._field_cache[goal] = (
+                        cached_region_rev, cached_world_rev, calls_left - 1, field
+                    )
+                    return field
         field = self.game_map.distance_field(goal)
-        self._field_cache[goal] = (edit_revision, _PATH_FIELD_REFRESH_CALLS, field)
+        self._field_cache[goal] = (
+            region_revision, world_revision, _PATH_FIELD_REFRESH_CALLS, field
+        )
         return field
 
     def _greedy_step_toward(
