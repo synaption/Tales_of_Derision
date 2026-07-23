@@ -1,179 +1,135 @@
 # Systems
 
 Systems (esper calls them **processors**) hold all behaviour. Each subclasses
-`esper.Processor` and implements `process(*args)`, which receives whatever was
-passed to `esper.process(...)`. Defined in [src/systems.py](../src/systems.py).
+`esper.Processor` and implements `process(*args)`, receiving whatever was passed to
+`esper.process(...)`. All live in [src/systems.py](../src/systems.py) today (being
+split into a `systems/` package — see [Roadmap](Roadmap.md)), alongside a large set
+of free **helper functions** that the processors and the turn loop share.
 
-## `MovementProcessor` (priority 1)
+Registration and priority are in [Architecture](Architecture.md#the-turn-loop).
+Time-advancing systems tick only on a real action — the movement actions **plus**
+`WAIT_ACTION` (`"wait"`); menu refreshes pass `None` and advance nothing.
 
-Applies a movement action to every player-controlled entity.
+## The processors
 
-```python
-class MovementProcessor(esper.Processor):
-    def __init__(self, game_map):
-        self.game_map = game_map
+### `TimeProcessor` (priority 2)
+Advances the `WorldClock` by the acting entity's action **cost** in time units, not
+by 1 (see [Action Economy](Action-Economy.md)). Runs first so needs/AI read the
+correct time of day, and emits a log line when the day's phase changes
+(`_PHASE_MESSAGES`). Time-of-day, calendar, night detection, and age-from-clock all
+derive from `WorldClock.turn` (`time_phase`, `is_night`, `calendar`,
+`format_datetime`, `age_years`) — nothing is ticked per entity.
 
-    def process(self, action=None):
-        delta = _ACTION_DELTAS.get(action)   # {"move_up": (0,-1), ...}
-        if delta is None:
-            return
-        dx, dy = delta
-        for _ent, (pos, _player) in esper.get_components(Position, Player):
-            nx, ny = pos.x + dx, pos.y + dy
-            if self.game_map.is_walkable(nx, ny):
-                pos.x, pos.y = nx, ny
-```
+### `MovementProcessor` (priority 1)
+Applies a movement action to the player. Walking is gated by `is_passable` (so the
+player can **swim**); walking into a creature is a **bump attack** (`slay_entity`
+shared with the AI), with optional melee/death SFX callbacks. Only `Position + Player`
+entities move, so it generalises to co-op for free.
 
-- Only entities with **both** `Position` and `Player` move, so it generalises to
-  co-op / multiple controlled entities for free.
-- Movement is gated by [`GameMap.is_walkable`](Game-Map.md) — walls block.
-- Unknown actions (e.g. the render-only frame) are ignored.
+### `NpcAiProcessor` (priority 0) — the land brain
+The single per-turn brain for every land `NPC` (~1000 lines; the biggest system). Per
+creature, roughly in order:
 
-## Turns and waiting
+1. **Urgent need** (≥ `_FORAGE_THRESHOLD`, thirst wins ties): drink at/route to
+   water; when hungry, eat a *prepared* item first, else act by `Diet` —
+   **herbivores** graze the nearest tree, **carnivores** hunt the nearest
+   corpse/deer and eat raw, **cooks** run the full loop one step per turn
+   (`_forage_meat` → `_gather_wood` → `_cook_at_stove` → eat next turn).
+2. **Sleep** when tired (`_seek_sleep`, preferring `Home`).
+3. **Build** when needs are met and a reachable blueprint exists (`_work_blueprints`
+   → haul wood, raise stocked ghosts).
+4. **Socialize** with a nearby compatible partner (`_socialize`).
+5. **Chase** the player when hostile and in vision + line of sight (`_chase_player`).
 
-Time-advancing systems (`NpcAiProcessor`, `NeedsProcessor`) tick on any action in
-`_TURN_ACTIONS` — the movement actions **plus `WAIT_ACTION`** (`"wait"`). The turn
-loop sends `esper.process(WAIT_ACTION)` when the player presses the confirm key
-(Space) with no direction held, so the player can pass time in place; menu
-refreshes still use `esper.process(None)`, which advances nothing.
+Water tiles and their walkable shores are precomputed (the map is static), so a
+thirsty animal is a cheap nearest-lookup plus one BFS, not a full-map rescan. A
+predator can delete its prey mid-loop, so the processor snapshots the NPC list and
+skips anything already killed this turn.
 
-## `NpcAiProcessor` (priority 0)
+**Scaling:** this processor drives NPCs through the **region scheduler** — far
+sections lag and catch up nearest-first instead of every NPC simulating every turn.
+See [World Simulation](World-Simulation.md) (`_advance_region`, `_region_bucket`,
+`_build_world_snapshot`).
 
-The single per-turn brain for every `NPC`. For each creature, in order:
+### `FishAiProcessor` (priority 0) — the sea brain
+The aquatic mirror: fish swim water-only (never the land pathfinder), wander, and
+graze seaweed when hungry. It pioneered the region-bucketed simulation later
+generalised into [regions.py](../src/regions.py).
 
-1. **Satisfy an urgent need** (need ≥ `_FORAGE_THRESHOLD`). Thirst wins ties:
-   - drink at adjacent water, else path to the nearest **shore** tile;
-   - when hungry, first **eat a prepared item it's carrying** (cooked meat,
-     bread, ...) via `_eat_from_inventory`; **raw meat is skipped — it must be
-     cooked**;
-   - **herbivores** (`Diet("herbivore")`, e.g. deer) graze the nearest tree —
-     eating restores hunger and depletes the tree's `wood` (it vanishes when
-     grazed bare);
-   - **carnivores** (`Diet("carnivore")`, e.g. goblins/rats) are predators:
-     `_seek_food` heads to the nearest corpse-with-meat or live `Deer` and eats
-     raw on the spot (a deer kill goes via `slay_entity`, leaving a corpse);
-   - **cooks** (`Diet("cook")`, e.g. villagers) run the full loop in `_feed_cook`,
-     one step per turn: `_forage_meat` (scavenge/kill for raw meat into the pack)
-     → `_gather_wood` (chop a tree) → `_cook_at_stove` (raw meat + wood →
-     `Cooked … Meat`) → eat the cooked meat next turn via `_eat_from_inventory`.
-2. Otherwise, hostiles (`Enemy`) chase the player when in vision + line of sight.
+### `NeedsProcessor` (priority 0)
+Raises hunger/thirst/tiredness each real turn (tiredness faster at night via
+`_NIGHT_TIREDNESS_MULTIPLIER`), and emits an escalating warning the first turn the
+player crosses each 50/80/100% threshold. Eating/drinking/sleeping lower the values.
+There is no HP system yet, so a maxed need currently warns rather than damages.
 
-Water tiles and the walkable shore beside them are precomputed once (the map is
-static), so a thirsty animal is a cheap nearest-lookup plus one BFS, not a
-full-map rescan. Corpse creation is shared with player melee through the
-module-level `slay_entity` helper.
+### `HousingProcessor` (priority 0)
+Runs before the AI so a villager that just got a home can start heading there. Claims
+the nearest reachable **unowned** house for a homeless `Resident`, merges spouses'
+homes, and — when nothing is claimable — ensures a reachable **construction site**
+exists to build one. Uses a back-off memo (`_no_site`, keyed by region cell +
+edit-revision) so a villager with nowhere to build doesn't re-run the site search
+every turn (a former hot spot — see [Performance](Performance.md)).
 
-> A predator can delete another NPC (its prey) mid-loop, so the processor
-> snapshots the NPC list and skips any entity already killed this turn.
+### `TreeGrowthProcessor` (priority 0)
+Evaluated **once per in-game day**: sprouts saplings on open ground
+(`_DAILY_SPROUT_CHANCE` trees, `_DAILY_BUSH_SPROUT_CHANCE` bushes), matures
+year-old saplings, kills off some mature plants (`_DAILY_DEATH_CHANCE`), regrows
+harvested berry bushes after 7 days, and sprouts seaweed in the sea — a
+self-sustaining forest and reef.
 
-Water is drawn by the [RenderProcessor](#renderprocessor-priority-0) using the
-Hexany `water` autotiles (a neighbour mask per tile, same mechanism as walls).
+### `ReproductionProcessor` (priority 0)
+Delivers due pregnancies: after `_GESTATION_DAYS` it spawns a newborn beside the
+mother, wires the family links reciprocally, names it via the onymancer, and removes
+`Pregnant`. Courtship/marriage/mating themselves live in the social helpers.
 
-## `NeedsProcessor` (priority 0)
+### `RenderProcessor` (priority 0) — draws last
+Draws the world every turn (~1200 lines; being split into a `render/` package). Key
+responsibilities:
 
-Advances hunger/thirst on every real turn.
+- **Field of view** memoized per player position; **remembered tiles** (fog of war)
+  drawn dimmed from memory when out of sight.
+- **Section camera** — only the player's 120×60 section is drawn; crossing an edge
+  snaps the camera and logs "You cross into a new area." (`_apply_section_camera`).
+- **Autotiling** — wall/water neighbour masks ([47-tile](47-tile_autotiling.md)),
+  cached (static map).
+- **Cached world surface** — the map is composited from a cached world-coordinate
+  surface and blitted per frame, never re-drawn tile-by-tile (see
+  [Performance](Performance.md)).
+- **Sidebar / log / status line** — date+clock+phase, needs, nearby objects, message
+  log.
+- **Status-identifier animation** (`_status_appearance`) — real-time glyph cycling
+  from `_STATUS_DISPLAY` / `_STATUS_ORDER`.
 
-```python
-class NeedsProcessor(esper.Processor):
-    def process(self, action=None):
-        if action not in _ACTION_DELTAS:   # menu refreshes pass None -> no tick
-            return
-        for _ent, (needs,) in esper.get_components(Needs):
-            needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate)
-            needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate)
-            # emit a warning the first turn each 50/80/100% threshold is crossed
-```
+It talks only to the [`Renderer`](Renderers.md) interface, never to pygame.
 
-The tick is gated on an actual movement action, so opening menus never starves
-the player. Eating/drinking (from the inventory menu, or drinking at a well)
-lowers the values; there is no HP system yet, so a maxed-out need currently
-produces an urgent log warning rather than damage/death.
+## Free-function subsystems (shared helpers)
 
-> **Note:** the world (entities, inventory, needs) is regenerated by
-> `_setup_world` each session — only map size and the player's tile are saved —
-> so survival state does not persist across a save/load yet.
+These aren't processors but are large behaviour clusters the processors and turn loop
+call. They'll become the modules of the future `systems/` package:
 
-## `RenderProcessor` (priority 0)
-
-Draws the world every turn. The status line also shows `Hunger n%  Thirst n%`
-read from the player's `Needs`.
-
-**Section camera.** The map is a 3×3 grid of sections; only the section the
-player occupies is drawn. `_apply_section_camera` locks the view origin inside
-the player's section and sets `_section_bounds`, which clips the field-of-view
-scan — the other eight sections keep simulating (movement/AI/needs run over the
-whole map) but are never rendered. Crossing a section edge snaps the camera and
-logs "You cross into a new area." Sectioning only engages on a map large enough
-for the grid to be meaningful (the real 120×60 world); tiny test maps keep the
-plain centred camera.
-
-**Swimming.** The player moves with `game_map.is_passable` (land + water), so it
-can swim across lakes and rivers; NPC pathfinding still uses `is_walkable` (land
-only), so animals stay ashore.
-
-**Status identifier animation.** A character's tile animates through its own
-glyph plus an identifier for each active status, each shown for a configurable
-number of seconds, cycling in real time (`_status_appearance`, driven by
-`self._clock` — injectable for tests). Statuses **stack sequentially**: e.g. a
-swimming + on-fire character cycles own tile (`_STATUS_BASE_SECONDS`, 1.0s) → `~`
-(0.5s) → red `F` (0.5s) → repeat. The registry (`_STATUS_DISPLAY`,
-`_STATUS_ORDER`) maps a status to its glyph/colour/duration; `active_statuses`
-derives which are on (swimming from a water tile, `on_fire` from the `OnFire`
-component). Status-identifier frames are drawn with `force_glyph=True` so the
-renderer draws the **literal glyph**: a glyph with no dedicated tile otherwise
-falls back to the character's classification sprite, which would mask the
-identifier (you'd keep seeing the character). Because the cycle is real-time, the bob plays even while idle: the
-turn loop polls on a short timeout and re-renders whenever `player_is_animated`
-(`_await_action_or_idle` in `main.py`); on land with no status it keeps the
-efficient blocking wait.
-
-```python
-class RenderProcessor(esper.Processor):
-    def __init__(self, renderer, game_map):
-        self.renderer = renderer
-        self.game_map = game_map
-
-    def process(self, action=None):
-        r = self.renderer
-        r.clear()
-        # 1. map tiles
-        for y in range(self.game_map.height):
-            for x in range(self.game_map.width):
-                r.draw_glyph(x, y, self.game_map.tile_at(x, y))
-        # 2. entities on top
-        for _ent, (pos, rend) in esper.get_components(Position, Renderable):
-            r.draw_glyph(pos.x, pos.y, rend.glyph)
-        # 3. UI
-        r.draw_text(0, self.game_map.height, "I inventory  Esc menu  +/- tile scale")
-        r.present()
-```
-
-    It talks only to the [`Renderer`](Renderers.md) interface, never to pygame
-    directly.
-
-## Priority and ordering
-
-`esper.process(action)` calls each processor's `process(action)` in **descending
-priority**. Registration in [src/main.py](../src/main.py):
-
-```python
-esper.add_processor(MovementProcessor(game_map), priority=1)  # runs first
-esper.add_processor(RenderProcessor(renderer, game_map), priority=0)  # then draw
-```
-
-Move-before-draw means a keypress is reflected in the same frame.
+- **Time/calendar** — `world_clock`, `time_phase`, `is_night`, `calendar`,
+  `format_datetime`, `age_years`, `night_overlay_alpha`.
+- **Sleep** — `go_to_sleep`, `wake_up`, `_camp_at`.
+- **Housing/ownership** — `houses_for`, `bed_owner`, `set_bed_owner`, `owned_bed_of`,
+  `house_is_owned`, `set_house_ownership`, `furnish_house`.
+- **Construction** — `choose_build_site`, `create_construction_site`,
+  `_spawn_blueprint`, `stock_blueprint`, `raise_blueprint`, `_complete_site`.
+- **Social** — `_TRAITS`, `personality_warmth`, `interaction_delta`, `friendship`,
+  `adjust_friendship`, `gibberish`, `spawn_speech_bubble`, `active_bubbles`,
+  `interact`, `_react`.
+- **Family/reproduction** — `are_courtship_eligible`, `try_marry`, `try_mate`,
+  `_merge_homes`, `_adopt_surname`.
+- **Combat/messages** — `slay_entity` (shared corpse creation), `queue_message` /
+  `_pull_turn_events` (the turn-event log).
 
 ## Adding a system
 
-1. Subclass `esper.Processor` in [src/systems.py](../src/systems.py) and implement
-   `process(self, action=None)`.
-2. Register it in [src/main.py](../src/main.py) with a `priority` that places it
-   correctly relative to movement and rendering.
-3. Query the components it needs with `esper.get_components(...)`.
+1. Subclass `esper.Processor` and implement `process(self, action=None)`.
+2. Register it in `main.py` with a `priority` placing it correctly relative to
+   Time (2), Movement (1), and Render (0).
+3. Query the components it needs with `esper.get_components(...)`; gate time-advancing
+   work on `action in _TURN_ACTIONS`.
 
-Example — a system that opens a door the player steps on would run at a priority
-between movement (1) and render (0), e.g. `priority=1` alongside movement or a
-fractional/interleaved value, reading `Position, Player` and mutating the
-[map](Game-Map.md).
-
-See [Architecture](Architecture.md) for the full turn loop.
+For a new *creature/item/effect*, you usually **don't** add a system — you add a
+[prefab or effect](Content-and-Mods.md) and let the existing systems act on the
+components it carries.

@@ -11,7 +11,7 @@ import time
 
 import esper
 
-from components import Actor, Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Camp, Chest, ConstructionSite, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, OnFire, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
+from components import Actor, Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Camp, Chest, ConstructionSite, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from action import BASE_ACTION_COST, action_cost
@@ -19,6 +19,12 @@ from onymancer import make_onymancer
 from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin, region_at
 from renderer.base import Renderer, memory_color
 from rng import world_rng
+from content.effects import (
+    STATUS_BASE_SECONDS,
+    active_effects,
+    effect_display,
+    effect_label,
+)
 
 _ACTION_DELTAS = {
     "move_up": (0, -1),
@@ -142,41 +148,11 @@ _RENDER_SECTION_H = LAND_HEIGHT // 3  # 20
 # time, then repeats. Statuses stack sequentially: e.g. swimming + on fire ->
 # own tile (1.0s) -> "~" (0.5s) -> red "F" (0.5s) -> loop.
 #
-# How long the character's own tile shows before the status identifiers cycle.
-_STATUS_BASE_SECONDS = 1.0
-# status name -> (identifier glyph, fg override or None to keep the character's
-# colour, seconds shown). Tune these freely.
-_STATUS_DISPLAY: dict[str, tuple[str, tuple[int, int, int] | None, float]] = {
-    "swimming": ("~", None, 0.5),
-    "on_fire": ("F", (224, 74, 44), 0.5),
-    "asleep": ("Z", (150, 170, 220), 0.6),
-}
-# Order the identifiers cycle in, after the base tile.
-_STATUS_ORDER: tuple[str, ...] = ("swimming", "on_fire", "asleep")
-
-# Human-readable status names for status/examine screens.
-_STATUS_LABELS: dict[str, str] = {
-    "swimming": "Swimming",
-    "on_fire": "On fire",
-    "asleep": "Asleep",
-}
-
-
-def status_label(name: str) -> str:
-    return _STATUS_LABELS.get(name, name.replace("_", " ").capitalize())
-
-
-def active_statuses(game_map: GameMap, ent: int, pos: Position) -> list[str]:
-    """The status keys currently affecting an entity, in display order. Swimming
-    is derived from standing on water; on_fire from the OnFire component."""
-    active: set[str] = set()
-    if game_map.is_water(pos.x, pos.y):
-        active.add("swimming")
-    if esper.has_component(ent, OnFire):
-        active.add("on_fire")
-    if esper.has_component(ent, Asleep):
-        active.add("asleep")
-    return [name for name in _STATUS_ORDER if name in active]
+# The status registry (display metadata + which statuses are active) now lives in
+# ``content.effects`` so effects are data-driven and moddable. These aliases keep the
+# original ``systems`` names (imported by ``main`` and the renderer) working.
+active_statuses = active_effects           # (game_map, ent, pos) -> ordered status ids
+status_label = effect_label                # status id -> human-readable label
 
 
 def player_is_animated(game_map: GameMap) -> bool:
@@ -4126,10 +4102,10 @@ class RenderProcessor(esper.Processor):
 
         # (glyph, fg, seconds, is_status_identifier)
         frames: list[tuple[str, tuple[int, int, int] | None, float, bool]] = [
-            (glyph, fg, _STATUS_BASE_SECONDS, False)
+            (glyph, fg, STATUS_BASE_SECONDS, False)
         ]
         for name in statuses:
-            id_glyph, id_fg, seconds = _STATUS_DISPLAY[name]
+            id_glyph, id_fg, seconds = effect_display(name)
             frames.append((id_glyph, id_fg if id_fg is not None else fg, seconds, True))
 
         total = sum(frame[2] for frame in frames)

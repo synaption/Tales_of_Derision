@@ -2,18 +2,19 @@
 
 ## ECS in one paragraph
 
-Entity-Component-System splits the game into three parts: **entities** are just
-ids, **components** are plain data attached to entities, and **systems**
-(processors, in esper's vocabulary) contain all the behaviour. Instead of a
-`Player` class with position + rendering + movement baked in, the player is an
-entity that *has* a `Position`, a `Renderable`, and a `Player` tag; separate
-systems read those components and do work. Behaviour composes by adding
-components, not by subclassing.
+Entity-Component-System splits the game into three parts: **entities** are just ids,
+**components** are plain data attached to entities, and **systems** (esper calls them
+*processors*) hold all the behaviour. The player isn't a `Player` class with position
++ rendering + movement baked in; it's an entity that *has* a `Position`, a
+`Renderable`, and a `Player` tag, and separate systems read those components and do
+work. **Behaviour composes by adding components, not by subclassing** — a creature is
+a carnivore because it has `Diet("carnivore")`, a resident because it has `Resident`,
+prey because it has `Deer`. This is what lets content scale: see
+[Content & Mods](Content-and-Mods.md).
 
 ## esper 3.x model
 
-esper 3.x keeps ECS state in **module-level** globals rather than a `World`
-object. The calls used here:
+esper 3.x keeps ECS state in **module-level** globals rather than a `World` object.
 
 | Call | Purpose |
 |------|---------|
@@ -21,111 +22,83 @@ object. The calls used here:
 | `esper.add_processor(proc, priority=0)` | Register a system; higher priority runs first |
 | `esper.get_components(A, B)` | Iterate `(entity, (a, b))` for entities having both |
 | `esper.component_for_entity(ent, A)` | Fetch one component off one entity |
+| `esper.has_component(ent, A)` | Membership test |
+| `esper.add_component` / `remove_component` / `delete_entity` | Mutate the database |
 | `esper.process(*args)` | Run every processor's `process(*args)` in priority order |
 
-## Layering
+## Layer DAG (imports only point down)
 
-```mermaid
-flowchart TD
-    subgraph Data["Data (renderer-agnostic)"]
-        C[components.py<br/>Position · Renderable · Player]
-        M[game_map.py<br/>GameMap tiles]
-    end
-    subgraph Logic["Systems"]
-        MP[MovementProcessor]
-        RP[RenderProcessor]
-    end
-    subgraph Display["Display seam"]
-        R[Renderer interface]
-        P[PygameRenderer]
-    end
-    MP --> C
-    MP --> M
-    RP --> C
-    RP --> M
-    RP --> R
-    R -.implemented by.-> P
-    main[main.py<br/>turn loop] --> MP
-    main --> RP
-    main --> P
+```
+L0 data/util    components.py · rng.py · action.py · onymancer.py
+L1 map/topology game_map.py · regions.py · schedule.py
+L2 content      content/ (registry · kits · effects · items · prefabs · loader)
+L3 systems      systems.py  (10 processors + free-function subsystems)
+L4 presentation main.py UI/menu/interaction helpers
+L5 app          main.py entry point + turn loop
+   persistence.py depends only on components + game_map
 ```
 
-The arrows only ever point *toward* data and the `Renderer` interface. Nothing in
-Data or Systems imports pygame.
+Nothing in Data, Map, or Systems imports pygame — the arrows only ever point toward
+data and the `Renderer` interface. `persistence.py`, `regions.py`, `schedule.py`, and
+`rng.py` are small, focused modules the big files build on.
+
+> **Refactor note:** `systems.py` (~4400 lines) and `main.py` (~3300 lines) are being
+> split into `systems/`, `render/`, `ui/`, `interactions.py`, `worldgen.py`, and
+> `audio.py` packages along exactly these layer lines. See the
+> [Roadmap](Roadmap.md).
 
 ## The turn loop
 
-The game is turn-based: it blocks for input, runs the systems once, and repeats.
+The game is turn-based: it waits for actionable input, runs the systems once, and
+repeats. A single call to `esper.process(action)` runs **every** processor in
+priority order, so one keypress advances time, AI, needs, and the frame together.
 
-```mermaid
-sequenceDiagram
-    participant U as Player
-    participant Main as main.py
-    participant Ren as PygameRenderer
-    participant Move as MovementProcessor
-    participant Draw as RenderProcessor
-    Main->>Draw: esper.process()  (initial frame)
-    loop each turn
-        Main->>Ren: poll_action()
-        Ren-->>Main: action string
-        alt open pause menu
-            Main->>Main: show pause menu
-            alt pause choice is quit
-                Main->>Main: break
-            else pause choice is save/resume/options
-                Main->>Draw: redraw frame
-            end
-        else confirm_action
-            Main->>Main: resolve held directions
-            Main->>Move: esper.process(live_action)
-            Main->>Draw: (same process call)
-        else action
-            Main->>Move: esper.process(action)
-            Move->>Move: move player if walkable
-            Main->>Draw: (same process call)
-            Draw->>Ren: clear / draw_glyph / present
-        end
-    end
-```
+Processor registration and priorities (`main.py`, high runs first):
 
-`esper.process(action)` runs **both** processors and passes `action` to each.
-`MovementProcessor` uses it; `RenderProcessor` ignores it. Priority ordering
-(`MovementProcessor` at `priority=1`, `RenderProcessor` at `priority=0`)
-guarantees movement is applied *before* the frame is drawn.
+| Priority | Processor | Role |
+|---------:|-----------|------|
+| 2 | `TimeProcessor` | Advance the world clock **first** so needs/AI read the right time of day |
+| 1 | `MovementProcessor` | Apply the player's move / bump-attack |
+| 0 | `HousingProcessor` | Claim/assign homes before the AI acts on them |
+| 0 | `NpcAiProcessor` | The per-turn brain for every land NPC |
+| 0 | `FishAiProcessor` | The sea's brain (aquatic mirror of the land AI) |
+| 0 | `NeedsProcessor` | Advance hunger/thirst/tiredness |
+| 0 | `TreeGrowthProcessor` | Daily flora grow/regrow/die |
+| 0 | `ReproductionProcessor` | Deliver due pregnancies |
+| 0 | `RenderProcessor` | Draw the frame **last** |
+
+Time-advancing systems only tick on a real action (a move or `WAIT_ACTION`); menu
+refreshes call `esper.process(None)`, which advances nothing. Move-before-draw (and
+Time-before-everything) means a keypress is reflected in the same frame.
+
+The loop also does the work a bare `esper.process` can't: it resolves held-direction
+keys into a single action, routes UI actions (menus, look mode, interactions) to
+their handlers, and — when the player is idle or only a status animation is playing —
+spends the spare time paying down background region-simulation debt
+([World Simulation](World-Simulation.md)).
 
 ## Data flow of a keypress
 
-1. `PygameRenderer.poll_action()` reads pygame events and emits an abstract
-    action string (`move_left`, `menu_select`, `confirm_action`, ...).
-2. `main.py` handles UI-state actions (inventory/pause/options/dialogue) and
-    routes gameplay actions into `esper.process(...)`.
-3. `MovementProcessor` looks up deltas, finds every `Position` + `Player`
-   entity, and moves it if `GameMap.is_walkable`.
-4. `RenderProcessor` clears the frame, draws the map, draws every `Renderable`,
-   draws the status line, and presents.
-
-Pause-menu actions (`save`, `options`, `quit`) are handled in `main.py` UI flow,
-not by ECS movement/render systems.
+1. `PygameRenderer.poll_action()` reads pygame events and emits an abstract action
+   string (`move_left`, `menu_select`, `confirm_action`, `sleep`, `look`, …).
+2. `main.py` handles UI-state actions (inventory/pause/options/dialogue/look/
+   interactions) and routes gameplay actions into `esper.process(...)`.
+3. `TimeProcessor` advances the clock; `MovementProcessor` moves the player (or bumps
+   an adjacent creature into a melee attack); the AI/needs/flora/reproduction systems
+   simulate the world.
+4. `RenderProcessor` computes field-of-view, draws visible tiles (+ remembered tiles
+   from memory), draws entities, the sidebar/log/status line, and presents.
 
 ## Testing headless
 
-Because the renderer is an interface, tests substitute a fake:
-
-```python
-class FakeRenderer(Renderer):
-    def setup(self): ...
-    def teardown(self): ...
-    def clear(self): self.buf = {}
-    def draw_glyph(self, x, y, g): self.buf[(x, y)] = g
-    def draw_text(self, x, y, t): ...
-    def present(self): ...
-    def poll_action(self): return None
-```
-
-Register it with `RenderProcessor`, call `esper.process("move_up")`, and assert on
-`buf` / the player's `Position`. No live window required.
+Because the renderer is an interface, tests substitute a fake (see
+[src/tests/fakes.py](../src/tests/fakes.py)): register it with `RenderProcessor`, call
+`esper.process("move_up")`, and assert on the recorded draw calls or the player's
+`Position`. No live window required. The whole survival/social/housing/reproduction
+sim is driven and asserted this way — 236 tests in ~1s.
 
 ## Related pages
 
-- [Components](Components.md) · [Systems](Systems.md) · [Game Map](Game-Map.md) ·
-  [Renderers](Renderers.md)
+[Components](Components.md) · [Systems](Systems.md) · [Game Map](Game-Map.md) ·
+[Action Economy](Action-Economy.md) · [World Simulation](World-Simulation.md) ·
+[Renderers](Renderers.md)

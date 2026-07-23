@@ -14,8 +14,7 @@ from typing import Any
 import esper
 
 from action import BASE_ACTION_COST
-from components import Age, Asleep, Attributes, Bed, BerryBush, Blueprint, BlocksMovement, Chest, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Gender, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Resident, Seaweed, Stove, Tree, Vision, Well, WorldClock
-from onymancer import make_onymancer
+from components import Asleep, Bed, BerryBush, Blueprint, Chest, Corpse, Deer, Dialogue, Enemy, Equipment, Family, Fish, Friendly, Home, Inventory, Meat, NPC, Name, Needs, Personality, Player, Position, Relationships, Renderable, Stove, Tree, Well
 from game_map import GameMap
 from items import (
     BERRIES,
@@ -25,12 +24,15 @@ from items import (
     WOOD_WINDOW,
     cook_meat,
     craft_cost,
+    default_equipment_slots,
     hunger_restored,
     is_placeable,
     is_raw_meat,
     placed_tile,
     thirst_restored,
 )
+from queries import first_player_entity
+from worldgen import _setup_world
 from persistence import (
     DEFAULT_SAVE_FILE,
     bootstrap_files,
@@ -41,9 +43,14 @@ from persistence import (
     save_options,
 )
 from rng import new_seed, set_world_rng, world_rng
+from audio import CombatSfxPlayer, start_background_music, stop_background_music
+from content.effects import EffectsProcessor
+from content.kits import person_kit
+from content.loader import load_all_content
+from content.registry import build_components, spawn
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
-from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, ReproductionProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, born_turn_for_age, bubbles_active, friendship, furnish_house, go_to_sleep, interact, pick_berries, player_is_animated, queue_message, raise_blueprint, set_bed_owner, slay_entity, spawn_speech_bubble, status_label, stock_blueprint, wake_up, world_clock
+from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, ReproductionProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, active_statuses, bed_owner, bubbles_active, friendship, go_to_sleep, interact, pick_berries, player_is_animated, queue_message, raise_blueprint, slay_entity, spawn_speech_bubble, status_label, stock_blueprint, wake_up, world_clock
 
 # The world is a 3x3 grid of 120x60 sections: the habitable island sits in the
 # centre section, ringed by a coastline, and the surrounding eight sections are
@@ -84,21 +91,10 @@ _RELEASE_TO_DIRECTION = {
 
 _SCALE_STEPS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
-AUDIO_SAMPLE_RATE = 44100
-AUDIO_SAMPLE_SIZE = -16
-AUDIO_CHANNELS = 2
-AUDIO_BUFFER_SIZES = (16384, 8192, 4096, 2048)
-
 # How often the idle/animation poll loop re-checks for input while waiting, so a
 # genuinely idle wait (status animations, background catch-up) doesn't busy-spin
 # the CPU. ~60Hz keeps input latency imperceptible.
 _IDLE_POLL_INTERVAL = 1 / 60
-
-
-def _audio_driver_order() -> list[str | None]:
-    if os.environ.get("PULSE_SERVER"):
-        return ["pulseaudio", "pipewire", "alsa", None, "dsp"]
-    return [None, "pipewire", "pulseaudio", "alsa", "dsp"]
 
 
 def _coerce_scale(value: object) -> float:
@@ -120,187 +116,6 @@ def _next_scale(current: float, direction: int = 1) -> float:
         return _SCALE_STEPS[nearest]
     idx = _SCALE_STEPS.index(current)
     return _SCALE_STEPS[(idx + direction) % len(_SCALE_STEPS)]
-
-
-def _audio_buffer_order(options: dict | None) -> list[int]:
-    configured = None
-    if isinstance(options, dict):
-        configured = options.get("audio_buffer")
-
-    if isinstance(configured, int) and configured > 0:
-        sizes = [configured, *AUDIO_BUFFER_SIZES]
-        seen: set[int] = set()
-        ordered: list[int] = []
-        for size in sizes:
-            if size not in seen:
-                ordered.append(size)
-                seen.add(size)
-        return ordered
-
-    return list(AUDIO_BUFFER_SIZES)
-
-
-def _pick_music_track(music_dir: Path) -> Path | None:
-    if not music_dir.exists() or not music_dir.is_dir():
-        return None
-
-    supported_suffixes = {".mp3", ".ogg", ".wav", ".flac", ".m4a"}
-    candidates = sorted(
-        path
-        for path in music_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in supported_suffixes
-    )
-    if not candidates:
-        return None
-
-    return candidates[0]
-
-
-def _init_pygame_mixer(options: dict | None = None) -> Any | None:
-    try:
-        pygame = __import__("pygame")
-    except ModuleNotFoundError:
-        return None
-
-    if pygame.mixer.get_init() is not None:
-        return pygame
-
-    original_driver = os.environ.get("SDL_AUDIODRIVER")
-    last_error: Exception | None = None
-    for driver in _audio_driver_order():
-        for buffer_size in _audio_buffer_order(options):
-            try:
-                if driver is None:
-                    if original_driver is None:
-                        os.environ.pop("SDL_AUDIODRIVER", None)
-                    else:
-                        os.environ["SDL_AUDIODRIVER"] = original_driver
-                else:
-                    os.environ["SDL_AUDIODRIVER"] = driver
-
-                pygame.mixer.quit()
-                pygame.mixer.init(
-                    frequency=AUDIO_SAMPLE_RATE,
-                    size=AUDIO_SAMPLE_SIZE,
-                    channels=AUDIO_CHANNELS,
-                    buffer=buffer_size,
-                    allowedchanges=0,
-                )
-                if original_driver is None:
-                    os.environ.pop("SDL_AUDIODRIVER", None)
-                else:
-                    os.environ["SDL_AUDIODRIVER"] = original_driver
-                return pygame
-            except Exception as exc:
-                last_error = exc
-                try:
-                    pygame.mixer.quit()
-                except Exception:
-                    pass
-
-    if original_driver is None:
-        os.environ.pop("SDL_AUDIODRIVER", None)
-    else:
-        os.environ["SDL_AUDIODRIVER"] = original_driver
-
-    if last_error is not None:
-        print(f"Audio disabled: {last_error}", file=sys.stderr)
-    return None
-
-
-def _start_background_music(options: dict | None = None) -> Any | None:
-    pygame = _init_pygame_mixer(options)
-    if pygame is None:
-        return None
-
-    music_dir = Path(__file__).resolve().parent.parent / "audio" / "music"
-    track = _pick_music_track(music_dir)
-    if track is None:
-        return pygame
-
-    try:
-        pygame.mixer.music.load(str(track))
-        pygame.mixer.music.play(-1)
-    except Exception as exc:
-        print(f"Music disabled: {exc}", file=sys.stderr)
-
-    return pygame
-
-
-class _CombatSfxPlayer:
-    def __init__(self, pygame_module: Any | None, options: dict | None = None):
-        self._pygame = pygame_module
-        self._channel: Any | None = None
-        self._enabled = True
-        if isinstance(options, dict):
-            self._enabled = bool(options.get("combat_sfx", True))
-
-        self._melee_sound: Any | None = None
-        self._death_sound: Any | None = None
-        if not self._enabled or self._pygame is None:
-            return
-
-        try:
-            self._channel = self._pygame.mixer.find_channel()
-        except Exception:
-            self._channel = None
-
-        self._melee_sound = self._load_sound(options, "melee_attack_sfx", "audio/sfx/swipe.wav")
-        self._death_sound = self._load_sound(options, "death_sfx", "audio/sfx/splat_quick.wav")
-
-    @staticmethod
-    def _resolve_sound_path(path_value: str) -> Path:
-        candidate = Path(path_value)
-        if candidate.is_absolute():
-            return candidate
-        return Path(__file__).resolve().parent.parent / candidate
-
-    def _load_sound(self, options: dict | None, key: str, fallback: str) -> Any | None:
-        configured = fallback
-        if isinstance(options, dict) and isinstance(options.get(key), str):
-            configured = options[key]
-
-        try:
-            sound_path = self._resolve_sound_path(configured)
-            if not sound_path.exists():
-                return None
-            return self._pygame.mixer.Sound(str(sound_path))
-        except Exception:
-            return None
-
-    def _play(self, sound: Any | None, queue_if_busy: bool = False) -> None:
-        if sound is None:
-            return
-        try:
-            if self._channel is not None:
-                if queue_if_busy and self._channel.get_busy():
-                    self._channel.queue(sound)
-                else:
-                    self._channel.play(sound)
-                return
-            sound.play()
-        except Exception:
-            return
-
-    def play_melee_attack(self) -> None:
-        self._play(self._melee_sound)
-
-    def play_death(self) -> None:
-        # When called immediately after melee, queue death so it plays next.
-        self._play(self._death_sound, queue_if_busy=True)
-
-
-def _stop_background_music(pygame_module: Any | None) -> None:
-    if pygame_module is None:
-        return
-    try:
-        pygame_module.mixer.music.stop()
-    except Exception:
-        pass
-    try:
-        pygame_module.mixer.quit()
-    except Exception:
-        pass
 
 
 def _parse_args() -> argparse.Namespace:
@@ -336,38 +151,6 @@ _MENU_MUTED_COLOR = (156, 156, 156)
 _MENU_SELECTED_BG = (44, 44, 44)
 _MENU_SELECTED_TEXT = (252, 252, 252)
 _TITLE_SPLASH_SECONDS = 3.0
-_GOBLIN_GREEN = (82, 166, 74)
-_RAT_BROWN = (128, 92, 60)
-_TREE_GREEN = (58, 138, 66)
-_WELL_STONE = (150, 168, 190)
-_STOVE_IRON = (120, 120, 128)
-_DEER_TAN = (176, 132, 92)
-_BED_WOOD = (156, 116, 72)
-_BERRY_RED = (200, 74, 96)
-_SEAWEED_GREEN = (54, 148, 116)
-_FISH_SILVER = (210, 224, 236)
-# Ocean creatures/plants render with a water-blue cell background so they blend
-# into the sea instead of punching a black hole through the water tile (the
-# fallback glyph sheet fills a solid background). Matches systems._WATER_BLUE.
-_OCEAN_WATER_BG = (64, 118, 190)
-_HUMAN_SKIN_TONES: list[tuple[int, int, int]] = [
-    (255, 238, 220),
-    (248, 227, 208),
-    (241, 216, 196),
-    (234, 205, 184),
-    (227, 194, 172),
-    (220, 183, 160),
-    (213, 172, 148),
-    (206, 161, 136),
-    (194, 149, 123),
-    (182, 137, 110),
-    (170, 125, 98),
-    (158, 113, 86),
-    (146, 101, 74),
-    (134, 89, 62),
-    (122, 77, 50),
-    (110, 65, 38),
-]
 
 
 def _capture_frame_screenshot(renderer: Renderer, output_path: Path) -> None:
@@ -832,19 +615,6 @@ def _run_startup_flow(
     return (False, game_map, player_position, selected_save_file)
 
 
-def _default_equipment_slots() -> dict[str, str | None]:
-    return {
-        "head": None,
-        "chest": None,
-        "hands": None,
-        "legs": None,
-        "feet": None,
-        "main hand": None,
-        "off hand": None,
-        "ring": None,
-    }
-
-
 def _infer_slot_for_item(item_name: str) -> str | None:
     lowered = item_name.lower()
     if any(token in lowered for token in ("helm", "hood", "hat", "crown")):
@@ -927,19 +697,6 @@ def _item_visual(item_name: str) -> tuple[str, str, tuple[int, int, int] | None,
     return ("*", "valuable", None, None)
 
 
-def _human_skin_tone(seed_text: str, offset: int = 0) -> tuple[int, int, int]:
-    seed = 0
-    for index, char in enumerate(seed_text):
-        seed += (index + 1) * ord(char)
-    return _HUMAN_SKIN_TONES[(seed + offset) % len(_HUMAN_SKIN_TONES)]
-
-
-def _first_player_entity() -> int | None:
-    for ent, (_pos, _player) in esper.get_components(Position, Player):
-        return ent
-    return None
-
-
 def _entity_name(entity_id: int, fallback: str = "Unknown") -> str:
     if esper.has_component(entity_id, Name):
         return esper.component_for_entity(entity_id, Name).value
@@ -1005,7 +762,7 @@ def _action_from_held_keys(
 
 
 def _find_interaction_npc(direction_action: str | None) -> int | None:
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
         return None
 
@@ -1023,7 +780,7 @@ def _find_interaction_npc(direction_action: str | None) -> int | None:
 def _find_interaction_creature(direction_action: str | None) -> int | None:
     """Any creature (friendly, wild, or hostile) on the faced tile. Used so the
     player can examine/interact with anything adjacent, not just friendlies."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
         return None
 
@@ -1088,7 +845,7 @@ def _creature_status_lines(game_map: GameMap, ent: int) -> list[str]:
     if esper.has_component(ent, Personality):
         traits = esper.component_for_entity(ent, Personality).traits
         lines.append("Traits: " + (", ".join(traits) if traits else "None"))
-        player_ent = _first_player_entity()
+        player_ent = first_player_entity()
         if player_ent is not None and esper.has_component(ent, Relationships):
             rel = esper.component_for_entity(ent, Relationships)
             score = friendship(rel, player_ent)
@@ -1108,7 +865,7 @@ def _creature_status_lines(game_map: GameMap, ent: int) -> list[str]:
 
 
 def _find_interaction_corpse(direction_action: str | None) -> int | None:
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
         return None
 
@@ -1250,7 +1007,7 @@ def _find_adjacent_feature(direction_action: str | None, component: type) -> int
     """Return the entity carrying ``component`` on the tile the player is facing
     (the aimed direction), or ``None``. Used to interact with wells, stoves, and
     trees the same way corpses/NPCs are targeted."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
         return None
 
@@ -1355,7 +1112,7 @@ _SLEEP_MAX_TURNS = 400
 def _bed_near_player() -> int | None:
     """The nearest Bed on or beside the player's tile (so the sleep action can bed
     them down rather than pitching a camp), or ``None`` if none is adjacent."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
         return None
     ppos = esper.component_for_entity(player_ent, Position)
@@ -1372,7 +1129,7 @@ def _confirm_if_owned_by_other(renderer: Renderer, ent: int, noun: str, verb: st
     """When ``ent`` belongs to someone other than the player, warn whose it is and
     ask for confirmation. Returns True if the player may go ahead (their own/
     unowned property proceeds silently; a decline returns False)."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     owner = bed_owner(ent)
     if owner is None or owner == player_ent:
         return True
@@ -1426,7 +1183,7 @@ def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
     The whole world keeps simulating during the rest (NPCs act, needs shift, the
     clock advances), so a night's sleep really passes the night. Each turn yields
     to the browser so the web build's single thread stays responsive."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None:
         return
     if not esper.has_component(player_ent, Needs):
@@ -1546,7 +1303,7 @@ def _work_blueprint(ghost_ent: int, player_ent: int, game_map: GameMap) -> tuple
 def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name: str) -> None:
     """Prompt for a direction and build the selected piece on that adjacent tile.
     Any non-direction key cancels and keeps the item."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
         return
     queue_message(f"Place the {item_name}: press a direction (Esc/other to cancel).")
@@ -1563,7 +1320,7 @@ def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name: str)
 
 
 def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None:
         return "close"
 
@@ -1706,7 +1463,7 @@ def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
 
 
 def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None:
         return "close"
 
@@ -2085,7 +1842,7 @@ def _draw_look_action_menu(
 def _look_interact(renderer: Renderer, game_map: GameMap, x: int, y: int) -> str:
     """Resolve an Enter press on the look cursor: interact with a creature there,
     loot an adjacent corpse, or just describe whatever the cursor rests on."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
         return "close"
     player_pos = esper.component_for_entity(player_ent, Position)
@@ -2137,7 +1894,7 @@ def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
     """Drive the look cursor: it starts on the player, moves with the direction
     keys, and Enter interacts with whatever it rests on. Returns "quit" if the
     player quit the game while looking, otherwise "close"."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     if player_ent is None or not esper.has_component(player_ent, Position):
         return "close"
     player_pos = esper.component_for_entity(player_ent, Position)
@@ -2249,7 +2006,7 @@ def _draw_dialogue_menu(renderer: Renderer, game_map: GameMap, npc_ent: int) -> 
                     talk_line = f"{npc_name} has nothing to say."
                 # Chatting with a sentient villager builds friendship (Sims-like);
                 # show the outcome and refresh the info block's Friendship line.
-                player_ent = _first_player_entity()
+                player_ent = first_player_entity()
                 if player_ent is not None and esper.has_component(npc_ent, Personality):
                     outcome = _player_talk(player_ent, npc_ent)
                     talk_line = f"{talk_line}  [{outcome}]"
@@ -2294,9 +2051,9 @@ def _render_inventory_body(
 ) -> None:
     """Draw the Inventory tab body (a message line + EQUIPPED and ITEMS panels)
     inside the given content region."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     inventory_items: list[str] = []
-    equipment_slots = _default_equipment_slots()
+    equipment_slots = default_equipment_slots()
     if player_ent is not None:
         if esper.has_component(player_ent, Inventory):
             inventory_items = list(esper.component_for_entity(player_ent, Inventory).items)
@@ -2396,13 +2153,13 @@ def _handle_inventory_input(action: str, state: _InventoryState) -> str | None:
     switching and closing are handled by the enclosing player menu. Returns the
     name of a buildable item when the player selects one to place (the menu then
     hands off to placement); otherwise ``None``."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
 
     slot_count = 0
     item_count = 0
     if player_ent is not None:
         if esper.has_component(player_ent, Equipment):
-            slot_count = len(_default_equipment_slots())
+            slot_count = len(default_equipment_slots())
         if esper.has_component(player_ent, Inventory):
             item_count = len(esper.component_for_entity(player_ent, Inventory).items)
 
@@ -2448,7 +2205,7 @@ def _handle_inventory_input(action: str, state: _InventoryState) -> str | None:
                     state.message = _equip_inventory_item(inventory, equipment, clamped_idx)
                 state.selected_item_idx = min(state.selected_item_idx, len(inventory.items) - 1) if inventory.items else 0
         else:
-            slot_names = list(_default_equipment_slots().keys())
+            slot_names = list(default_equipment_slots().keys())
             if slot_names:
                 slot_name = slot_names[max(0, min(state.selected_slot_idx, len(slot_names) - 1))]
                 state.message = _unequip_slot(inventory, equipment, slot_name)
@@ -2473,7 +2230,7 @@ def _render_crafting_body(
     state: _CraftingState,
 ) -> None:
     """Draw the Crafting tab: your Wood on hand and the buildable recipes."""
-    player_ent = _first_player_entity()
+    player_ent = first_player_entity()
     wood_count = 0
     if player_ent is not None and esper.has_component(player_ent, Inventory):
         wood_count = esper.component_for_entity(player_ent, Inventory).items.count(WOOD)
@@ -2518,7 +2275,7 @@ def _handle_crafting_input(action: str, state: _CraftingState) -> None:
         state.selected_idx = (state.selected_idx + 1) % len(_CRAFT_MENU)
         return
     if action in {"menu_select", "confirm_action"}:
-        player_ent = _first_player_entity()
+        player_ent = first_player_entity()
         if player_ent is not None:
             state.message = _craft_item(player_ent, _CRAFT_MENU[state.selected_idx])
 
@@ -2575,7 +2332,7 @@ def _draw_player_menu(renderer: Renderer, game_map: GameMap, start_tab: str = "i
         elif current_key == "craft":
             _render_crafting_body(renderer, x, content_y, width, content_h, craft_state)
         elif current_key == "status":
-            player_ent = _first_player_entity()
+            player_ent = first_player_entity()
             lines = _creature_status_lines(game_map, player_ent) if player_ent is not None else ["No player."]
             for idx, line in enumerate(lines):
                 _draw_ui_text(renderer, x + 3, content_y + 1 + idx, line, _MENU_TEXT_COLOR, width - 6)
@@ -2613,370 +2370,6 @@ def _draw_player_menu(renderer: Renderer, game_map: GameMap, start_tab: str = "i
             _handle_crafting_input(action, craft_state)
 
 
-def _spawn_cave_rat(
-    x: int,
-    y: int,
-    *,
-    include_loot: bool,
-) -> None:
-    components: list[object] = [
-        Position(x, y),
-        Renderable("r", fg=_RAT_BROWN),
-        Name("Cave Rat"),
-        NPC(),
-        Enemy(),
-        Vision(6),
-        BlocksMovement(),
-        Meat("Rat Meat"),
-        Diet("carnivore"),
-        # Quick, scurrying vermin: high dexterity makes a rat act ~1.2x as often
-        # as a baseline creature in the action economy (see action.actor_speed).
-        Attributes(dexterity=16),
-        Needs(),
-    ]
-    if include_loot:
-        components.extend(
-            [
-                Inventory(items=["String", "Pebble"]),
-                Equipment(slots=_default_equipment_slots()),
-            ]
-        )
-
-    esper.create_entity(*components)
-
-
-def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool = False) -> int:
-    # Singleton world clock driving the day/night cycle and the night-time
-    # tiredness ramp. Created before any creature so the first turn has a time.
-    # The game opens mid-morning so the player starts a fresh day in daylight.
-    start_clock = WorldClock()
-    start_clock.turn = int(start_clock.day_length * 0.2)
-    esper.create_entity(start_clock)
-
-    # The onymancer names every villager procedurally, seeded off the world seed
-    # so the same seed always conjures the same starting village.
-    onymancer = make_onymancer(world_rng().int_seed("names_startup"))
-
-    player_name = "You"
-    player_skin = _human_skin_tone(player_name)
-
-    player_equipment = _default_equipment_slots()
-    player_equipment["main hand"] = "Rusty Sword"
-    player_equipment["chest"] = "Traveler Tunic"
-    esper.create_entity(
-        player_position,
-        Renderable("@", fg=player_skin),
-        Name(player_name),
-        # Placeholder until character creation lets the player choose; the future
-        # reproduction system reads this.
-        Gender("male"),
-        Age(born_turn_for_age(start_clock, 25.0)),
-        Player(),
-        Vision(10),
-        BlocksMovement(),
-        # Average attributes for now; dexterity drives how long the player's
-        # actions take in the action economy (see action.action_cost).
-        Attributes(),
-        # Some starting wood so the player can craft walls/doors/windows right
-        # away (Crafting tab in the Tab menu, then place from the inventory).
-        Inventory(items=["Bandage", "Torch", "Apple", WOOD, WOOD, WOOD, WOOD, WOOD]),
-        Equipment(slots=player_equipment),
-        Needs(),
-    )
-
-    if rat_flood:
-        rats_spawned = 0
-        player_xy = (player_position.x, player_position.y)
-        for y in range(game_map.height):
-            for x in range(game_map.width):
-                if not game_map.is_walkable(x, y):
-                    continue
-                if (x, y) == player_xy:
-                    continue
-                _spawn_cave_rat(x, y, include_loot=False)
-                rats_spawned += 1
-        return rats_spawned
-
-    guard_pos = Position(max(2, player_position.x - 5), player_position.y)
-    rat_pos = Position(min(game_map.width - 3, player_position.x + 6), max(2, player_position.y - 2))
-
-    def spawn_villager(pos: Position, gender: str, traits: list[str], surname: str, age_years: float) -> int:
-        # The onymancer coins the given name (flavoured by gender) and joins it to
-        # the family surname. Skin tone still seeds off the final name so it stays
-        # stable across runs.
-        _given, _surname, full = onymancer.full_name(gender, surname)
-        return esper.create_entity(
-            pos,
-            Renderable("v", fg=_human_skin_tone(full, offset=7)),
-            Name(full),
-            Gender(gender),
-            # Born far enough in the past to be their starting age now; parents are
-            # adults, the children too young to marry or reproduce until they grow.
-            Age(born_turn_for_age(start_clock, age_years)),
-            # Links (spouse/parents/children) are wired reciprocally after the
-            # whole household is spawned.
-            Family(surname=surname),
-            NPC(),
-            Friendly(),
-            Dialogue("##!/$*~# GH01^@"),
-            BlocksMovement(),
-            Inventory(items=["Bread", "Waterskin"]),
-            Equipment(slots=_default_equipment_slots()),
-            # Villagers cook: they gather meat + wood and cook at a stove before
-            # eating (unlike predator monsters, which eat raw on the spot).
-            Diet("cook"),
-            Needs(),
-            # Residents seek out an unowned house to live in (claiming it as their
-            # home), and build a cabin of their own if none is free.
-            Resident(),
-            # A named personality drives who they befriend and how they socialise.
-            Personality(traits=list(traits)),
-            Relationships(),
-        )
-
-    def _place(offset: tuple[int, int]) -> Position:
-        dx, dy = offset
-        vx = min(game_map.width - 3, max(2, player_position.x + dx))
-        vy = min(game_map.height - 3, max(2, player_position.y + dy))
-        return Position(vx, vy)
-
-    # The starting cast forms two households (a full family of four and a couple),
-    # so relationships include spouses, parents/children, and siblings from the
-    # outset. Traits are the original contrasting personalities -- so the social AI
-    # still produces both warming (++) and souring (--) interactions -- while names,
-    # genders, ages, and family ties are new. Each entry is
-    # (gender, traits, offset, age_years): the parents are adults, the children too
-    # young to marry or reproduce until they grow up. Placement stays a
-    # deterministic loose cluster near the player.
-    Person = tuple[str, list[str], tuple[int, int], float]
-    households: list[tuple[Person, Person, list[Person]]] = [
-        (
-            ("male", ["Cheerful", "Outgoing"], (-2, 1), 34.0),
-            ("female", ["Kind", "Shy"], (-3, 2), 31.0),
-            [
-                ("male", ["Grumpy"], (-4, 1), 9.0),
-                ("female", ["Playful", "Kind"], (-2, 3), 6.0),
-            ],
-        ),
-        (
-            ("male", ["Aloof"], (-5, 2), 28.0),
-            ("female", ["Outgoing", "Playful"], (-3, 3), 26.0),
-            [],
-        ),
-    ]
-
-    for father_spec, mother_spec, child_specs in households:
-        surname = onymancer.surname()
-        fg, ftraits, foff, fage = father_spec
-        mg, mtraits, moff, mage = mother_spec
-        father = spawn_villager(_place(foff), fg, ftraits, surname, fage)
-        mother = spawn_villager(_place(moff), mg, mtraits, surname, mage)
-        father_fam = esper.component_for_entity(father, Family)
-        mother_fam = esper.component_for_entity(mother, Family)
-        father_fam.spouse = mother
-        mother_fam.spouse = father
-        for cg, ctraits, coff, cage in child_specs:
-            child = spawn_villager(_place(coff), cg, ctraits, surname, cage)
-            child_fam = esper.component_for_entity(child, Family)
-            child_fam.parents = [father, mother]
-            father_fam.children.append(child)
-            mother_fam.children.append(child)
-
-    goblin_equipment = _default_equipment_slots()
-    goblin_equipment["main hand"] = "Jagged Dagger"
-    esper.create_entity(
-        guard_pos,
-        Renderable("g", fg=_GOBLIN_GREEN),
-        Name("Goblin Scout"),
-        NPC(),
-        Enemy(),
-        Vision(8),
-        BlocksMovement(),
-        Inventory(items=["Copper Coin", "Bone Charm"]),
-        Equipment(slots=goblin_equipment),
-        Meat("Goblin Meat"),
-        Diet("carnivore"),
-        Needs(),
-    )
-    esper.create_entity(
-        rat_pos,
-        Renderable("r", fg=_RAT_BROWN),
-        Name("Cave Rat"),
-        NPC(),
-        Enemy(),
-        Vision(6),
-        BlocksMovement(),
-        Inventory(items=["String", "Pebble"]),
-        Equipment(slots=_default_equipment_slots()),
-        Meat("Rat Meat"),
-        Diet("carnivore"),
-        Needs(),
-    )
-
-    _spawn_environment_features(game_map, player_position)
-    if getattr(game_map, "has_ocean", False):
-        _spawn_ocean_life(game_map)
-
-    # Furnish the pre-built houses (bed, oven, chest, table, wardrobe,
-    # bookshelf). Residents claim these unowned houses as homes at runtime.
-    for interior in game_map.find_enclosed_rooms():
-        furnish_house(game_map, interior)
-
-    return 1
-
-
-def _spawn_ocean_life(game_map: GameMap) -> None:
-    """Scatter seaweed and fish across the open sea that surrounds the island.
-    Fish graze the seaweed (see ``FishAiProcessor``). Placement draws from the
-    world seed so the ocean is reproducible for a given seed."""
-    rng = world_rng().stream("worldgen_ocean")
-    occupied = {(pos.x, pos.y) for _ent, (pos,) in esper.get_components(Position)}
-
-    for y in range(1, game_map.height - 1):
-        for x in range(1, game_map.width - 1):
-            if not game_map.is_ocean(x, y) or (x, y) in occupied:
-                continue
-            roll = rng.random()
-            if roll < 0.028:
-                esper.create_entity(
-                    Position(x, y),
-                    Renderable('"', fg=_SEAWEED_GREEN, bg=_OCEAN_WATER_BG),
-                    Name("Seaweed"),
-                    Seaweed(),
-                )
-                occupied.add((x, y))
-            elif roll < 0.028 + 0.001:
-                esper.create_entity(
-                    Position(x, y),
-                    Renderable("f", fg=_FISH_SILVER, bg=_OCEAN_WATER_BG),
-                    Name("Fish"),
-                    Fish(),
-                    # Fish never go thirsty (they live in water); their only drive
-                    # is hunger, which sends them grazing seaweed.
-                    Needs(hunger=25.0, thirst=0.0, thirst_rate=0.0, tiredness_rate=0.0),
-                )
-                occupied.add((x, y))
-
-
-def _spawn_deer(game_map: GameMap, x: int, y: int) -> None:
-    """Create a wild deer: prey that grazes trees and drinks water, and yields
-    Deer Meat when hunted."""
-    if not game_map.is_walkable(x, y):
-        return
-    esper.create_entity(
-        Position(x, y),
-        Renderable("d", fg=_DEER_TAN),
-        Name("Deer"),
-        NPC(),
-        Deer(),
-        Diet("herbivore"),
-        Vision(8),
-        BlocksMovement(),
-        Meat("Deer Meat"),
-        Needs(hunger=30.0, thirst=30.0),
-    )
-
-
-def _spawn_environment_features(game_map: GameMap, player_position: Position) -> None:
-    """Populate the world: a well and stove by the player for the survival loop,
-    tree stands and roaming deer scattered across the map, with the wildlife
-    biased toward the water so grazing/drinking is nearby."""
-    # Safety: never leave the player standing in (or walled by) a lake/river.
-    game_map.clear_water_around(player_position.x, player_position.y, radius=2)
-
-    occupied = {
-        (pos.x, pos.y)
-        for _ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
-    }
-
-    def place_at(x: int, y: int, *components: object) -> bool:
-        if not game_map.is_walkable(x, y):
-            return False
-        if (x, y) in occupied or (x, y) == (player_position.x, player_position.y):
-            return False
-        occupied.add((x, y))
-        esper.create_entity(Position(x, y), *components)
-        return True
-
-    def place(dx: int, dy: int, *components: object) -> bool:
-        return place_at(player_position.x + dx, player_position.y + dy, *components)
-
-    place(2, 2, Renderable("O", fg=_WELL_STONE), Name("Stone Well"), Well(), BlocksMovement())
-    place(4, 2, Renderable("#", fg=_STOVE_IRON), Name("Iron Stove"), Stove(), BlocksMovement())
-    # The player's bed: sleep beside it to rest at home instead of camping. It
-    # belongs to the player, so villagers never claim it (even if you wall it in).
-    if place(3, 2, Renderable("=", fg=_BED_WOOD), Name("Bed"), Bed()):
-        player_ent = _first_player_entity()
-        bed_xy = (player_position.x + 3, player_position.y + 2)
-        if player_ent is not None:
-            for bed_ent, (bpos, _bed) in esper.get_components(Position, Bed):
-                if (bpos.x, bpos.y) == bed_xy:
-                    set_bed_owner(bed_ent, player_ent)
-                    break
-
-    def plant_tree(x: int, y: int) -> bool:
-        return place_at(x, y, Renderable("T", fg=_TREE_GREEN), Name("Tree"), Tree(), BlocksMovement())
-
-    def plant_bush(x: int, y: int) -> bool:
-        return place_at(x, y, Renderable("%", fg=_BERRY_RED), Name("Berry Bush"), BerryBush(), BlocksMovement())
-
-    # A few starter trees within reach, plus a forest scattered across the land
-    # so both the player and grazing deer have wood/food.
-    for tree_dx, tree_dy in (
-        (-3, -2), (-4, -2), (-3, 3), (5, 3), (6, 3),
-        (-5, -2), (-4, 3), (6, 4), (-5, 2), (5, 4),
-    ):
-        plant_tree(player_position.x + tree_dx, player_position.y + tree_dy)
-
-    # A couple of ripe berry bushes within reach of the player to start.
-    for bush_dx, bush_dy in ((-2, 3), (4, -2)):
-        plant_bush(player_position.x + bush_dx, player_position.y + bush_dy)
-
-    # Grow the forest in clustered stands rather than a uniform sprinkle: cover
-    # roughly 10% of the walkable land in trees while leaving open clearings
-    # between the stands so villagers can still find room to raise cabins. Each
-    # stand is a dense core that thins toward its edges, with the odd ripe berry
-    # bush mixed in for foragers. Reproducible per world seed.
-    rng = world_rng().stream("worldgen_env")
-    walkable = [
-        (x, y)
-        for y in range(game_map.land_y0, game_map.land_y0 + game_map.land_h)
-        for x in range(game_map.land_x0, game_map.land_x0 + game_map.land_w)
-        if game_map.is_walkable(x, y)
-    ]
-    tree_target = int(len(walkable) * 0.10)
-    planted = 0
-    guard = 0
-    while walkable and planted < tree_target and guard < tree_target * 50:
-        guard += 1
-        cx, cy = rng.choice(walkable)
-        radius = rng.randint(2, 6)
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
-                if planted >= tree_target:
-                    break
-                dist = (dx * dx + dy * dy) ** 0.5
-                if dist > radius:
-                    continue
-                # Denser at the core, thinning out toward the stand's edge.
-                if rng.random() < dist / (radius + 1):
-                    continue
-                if rng.random() < 0.04:
-                    plant_bush(cx + dx, cy + dy)
-                elif plant_tree(cx + dx, cy + dy):
-                    planted += 1
-
-    stand_centers = [
-        (int(game_map.width * fx), int(game_map.height * fy))
-        for fx, fy in ((0.15, 0.25), (0.4, 0.8), (0.7, 0.6), (0.85, 0.75), (0.55, 0.2))
-    ]
-
-    # Deer near the tree stands / water so they can graze and drink.
-    for cx, cy in stand_centers:
-        for dxy in ((-2, 0), (3, 2)):
-            _spawn_deer(game_map, cx + dxy[0], cy + dxy[1])
-
-
 def main() -> None:
     args = _parse_args()
     bootstrap_files(MAP_WIDTH, MAP_HEIGHT)
@@ -2989,7 +2382,7 @@ def main() -> None:
         options["fullscreen"] = False
 
     pygame_module = None
-    combat_sfx = _CombatSfxPlayer(None, options)
+    combat_sfx = CombatSfxPlayer(None, options)
 
     game_map = GameMap(MAP_WIDTH, MAP_HEIGHT)
     player_position = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
@@ -3015,8 +2408,8 @@ def main() -> None:
                 return
 
             if args.screenshot is None:
-                pygame_module = _start_background_music(options)
-                combat_sfx = _CombatSfxPlayer(pygame_module, options)
+                pygame_module = start_background_music(options)
+                combat_sfx = CombatSfxPlayer(pygame_module, options)
 
             rat_count = _setup_world(game_map, player_position, rat_flood=args.rat_flood)
             if args.rat_flood:
@@ -3038,6 +2431,9 @@ def main() -> None:
             esper.add_processor(NpcAiProcessor(game_map), priority=0)
             esper.add_processor(FishAiProcessor(game_map), priority=0)
             esper.add_processor(NeedsProcessor(), priority=0)
+            # Ticks registered status effects (fire, poison, ...). A no-op until an
+            # effect declares behaviour; the seam lives in content.effects.
+            esper.add_processor(EffectsProcessor(), priority=0)
             esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
             esper.add_processor(ReproductionProcessor(), priority=0)
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
@@ -3190,7 +2586,7 @@ def main() -> None:
                     # Environment features: chop a faced tree, drink from a faced
                     # well, or cook at a faced stove. Each queues a log line and
                     # refreshes the frame (a free action, like looting).
-                    player_ent = _first_player_entity()
+                    player_ent = first_player_entity()
                     if player_ent is not None:
                         # A faced blueprint ghost: haul wood into it, or raise it.
                         # Building is labour -- a successful haul/raise spends a
@@ -3266,7 +2662,7 @@ def main() -> None:
                     continue
                 esper.process(action)
     finally:
-        _stop_background_music(pygame_module)
+        stop_background_music(pygame_module)
 
 
 def run() -> None:
