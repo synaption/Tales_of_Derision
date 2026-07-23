@@ -17,32 +17,19 @@ from game_map import GameMap
 from config import DEFAULT_WORLD_SEED, MAP_HEIGHT, MAP_WIDTH
 from queries import entity_name, first_player_entity
 from worldgen import _setup_world
-# Re-exported for the turn loop below and for tests that import these from ``main``.
+# Used by the turn loop below. Tests import these helpers from ``interactions`` directly.
 from interactions import (
     _CARDINAL_ACTION_DELTAS,
     _action_from_held_keys,
-    _apply_consumable,
     _bed_near_player,
     _chop_tree,
     _cook_at_stove,
-    _craft_item,
-    _creature_at_xy,
     _creature_status_lines,
     _drink_from_well,
-    _equip_inventory_item,
     _find_adjacent_feature,
     _find_interaction_corpse,
     _find_interaction_creature,
-    _find_interaction_npc,
     _harvest_bush,
-    _infer_slot_for_item,
-    _list_trade_entries,
-    _look_available_actions,
-    _loot_item_from_corpse,
-    _place_buildable_at,
-    _player_talk,
-    _trade_item,
-    _unequip_slot,
     _work_blueprint,
 )
 from persistence import (
@@ -57,7 +44,6 @@ from rng import set_world_rng, world_rng
 from ui import (
     _capture_frame_screenshot,
     _coerce_scale,
-    _confirm,
     _confirm_if_owned_by_other,
     _draw_dialogue_menu,
     _draw_info_screen,

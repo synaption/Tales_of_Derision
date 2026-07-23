@@ -10,11 +10,15 @@ import re
 import esper
 import pytest
 
+import ai
+import interactions
 import main
+import render
 import systems
+import worldgen
 from components import Name, Position
 from game_map import GameMap
-from main import _setup_world
+from worldgen import _setup_world
 from rng import WorldRng, new_seed, set_world_rng, world_rng
 
 pytestmark = pytest.mark.unrendered
@@ -107,7 +111,7 @@ _BARE_RANDOM_CALL = re.compile(r"(?:^|[^.\w])random\.[A-Za-z_]")
 _IMPORT_RANDOM = re.compile(r"^\s*(?:import random\b|from random import)", re.MULTILINE)
 
 
-@pytest.mark.parametrize("module", [systems, main])
+@pytest.mark.parametrize("module", [systems, main, ai, render, worldgen, interactions])
 def test_no_global_random_in_sim_modules(module) -> None:
     """Simulation randomness must flow through ``rng.world_rng()``. A stray
     ``import random`` / ``random.foo`` reintroduces process-global RNG state and

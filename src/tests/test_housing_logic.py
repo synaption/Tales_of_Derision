@@ -25,7 +25,7 @@ from components import (
 )
 from game_map import GameMap
 from items import WOOD, WOOD_DOOR, WOOD_WALL, WOOD_WINDOW, craft_cost, is_placeable, placed_tile
-from main import _craft_item, _place_buildable_at
+from interactions import _craft_item, _place_buildable_at
 from systems import (
     HousingProcessor,
     NpcAiProcessor,

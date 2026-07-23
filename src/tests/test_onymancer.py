@@ -8,7 +8,7 @@ import pytest
 from components import Family, Gender, Name, Personality
 from game_map import GameMap
 from components import Position
-from main import _setup_world
+from worldgen import _setup_world
 from onymancer import Onymancer, make_onymancer
 
 pytestmark = pytest.mark.unrendered

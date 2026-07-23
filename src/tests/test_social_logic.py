@@ -30,7 +30,7 @@ from systems import (
     interaction_delta,
     spawn_speech_bubble,
 )
-from main import _player_talk
+from interactions import _player_talk
 
 pytestmark = pytest.mark.unrendered
 

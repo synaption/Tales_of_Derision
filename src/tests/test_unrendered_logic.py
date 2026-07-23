@@ -7,7 +7,8 @@ import pytest
 
 from components import Enemy, NPC, Player, Position
 from game_map import GameMap
-from main import _action_from_held_keys, _setup_world
+from interactions import _action_from_held_keys
+from worldgen import _setup_world
 from persistence import load_game, save_game
 from systems import MovementProcessor
 

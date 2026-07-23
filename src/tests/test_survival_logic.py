@@ -34,7 +34,7 @@ from items import (
     is_cooked_meat,
     is_raw_meat,
 )
-from main import (
+from interactions import (
     _apply_consumable,
     _chop_tree,
     _cook_at_stove,

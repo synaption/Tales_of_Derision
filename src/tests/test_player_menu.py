@@ -8,7 +8,7 @@ import esper
 import pytest
 
 from components import BlocksMovement, Equipment, Inventory, Name, Player, Position, Renderable
-from main import _draw_player_menu
+from ui import _draw_player_menu
 from game_map import GameMap
 from fakes import FakeRenderer
 

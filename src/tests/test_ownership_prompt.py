@@ -9,7 +9,7 @@ import pytest
 
 from components import Bed, Name, Player, Position
 from fakes import FakeRenderer
-from main import _confirm, _confirm_if_owned_by_other
+from ui import _confirm, _confirm_if_owned_by_other
 from systems import set_bed_owner
 
 pytestmark = pytest.mark.headless_renderer
