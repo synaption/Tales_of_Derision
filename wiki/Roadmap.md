@@ -34,8 +34,12 @@ Tracked in the plan; each phase keeps the test suite green.
    cross-references are unchanged. `systems.py` remains the core hub (time, sleep,
    housing, construction, social, family, needs, flora, reproduction, movement,
    combat, messages); splitting those further is optional future work.
-5. [ ] **Perf/scaling passes** — entity spatial index, verified region catch-up on
-   entry/sleep, a cProfile stress harness.
+5. [x] **Perf/scaling passes** — inlined the `distance_field` / `_compute_regions`
+   BFS hot loops (~32 → ~20 ms/turn, behaviour-identical); added
+   `scripts/profile_turns.py` (cProfile stress harness). Region catch-up on entry and
+   whole-world catch-up on sleep confirmed wired. Measurement deferred the entity
+   spatial index (pathfinding, not entity lookup, is the bottleneck) — see
+   [Performance](Performance.md).
 
 ## Next — gameplay depth
 
