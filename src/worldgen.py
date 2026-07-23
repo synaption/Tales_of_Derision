@@ -71,10 +71,42 @@ def _spawn_cave_rat(x: int, y: int, *, include_loot: bool) -> None:
     esper.create_entity(*components)
 
 
+def _nearest_walkable(game_map: GameMap, x: int, y: int) -> Position:
+    """The closest walkable (land) tile to ``(x, y)``, searched in growing rings.
+    On the classic single island the target is already land, so this is a no-op;
+    on the archipelago it nudges a spawn off a narrow water margin onto the island
+    it was meant for, so land NPCs never start stranded in the sea. Falls back to
+    the original tile if nothing walkable is found."""
+    if game_map.is_walkable(x, y):
+        return Position(x, y)
+    for radius in range(1, max(game_map.width, game_map.height)):
+        for ny in range(y - radius, y + radius + 1):
+            for nx in range(x - radius, x + radius + 1):
+                # Only the ring at this radius (Chebyshev), so nearer tiles win first.
+                if max(abs(nx - x), abs(ny - y)) != radius:
+                    continue
+                if game_map.is_walkable(nx, ny):
+                    return Position(nx, ny)
+    return Position(x, y)
+
+
 def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool = False) -> int:
     # Register all content (prefabs/kits/effects/items) before anything is spawned.
     # Idempotent, so tests that call _setup_world directly get a populated registry.
     load_all_content()
+
+    # Seat the player at the centre of the island nearest the map centre (on the
+    # archipelago the geometric centre is open water between islands). On the classic
+    # single-island / room maps there is one island and its centre is the map centre,
+    # so this reproduces the original spawn. The Position object is shared with the
+    # player entity created below, so setting it here places that entity.
+    islands = _islands_of(game_map)
+    landing = _nearest_walkable(game_map, player_position.x, player_position.y)
+    player_island = _island_containing(islands, landing.x, landing.y)
+    if player_island is None:
+        player_island = 0
+    center = _nearest_walkable(game_map, *_island_center(islands[player_island]))
+    player_position.x, player_position.y = center.x, center.y
 
     # Singleton world clock driving the day/night cycle and the night-time
     # tiredness ramp. Created before any creature so the first turn has a time.
@@ -82,10 +114,6 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     start_clock = WorldClock()
     start_clock.turn = int(start_clock.day_length * 0.2)
     esper.create_entity(start_clock)
-
-    # The onymancer names every villager procedurally, seeded off the world seed
-    # so the same seed always conjures the same starting village.
-    onymancer = make_onymancer(world_rng().int_seed("names_startup"))
 
     player_name = "You"
     player_skin = _human_skin_tone(player_name)
@@ -127,89 +155,200 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
                 rats_spawned += 1
         return rats_spawned
 
-    guard_pos = Position(max(2, player_position.x - 5), player_position.y)
-    rat_pos = Position(min(game_map.width - 3, player_position.x + 6), max(2, player_position.y - 2))
+    # Populate every island with the same starting content the lone island got: a
+    # village of two households, a goblin scout, a cave rat, and a clustered forest
+    # with roaming deer. Each island draws from its own seeded RNG streams (keyed by
+    # index) so the archipelago is reproducible yet the islands are not carbon
+    # copies. This is the scale test: ~100x the entities and AI of one island.
+    # One running set of occupied tiles threaded through every island, so placement
+    # never rescans the (fast-growing) entity table -- crucial at 100-island scale.
+    occupied: set[tuple[int, int]] = {(player_position.x, player_position.y)}
+    for idx, rect in enumerate(islands):
+        _populate_island(game_map, rect, idx, start_clock, occupied)
+
+    # The player's own island also gets the survival starter kit (well, stove, owned
+    # bed, a few trees/bushes) laid out around the player.
+    _place_player_kit(game_map, player_position, occupied)
+
+    if getattr(game_map, "has_ocean", False):
+        _spawn_ocean_life(game_map)
+
+    # Furnish the pre-built houses (bed, oven, chest, table, wardrobe, bookshelf)
+    # across every island. Residents claim these unowned houses as homes at runtime.
+    # The shared ``occupied`` set is passed through so 200 houses don't each rescan
+    # the whole (80k-entity) table.
+    for interior in game_map.find_enclosed_rooms():
+        furnish_house(game_map, interior, occupied)
+
+    return 1
+
+
+# The starting cast of one island: two households (a family of four and a couple),
+# so relationships include spouses, parents/children, and siblings from the outset.
+# Contrasting personalities keep the social AI producing both warming (++) and
+# souring (--) interactions. Each entry is (gender, traits, offset-from-island-centre,
+# age_years); parents are adults, children too young to marry until they grow up.
+_Person = tuple[str, list[str], tuple[int, int], float]
+_HOUSEHOLDS: list[tuple[_Person, _Person, list[_Person]]] = [
+    (
+        ("male", ["Cheerful", "Outgoing"], (-2, 1), 34.0),
+        ("female", ["Kind", "Shy"], (-3, 2), 31.0),
+        [
+            ("male", ["Grumpy"], (-4, 1), 9.0),
+            ("female", ["Playful", "Kind"], (-2, 3), 6.0),
+        ],
+    ),
+    (
+        ("male", ["Aloof"], (-5, 2), 28.0),
+        ("female", ["Outgoing", "Playful"], (-3, 3), 26.0),
+        [],
+    ),
+]
+
+
+def _islands_of(game_map: GameMap) -> list[tuple[int, int, int, int]]:
+    """Every island's land rect. The archipelago records these directly; a lone
+    island or plain room is treated as a one-island world (its single land rect)."""
+    islands = getattr(game_map, "islands", None)
+    if islands:
+        return list(islands)
+    return [(
+        getattr(game_map, "land_x0", 0),
+        getattr(game_map, "land_y0", 0),
+        getattr(game_map, "land_w", game_map.width),
+        getattr(game_map, "land_h", game_map.height),
+    )]
+
+
+def _island_center(rect: tuple[int, int, int, int]) -> tuple[int, int]:
+    lx, ly, lw, lh = rect
+    return (lx + lw // 2, ly + lh // 2)
+
+
+def _island_containing(
+    islands: list[tuple[int, int, int, int]], x: int, y: int
+) -> int | None:
+    """Index of the island whose land rect contains ``(x, y)``, or ``None`` if the
+    point is in open water between islands."""
+    for idx, (lx, ly, lw, lh) in enumerate(islands):
+        if lx <= x < lx + lw and ly <= y < ly + lh:
+            return idx
+    return None
+
+
+def _populate_island(
+    game_map: GameMap,
+    rect: tuple[int, int, int, int],
+    idx: int,
+    clock: WorldClock,
+    occupied: set[tuple[int, int]],
+) -> None:
+    """Spawn one island's village, lone monsters, forest, and deer -- the same
+    content the single-island world produced, offset to this island and seeded off
+    its index so each island is deterministic but distinct. ``occupied`` is the
+    shared running set of taken tiles (updated as blockers are placed)."""
+    cx, cy = _island_center(rect)
+    # The onymancer names this island's villagers; seeding by index keeps names
+    # reproducible per seed while differing island to island.
+    onymancer = make_onymancer(world_rng().int_seed(f"names_{idx}"))
+
+    def place(offset: tuple[int, int]) -> Position:
+        dx, dy = offset
+        return _nearest_walkable(game_map, cx + dx, cy + dy)
 
     def spawn_villager(pos: Position, gender: str, traits: list[str], surname: str, age_years: float) -> int:
-        # The onymancer coins the given name (flavoured by gender) and joins it to
-        # the family surname. Skin tone still seeds off the final name so it stays
-        # stable across runs. The shared villager bundle (gender, family, cook diet,
-        # resident, personality, inventory, ...) comes from ``person_kit``; the
-        # per-person pieces (name, colour, and age -- which needs the clock) are
-        # added here. Family links are wired reciprocally after the whole household
-        # is spawned.
+        # The shared villager bundle (gender, family, cook diet, resident,
+        # personality, inventory, ...) comes from ``person_kit``; name, colour, and
+        # age (which needs the clock) are added here. Family links wired below.
         _given, _surname, full = onymancer.full_name(gender, surname)
+        occupied.add((pos.x, pos.y))
         return esper.create_entity(
             pos,
             Renderable("v", fg=_human_skin_tone(full, offset=7)),
             Name(full),
-            # Born far enough in the past to be their starting age now; parents are
-            # adults, the children too young to marry or reproduce until they grow.
-            Age(born_turn_for_age(start_clock, age_years)),
+            Age(born_turn_for_age(clock, age_years)),
             *person_kit(gender=gender, traits=traits, surname=surname),
         )
 
-    def _place(offset: tuple[int, int]) -> Position:
-        dx, dy = offset
-        vx = min(game_map.width - 3, max(2, player_position.x + dx))
-        vy = min(game_map.height - 3, max(2, player_position.y + dy))
-        return Position(vx, vy)
-
-    # The starting cast forms two households (a full family of four and a couple),
-    # so relationships include spouses, parents/children, and siblings from the
-    # outset. Traits are the original contrasting personalities -- so the social AI
-    # still produces both warming (++) and souring (--) interactions -- while names,
-    # genders, ages, and family ties are new. Each entry is
-    # (gender, traits, offset, age_years): the parents are adults, the children too
-    # young to marry or reproduce until they grow up. Placement stays a
-    # deterministic loose cluster near the player.
-    Person = tuple[str, list[str], tuple[int, int], float]
-    households: list[tuple[Person, Person, list[Person]]] = [
-        (
-            ("male", ["Cheerful", "Outgoing"], (-2, 1), 34.0),
-            ("female", ["Kind", "Shy"], (-3, 2), 31.0),
-            [
-                ("male", ["Grumpy"], (-4, 1), 9.0),
-                ("female", ["Playful", "Kind"], (-2, 3), 6.0),
-            ],
-        ),
-        (
-            ("male", ["Aloof"], (-5, 2), 28.0),
-            ("female", ["Outgoing", "Playful"], (-3, 3), 26.0),
-            [],
-        ),
-    ]
-
-    for father_spec, mother_spec, child_specs in households:
+    for father_spec, mother_spec, child_specs in _HOUSEHOLDS:
         surname = onymancer.surname()
         fg, ftraits, foff, fage = father_spec
         mg, mtraits, moff, mage = mother_spec
-        father = spawn_villager(_place(foff), fg, ftraits, surname, fage)
-        mother = spawn_villager(_place(moff), mg, mtraits, surname, mage)
+        father = spawn_villager(place(foff), fg, ftraits, surname, fage)
+        mother = spawn_villager(place(moff), mg, mtraits, surname, mage)
         father_fam = esper.component_for_entity(father, Family)
         mother_fam = esper.component_for_entity(mother, Family)
         father_fam.spouse = mother
         mother_fam.spouse = father
         for cg, ctraits, coff, cage in child_specs:
-            child = spawn_villager(_place(coff), cg, ctraits, surname, cage)
+            child = spawn_villager(place(coff), cg, ctraits, surname, cage)
             child_fam = esper.component_for_entity(child, Family)
             child_fam.parents = [father, mother]
             father_fam.children.append(child)
             mother_fam.children.append(child)
 
-    spawn("goblin_scout", guard_pos.x, guard_pos.y)
-    _spawn_cave_rat(rat_pos.x, rat_pos.y, include_loot=True)
+    guard = place((-5, 0))
+    occupied.add((guard.x, guard.y))
+    spawn("goblin_scout", guard.x, guard.y)
+    rat = place((6, -2))
+    occupied.add((rat.x, rat.y))
+    _spawn_cave_rat(rat.x, rat.y, include_loot=True)
 
-    _spawn_environment_features(game_map, player_position)
-    if getattr(game_map, "has_ocean", False):
-        _spawn_ocean_life(game_map)
+    _grow_island_forest(game_map, rect, idx, occupied)
 
-    # Furnish the pre-built houses (bed, oven, chest, table, wardrobe,
-    # bookshelf). Residents claim these unowned houses as homes at runtime.
-    for interior in game_map.find_enclosed_rooms():
-        furnish_house(game_map, interior)
 
-    return 1
+def _grow_island_forest(
+    game_map: GameMap,
+    rect: tuple[int, int, int, int],
+    idx: int,
+    occupied: set[tuple[int, int]],
+) -> None:
+    """Grow one island's forest in clustered stands (~10% of its walkable land) with
+    the odd berry bush, then scatter deer near the stands. Reproducible per seed via
+    an index-keyed RNG stream. ``occupied`` is the shared running set of taken tiles."""
+    lx, ly, lw, lh = rect
+
+    def place_prefab(x: int, y: int, prefab_id: str) -> bool:
+        if not game_map.is_walkable(x, y) or (x, y) in occupied:
+            return False
+        occupied.add((x, y))
+        spawn(prefab_id, x, y)
+        return True
+
+    rng = world_rng().stream(f"worldgen_env_{idx}")
+    walkable = [
+        (x, y)
+        for y in range(ly, ly + lh)
+        for x in range(lx, lx + lw)
+        if game_map.is_walkable(x, y)
+    ]
+    tree_target = int(len(walkable) * 0.10)
+    planted = 0
+    guard = 0
+    while walkable and planted < tree_target and guard < tree_target * 50:
+        guard += 1
+        scx, scy = rng.choice(walkable)
+        radius = rng.randint(2, 6)
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if planted >= tree_target:
+                    break
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist > radius:
+                    continue
+                # Denser at the core, thinning out toward the stand's edge.
+                if rng.random() < dist / (radius + 1):
+                    continue
+                if rng.random() < 0.04:
+                    place_prefab(scx + dx, scy + dy, "berry_bush")
+                elif place_prefab(scx + dx, scy + dy, "tree"):
+                    planted += 1
+
+    # Deer near the island's stands / water so they can graze and drink.
+    for fx, fy in ((0.25, 0.3), (0.5, 0.75), (0.75, 0.5), (0.35, 0.6)):
+        dcx, dcy = lx + int(lw * fx), ly + int(lh * fy)
+        for off_x, off_y in ((-2, 0), (3, 2)):
+            _spawn_deer(game_map, dcx + off_x, dcy + off_y)
 
 
 def _spawn_ocean_life(game_map: GameMap) -> None:
@@ -240,17 +379,18 @@ def _spawn_deer(game_map: GameMap, x: int, y: int) -> None:
     spawn("deer", x, y)
 
 
-def _spawn_environment_features(game_map: GameMap, player_position: Position) -> None:
-    """Populate the world: a well and stove by the player for the survival loop,
-    tree stands and roaming deer scattered across the map, with the wildlife
-    biased toward the water so grazing/drinking is nearby."""
-    # Safety: never leave the player standing in (or walled by) a lake/river.
-    game_map.clear_water_around(player_position.x, player_position.y, radius=2)
-
-    occupied = {
-        (pos.x, pos.y)
-        for _ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
-    }
+def _place_player_kit(
+    game_map: GameMap, player_position: Position, occupied: set[tuple[int, int]]
+) -> None:
+    """Lay the survival starter kit around the player on their home island: a well
+    and stove for the survival loop, an owned bed, and a few trees/bushes within
+    reach. Anything that would land in water (a tight island edge) is simply skipped.
+    ``occupied`` is the shared running set of taken tiles."""
+    # Safety on the classic maps: never leave the player walled by a lake/river. On
+    # the archipelago the player is seated at a whole island's centre, so skip it --
+    # carving the surrounding sea would just erode that island's coastline.
+    if not getattr(game_map, "is_archipelago", False):
+        game_map.clear_water_around(player_position.x, player_position.y, radius=2)
 
     def place_prefab(x: int, y: int, prefab_id: str) -> bool:
         """Spawn a content prefab on a clear, walkable tile (never the player's)."""
@@ -278,64 +418,12 @@ def _spawn_environment_features(game_map: GameMap, player_position: Position) ->
                     set_bed_owner(bed_ent, player_ent)
                     break
 
-    def plant_tree(x: int, y: int) -> bool:
-        return place_prefab(x, y, "tree")
-
-    def plant_bush(x: int, y: int) -> bool:
-        return place_prefab(x, y, "berry_bush")
-
-    # A few starter trees within reach, plus a forest scattered across the land
-    # so both the player and grazing deer have wood/food.
+    # A few starter trees and berry bushes within reach so the player has wood/food
+    # from turn one (the island's wider forest is grown by ``_grow_island_forest``).
     for tree_dx, tree_dy in (
         (-3, -2), (-4, -2), (-3, 3), (5, 3), (6, 3),
         (-5, -2), (-4, 3), (6, 4), (-5, 2), (5, 4),
     ):
-        plant_tree(player_position.x + tree_dx, player_position.y + tree_dy)
-
-    # A couple of ripe berry bushes within reach of the player to start.
+        place_prefab(player_position.x + tree_dx, player_position.y + tree_dy, "tree")
     for bush_dx, bush_dy in ((-2, 3), (4, -2)):
-        plant_bush(player_position.x + bush_dx, player_position.y + bush_dy)
-
-    # Grow the forest in clustered stands rather than a uniform sprinkle: cover
-    # roughly 10% of the walkable land in trees while leaving open clearings
-    # between the stands so villagers can still find room to raise cabins. Each
-    # stand is a dense core that thins toward its edges, with the odd ripe berry
-    # bush mixed in for foragers. Reproducible per world seed.
-    rng = world_rng().stream("worldgen_env")
-    walkable = [
-        (x, y)
-        for y in range(game_map.land_y0, game_map.land_y0 + game_map.land_h)
-        for x in range(game_map.land_x0, game_map.land_x0 + game_map.land_w)
-        if game_map.is_walkable(x, y)
-    ]
-    tree_target = int(len(walkable) * 0.10)
-    planted = 0
-    guard = 0
-    while walkable and planted < tree_target and guard < tree_target * 50:
-        guard += 1
-        cx, cy = rng.choice(walkable)
-        radius = rng.randint(2, 6)
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
-                if planted >= tree_target:
-                    break
-                dist = (dx * dx + dy * dy) ** 0.5
-                if dist > radius:
-                    continue
-                # Denser at the core, thinning out toward the stand's edge.
-                if rng.random() < dist / (radius + 1):
-                    continue
-                if rng.random() < 0.04:
-                    plant_bush(cx + dx, cy + dy)
-                elif plant_tree(cx + dx, cy + dy):
-                    planted += 1
-
-    stand_centers = [
-        (int(game_map.width * fx), int(game_map.height * fy))
-        for fx, fy in ((0.15, 0.25), (0.4, 0.8), (0.7, 0.6), (0.85, 0.75), (0.55, 0.2))
-    ]
-
-    # Deer near the tree stands / water so they can graze and drink.
-    for cx, cy in stand_centers:
-        for dxy in ((-2, 0), (3, 2)):
-            _spawn_deer(game_map, cx + dxy[0], cy + dxy[1])
+        place_prefab(player_position.x + bush_dx, player_position.y + bush_dy, "berry_bush")

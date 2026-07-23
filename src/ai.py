@@ -57,6 +57,15 @@ class NpcAiProcessor(esper.Processor):
         self._wall_clock = wall_clock if wall_clock is not None else time.monotonic
         self.scheduler = RegionScheduler(game_map, _current_region_turn())
         self.scheduler.register("npc_ai", self._advance_region)
+        # Shore tiles bucketed by simulation region (like the resource snapshot), so
+        # a thirsty NPC scans only nearby shores, not every shore in the world -- the
+        # flat list is O(all shores) per drink and dominates at archipelago scale.
+        # Shores are static (drawn from the fixed water layout), so this is built once.
+        self._shore_by_region: dict[RegionId, list[tuple[int, int]]] = {}
+        for shore in self._shore_tiles:
+            self._shore_by_region.setdefault(
+                self.scheduler.region_at(shore[0], shore[1]), []
+            ).append(shore)
         # A world-wide, region-bucketed snapshot (occupied tiles + every goal
         # kind + every NPC), rebuilt from scratch only every
         # _WORLD_SNAPSHOT_REFRESH_CALLS advances instead of on every single
@@ -247,7 +256,12 @@ class NpcAiProcessor(esper.Processor):
         return [item for item in items if self.game_map.same_region((pos.x, pos.y), item[0])]
 
     def _seek_water(
-        self, ent: int, pos: Position, needs: Needs, occupied: dict[tuple[int, int], int]
+        self,
+        ent: int,
+        pos: Position,
+        needs: Needs,
+        occupied: dict[tuple[int, int], int],
+        shore: list[tuple[int, int]],
     ) -> bool:
         if any(self.game_map.is_water(nx, ny) for nx, ny in self.game_map.neighbors_8(pos.x, pos.y)):
             needs.thirst = max(0.0, needs.thirst - _DRINK_RESTORE)
@@ -255,9 +269,11 @@ class NpcAiProcessor(esper.Processor):
         # Drink from a shore tile we can actually stand on -- skip shores blocked
         # by a tree/creature (trees cluster by water), or the animal would fixate
         # on an unreachable spot and thrash on the bank without ever drinking.
+        # ``shore`` is already this region's local shore bucket, so the same_region
+        # filter runs over a handful of tiles, never every shore in the world.
         reachable = [
             s
-            for s in self._shore_tiles
+            for s in shore
             if s not in occupied and self.game_map.same_region((pos.x, pos.y), s)
         ]
         target = self._nearest((pos.x, pos.y), reachable)
@@ -899,6 +915,7 @@ class NpcAiProcessor(esper.Processor):
         stoves = self._region_bucket(snapshot["stoves"], region_id, xy_of_pair)
         bushes = self._region_bucket(snapshot["bushes"], region_id, xy_of_pair)
         sentients = self._region_bucket(snapshot["sentients"], region_id, xy_of_pos)
+        shore = self._region_bucket(self._shore_by_region, region_id, lambda s: s)
 
         # NPCs acting this turn are exactly this region's own bucket (no
         # margin) -- a border-straddling NPC must belong to exactly one
@@ -941,7 +958,7 @@ class NpcAiProcessor(esper.Processor):
                     self._take_turn(
                         ent, pos, occupied, player_xy, diet_buckets=(
                             trees, prey, corpses, stoves, bushes, sentients
-                        ), logical_turn=logical_turn, clock=clock,
+                        ), shore=shore, logical_turn=logical_turn, clock=clock,
                     )
                     actor.energy -= cost
                     acted += 1
@@ -959,6 +976,7 @@ class NpcAiProcessor(esper.Processor):
         occupied: dict[tuple[int, int], int],
         player_xy: tuple[int, int] | None,
         diet_buckets: tuple,
+        shore: list[tuple[int, int]],
         logical_turn: int,
         clock: "WorldClock | None",
     ) -> None:
@@ -981,7 +999,7 @@ class NpcAiProcessor(esper.Processor):
                 acted = self._seek_sleep(ent, pos, needs, occupied)
             # Thirst wins ties -- a parched animal drinks before it eats.
             elif needs.thirst >= _FORAGE_THRESHOLD and needs.thirst >= needs.hunger:
-                acted = self._seek_water(ent, pos, needs, occupied)
+                acted = self._seek_water(ent, pos, needs, occupied, shore)
             elif needs.hunger >= _FORAGE_THRESHOLD:
                 # Eat prepared food already carried; otherwise forage by diet.
                 if self._eat_from_inventory(ent, needs):

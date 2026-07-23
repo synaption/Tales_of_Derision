@@ -14,7 +14,7 @@ import esper
 from action import BASE_ACTION_COST
 from components import Bed, BerryBush, Blueprint, Chest, Friendly, Player, Position, Stove, Tree, Well
 from game_map import GameMap
-from config import DEFAULT_WORLD_SEED, MAP_HEIGHT, MAP_WIDTH
+from config import DEFAULT_WORLD_SEED, MAP_HEIGHT, MAP_WIDTH, WORLD_LAYOUT
 from queries import entity_name, first_player_entity
 from worldgen import _setup_world
 # Used by the turn loop below. Tests import these helpers from ``interactions`` directly.
@@ -187,7 +187,7 @@ def main() -> None:
     pygame_module = None
     combat_sfx = CombatSfxPlayer(None, options)
 
-    game_map = GameMap(MAP_WIDTH, MAP_HEIGHT)
+    game_map = GameMap(MAP_WIDTH, MAP_HEIGHT, layout=WORLD_LAYOUT)
     player_position = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
     startup_save_file = args.save_file
     if args.screenshot is not None and startup_save_file is None:

@@ -21,7 +21,7 @@ from components import (
     Asleep, Corpse, Dialogue, Equipment, Inventory, Needs, Personality, Player,
     Position,
 )
-from config import MAP_HEIGHT, MAP_WIDTH
+from config import MAP_HEIGHT, MAP_WIDTH, WORLD_LAYOUT
 from game_map import GameMap
 from items import WOOD, craft_cost, default_equipment_slots, is_placeable
 from persistence import DEFAULT_SAVE_FILE, load_game, save_game, save_options
@@ -453,6 +453,7 @@ def _run_startup_flow(
             selected_save_file,
             MAP_WIDTH,
             MAP_HEIGHT,
+            WORLD_LAYOUT,
         )
         return (True, loaded_map, loaded_player_position, selected_save_file)
 
@@ -467,6 +468,7 @@ def _run_startup_flow(
             DEFAULT_SAVE_FILE,
             MAP_WIDTH,
             MAP_HEIGHT,
+            WORLD_LAYOUT,
         )
         return (True, loaded_map, loaded_player_position, selected_save_file)
     if menu_choice == "new_game":

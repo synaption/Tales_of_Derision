@@ -111,7 +111,11 @@ def save_game(
     seed: int | None = None,
 ) -> None:
     save_data = {
-        "map": {"width": game_map.width, "height": game_map.height},
+        "map": {
+            "width": game_map.width,
+            "height": game_map.height,
+            "layout": getattr(game_map, "layout", "auto"),
+        },
         "player": {"x": player_pos.x, "y": player_pos.y},
     }
     # The world regenerates from its seed each session, so storing the seed makes
@@ -137,9 +141,14 @@ def load_seed(save_file: Path) -> int | None:
     return int(seed) if isinstance(seed, int) else None
 
 
-def load_game(save_file: Path, fallback_width: int, fallback_height: int) -> tuple[GameMap, Position]:
+def load_game(
+    save_file: Path,
+    fallback_width: int,
+    fallback_height: int,
+    fallback_layout: str = "auto",
+) -> tuple[GameMap, Position]:
     if not save_file.exists():
-        game_map = GameMap(fallback_width, fallback_height)
+        game_map = GameMap(fallback_width, fallback_height, layout=fallback_layout)
         return game_map, Position(fallback_width // 2, fallback_height // 2)
 
     with save_file.open("r", encoding="utf-8") as file:
@@ -150,7 +159,11 @@ def load_game(save_file: Path, fallback_width: int, fallback_height: int) -> tup
 
     width = int(map_data.get("width", fallback_width))
     height = int(map_data.get("height", fallback_height))
-    game_map = GameMap(width, height)
+    # A saved layout wins; older saves predate the field and were always the classic
+    # auto world (single island / room), so they must reconstruct as "auto" -- not
+    # the caller's current default, which could be a differently sized archipelago.
+    layout = str(map_data.get("layout", "auto"))
+    game_map = GameMap(width, height, layout=layout)
 
     px = int(player_data.get("x", width // 2))
     py = int(player_data.get("y", height // 2))

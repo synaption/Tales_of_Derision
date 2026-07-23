@@ -2,13 +2,15 @@
 else) can import them without importing each other."""
 from __future__ import annotations
 
-from game_map import LAND_HEIGHT, LAND_WIDTH
+from game_map import ARCHIPELAGO_HEIGHT, ARCHIPELAGO_WIDTH
 
-# The world is a 3x3 grid of 120x60 sections: the habitable island sits in the
-# centre section, ringed by coastline, and the surrounding eight sections are open
-# ocean full of fish and seaweed. The land itself is the classic 120x60 world.
-MAP_WIDTH = LAND_WIDTH * 3
-MAP_HEIGHT = LAND_HEIGHT * 3
+# Scale-test world: an archipelago of 100 copies of the classic 120x60 island
+# (10x10 grid), each with its own coastline, houses, lakes/river, village and
+# wildlife, all in open sea with no wall border. Swap WORLD_LAYOUT back to "auto"
+# for the original single-island 360x180 world. See ``GameMap`` layout="islands".
+MAP_WIDTH = ARCHIPELAGO_WIDTH
+MAP_HEIGHT = ARCHIPELAGO_HEIGHT
+WORLD_LAYOUT = "islands"
 
 # Fixed world seed for a new game with no --seed, so every new game regenerates the
 # same world for now. (Swap to rng.new_seed() for randomized worlds.)

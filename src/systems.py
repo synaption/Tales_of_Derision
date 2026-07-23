@@ -406,8 +406,14 @@ _BOOKSHELF_RED = (150, 92, 70)
 
 
 def houses_for(game_map: GameMap, cache: dict) -> list[frozenset[tuple[int, int]]]:
-    """Enclosed house interiors, recomputed only when the map has changed since
-    the cache was filled. ``cache`` is any dict the caller keeps around."""
+    """Enclosed house interiors. Delegates to ``GameMap.enclosed_rooms``, which
+    caches per island and rebuilds only the island(s) edited since the last call --
+    so this stays cheap even on the 100-island world. ``cache`` is accepted for
+    backward compatibility but no longer needed (the map owns the cache now)."""
+    enclosed = getattr(game_map, "enclosed_rooms", None)
+    if callable(enclosed):
+        return enclosed()
+    # Fallback for a map object without the cached API (older test doubles).
     revision = getattr(game_map, "revision", 0)
     if cache.get("revision") != revision:
         cache["revision"] = revision
@@ -415,7 +421,25 @@ def houses_for(game_map: GameMap, cache: dict) -> list[frozenset[tuple[int, int]
     return cache["houses"]
 
 
-def _bed_in_interior(interior: frozenset[tuple[int, int]]) -> int | None:
+def beds_by_position() -> dict[tuple[int, int], int]:
+    """Map every bed's tile to its entity. Build once per turn and reuse for many
+    ``_bed_in_interior`` lookups, rather than rescanning all beds per house."""
+    return {(pos.x, pos.y): ent for ent, (pos, _bed) in esper.get_components(Position, Bed)}
+
+
+def _bed_in_interior(
+    interior: frozenset[tuple[int, int]],
+    beds_by_pos: dict[tuple[int, int], int] | None = None,
+) -> int | None:
+    """The bed entity inside ``interior``, or ``None``. Pass ``beds_by_pos`` (from
+    ``beds_by_position``) to look up the room's own tiles -- O(room) -- instead of
+    scanning every bed in the world."""
+    if beds_by_pos is not None:
+        for tile in interior:
+            ent = beds_by_pos.get(tile)
+            if ent is not None:
+                return ent
+        return None
     for ent, (pos, _bed) in esper.get_components(Position, Bed):
         if (pos.x, pos.y) in interior:
             return ent
@@ -500,25 +524,36 @@ def _interior_reachable(
     return seen
 
 
-def furnish_house(game_map: GameMap, interior: frozenset[tuple[int, int]]) -> tuple[int, int] | None:
+def furnish_house(
+    game_map: GameMap,
+    interior: frozenset[tuple[int, int]],
+    occupied: set[tuple[int, int]] | None = None,
+) -> tuple[int, int] | None:
     """Populate a house interior with a bed, oven, chest, table, wardrobe, and
     bookshelf on distinct floor tiles, keeping the doorway clear. Returns the bed
     tile (a resident's sleep spot) or ``None`` if the room was too small.
 
     Blocking furniture is only placed where it keeps the whole interior -- the bed
     especially -- reachable from the door, so a resident can always walk in and
-    lie down (never sealed behind its own furniture)."""
+    lie down (never sealed behind its own furniture).
+
+    ``occupied`` may be a shared, caller-maintained set of taken tiles (furnishing
+    updates it in place as it drops furniture). When omitted it is built here from a
+    scan of blocking/bed entities -- fine for a one-off house, but a bulk caller
+    (e.g. furnishing every island of the archipelago) should pass one shared set to
+    avoid rescanning the whole entity table per house."""
     interior_set = set(interior)
     door_adjacent: set[tuple[int, int]] = set()
     for (x, y) in interior:
         if any(game_map.tile_at(nx, ny) == game_map.DOOR for nx, ny in game_map.neighbors_4(x, y)):
             door_adjacent.add((x, y))
 
-    occupied = {
-        (pos.x, pos.y)
-        for _ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
-    }
-    occupied |= {(pos.x, pos.y) for _ent, (pos, _bed) in esper.get_components(Position, Bed)}
+    if occupied is None:
+        occupied = {
+            (pos.x, pos.y)
+            for _ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
+        }
+        occupied |= {(pos.x, pos.y) for _ent, (pos, _bed) in esper.get_components(Position, Bed)}
 
     def door_distance(tile: tuple[int, int]) -> int:
         if not door_adjacent:
@@ -1478,13 +1513,25 @@ class HousingProcessor(esper.Processor):
             return
         houses = houses_for(self.game_map, self._cache)
         sites = [(e, comp) for e, (comp,) in esper.get_components(ConstructionSite)]
+        # Compute the unowned houses ONCE per turn (interior + bed tile), rather than
+        # having every homeless resident rescan every house. Each resident then just
+        # picks the nearest reachable one and pops it from this shared list, so the
+        # whole housing pass is O(houses + residents), not O(houses x residents).
+        beds_by_pos = beds_by_position()
+        unowned_houses: list[tuple[frozenset[tuple[int, int]], tuple[int, int]]] = []
+        for interior in houses:
+            bed_ent = _bed_in_interior(interior, beds_by_pos)
+            if bed_ent is None or bed_owner(bed_ent) is not None:
+                continue  # no bed, or already someone's house
+            bed_pos = esper.component_for_entity(bed_ent, Position)
+            unowned_houses.append((interior, (bed_pos.x, bed_pos.y)))
 
         for ent, (_res,) in list(esper.get_components(Resident)):
             if owned_bed_of(ent) is not None:
                 continue  # already owns a house -- never re-claim or rebuild
             if self._handle_spouse_housing(ent):
                 continue  # married couples settle into one shared home
-            if self._claim_unowned_house(ent, houses):
+            if self._claim_unowned_house(ent, unowned_houses):
                 continue
             self._ensure_site_for(ent, sites)
 
@@ -1512,21 +1559,20 @@ class HousingProcessor(esper.Processor):
         # other waits and moves in once its partner has a home.
         return ent > spouse
 
-    def _claim_unowned_house(self, ent: int, houses: list[frozenset[tuple[int, int]]]) -> bool:
-        pos = esper.component_for_entity(ent, Position) if esper.has_component(ent, Position) else None
-        candidates: list[tuple[frozenset[tuple[int, int]], tuple[int, int]]] = []
-        for interior in houses:
-            bed_ent = _bed_in_interior(interior)
-            if bed_ent is None or bed_owner(bed_ent) is not None:
-                continue  # no bed, or already someone's house
-            bed_pos = esper.component_for_entity(bed_ent, Position)
-            candidates.append((interior, (bed_pos.x, bed_pos.y)))
-        if not candidates:
+    def _claim_unowned_house(
+        self,
+        ent: int,
+        unowned_houses: list[tuple[frozenset[tuple[int, int]], tuple[int, int]]],
+    ) -> bool:
+        """Claim the nearest reachable unowned house for ``ent``, removing it from
+        the shared ``unowned_houses`` list so no one else claims it this turn."""
+        if not unowned_houses:
             return False
+        pos = esper.component_for_entity(ent, Position) if esper.has_component(ent, Position) else None
         if pos is not None:
-            candidates.sort(key=lambda c: _chebyshev((pos.x, pos.y), c[1]))
+            unowned_houses.sort(key=lambda c: _chebyshev((pos.x, pos.y), c[1]))
 
-        for interior, bed_xy in candidates:
+        for index, (interior, bed_xy) in enumerate(unowned_houses):
             # Only claim a house the villager can actually walk to -- otherwise it
             # would strand itself commuting to a home across water/walls and never
             # get back to foraging. If none are reachable, it builds one instead.
@@ -1538,6 +1584,7 @@ class HousingProcessor(esper.Processor):
                 home.x, home.y = bed_xy
             else:
                 esper.add_component(ent, Home(bed_xy[0], bed_xy[1]))
+            unowned_houses.pop(index)  # taken -- keep other settlers off it
             return True
         return False
 
@@ -1614,9 +1661,11 @@ class TreeGrowthProcessor(esper.Processor):
         self._rng = rng if rng is not None else world_rng().stream("flora").random
         # Flora fills the land, so its soft cap scales to the land area (not the
         # whole map -- otherwise the ocean's tiles would inflate the tree budget).
-        land_area = getattr(game_map, "land_w", game_map.width) * getattr(
-            game_map, "land_h", game_map.height
-        )
+        # ``land_area`` is the whole world's land (the sum over every island on the
+        # archipelago); fall back to the single land rect, then the map size.
+        land_area = getattr(game_map, "land_area", None) or getattr(
+            game_map, "land_w", game_map.width
+        ) * getattr(game_map, "land_h", game_map.height)
         self._cap = max(40, land_area * 3 // 10)
         # Seaweed fills the open sea; its cap scales to the ocean area.
         ocean_area = max(0, (game_map.width * game_map.height) - land_area)
@@ -1697,7 +1746,7 @@ class TreeGrowthProcessor(esper.Processor):
         revision = getattr(self.game_map, "revision", 0)
         if self._ground_cache.get("revision") != revision:
             interiors: set[tuple[int, int]] = set()
-            for interior in self.game_map.find_enclosed_rooms():
+            for interior in self.game_map.enclosed_rooms():
                 interiors |= interior
             tiles = [
                 (x, y)

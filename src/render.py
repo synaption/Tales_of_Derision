@@ -454,6 +454,27 @@ class RenderProcessor(esper.Processor):
             glyph, classification, fg, bg = appearance
             self._draw_memory_glyph(r, vx, vy, glyph, classification, fg, bg)
 
+    # SDL's common maximum texture dimension. A cached world surface wider or taller
+    # than this can't live on the GPU and, as a software surface, balloons into
+    # gigabytes (a 1400x800 world at 24px/cell is 33600x19200 ~ 2.6 GB), so past this
+    # we skip the whole-map cache and draw the viewport per tile instead.
+    _MAX_WORLD_SURFACE_PX = 16384
+
+    def _world_surface_too_large(self, r) -> bool:
+        """True when a whole-map cached surface would exceed the safe texture size,
+        so ``_render_map_layer`` should fall back to per-viewport tile drawing."""
+        get_cell = getattr(r, "get_tile_cell_size_px", None)
+        cell_w = cell_h = 24
+        if callable(get_cell):
+            try:
+                cell_w, cell_h = get_cell()
+            except Exception:
+                pass
+        return (
+            self.game_map.width * cell_w > self._MAX_WORLD_SURFACE_PX
+            or self.game_map.height * cell_h > self._MAX_WORLD_SURFACE_PX
+        )
+
     def _render_map_layer(self, r, draw_autotile_variant) -> None:
         """Draw the map for the current FOV. When the renderer supports a cached
         map surface, a step becomes one region blit + a few shadow fills instead
@@ -464,14 +485,18 @@ class RenderProcessor(esper.Processor):
         fill_cell_bg = getattr(r, "fill_cell_bg", None)
         can_composite = all(
             callable(fn) for fn in (has_map_surface, build_map_surface, blit_map_region, fill_cell_bg)
-        )
+        ) and not self._world_surface_too_large(r)
 
         ox, oy = self._view_origin_x, self._view_origin_y
 
         if not can_composite:
-            # Fallback (e.g. test double renderer): per-tile draw. Lit tiles show
-            # in full colour; explored-but-unseen tiles are drawn from memory
-            # (desaturated terrain + last-seen scenery).
+            # Fallback: per-tile draw of just the viewport. Used by the test double
+            # renderer, and by worlds too large to cache as one surface (the
+            # archipelago) -- the whole-map surface is only a walking-speed cache, so
+            # dropping it just costs a few extra per-tile draws inside the FOV each
+            # frame, never a giant off-screen allocation. Lit tiles show in full
+            # colour; explored-but-unseen tiles are drawn from memory (desaturated
+            # terrain + last-seen scenery).
             for vy in range(self._view_height):
                 wy = oy + vy
                 for vx in range(self._view_width):
