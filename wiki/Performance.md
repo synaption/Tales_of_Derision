@@ -39,10 +39,31 @@ assume walls don't change mid-session).
 ## Simulation budget (per turn)
 
 The lever is the synchronous per-turn `esper.process()` spike. **Profile the real
-workload, not intuition** — a cProfile of a cross-region walk with a `FakeRenderer`
+workload, not intuition** — a cProfile of a cross-region walk with a headless renderer
 (so the map-surface build doesn't mask sim cost) is the trustworthy signal.
 Whole-turn A/B timings are confounded because A*'s tie-break changes NPC routes and
 the two runs diverge; trust divergence-proof metrics (per-call time, node counts).
+
+Run the harness: `python3 scripts/profile_turns.py [turns] [--flood] [--render]`. It
+builds the real 360×180 world and walks the player across section seams under
+cProfile, sim-only by default. `--flood` spawns a cave rat on every walkable tile
+(thousands of NPCs) for the scaling worst case.
+
+Representative results (200 turns, ~2300 entities): **~20 ms/turn**, with cost spread
+across `distance_field` (flow-field builds), `_compute_regions` / `find_enclosed_rooms`
+(recomputed when the living world edits a tile and bumps `revision`), and the AI's
+per-region bucket rebuild (`_region_bucket`). The flood case (~6500 NPCs) is
+pathfinding-bound: `distance_field` + the AI chase/step loop dominate.
+
+**Measured, not guessed:** an entity spatial index (per-tile buckets to replace the
+O(n) `get_components(Position)` scans) was on the roadmap, but the profile shows those
+scans are *not* the bottleneck — pathfinding is. So it isn't warranted yet. The next
+real lever is the AI's flow-field reuse (share one `distance_field` toward the player
+across all chasers in a region per turn), not entity lookup.
+
+The BFS hot loops (`distance_field`, `_compute_regions`) inline their neighbour/bounds/
+walkability tests the same way `find_path` does — that alone cut the normal case from
+~32 to ~20 ms/turn with identical behaviour.
 
 What has actually dominated, and the fixes already in place:
 - **Build-site search** (`choose_build_site` / `_site_is_clear`) once cost 53–75% of
@@ -60,13 +81,19 @@ Remaining per-turn cost is spread thin (no single dominant): per-region bucket r
 (`region_bounds`/`region_grid_size`/`in_region_with_margin`, called ~1.25M times over
 300 turns). These are the next levers.
 
-## Scaling levers on the roadmap
+## Scaling levers (in profile-justified order)
 
-- **Entity spatial index** — replace the O(n) `esper.get_components(Position)` scans in
-  targeting/interaction/AI-occupancy with per-tile / per-region entity buckets. The
-  biggest lever for thousands of NPCs.
+- **AI flow-field reuse** — the top lever for thousands of NPCs: `distance_field`
+  builds dominate, so share one field toward a common goal (the player) across all
+  chasers in a region per turn instead of rebuilding per creature.
+- **Incremental region relabelling** — `_compute_regions` / `find_enclosed_rooms`
+  recompute the whole map whenever a single tile edit bumps `revision`; relabel only
+  the affected component instead.
 - **Scheduler heap** — `next_actor()`'s O(n) scan → a heap (the interface already
   anticipates it; see [Action Economy](Action-Economy.md)).
+- **Entity spatial index** — per-tile buckets for `get_components(Position)` scans.
+  *Deferred:* the profile shows these scans are not the bottleneck (pathfinding is);
+  revisit only if a measurement says otherwise.
 - **Everything in memory at startup** — sounds, tiles, state (per `next.md`).
 
 See [Roadmap](Roadmap.md) for sequencing.

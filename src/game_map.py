@@ -273,17 +273,34 @@ class GameMap:
         many turns and many travellers: from any current position, stepping to
         the neighbour with the smallest value here always makes progress
         toward ``goal``, without a fresh pathfind."""
-        if not self.in_bounds(goal[0], goal[1]) or not self.is_walkable(goal[0], goal[1]):
+        gx, gy = goal
+        width, height, tiles = self.width, self.height, self.tiles
+        WALL, WATER, WINDOW = self.WALL, self.WATER, self.WINDOW
+        if not (0 <= gx < width and 0 <= gy < height):
             return {}
+        if tiles[gy][gx] == WALL or tiles[gy][gx] == WATER or tiles[gy][gx] == WINDOW:
+            return {}
+        # The neighbour scan, bounds test and walkability test are inlined (rather
+        # than going through neighbors_8/is_walkable) because this is a hot BFS loop
+        # -- it avoids building a fresh candidate list and two method calls per tile.
         distances: dict[tuple[int, int], int] = {goal: 0}
         queue: deque[tuple[int, int]] = deque([goal])
         while queue:
-            current = queue.popleft()
-            d = distances[current]
-            for nxt in self.neighbors_8(current[0], current[1]):
-                if nxt in distances or not self.is_walkable(nxt[0], nxt[1]):
+            cx, cy = queue.popleft()
+            nd = distances[(cx, cy)] + 1
+            for nx, ny in (
+                (cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1),
+                (cx + 1, cy + 1), (cx + 1, cy - 1), (cx - 1, cy + 1), (cx - 1, cy - 1),
+            ):
+                if not (0 <= nx < width and 0 <= ny < height):
                     continue
-                distances[nxt] = d + 1
+                t = tiles[ny][nx]
+                if t == WALL or t == WATER or t == WINDOW:
+                    continue
+                nxt = (nx, ny)
+                if nxt in distances:
+                    continue
+                distances[nxt] = nd
                 queue.append(nxt)
         return distances
 
@@ -300,21 +317,36 @@ class GameMap:
         matching ``find_path``). Tiles separated by water/walls/windows land in
         different regions, so two tiles share a region iff a walking path exists
         between them (ignoring transient entity blockers)."""
+        width, height, tiles = self.width, self.height, self.tiles
+        WALL, WATER, WINDOW = self.WALL, self.WATER, self.WINDOW
+
+        def _blocked(tx: int, ty: int) -> bool:
+            t = tiles[ty][tx]
+            return t == WALL or t == WATER or t == WINDOW
+
         regions: dict[tuple[int, int], int] = {}
         region_id = 0
-        for y in range(self.height):
-            for x in range(self.width):
-                if (x, y) in regions or not self.is_walkable(x, y):
+        for y in range(height):
+            for x in range(width):
+                if (x, y) in regions or _blocked(x, y):
                     continue
                 region_id += 1
                 queue: deque[tuple[int, int]] = deque([(x, y)])
                 regions[(x, y)] = region_id
+                # Inlined neighbour/walkability scan (hot flood-fill); mirrors
+                # find_path / distance_field for the same reason.
                 while queue:
                     cx, cy = queue.popleft()
-                    for nx, ny in self.neighbors_8(cx, cy):
-                        if (nx, ny) not in regions and self.is_walkable(nx, ny):
-                            regions[(nx, ny)] = region_id
-                            queue.append((nx, ny))
+                    for nx, ny in (
+                        (cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1),
+                        (cx + 1, cy + 1), (cx + 1, cy - 1), (cx - 1, cy + 1), (cx - 1, cy - 1),
+                    ):
+                        if not (0 <= nx < width and 0 <= ny < height):
+                            continue
+                        if (nx, ny) in regions or _blocked(nx, ny):
+                            continue
+                        regions[(nx, ny)] = region_id
+                        queue.append((nx, ny))
         return regions
 
     def region_of(self, x: int, y: int) -> int | None:
