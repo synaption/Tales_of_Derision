@@ -9,5 +9,7 @@ change name to Seeds of Derision?
 
 make sure people don't get stuck.  
 
-can tcod help?
-- pathfinding?
+better pathfinding, better fov (not tcod)
+
+Everything takes a certain amount of time.  
+

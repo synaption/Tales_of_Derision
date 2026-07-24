@@ -114,6 +114,15 @@ class NpcAiProcessor(esper.Processor):
         # is rebuilt (the halves hold live refs -- occupied is mutated in place, NPC
         # positions are live -- so the cached merge stays correct between rebuilds).
         self._merged_snapshot: dict[str, dict] | None = None
+        # Bumped every time the merged snapshot is rebuilt. Keys the widened
+        # per-region bucket cache below: a catch-up burst replays one region many
+        # turns in a row against the same snapshot, and re-running the (up to
+        # 9-bucket, margin-filtered) widening every replayed turn was the dominant
+        # catch-up cost. region_id -> (generation, the 7 widened item lists).
+        self._snapshot_generation = 0
+        self._region_bucket_cache: dict[
+            RegionId, tuple[int, tuple[list, ...]]
+        ] = {}
         # goal xy -> (region edit revision near goal, world edit revision, calls
         # left before a routine refresh, the flow field itself). Shared across
         # every NPC heading to the same goal, not per-entity -- a distance field
@@ -991,6 +1000,8 @@ class NpcAiProcessor(esper.Processor):
             self._world_snapshot_calls_left -= 1
         if rebuilt or self._merged_snapshot is None:
             self._merged_snapshot = {**self._static_snapshot, **self._world_snapshot}
+            # New bucket dicts -> every cached widening is stale.
+            self._snapshot_generation += 1
         return self._merged_snapshot
 
     def _region_bucket(
@@ -1013,6 +1024,35 @@ class NpcAiProcessor(esper.Processor):
                     if in_region_with_margin(game_map, region_id, x, y, margin):
                         items.append(item)
         return items
+
+    def _widened_buckets(
+        self, snapshot: dict[str, dict], region_id: RegionId
+    ) -> tuple[list, list, list, list, list, list, list]:
+        """The seven margin-widened per-region item lists (trees, prey, corpses,
+        stoves, bushes, sentients, shore), memoised per snapshot generation.
+
+        Every list is a pure function of its underlying (per-generation immutable)
+        bucket dict plus ``region_id`` -- the item lists are read-only targets, and
+        the sentient/NPC live positions they carry already tolerate snapshot-window
+        staleness by design -- so within one snapshot generation the widening is
+        identical for a region. A catch-up burst replays a region many turns
+        against the same snapshot, so caching collapses those N widenings to one."""
+        cached = self._region_bucket_cache.get(region_id)
+        if cached is not None and cached[0] == self._snapshot_generation:
+            return cached[1]
+        xy_of_pair = lambda item: item[0]  # noqa: E731 -- ((x, y), ent) items
+        xy_of_pos = lambda item: (item[1].x, item[1].y)  # noqa: E731 -- (ent, Position)
+        widened = (
+            self._region_bucket(snapshot["trees"], region_id, xy_of_pair),
+            self._region_bucket(snapshot["prey"], region_id, xy_of_pair),
+            self._region_bucket(snapshot["corpses"], region_id, xy_of_pair),
+            self._region_bucket(snapshot["stoves"], region_id, xy_of_pair),
+            self._region_bucket(snapshot["bushes"], region_id, xy_of_pair),
+            self._region_bucket(snapshot["sentients"], region_id, xy_of_pos),
+            self._region_bucket(self._shore_by_region, region_id, lambda s: s),
+        )
+        self._region_bucket_cache[region_id] = (self._snapshot_generation, widened)
+        return widened
 
     def _advance_region(self, region_id: RegionId) -> None:
         """Run one turn of NPC AI for the NPCs standing in ``region_id``,
@@ -1041,16 +1081,9 @@ class NpcAiProcessor(esper.Processor):
         # Per-NPC full-vs-cached-path movement keys off distance to this tile.
         self._player_xy = player_xy
 
-        xy_of_pair = lambda item: item[0]  # noqa: E731 -- ((x, y), ent) items
-        xy_of_pos = lambda item: (item[1].x, item[1].y)  # noqa: E731 -- (ent, Position) items
-
-        trees = self._region_bucket(snapshot["trees"], region_id, xy_of_pair)
-        prey = self._region_bucket(snapshot["prey"], region_id, xy_of_pair)
-        corpses = self._region_bucket(snapshot["corpses"], region_id, xy_of_pair)
-        stoves = self._region_bucket(snapshot["stoves"], region_id, xy_of_pair)
-        bushes = self._region_bucket(snapshot["bushes"], region_id, xy_of_pair)
-        sentients = self._region_bucket(snapshot["sentients"], region_id, xy_of_pos)
-        shore = self._region_bucket(self._shore_by_region, region_id, lambda s: s)
+        trees, prey, corpses, stoves, bushes, sentients, shore = self._widened_buckets(
+            snapshot, region_id
+        )
 
         # NPCs acting this turn are exactly this region's own bucket (no
         # margin) -- a border-straddling NPC must belong to exactly one
@@ -1179,10 +1212,12 @@ class NpcAiProcessor(esper.Processor):
         if action not in _TURN_ACTIONS:
             return
 
-        # A recycled entity id must never inherit a previous world's cached route.
+        # A recycled entity id must never inherit a previous world's cached route
+        # or widened buckets (both hold entity ids / live Position refs).
         world = esper.current_world
         if world != self._trip_cache_world:
             self._trip_cache.clear()
+            self._region_bucket_cache.clear()
             self._trip_cache_world = world
 
         player_xy = self._find_player_position()
