@@ -124,14 +124,19 @@ class NpcAiProcessor(esper.Processor):
         self._region_bucket_cache: dict[
             RegionId, tuple[int, tuple[list, ...]]
         ] = {}
-        # goal xy -> (region edit revision near goal, world edit revision, calls
-        # left before a routine refresh, the flow field itself). Shared across
-        # every NPC heading to the same goal, not per-entity -- a distance field
+        # goal xy -> (connectivity revision key, the flow field itself). Shared
+        # across every NPC heading to the same goal, not per-entity -- a distance field
         # rooted at a (largely static) goal stays valid for any traveller
         # approaching it from anywhere, so many NPCs reuse the one flood.
         self._field_cache: dict[
-            tuple[int, int], tuple[int, int, int, dict[tuple[int, int], int]]
+            tuple[int, int], tuple[tuple[int | None, int], dict[tuple[int, int], int]]
         ] = {}
+        # Per-map-revision memo for walkable connected-region ids. Many drives
+        # filter dozens of local resource candidates with same-region checks;
+        # caching the labels for each tile turns those scans into dict lookups
+        # and avoids repeatedly touching GameMap's island flood-fill cache.
+        self._region_of_cache_revision = -1
+        self._region_of_cache: dict[tuple[int, int], int | None] = {}
         # ent -> the tile it stood on at the start of its previous turn. Used to
         # forbid an immediate one-tile reversal (see ``_advance_region``), which
         # is the only way an NPC ends up flip-flopping between two tiles forever.
@@ -170,44 +175,21 @@ class NpcAiProcessor(esper.Processor):
     def _distance_field_for(self, goal: tuple[int, int]) -> dict[tuple[int, int], int]:
         """A cached flow field to ``goal`` (see ``GameMap.distance_field``).
 
-        ``distance_field`` is a pure function of the goal and the (static-per-
-        turn) tile grid, so a cached field is valid exactly as long as no tile
-        it could cover has changed. Two revisions gate reuse:
-
-        * **World edit revision** (``GameMap.revision``, bumped on *any* tile
-          edit anywhere). If it hasn't moved since the field was built, nothing
-          in the world changed, so the field is provably identical -- reuse it
-          indefinitely, no rebuild. This is the dominant case: during a
-          catch-up burst the player stands still and NPCs edit no tiles, so one
-          flood toward the player serves every chaser across the whole burst
-          instead of being rebuilt dozens of times.
-        * **Region edit revision** near the goal. When the world *has* been
-          edited somewhere, the field spans more than the goal's own region
-          cell, so a per-cell revision can't prove the edit missed it. We then
-          fall back to a bounded-staleness reuse (``calls_left`` refreshes)
-          exactly as before -- no regression for the living, self-editing world.
+        ``distance_field`` is a pure function of the goal and the walkable
+        connected component that contains it. The archipelago's components never
+        cross the water between islands, so an edit on another island cannot
+        affect this field. Cache by ``GameMap.connectivity_revision`` instead of
+        the global map revision to avoid rebuilding every flow field whenever an
+        unrelated off-screen villager raises a wall.
         """
-        region_revision = self.game_map.region_edit_revision(goal[0], goal[1])
-        world_revision = self.game_map.revision
+        connectivity_rev = self.game_map.connectivity_revision(goal[0], goal[1])
         cached = self._field_cache.get(goal)
         if cached is not None:
-            cached_region_rev, cached_world_rev, calls_left, field = cached
-            if cached_region_rev == region_revision:
-                if cached_world_rev == world_revision:
-                    # No tile anywhere edited since the build -> byte-identical.
-                    return field
-                if calls_left > 0:
-                    # Edited somewhere, but not in the goal's cell we can see;
-                    # reuse under the staleness bound (keep the old world rev so
-                    # the countdown still eventually rebuilds to pick it up).
-                    self._field_cache[goal] = (
-                        cached_region_rev, cached_world_rev, calls_left - 1, field
-                    )
-                    return field
+            cached_rev, field = cached
+            if cached_rev == connectivity_rev:
+                return field
         field = self.game_map.distance_field(goal)
-        self._field_cache[goal] = (
-            region_revision, world_revision, _PATH_FIELD_REFRESH_CALLS, field
-        )
+        self._field_cache[goal] = (connectivity_rev, field)
         return field
 
     def _greedy_step_toward(
@@ -366,12 +348,25 @@ class NpcAiProcessor(esper.Processor):
         # what lets ``occupied`` be a cheap, rarely-rebuilt static cache.
         pos.x, pos.y = next_xy
 
+    def _region_of_cached(self, xy: tuple[int, int]) -> int | None:
+        if self._region_of_cache_revision != self.game_map.revision:
+            self._region_of_cache.clear()
+            self._region_of_cache_revision = self.game_map.revision
+        if xy not in self._region_of_cache:
+            self._region_of_cache[xy] = self.game_map.region_of(xy[0], xy[1])
+        return self._region_of_cache[xy]
+
+    def _same_region_cached(self, a: tuple[int, int], b: tuple[int, int]) -> bool:
+        region = self._region_of_cached(a)
+        return region is not None and region == self._region_of_cached(b)
+
     def _reachable(
         self, pos: Position, items: list[tuple[tuple[int, int], int]]
     ) -> list[tuple[tuple[int, int], int]]:
         """Keep only ``(xy, ent)`` targets in the same walkable region as ``pos``,
         so a creature never fixates on food/water across a river it can't cross."""
-        return [item for item in items if self.game_map.same_region((pos.x, pos.y), item[0])]
+        here = (pos.x, pos.y)
+        return [item for item in items if self._same_region_cached(here, item[0])]
 
     def _seek_water(
         self,
@@ -392,7 +387,7 @@ class NpcAiProcessor(esper.Processor):
         reachable = [
             s
             for s in shore
-            if s not in occupied and self.game_map.same_region((pos.x, pos.y), s)
+            if s not in occupied and self._same_region_cached((pos.x, pos.y), s)
         ]
         target = self._nearest((pos.x, pos.y), reachable)
         if target is None:
@@ -672,7 +667,7 @@ class NpcAiProcessor(esper.Processor):
         # Couldn't advance toward home. Camp where we stand if we're spent, or if
         # home is genuinely unreachable (blocked by water/walls) -- better to camp
         # and recover than to idle at a barrier, pinning tiredness and starving.
-        if needs.tiredness >= _EXHAUSTED_THRESHOLD or not self.game_map.same_region((pos.x, pos.y), home_xy):
+        if needs.tiredness >= _EXHAUSTED_THRESHOLD or not self._same_region_cached((pos.x, pos.y), home_xy):
             go_to_sleep(ent, in_camp=True)
             return True
         return False
@@ -709,7 +704,7 @@ class NpcAiProcessor(esper.Processor):
             gxy = (g_pos.x, g_pos.y)
             if self.game_map.tile_at(gxy[0], gxy[1]) == bp.tile:
                 continue  # already raised elsewhere; ignore this stale ghost
-            if here == gxy or self.game_map.same_region(here, gxy):
+            if here == gxy or self._same_region_cached(here, gxy):
                 out.append((g_ent, gxy, bp))
         return out
 
@@ -847,7 +842,7 @@ class NpcAiProcessor(esper.Processor):
         # pathfind every single turn it keeps watching. Reachability is a
         # cheap, cached lookup (GameMap.region_of); check it before ever
         # calling into pathfinding.
-        if not self.game_map.same_region((pos.x, pos.y), player_xy):
+        if not self._same_region_cached((pos.x, pos.y), player_xy):
             return False
         if _chebyshev((pos.x, pos.y), player_xy) == 1:
             return False  # adjacent: hold (player-facing combat is player-driven)
@@ -875,7 +870,7 @@ class NpcAiProcessor(esper.Processor):
             dist = _chebyshev((pos.x, pos.y), (other_pos.x, other_pos.y))
             if dist > _SOCIAL_SIGHT:
                 continue
-            if not self.game_map.same_region((pos.x, pos.y), (other_pos.x, other_pos.y)):
+            if not self._same_region_cached((pos.x, pos.y), (other_pos.x, other_pos.y)):
                 continue
             # Prefer friends: friendship pulls the score up, distance pushes it
             # down. A stranger (0 friendship) is still chosen when nobody

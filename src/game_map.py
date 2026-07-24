@@ -491,6 +491,21 @@ class GameMap:
                         queue.append((nx, ny))
         return regions
 
+    def connectivity_revision(self, x: int, y: int) -> tuple[int | None, int]:
+        """Return the island-local revision that controls walk connectivity here.
+
+        Pathing and reachability on the archipelago can never cross the ocean
+        gap between islands, so a wall raised on island A cannot affect paths on
+        island B.  Exposing this tiny key lets AI caches stay valid across edits
+        elsewhere in the world instead of falling back to the global map
+        revision, which is exactly what caused catch-up bursts to rebuild flow
+        fields after unrelated villagers edited their own houses.
+        """
+        island = self._island_index_of(x, y)
+        if island is None:
+            return None, self.revision
+        return island, self._island_edit_rev.get(island, 0)
+
     def region_of(self, x: int, y: int) -> int | None:
         """The connected-region id of a walkable tile, or ``None`` if the tile isn't
         walkable. Labels are cached per island and rebuilt only when that island is

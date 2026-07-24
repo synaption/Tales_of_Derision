@@ -55,6 +55,8 @@ class RenderProcessor(esper.Processor):
         self._last_player_pos: tuple[int, int] | None = None
         self._seen_entity_ids: set[int] = set()
         self._visible_tiles: set[tuple[int, int]] = set()
+        self._visible_npcs_cache: list[tuple[int, str, str, str, int, int, int, int]] = []
+        self._nearby_cache: list[_NearbyEntry] = []
         # Tile memory ("fog of war"): every tile ever in view is "explored" and
         # keeps being drawn -- desaturated -- once it drops out of line of sight.
         # ``_tile_memory`` remembers the last static scenery (tree, furniture,
@@ -700,9 +702,8 @@ class RenderProcessor(esper.Processor):
 
         nearby_data: list[_NearbyEntry] = []
         if player_pos is not None:
-            visible_npcs = self._collect_visible_npcs(player_pos)
-            self._update_sighting_events(visible_npcs)
-            nearby_data = self._collect_nearby_objects(player_pos)
+            self._update_sighting_events(self._visible_npcs_cache)
+            nearby_data = self._nearby_cache
 
         nearby_lines: list[str] = []
 
@@ -1100,17 +1101,26 @@ class RenderProcessor(esper.Processor):
         DrawData = tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None, bool]
         player_draw: DrawData | None = None
         character_draws: list[DrawData] = []
+        visible_npcs: list[tuple[int, str, str, str, int, int, int, int]] = []
+        nearby_entries: list[_NearbyEntry] = []
         # Static scenery seen this frame, keyed by tile -- folded into tile memory
         # after drawing so it can be recalled once the tile leaves view. Gathered
         # here to piggyback on the entity scan rather than sweep every entity twice.
         seen_scenery: dict[tuple[int, int], tuple[str, str, tuple[int, int, int] | None, tuple[int, int, int] | None]] = {}
         for ent, (pos, rend) in esper.get_components(Position, Renderable):
-            is_player = esper.has_component(ent, Player)
-            is_character = is_player or esper.has_component(ent, NPC)
-            if (pos.x, pos.y) not in self._visible_tiles and not is_player:
+            is_player = ent == player_ent
+            visible = (pos.x, pos.y) in self._visible_tiles
+            if not visible and not is_player:
                 continue
 
-            if (pos.x, pos.y) in self._visible_tiles and is_memorable_scenery(ent):
+            # Avoid component lookups for the thousands of off-screen renderables
+            # on the archipelago. The old order asked esper whether every tree,
+            # bush, fish and villager was an NPC/friendly/enemy before checking
+            # visibility, which made walking stutter even though only a viewport's
+            # worth of entities can ever be drawn.
+            is_character = is_player or esper.has_component(ent, NPC)
+
+            if visible and is_memorable_scenery(ent):
                 seen_scenery[(pos.x, pos.y)] = (rend.glyph, "default", rend.fg, rend.bg)
 
             view_xy = self._world_to_view(pos.x, pos.y)
@@ -1128,6 +1138,20 @@ class RenderProcessor(esper.Processor):
             else:
                 glyph, fg, force_glyph = rend.glyph, rend.fg, False
 
+            if visible and player_pos is not None and not is_player:
+                dx = pos.x - player_pos.x
+                dy = pos.y - player_pos.y
+                arrow = self._direction_arrow(player_pos, pos)
+                name = "Unknown"
+                if esper.has_component(ent, Name):
+                    name = esper.component_for_entity(ent, Name).value
+                mdist = abs(dx) + abs(dy)
+                cdist = max(abs(dx), abs(dy))
+                if is_character:
+                    visible_npcs.append((ent, glyph, arrow, name, mdist, cdist, pos.x, pos.y))
+                if cdist == 1:
+                    nearby_entries.append((ent, glyph, arrow, name, mdist, cdist, classification, fg, rend.bg))
+
             if is_player:
                 if view_xy is not None:
                     player_draw = (view_xy[0], view_xy[1], glyph, classification, fg, rend.bg, force_glyph)
@@ -1142,6 +1166,11 @@ class RenderProcessor(esper.Processor):
                         draw_data[0], draw_data[1], draw_data[2], draw_data[3],
                         fg=draw_data[4], bg=draw_data[5], force_glyph=draw_data[6],
                     )
+
+        visible_npcs.sort(key=lambda item: (item[4], item[5], item[3]))
+        nearby_entries.sort(key=lambda item: (item[4], item[5], item[3]))
+        self._visible_npcs_cache = visible_npcs
+        self._nearby_cache = nearby_entries
 
         for draw_data in character_draws:
             r.draw_glyph_classified(
