@@ -16,6 +16,7 @@ RUN dpkg --add-architecture i386 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV WINEDEBUG=-all \
+    WINEDLLOVERRIDES="winemenubuilder.exe=d;winedbg.exe=d" \
     WINEPREFIX=/opt/wine-python \
     WINEARCH=win64 \
     DISPLAY=:99
