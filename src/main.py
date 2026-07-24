@@ -150,6 +150,69 @@ def _idle_pump_budget(idle_ticks: int) -> float:
     return min(_IDLE_PUMP_MAX_BUDGET, _IDLE_PUMP_BASE_BUDGET * (_IDLE_PUMP_RAMP**idle_ticks))
 
 
+def _player_region_for_processors(player_xy: tuple[int, int] | None) -> tuple[int, int] | None:
+    if player_xy is None:
+        return None
+    processor = esper.get_processor(NpcAiProcessor) or esper.get_processor(FishAiProcessor)
+    if processor is None:
+        return None
+    return processor.scheduler.region_at(player_xy[0], player_xy[1])
+
+
+def _current_target_region_turn() -> int | None:
+    clock = world_clock()
+    if clock is None:
+        return None
+    return clock.turn // BASE_ACTION_COST
+
+
+def _catch_up_entered_region_cooperatively(renderer: Renderer, region_id: tuple[int, int] | None) -> None:
+    """Bring an entered region current without one long blocking frame.
+
+    Region entry is one of the few moments where the off-screen simulation must
+    become authoritative before the next player command. Do that as a sequence of
+    small deterministic scheduler advances, rendering between chunks so the UI
+    keeps responding instead of freezing for the whole backlog.
+    """
+    if region_id is None:
+        return
+    target_turn = _current_target_region_turn()
+    if target_turn is None:
+        return
+    processors = [
+        processor
+        for processor in (esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor))
+        if processor is not None
+    ]
+    if not processors:
+        return
+    while True:
+        any_lagging = False
+        for processor in processors:
+            if processor.scheduler.region_turn.get(region_id, target_turn) < target_turn:
+                any_lagging = True
+                processor.scheduler.catch_up_region(
+                    region_id,
+                    target_turn,
+                    max_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT,
+                )
+        if not any_lagging:
+            return
+        esper.process(None)
+
+
+def _process_player_turn(
+    action: str | None, renderer: Renderer, previous_region: tuple[int, int] | None
+) -> tuple[int, int] | None:
+    """Run one input frame, then cooperatively settle a newly entered region."""
+    esper.process(action)
+    player_pos = first_player_position()
+    current_region = _player_region_for_processors(player_pos)
+    if current_region != previous_region:
+        _catch_up_entered_region_cooperatively(renderer, current_region)
+    return current_region
+
+
 def _pump_background_regions(budget_seconds: float) -> None:
     """Spend up to ``budget_seconds`` advancing the nearest lagging region for
     each region-aware processor, closest to the player first. Safe to call
@@ -273,6 +336,7 @@ def main() -> None:
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame
+            current_player_region = _player_region_for_processors(first_player_position())
             if args.screenshot is not None:
                 _capture_frame_screenshot(renderer, args.screenshot)
                 return
@@ -370,11 +434,15 @@ def main() -> None:
                 if action == "confirm_action":
                     live_action = _action_from_held_keys(held_directions, direction_pressed_order)
                     if live_action is not None:
-                        esper.process(live_action)
+                        current_player_region = _process_player_turn(
+                            live_action, renderer, current_player_region
+                        )
                     else:
                         # No direction held: wait in place, passing a turn (needs
                         # rise, NPCs act) instead of a no-op refresh.
-                        esper.process(WAIT_ACTION)
+                        current_player_region = _process_player_turn(
+                            WAIT_ACTION, renderer, current_player_region
+                        )
                     continue
                 if action == "menu_select":
                     interact_action = _action_from_held_keys(held_directions, direction_pressed_order)
@@ -429,7 +497,12 @@ def main() -> None:
                         if interact_ghost is not None:
                             message, took_turn = _work_blueprint(interact_ghost, player_ent, game_map)
                             queue_message(message)
-                            esper.process(WAIT_ACTION if took_turn else None)
+                            if took_turn:
+                                current_player_region = _process_player_turn(
+                                    WAIT_ACTION, renderer, current_player_region
+                                )
+                            else:
+                                esper.process(None)
                             continue
 
                         interact_tree = _find_adjacent_feature(interact_action, Tree)
@@ -494,7 +567,7 @@ def main() -> None:
                         break
                     esper.process(None)
                     continue
-                esper.process(action)
+                current_player_region = _process_player_turn(action, renderer, current_player_region)
     finally:
         stop_background_music(pygame_module)
 
