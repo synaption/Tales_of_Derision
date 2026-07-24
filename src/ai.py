@@ -17,11 +17,12 @@ from dataclasses import replace
 import esper
 
 from components import (
-    Actor, Asleep, BerryBush, BlocksMovement, Blueprint, Corpse, Deer, Diet, Enemy,
-    Fish, Friendly, Home, Inventory, NPC, Needs, Personality, Player, Position,
+    Actor, Asleep, BerryBush, BlocksMovement, Blueprint, Corpse, Deer, Diet, DriveProfile,
+    Enemy, Fish, Friendly, Home, Inventory, NPC, Needs, Personality, Player, Position,
     Relationships, Resident, Seaweed, Stove, Tree, Vision, WorldClock,
 )
 from game_map import GameMap
+from content.drives import DriveDef, all_drives
 from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin
 from action import BASE_ACTION_COST, action_cost
 from items import WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
@@ -135,6 +136,10 @@ class NpcAiProcessor(esper.Processor):
         # forbid an immediate one-tile reversal (see ``_advance_region``), which
         # is the only way an NPC ends up flip-flopping between two tiles forever.
         self._prev_turn_pos: dict[int, tuple[int, int]] = {}
+        # Debug/inspection hook for data-driven AI: ent -> per-drive allow/weight
+        # records from its most recent decision. Tests and a future UI panel can
+        # read this without re-running any triggers.
+        self.last_decisions: dict[int, list[dict]] = {}
 
     def _compute_shore_tiles(self) -> list[tuple[int, int]]:
         shore: list[tuple[int, int]] = []
@@ -1137,6 +1142,112 @@ class NpcAiProcessor(esper.Processor):
                     del occupied[guard]
                 self._prev_turn_pos[ent] = start_xy
 
+    def _drive_factor(self, ent: int, drive_id: str) -> float:
+        if not esper.has_component(ent, DriveProfile):
+            return 1.0
+        return float(esper.component_for_entity(ent, DriveProfile).drives.get(drive_id, 1.0))
+
+    def _has_inventory_food(self, ent: int) -> bool:
+        if not esper.has_component(ent, Inventory):
+            return False
+        return any(
+            not is_raw_meat(item) and hunger_restored(item) is not None
+            for item in esper.component_for_entity(ent, Inventory).items
+        )
+
+    def _trigger_passes(self, ent: int, trigger: tuple, ctx: dict) -> bool:
+        name, *args = trigger
+        needs = ctx.get("needs")
+        diet_kind = ctx.get("diet_kind")
+        if name == "tiredness_at_least":
+            return needs is not None and needs.tiredness >= float(args[0])
+        if name == "thirst_at_least":
+            return needs is not None and needs.thirst >= float(args[0])
+        if name == "hunger_at_least":
+            return needs is not None and needs.hunger >= float(args[0])
+        if name == "thirst_beats_hunger":
+            return needs is not None and needs.thirst >= needs.hunger
+        if name == "has_diet":
+            return diet_kind == args[0]
+        if name == "diet_in":
+            return diet_kind in args
+        if name == "is_starving":
+            return needs is not None and needs.hunger >= needs.max_value * 0.9
+        if name == "has_inventory_food":
+            return self._has_inventory_food(ent)
+        if name == "region_has_trees":
+            return bool(ctx["trees"])
+        if name == "region_has_bushes":
+            return bool(ctx["bushes"])
+        if name == "region_has_meat":
+            return bool(ctx["prey"] or ctx["corpses"])
+        if name == "region_has_shore":
+            return bool(ctx["shore"])
+        if name == "should_build":
+            return self._should_build(ent)
+        if name == "can_socialize":
+            return esper.has_component(ent, Personality) and esper.has_component(ent, Friendly)
+        if name == "has_player":
+            return ctx["player_xy"] is not None
+        if name == "is_enemy":
+            return esper.has_component(ent, Enemy)
+        raise KeyError(f"unknown AI trigger {name!r}")
+
+    def _score_drive(self, ent: int, drive: DriveDef, ctx: dict) -> tuple[float | None, dict]:
+        factor = self._drive_factor(ent, drive.id)
+        allow_results = [
+            {"trigger": trigger, "passed": self._trigger_passes(ent, trigger, ctx)}
+            for trigger in drive.allow
+        ]
+        if factor <= 0.0 or not all(item["passed"] for item in allow_results):
+            return None, {
+                "drive": drive.id, "factor": factor, "allow": allow_results, "weight": None,
+            }
+        weight = drive.weight.base * factor
+        for modifier in drive.weight.modifiers:
+            if self._trigger_passes(ent, modifier.trigger, ctx):
+                weight *= modifier.factor
+        return weight, {
+            "drive": drive.id, "factor": factor, "allow": allow_results, "weight": weight,
+        }
+
+    def _rank_drives(self, ent: int, ctx: dict) -> list[DriveDef]:
+        scored = []
+        debug = []
+        for drive in all_drives():
+            weight, record = self._score_drive(ent, drive, ctx)
+            debug.append(record)
+            if weight is not None and weight > 0.0:
+                scored.append((weight, drive.id, drive))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        self.last_decisions[ent] = debug
+        return [drive for _weight, _id, drive in scored]
+
+    def _execute_drive(self, drive: DriveDef, ent: int, pos: Position, occupied: dict, ctx: dict) -> bool:
+        needs = ctx.get("needs")
+        if drive.act == "seek_sleep" and needs is not None:
+            return self._seek_sleep(ent, pos, needs, occupied)
+        if drive.act == "seek_water" and needs is not None:
+            return self._seek_water(ent, pos, needs, occupied, ctx["shore"])
+        if drive.act == "eat_from_inventory" and needs is not None:
+            return self._eat_from_inventory(ent, needs)
+        if drive.act == "forage_berries" and needs is not None:
+            return self._forage_berries(ent, pos, needs, ctx["bushes"], occupied, ctx["clock"])
+        if drive.act == "graze" and needs is not None:
+            return self._graze(ent, pos, needs, ctx["trees"], occupied)
+        if drive.act == "seek_food" and needs is not None:
+            return self._seek_food(ent, pos, needs, ctx["prey"], ctx["corpses"], occupied)
+        if drive.act == "feed_cook":
+            return self._feed_cook(ent, pos, ctx["prey"], ctx["corpses"], ctx["trees"], ctx["stoves"], occupied)
+        if drive.act == "work_blueprints":
+            return self._work_blueprints(ent, pos, ctx["trees"], occupied)
+        if drive.act == "socialize":
+            return self._socialize(ent, pos, occupied, ctx["sentients"], ctx["logical_turn"], ctx["clock"])
+        if drive.act == "chase_player":
+            self._chase_player(ent, pos, ctx["player_xy"], occupied)
+            return True
+        raise KeyError(f"unknown AI action {drive.act!r}")
+
     def _take_turn(
         self,
         ent: int,
@@ -1148,65 +1259,25 @@ class NpcAiProcessor(esper.Processor):
         logical_turn: int,
         clock: "WorldClock | None",
     ) -> None:
-        """One NPC's single-turn behaviour: the priority ladder of survival
-        drives, then building, then leisure, then hostile pursuit. Split out of
-        ``_advance_region`` so the per-turn anti-oscillation guard there can wrap
-        it cleanly."""
+        """Select and execute one declarative drive for an NPC.
+
+        The selector is deterministic highest-weight scoring. The old priority
+        ladder is represented by data in ``content.drives`` with widely spaced
+        base weights, so changing species/personality behavior no longer needs a
+        new branch here.
+        """
         trees, prey, corpses, stoves, bushes, sentients = diet_buckets
-        acted = False
-
-        if esper.has_component(ent, Needs):
-            needs = esper.component_for_entity(ent, Needs)
-            diet_kind = None
-            if esper.has_component(ent, Diet):
-                diet_kind = esper.component_for_entity(ent, Diet).kind
-
-            # Sleep is the strongest drive: a spent creature beds down before
-            # it forages, preferring its home over camping.
-            if needs.tiredness >= _SLEEP_THRESHOLD:
-                acted = self._seek_sleep(ent, pos, needs, occupied)
-            # Thirst wins ties -- a parched animal drinks before it eats.
-            elif needs.thirst >= _FORAGE_THRESHOLD and needs.thirst >= needs.hunger:
-                acted = self._seek_water(ent, pos, needs, occupied, shore)
-            elif needs.hunger >= _FORAGE_THRESHOLD:
-                # Eat prepared food already carried; otherwise forage by diet.
-                if self._eat_from_inventory(ent, needs):
-                    acted = True
-                elif diet_kind == "herbivore":
-                    # Ripe berries first (quick food); else graze a tree.
-                    acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
-                    if not acted:
-                        acted = self._graze(ent, pos, needs, trees, occupied)
-                elif diet_kind == "carnivore":
-                    # Predator: eats raw meat on the spot.
-                    acted = self._seek_food(ent, pos, needs, prey, corpses, occupied)
-                elif diet_kind == "cook":
-                    # Villager: pick ripe berries when handy, else cook meat.
-                    acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
-                    if not acted:
-                        acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
-
-        # Building a house is the lowest-priority survival drive: a homeless
-        # resident helps raise the nearest blueprint only once fed, watered,
-        # and rested. Labour is shared -- several villagers can work one site.
-        if not acted and self._should_build(ent):
-            acted = self._work_blueprints(ent, pos, trees, occupied)
-
-        # Leisure: a fed, rested, non-hostile being with a personality seeks
-        # out company -- preferring beings it already likes. Lowest priority
-        # of all, so survival and building always come first.
-        if (
-            not acted
-            and esper.has_component(ent, Personality)
-            and esper.has_component(ent, Friendly)
-        ):
-            acted = self._socialize(ent, pos, occupied, sentients, logical_turn, clock)
-
-        if acted:
-            return
-
-        if player_xy is not None and esper.has_component(ent, Enemy):
-            self._chase_player(ent, pos, player_xy, occupied)
+        needs = esper.component_for_entity(ent, Needs) if esper.has_component(ent, Needs) else None
+        diet_kind = esper.component_for_entity(ent, Diet).kind if esper.has_component(ent, Diet) else None
+        ctx = {
+            "needs": needs, "diet_kind": diet_kind, "trees": trees, "prey": prey,
+            "corpses": corpses, "stoves": stoves, "bushes": bushes,
+            "sentients": sentients, "shore": shore, "player_xy": player_xy,
+            "logical_turn": logical_turn, "clock": clock,
+        }
+        for drive in self._rank_drives(ent, ctx):
+            if self._execute_drive(drive, ent, pos, occupied, ctx):
+                return
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:

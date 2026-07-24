@@ -87,6 +87,16 @@ class NPC:
 
 
 @dataclass
+class DriveProfile:
+    """Data gates for NPC drives. A missing drive defaults to enabled; a factor
+    of 0 removes the drive from consideration, while other values scale its
+    scripted weight. This keeps species/personality differences in prefab data
+    instead of hard-coded AI branches.
+    """
+    drives: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class Enemy:
     """Tag component: marks an NPC as hostile to the player."""
 
