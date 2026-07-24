@@ -150,13 +150,17 @@ def _idle_pump_budget(idle_ticks: int) -> float:
     return min(_IDLE_PUMP_MAX_BUDGET, _IDLE_PUMP_BASE_BUDGET * (_IDLE_PUMP_RAMP**idle_ticks))
 
 
-def _player_region_for_processors(player_xy: tuple[int, int] | None) -> tuple[int, int] | None:
+def _player_region_for_processors(player_xy: Position | tuple[int, int] | None) -> tuple[int, int] | None:
     if player_xy is None:
         return None
     processor = esper.get_processor(NpcAiProcessor) or esper.get_processor(FishAiProcessor)
     if processor is None:
         return None
-    return processor.scheduler.region_at(player_xy[0], player_xy[1])
+    if isinstance(player_xy, Position):
+        x, y = player_xy.x, player_xy.y
+    else:
+        x, y = player_xy
+    return processor.scheduler.region_at(x, y)
 
 
 def _current_target_region_turn() -> int | None:
