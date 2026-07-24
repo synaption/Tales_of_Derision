@@ -37,14 +37,18 @@ from systems import (
     pick_berries, raise_blueprint, slay_entity, try_marry, try_mate, world_clock,
 )
 
-# An empty occupant map, passed to the greedy stepper for off-screen movement so it
-# ignores dynamic collisions entirely (see ``_step_toward``). Never mutated.
-_NO_OCCUPANTS: dict[tuple[int, int], int] = {}
-
 # How far the occupant-aware fallback pathfind may search around a creature. Big
 # enough to round any local cluster of blockers, small enough that the search is
 # cheap; long-range travel rides the cached flow field, not this fallback.
 _LOCAL_PATH_RADIUS = 12
+
+# Full-simulation box (width x height) centred on the player. An NPC inside it
+# gets full, occupant-aware, flow-field pathfinding every turn; one outside walks
+# a cached concrete route (``_far_path_step``) and pays a real pathfind only on a
+# cache miss -- no per-turn flow-field builds for the distant world. Sized to the
+# player's current map-tile plus its neighbours.
+_FULL_SIM_HALF_W = 80   # 160 wide
+_FULL_SIM_HALF_H = 40   # 80 tall
 
 
 class NpcAiProcessor(esper.Processor):
@@ -64,14 +68,23 @@ class NpcAiProcessor(esper.Processor):
         self.game_map = game_map
         self._shore_tiles: list[tuple[int, int]] = self._compute_shore_tiles()
         self._wall_clock = wall_clock if wall_clock is not None else time.monotonic
-        # The player's region + its 8 neighbours: the on-screen band that gets full,
-        # dynamic pathfinding. Every other region is "off-screen" and moves with a
-        # cheap static approximation (see ``_step_toward`` / ``_static_movement``).
-        # ``None`` means "treat everything as on-screen" -- the safe default for
-        # unit tests and whole-world catch-up (sleep), which want exact behaviour.
-        self._near_regions: set[RegionId] | None = None
-        # Set per region-advance: True when advancing an off-screen region.
-        self._static_movement = False
+        # The player's tile as of the region-advance in flight. An NPC within the
+        # full-simulation box around it (``_far_from_player``) gets full, occupant-
+        # aware, per-turn pathfinding; one beyond it walks a cached concrete route
+        # and re-pathfinds only on a cache miss. ``None`` (no player: unit tests,
+        # whole-world catch-up) means "full sim for everyone" -- exact, fully
+        # pathfound behaviour.
+        self._player_xy: tuple[int, int] | None = None
+        # ent -> (goal, path, cursor) for an NPC currently beyond the box. ``path``
+        # is start-inclusive, so ``path[cursor]`` is where the NPC stands and
+        # ``path[cursor + 1]`` its next step. Reused every turn with no pathfinding
+        # until the goal changes, the route runs out, the NPC drifts off it, or a
+        # tile on it stops being walkable (see ``_far_path_step``). Cleared on a
+        # world switch so a recycled entity id can never inherit a stale route.
+        self._trip_cache: dict[
+            int, tuple[tuple[int, int], list[tuple[int, int]], int]
+        ] = {}
+        self._trip_cache_world: str | None = None
         self.scheduler = RegionScheduler(game_map, _current_region_turn())
         self.scheduler.register("npc_ai", self._advance_region)
         # Shore tiles bucketed by simulation region (like the resource snapshot), so
@@ -220,6 +233,61 @@ class NpcAiProcessor(esper.Processor):
                 return nxy
         return None
 
+    def _far_from_player(self, xy: tuple[int, int]) -> bool:
+        """True when ``xy`` lies outside the full-simulation box centred on the
+        player, so the NPC there should move by cached path rather than per-turn
+        pathfinding. Always False when there is no player (unit tests, whole-world
+        catch-up), which want exact, fully-pathfound behaviour."""
+        p = self._player_xy
+        if p is None:
+            return False
+        return abs(xy[0] - p[0]) > _FULL_SIM_HALF_W or abs(xy[1] - p[1]) > _FULL_SIM_HALF_H
+
+    def _far_path_step(
+        self,
+        ent: int,
+        pos: Position,
+        goal: tuple[int, int],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        """Move one tile toward ``goal`` for an NPC beyond the full-sim box, using a
+        cached concrete route and paying a real ``find_path`` only on a cache miss.
+
+        The distant world doesn't need optimal, occupant-aware routing every turn:
+        once a valid path to the goal is found it stays valid until a tile on it is
+        edited, so the NPC just walks it step by step for free. Dynamic occupants
+        (other movers) are ignored out here -- invisible off-screen and never
+        recorded in ``occupied`` anyway -- so a cached route is only invalidated by
+        a static tile change, i.e. essentially never mid-trip. On a miss it pays one
+        occupant-blind ``find_path`` (unbounded -- it runs once per trip, not per
+        turn) and caches the result."""
+        xy = (pos.x, pos.y)
+        cached = self._trip_cache.get(ent)
+        if cached is not None:
+            c_goal, path, cursor = cached
+            # Re-usable iff it's the same trip, the NPC is still standing on the
+            # route, and the next tile hasn't become unwalkable since it was built.
+            if (
+                c_goal == goal
+                and cursor + 1 < len(path)
+                and path[cursor] == xy
+                and self.game_map.is_walkable(path[cursor + 1][0], path[cursor + 1][1])
+            ):
+                nxt = path[cursor + 1]
+                self._commit_step(ent, pos, nxt, occupied)
+                self._trip_cache[ent] = (goal, path, cursor + 1)
+                return True
+        # Cache miss: compute one route (start-inclusive so path[0] == xy), cache
+        # it, and take the first step.
+        route = self.game_map.find_path(xy, goal)
+        if not route:
+            self._trip_cache.pop(ent, None)
+            return False
+        path = [xy, *route]
+        self._commit_step(ent, pos, path[1], occupied)
+        self._trip_cache[ent] = (goal, path, 1)
+        return True
+
     def _step_toward(
         self,
         ent: int,
@@ -246,17 +314,10 @@ class NpcAiProcessor(esper.Processor):
             return False
 
         xy = (pos.x, pos.y)
-        if self._static_movement:
-            # Off-screen: step along the cached *static* flow field only, ignoring
-            # dynamic occupants and never doing a dynamic fallback pathfind. This
-            # approximates how long the trip takes (one tile per turn along the
-            # static shortest path) without the expensive occupant-aware search;
-            # invisible creatures overlapping for a turn costs nothing on-screen.
-            step = self._greedy_step_toward(ent, xy, goal, _NO_OCCUPANTS)
-            if step is not None:
-                self._commit_step(ent, pos, step, occupied)
-                return True
-            return False
+        if self._far_from_player(xy):
+            # Beyond the full-sim box: no per-turn pathfinding. Walk a cached route
+            # toward the goal, paying a real pathfind only when none applies.
+            return self._far_path_step(ent, pos, goal, occupied)
 
         step = self._greedy_step_toward(ent, xy, goal, occupied)
         if step is not None:
@@ -962,11 +1023,6 @@ class NpcAiProcessor(esper.Processor):
         and hostile-chase distance is short-range enough that staleness here
         would actually be noticeable.
         """
-        # Off-screen regions move their creatures with a cheap static approximation
-        # (no dynamic pathfinding / collision) -- see ``_step_toward``.
-        self._static_movement = (
-            self._near_regions is not None and region_id not in self._near_regions
-        )
         snapshot = self._world_snapshot_for_this_call()
         occupied = snapshot["occupied"]
 
@@ -982,6 +1038,8 @@ class NpcAiProcessor(esper.Processor):
         clock = replace(real_clock, turn=logical_turn) if real_clock is not None else None
 
         player_xy = self._find_player_position()
+        # Per-NPC full-vs-cached-path movement keys off distance to this tile.
+        self._player_xy = player_xy
 
         xy_of_pair = lambda item: item[0]  # noqa: E731 -- ((x, y), ent) items
         xy_of_pos = lambda item: (item[1].x, item[1].y)  # noqa: E731 -- (ent, Position) items
@@ -1121,25 +1179,25 @@ class NpcAiProcessor(esper.Processor):
         if action not in _TURN_ACTIONS:
             return
 
+        # A recycled entity id must never inherit a previous world's cached route.
+        world = esper.current_world
+        if world != self._trip_cache_world:
+            self._trip_cache.clear()
+            self._trip_cache_world = world
+
         player_xy = self._find_player_position()
         player_region = (
             self.scheduler.region_at(player_xy[0], player_xy[1]) if player_xy is not None else None
         )
 
         if player_region is None:
-            # No player (unit tests construct this processor directly): bring
-            # every region up to date once, matching an unpartitioned pass.
-            self._near_regions = None  # everything on-screen: exact behaviour
+            # No player (unit tests construct this processor directly): bring every
+            # region up to date once, matching an unpartitioned pass. With no player
+            # ``_far_from_player`` is always False, so every NPC is fully pathfound
+            # -- exact, unpartitioned behaviour.
             for region_id in all_region_ids(self.game_map):
                 self.scheduler.advance_region(region_id)
             return
-
-        # The on-screen band: the player's region and its 8 neighbours get full,
-        # dynamic simulation; everything else moves by the static approximation.
-        px, py = player_region
-        self._near_regions = {
-            (px + dx, py + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
-        }
 
         target_turn = self.scheduler.next_turn_for(player_region, _current_region_turn())
 
