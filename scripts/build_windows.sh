@@ -22,6 +22,7 @@ docker run --rm \
   -v "$REPO_ROOT:/workspace" \
   -w /workspace \
   "$IMAGE_NAME" \
-  /bin/bash -lc 'xvfb-run -a wine C:\\Python312\\python.exe -m pip install --disable-pip-version-check -r requirements.txt pyinstaller && xvfb-run -a wine C:\\Python312\\python.exe -m PyInstaller --clean --noconfirm packaging/tales_of_derision_windows.spec'
+  xvfb-run -a --server-args="-screen 0 1024x768x24" \
+  /bin/bash packaging/build_windows_in_container.sh
 
 echo "Built dist/TalesOfDerision.exe"

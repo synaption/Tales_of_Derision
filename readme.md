@@ -73,6 +73,10 @@ API, which is not implemented by the Ubuntu Wine version and can leave Wine's
 debugger waiting indefinitely. If an older build stopped at a `CopyFile2` error,
 press **Ctrl+C**, pull this version of the script, and run the build again.
 
+Dependency installation and PyInstaller run under one virtual X server. Starting
+each Wine command with a separate `xvfb-run` can shut down the first display while
+Wine is still using it, resulting in `X connection ... broken` followed by a hang.
+
 GitHub Actions uses the same Linux build script and uploads the executable artifact
 through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and
 pushes to `dev` or `work`.
