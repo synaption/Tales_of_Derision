@@ -1,0 +1,26 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+      - work
+  pull_request:
+
+jobs:
+  windows-exe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Windows executable from Linux
+        run: ./scripts/build_windows.sh
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: TalesOfDerision-windows-exe
+          path: dist/TalesOfDerision.exe
+          if-no-files-found: error

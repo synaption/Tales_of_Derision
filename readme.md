@@ -53,6 +53,21 @@ inventory, **C** status, **R** sleep, **Esc** pause. Full controls and the survi
 **Reading order of authority** (per `notes4LLMs.md`): `notes4LLMs.md` → this
 README → the wiki.
 
+
+## Windows executable packaging
+
+Build a standalone Windows executable from Linux with Docker:
+
+```bash
+./scripts/build_windows.sh
+```
+
+The script builds a Wine-based Linux container, installs Windows Python plus the
+packaging dependencies inside that container, and writes `dist/TalesOfDerision.exe`.
+GitHub Actions uses the same Linux build script and uploads the executable artifact
+through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and
+pushes to `dev` or `work`.
+
 ---
 
 ## Design goals — big picture
