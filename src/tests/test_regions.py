@@ -85,6 +85,21 @@ def test_catch_up_region_replays_every_missing_turn_in_order() -> None:
     assert scheduler.region_turn[(1, 0)] == 4
 
 
+def test_catch_up_region_can_be_capped_for_live_turn_budget() -> None:
+    game_map = GameMap(240, 60)
+    scheduler = RegionScheduler(game_map, 0)
+    seen: list[int] = []
+    scheduler.register("record", lambda region_id: seen.append(scheduler.region_turn[region_id]))
+
+    assert scheduler.catch_up_region((1, 0), target_turn=5, max_advances=2) is False
+    assert seen == [0, 1]
+    assert scheduler.region_turn[(1, 0)] == 2
+
+    assert scheduler.catch_up_region((1, 0), target_turn=5, max_advances=3) is True
+    assert seen == [0, 1, 2, 3, 4]
+    assert scheduler.region_turn[(1, 0)] == 5
+
+
 def test_catch_up_all_brings_every_region_up_to_date() -> None:
     game_map = GameMap(240, 60)
     scheduler = RegionScheduler(game_map, 0)

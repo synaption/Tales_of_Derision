@@ -14,7 +14,10 @@ import esper
 from action import BASE_ACTION_COST
 from components import Bed, BerryBush, Blueprint, Chest, Friendly, Player, Position, Stove, Tree, Well
 from game_map import GameMap
-from config import DEFAULT_WORLD_SEED, MAP_HEIGHT, MAP_WIDTH, WORLD_LAYOUT, WORLD_SETTLE_TURNS
+from config import (
+    ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT, DEFAULT_WORLD_SEED, MAP_HEIGHT, MAP_WIDTH,
+    WORLD_LAYOUT, WORLD_SETTLE_TURNS,
+)
 from queries import entity_name, first_player_entity
 from worldgen import _setup_world
 # Used by the turn loop below. Tests import these helpers from ``interactions`` directly.
@@ -236,8 +239,20 @@ def main() -> None:
             # Housing runs before the AI so a villager that just claimed a home
             # can start heading there this turn.
             esper.add_processor(HousingProcessor(game_map), priority=0)
-            esper.add_processor(NpcAiProcessor(game_map), priority=0)
-            esper.add_processor(FishAiProcessor(game_map), priority=0)
+            esper.add_processor(
+                NpcAiProcessor(
+                    game_map,
+                    max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT,
+                ),
+                priority=0,
+            )
+            esper.add_processor(
+                FishAiProcessor(
+                    game_map,
+                    max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT,
+                ),
+                priority=0,
+            )
             esper.add_processor(NeedsProcessor(), priority=0)
             # Ticks registered status effects (fire, poison, ...). A no-op until an
             # effect declares behaviour; the seam lives in content.effects.

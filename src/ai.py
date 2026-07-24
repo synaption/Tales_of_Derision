@@ -65,8 +65,14 @@ class NpcAiProcessor(esper.Processor):
     pathfind, not a full-map rescan every turn.
     """
 
-    def __init__(self, game_map: GameMap, wall_clock: Callable[[], float] | None = None):
+    def __init__(
+        self,
+        game_map: GameMap,
+        wall_clock: Callable[[], float] | None = None,
+        max_entry_catchup_advances: int | None = None,
+    ):
         self.game_map = game_map
+        self._max_entry_catchup_advances = max_entry_catchup_advances
         self._shore_tiles: list[tuple[int, int]] = self._compute_shore_tiles()
         self._wall_clock = wall_clock if wall_clock is not None else time.monotonic
         # The player's tile as of the region-advance in flight. An NPC within the
@@ -1302,10 +1308,12 @@ class NpcAiProcessor(esper.Processor):
 
         target_turn = self.scheduler.next_turn_for(player_region, _current_region_turn())
 
-        # The player's own region is always fully live -- this also covers
-        # "just entered a new region": catch_up_region replays every turn the
-        # region missed, in order, right here.
-        self.scheduler.catch_up_region(player_region, target_turn)
+        # The player's own region gets first priority. In tests/default construction
+        # this fully catches up; live play may cap the replay count so entering a
+        # stale region does not block a walking frame for the whole debt.
+        self.scheduler.catch_up_region(
+            player_region, target_turn, max_advances=self._max_entry_catchup_advances
+        )
 
         # Background: nudge the *nearest* other lagging regions along, closest
         # to the player first (never the stalest). Bounded, so it can never
@@ -1340,8 +1348,10 @@ class FishAiProcessor(esper.Processor):
         game_map: GameMap,
         rng: Callable[[], float] | None = None,
         clock: Callable[[], float] | None = None,
+        max_entry_catchup_advances: int | None = None,
     ):
         self.game_map = game_map
+        self._max_entry_catchup_advances = max_entry_catchup_advances
         self._rng = rng if rng is not None else world_rng().stream("ai").random
         self._wall_clock = clock if clock is not None else time.monotonic
         self.scheduler = RegionScheduler(game_map, _current_region_turn())
@@ -1421,10 +1431,12 @@ class FishAiProcessor(esper.Processor):
 
         target_turn = self.scheduler.next_turn_for(player_region, _current_region_turn())
 
-        # The player's own region is always fully live -- this also covers
-        # "just entered a new region": catch_up_region replays every turn the
-        # region missed, in order, right here.
-        self.scheduler.catch_up_region(player_region, target_turn)
+        # The player's own region gets first priority. In tests/default construction
+        # this fully catches up; live play may cap the replay count so entering a
+        # stale region does not block a walking frame for the whole debt.
+        self.scheduler.catch_up_region(
+            player_region, target_turn, max_advances=self._max_entry_catchup_advances
+        )
 
         # Background: nudge the *nearest* other lagging regions along, closest
         # to the player first. Zero by default (see _FISH_BACKGROUND_BUDGET): an
