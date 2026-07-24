@@ -25,4 +25,4 @@ DEFAULT_WORLD_SEED = 0x7A1E5  # "TALES"
 # inside a region that is behind. ``None`` would replay the whole debt in one
 # input frame; a small deterministic cap prioritizes the player's action and
 # amortizes old off-screen debt over subsequent turns/idle pumps.
-ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT = 4
+ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT = 1

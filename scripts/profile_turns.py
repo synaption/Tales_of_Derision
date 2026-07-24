@@ -59,14 +59,14 @@ def build(flood: bool, render: bool, active_cap: int | None = None) -> GameMap:
     count = _setup_world(game_map, player, rat_flood=flood)
     esper.add_processor(TimeProcessor(), priority=2)
     esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(HousingProcessor(game_map), priority=0)
+    esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
     esper.add_processor(
         NpcAiProcessor(game_map, max_entry_catchup_advances=active_cap), priority=0
     )
     esper.add_processor(
         FishAiProcessor(game_map, max_entry_catchup_advances=active_cap), priority=0
     )
-    esper.add_processor(NeedsProcessor(), priority=0)
+    esper.add_processor(NeedsProcessor(game_map), priority=0)
     esper.add_processor(EffectsProcessor(), priority=0)
     esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
     esper.add_processor(ReproductionProcessor(), priority=0)

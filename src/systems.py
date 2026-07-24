@@ -1536,8 +1536,9 @@ class HousingProcessor(esper.Processor):
     cheap per-turn pass on a static map.
     """
 
-    def __init__(self, game_map: GameMap):
+    def __init__(self, game_map: GameMap, live_region_only: bool = False):
         self.game_map = game_map
+        self.live_region_only = live_region_only
         self._cache: dict = {}
         # Back-off memo for the (expensive) build-site search: entity -> the
         # (region cell, that region's edit-count) at which its last search found
@@ -1550,8 +1551,19 @@ class HousingProcessor(esper.Processor):
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
             return
+        active_region = self._player_region() if self.live_region_only else None
         houses = houses_for(self.game_map, self._cache)
+        if active_region is not None:
+            houses = [
+                interior for interior in houses
+                if interior and region_at(self.game_map, *next(iter(interior))) == active_region
+            ]
         sites = [(e, comp) for e, (comp,) in esper.get_components(ConstructionSite)]
+        if active_region is not None:
+            sites = [
+                (e, comp) for e, comp in sites
+                if comp.pieces and region_at(self.game_map, *next(iter(comp.pieces))) == active_region
+            ]
         # Compute the unowned houses ONCE per turn (interior + bed tile), rather than
         # having every homeless resident rescan every house. Each resident then just
         # picks the nearest reachable one and pops it from this shared list, so the
@@ -1566,6 +1578,8 @@ class HousingProcessor(esper.Processor):
             unowned_houses.append((interior, (bed_pos.x, bed_pos.y)))
 
         for ent, (_res,) in list(esper.get_components(Resident)):
+            if active_region is not None and not self._entity_in_region(ent, active_region):
+                continue
             if owned_bed_of(ent) is not None:
                 continue  # already owns a house -- never re-claim or rebuild
             if self._handle_spouse_housing(ent):
@@ -1573,6 +1587,19 @@ class HousingProcessor(esper.Processor):
             if self._claim_unowned_house(ent, unowned_houses):
                 continue
             self._ensure_site_for(ent, sites)
+
+    def _player_region(self) -> RegionId | None:
+        for _ent, (pos, _player) in esper.get_components(Position, Player):
+            return region_at(self.game_map, pos.x, pos.y)
+        return None
+
+    def _entity_in_region(self, ent: int, region_id: RegionId) -> bool:
+        if esper.has_component(ent, Player):
+            return True
+        if not esper.has_component(ent, Position):
+            return False
+        pos = esper.component_for_entity(ent, Position)
+        return region_at(self.game_map, pos.x, pos.y) == region_id
 
     def _handle_spouse_housing(self, ent: int) -> bool:
         """Keep a married couple under one roof. Returns True (handled: skip
@@ -2203,9 +2230,32 @@ class NeedsProcessor(esper.Processor):
     so the tick is gated on a turn-advancing action.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, game_map: GameMap | None = None) -> None:
+        # In live play, pass a map to tick only the player's active simulation
+        # region. Off-screen regions are allowed to lag and are caught up by
+        # their region schedulers when explicitly needed, so the player's input
+        # frame never pays hunger/thirst/tiredness costs for every island. Unit
+        # tests and tools can keep the old whole-world behaviour by omitting it.
+        self.game_map = game_map
         # World-clock TU at the last accrual, so we can charge only the elapsed span.
         self._last_turn: int | None = None
+
+    def _player_region(self) -> RegionId | None:
+        if self.game_map is None:
+            return None
+        for _ent, (pos, _player) in esper.get_components(Position, Player):
+            return region_at(self.game_map, pos.x, pos.y)
+        return None
+
+    def _should_tick_entity(self, ent: int, active_region: RegionId | None) -> bool:
+        if self.game_map is None or active_region is None:
+            return True
+        if esper.has_component(ent, Player):
+            return True
+        if not esper.has_component(ent, Position):
+            return False
+        pos = esper.component_for_entity(ent, Position)
+        return region_at(self.game_map, pos.x, pos.y) == active_region
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
@@ -2226,9 +2276,12 @@ class NeedsProcessor(esper.Processor):
         scale = elapsed / BASE_ACTION_COST
 
         night = is_night(clock)
+        active_region = self._player_region()
         woke: list[int] = []
 
         for ent, (needs,) in esper.get_components(Needs):
+            if not self._should_tick_entity(ent, active_region):
+                continue
             prev_hunger = needs.hunger
             prev_thirst = needs.thirst
             prev_tiredness = needs.tiredness

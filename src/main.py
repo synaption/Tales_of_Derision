@@ -305,7 +305,7 @@ def main() -> None:
             esper.add_processor(TimeProcessor(), priority=2)
             # Housing runs before the AI so a villager that just claimed a home
             # can start heading there this turn.
-            esper.add_processor(HousingProcessor(game_map), priority=0)
+            esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
             esper.add_processor(
                 NpcAiProcessor(
                     game_map,
@@ -320,7 +320,7 @@ def main() -> None:
                 ),
                 priority=0,
             )
-            esper.add_processor(NeedsProcessor(), priority=0)
+            esper.add_processor(NeedsProcessor(game_map), priority=0)
             # Ticks registered status effects (fire, poison, ...). A no-op until an
             # effect declares behaviour; the seam lives in content.effects.
             esper.add_processor(EffectsProcessor(), priority=0)
