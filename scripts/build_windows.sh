@@ -22,6 +22,6 @@ docker run --rm \
   -v "$REPO_ROOT:/workspace" \
   -w /workspace \
   "$IMAGE_NAME" \
-  /bin/bash -lc 'wine C:\\Python312\\python.exe -m pip install --upgrade pip && wine C:\\Python312\\python.exe -m pip install esper pygame-ce pyinstaller && wine C:\\Python312\\Scripts\\pyinstaller.exe --clean --noconfirm packaging/tales_of_derision_windows.spec'
+  /bin/bash -lc 'xvfb-run -a wine C:\\Python312\\python.exe -m pip install --upgrade pip && xvfb-run -a wine C:\\Python312\\python.exe -m pip install -r requirements.txt pyinstaller && xvfb-run -a wine C:\\Python312\\Scripts\\pyinstaller.exe --clean --noconfirm packaging/tales_of_derision_windows.spec'
 
 echo "Built dist/TalesOfDerision.exe"

@@ -8,8 +8,10 @@ RUN dpkg --add-architecture i386 \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         wget \
+        wine \
         wine64 \
         wine32 \
+        xauth \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 
@@ -18,8 +20,7 @@ ENV WINEDEBUG=-all \
     WINEARCH=win64 \
     DISPLAY=:99
 
-RUN Xvfb :99 -screen 0 1024x768x16 >/tmp/xvfb.log 2>&1 & \
-    wget -q "https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-amd64.exe" -O /tmp/python-installer.exe \
-    && wine /tmp/python-installer.exe /quiet InstallAllUsers=1 PrependPath=1 Include_pip=1 TargetDir=C:\\Python312 \
+RUN wget -q "https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-amd64.exe" -O /tmp/python-installer.exe \
+    && xvfb-run -a wine /tmp/python-installer.exe /quiet InstallAllUsers=1 PrependPath=1 Include_pip=1 TargetDir=C:\\Python312 \
     && rm /tmp/python-installer.exe \
-    && wine C:\\Python312\\python.exe -m pip --version
+    && xvfb-run -a wine C:\\Python312\\python.exe -m pip --version

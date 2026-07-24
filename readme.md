@@ -16,7 +16,7 @@ extend it" reference.
 ## Quick start
 
 ```bash
-python3 -m pip install --user esper pygame pytest
+./scripts/install.sh
 
 python3 src/main.py                                   # play
 python3 src/main.py --save_file src/data/saves/x.json # load a save (skips menus)
@@ -64,6 +64,8 @@ Build a standalone Windows executable from Linux with Docker:
 
 The script builds a Wine-based Linux container, installs Windows Python plus the
 packaging dependencies inside that container, and writes `dist/TalesOfDerision.exe`.
+It only builds the executable; it does not attempt to launch it under Linux. Copy
+the resulting executable to Windows to run it.
 GitHub Actions uses the same Linux build script and uploads the executable artifact
 through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and
 pushes to `dev` or `work`.
