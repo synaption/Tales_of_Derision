@@ -1,12 +1,12 @@
 {
   "map": {
-    "width": 280,
-    "height": 160,
+    "width": 1400,
+    "height": 800,
     "layout": "islands"
   },
   "player": {
-    "x": 140,
-    "y": 80
+    "x": 700,
+    "y": 400
   },
   "seed": 500197
 }

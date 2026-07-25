@@ -394,10 +394,28 @@ class GameSession:
         """Refresh the frame without advancing the world."""
         esper.process(None)
 
-    def take_turn(self, action: str) -> None:
+    def take_turn(self, action: str, draw: bool = True) -> None:
         """Run the systems for one player action, then cooperatively settle a
-        newly entered region before the next command."""
-        esper.process(action)
+        newly entered region before the next command.
+
+        With ``draw=False`` the systems run without drawing and the caller puts
+        the frame up itself (with ``redraw``). The turn loop wants that: it
+        holds every turn to the same wall-clock length, so the frame should land
+        on the beat rather than as soon as the simulation happens to finish --
+        otherwise a cheap turn appears sooner than an expensive one and movement
+        looks uneven. The deferred frame still describes *this* turn; the
+        RenderProcessor holds on to the action it skipped.
+        """
+        render_processor = None if draw else esper.get_processor(RenderProcessor)
+        if render_processor is not None:
+            render_processor.defer_frame = True
+        try:
+            esper.process(action)
+        finally:
+            if render_processor is not None:
+                # Region catch-up below draws interim frames on purpose, so the
+                # deferral ends with the simulation pass.
+                render_processor.defer_frame = False
         current_region = _player_region_for_processors(first_player_position())
         if current_region != self._player_region:
             _catch_up_entered_region_cooperatively(self.renderer, current_region)

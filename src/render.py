@@ -49,6 +49,14 @@ class RenderProcessor(esper.Processor):
         # the turn loop's look handler).
         self.look_cursor: tuple[int, int] | None = None
         self.look_info: str | None = None
+        # Set by the turn loop while the simulation runs, so the frame isn't
+        # drawn the instant the systems finish -- turns are paced to a fixed
+        # wall-clock length, and drawing early makes fast turns visibly outrun
+        # slow ones. The skipped pass's action is held here and picked up by the
+        # next draw, so the deferred frame still describes the turn that caused
+        # it (movement/bump messages, the static-index refresh gate).
+        self.defer_frame = False
+        self._deferred_action: str | None = None
         self._status_y = game_map.height
         self._message_log: list[str] = ["You enter the area."]
         self._max_log_lines = 200
@@ -1111,6 +1119,13 @@ class RenderProcessor(esper.Processor):
             invalidate_surface()
 
     def process(self, action: str | None = None) -> None:
+        if self.defer_frame:
+            # The turn loop will draw this turn once it's due on the clock.
+            self._deferred_action = action
+            return
+        if action is None and self._deferred_action is not None:
+            action, self._deferred_action = self._deferred_action, None
+
         r = self.renderer
         r.clear()
 

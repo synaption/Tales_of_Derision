@@ -41,8 +41,10 @@ def main() -> None:
                 break
 
             # 3. Move the world -- but only for an action that cost a turn.
+            #    The frame is held back until step 4, so every turn appears on
+            #    the beat instead of as soon as its simulation finished.
             if intent.world_action is not None:
-                game.take_turn(intent.world_action)
+                game.take_turn(intent.world_action, draw=False)
                 # 4. Hold the turn to its minimum length. Measured from the end
                 #    of the previous turn, so the world's own work counts toward
                 #    the budget instead of being added on top of it.
@@ -53,6 +55,7 @@ def main() -> None:
                     now = datetime.now()
                 #print(f"Time since last turn: {now - last_turn}")
                 last_turn = now
+                game.redraw()  # this turn's frame, on the beat
             elif intent.redraw:
                 game.redraw()
 
