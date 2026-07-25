@@ -82,6 +82,9 @@ prints progress before each Wine command. Dependency installation times out afte
 Before packaging, the builder verifies that Windows Python imports the complete
 `pygame` package. The PyInstaller specification explicitly collects pygame's
 Python modules, data, and native DLLs because the game imports pygame dynamically.
+It likewise collects the complete `content` package because the content loader
+discovers core creatures, items, effects, flora, and features by module name at
+runtime rather than through static imports.
 
 GitHub Actions uses the same Linux build script and uploads the executable artifact
 through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and

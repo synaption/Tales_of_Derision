@@ -1,11 +1,13 @@
 # PyInstaller spec for the Windows executable build.
 # Build from the repository root with:
 #   pyinstaller --clean --noconfirm packaging/tales_of_derision_windows.spec
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def tree_data(source: str, dest: str):
@@ -13,22 +15,27 @@ def tree_data(source: str, dest: str):
 
 
 pygame_datas, pygame_binaries, pygame_hiddenimports = collect_all("pygame")
+content_datas, content_binaries, content_hiddenimports = collect_all("content")
 
 datas = [
     *tree_data("audio", "audio"),
     *tree_data("gfx", "gfx"),
     *tree_data("src/data", "src/data"),
     *pygame_datas,
+    *content_datas,
 ]
+
+binaries = [*pygame_binaries, *content_binaries]
+hiddenimports = sorted({*pygame_hiddenimports, *content_hiddenimports})
 
 block_cipher = None
 
 a = Analysis(
     [str(ROOT / "src" / "main.py")],
     pathex=[str(ROOT / "src")],
-    binaries=pygame_binaries,
+    binaries=binaries,
     datas=datas,
-    hiddenimports=pygame_hiddenimports,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
