@@ -9,9 +9,9 @@ import esper
 
 from components import Player, Position
 from game_map import GameMap
+from paths import writable_data_root
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = writable_data_root()
 SAVES_DIR = DATA_DIR / "saves"
 CONFIG_DIR = DATA_DIR / "config"
 

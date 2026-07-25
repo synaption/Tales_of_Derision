@@ -85,6 +85,9 @@ Python modules, data, and native DLLs because the game imports pygame dynamicall
 It likewise collects the complete `content` package because the content loader
 discovers core creatures, items, effects, flora, and features by module name at
 runtime rather than through static imports.
+At runtime, the frozen application resolves tiles and sounds from PyInstaller's
+bundle directory. Saves and options—including tile scale—are stored persistently
+under `%LOCALAPPDATA%\TalesOfDerision` instead of the temporary bundle directory.
 
 GitHub Actions uses the same Linux build script and uploads the executable artifact
 through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and
