@@ -6,12 +6,13 @@ process() receives whatever args are passed to esper.process().
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from math import ceil
 import textwrap
 import time
 
 import esper
 
-from components import Actor, Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Camp, Chest, ConstructionSite, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Stove, Tree, Vision, WorldClock
+from components import Actor, Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Camp, Chest, ConstructionSite, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, Seaweed, Settled, Stove, Tree, Vision, WorldClock
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 from items import RAW_MEAT, WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from action import BASE_ACTION_COST, action_cost
@@ -396,6 +397,11 @@ def wake_up(ent: int, game_map: GameMap | None = None) -> None:
     if esper.has_component(ent, Asleep):
         in_camp = esper.component_for_entity(ent, Asleep).in_camp
         esper.remove_component(ent, Asleep)
+    # Anything that wakes a sleeper early -- being attacked, the player shaking it
+    # -- cancels the rest of a compacted sleep. Leaving the receipt behind would
+    # make an awake creature invisible to the per-turn systems for the remainder.
+    if esper.has_component(ent, Settled):
+        esper.remove_component(ent, Settled)
     if in_camp and esper.has_component(ent, Position):
         pos = esper.component_for_entity(ent, Position)
         camp_ent = _camp_at(pos.x, pos.y, game_map)
@@ -2422,6 +2428,35 @@ _TIREDNESS_WARNINGS = (
 _SLEEP_RECOVERY = 3.0
 
 
+def sleep_turns_needed(needs: Needs) -> int:
+    """How many region-turns of unbroken sleep it takes to get ``needs`` rested.
+
+    ``NeedsProcessor._accrue`` pays ``_SLEEP_RECOVERY`` off tiredness per turn and
+    the caller wakes the sleeper the turn tiredness reaches zero, so this is just
+    that division rounded up -- always at least one turn, since even a barely tired
+    creature that lies down sleeps a turn.
+    """
+    return max(1, ceil(needs.tiredness / _SLEEP_RECOVERY))
+
+
+def settle_sleep(needs: Needs, turns: int) -> None:
+    """Apply ``turns`` region-turns of sleep to ``needs`` in one go.
+
+    The closed form of ``NeedsProcessor._accrue``'s asleep branch: tiredness falls
+    by ``_SLEEP_RECOVERY`` a turn, hunger and thirst climb at their own rates
+    whether awake or asleep, and all three clamp at the same bounds. Sleep is the
+    purest compactable activity in the game -- nothing about it depends on
+    anything that happens during it -- so the N turns can be run as arithmetic
+    instead of N loop iterations.
+
+    Lives here, beside ``_accrue``, precisely so the two can't drift apart; the
+    test suite pins them together (``test_activity_compaction``).
+    """
+    needs.tiredness = max(0.0, needs.tiredness - _SLEEP_RECOVERY * turns)
+    needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate * turns)
+    needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate * turns)
+
+
 def _crossed_warning(
     previous: float,
     current: float,
@@ -2460,6 +2495,9 @@ class NeedsProcessor(esper.Processor):
         # what lets a region that has been asleep for a thousand turns wake up with
         # a thousand turns of hunger instead of the hunger it had when you left.
         self._scheduler_driven = False
+        # Set alongside it, so a replayed turn can be dated to the region's own
+        # cursor (``_as_of_clock``) rather than to whenever the replay happened.
+        self._scheduler = None
 
     def register_region_step(self, scheduler) -> None:
         """Make needs part of a region's turn.
@@ -2470,6 +2508,31 @@ class NeedsProcessor(esper.Processor):
         """
         scheduler.register("needs", self.advance_region)
         self._scheduler_driven = True
+        # Kept so a replayed turn can be dated to the region's own history rather
+        # than to the moment the replay happens -- see ``_as_of_clock``.
+        self._scheduler = scheduler
+
+    def _as_of_clock(self, region_id: RegionId) -> WorldClock | None:
+        """The world clock **as of the region-turn being run**, not the true "now".
+
+        A lagging region replays turn N, N+1, N+2 … long after they happened, so
+        dating them by the real clock would charge a turn that happened at midnight
+        as though it were noon. Worse, it would not even be *stable*: how far a
+        region lags depends on the wall-clock budget the background pump got, so
+        the same seed and the same player inputs would accrue different tiredness
+        on a faster machine. Reading the region's own cursor instead makes the
+        answer depend only on which turn it is, which is the whole determinism
+        requirement (see ``RegionScheduler``).
+
+        Mirrors what ``NpcAiProcessor._advance_region`` does with the same cursor,
+        and reads it at the same point -- the scheduler bumps it only after every
+        step has run -- so the AI and the needs it drives agree on the time of day.
+        """
+        clock = world_clock()
+        if clock is None or self._scheduler is None:
+            return clock
+        logical_turn = (self._scheduler.region_turn[region_id] + 1) * BASE_ACTION_COST
+        return replace(clock, turn=logical_turn)
 
     def advance_region(self, region_id: RegionId) -> None:
         """One region-turn of hunger, thirst and tiredness for one region.
@@ -2484,15 +2547,35 @@ class NeedsProcessor(esper.Processor):
         """
         if self.game_map is None:
             return
-        night = is_night(world_clock())
+        night = is_night(self._as_of_clock(region_id))
         woke: list[int] = []
         for ent, (needs,) in spatial.ensure(self.game_map).components(region_id, Needs):
             if esper.has_component(ent, Player):
+                continue
+            if esper.has_component(ent, Settled):
+                # A compacted activity already applied this turn's effects, back
+                # when it was settled in one go. Burn one turn off the receipt and
+                # leave the needs alone -- accruing here would live the turn twice.
+                if self._burn_settled_turn(ent):
+                    woke.append(ent)
                 continue
             if self._accrue(ent, needs, scale=1.0, night=night):
                 woke.append(ent)
         for ent in woke:
             wake_up(ent, self.game_map)
+
+    @staticmethod
+    def _burn_settled_turn(ent: int) -> bool:
+        """Consume one region-turn of a compacted activity. Returns True when that
+        was the last one and the entity was asleep -- i.e. the sleep it settled has
+        now really elapsed and it should wake, on exactly the turn it would have
+        woken had every turn been simulated one at a time."""
+        settled = esper.component_for_entity(ent, Settled)
+        settled.turns -= 1
+        if settled.turns > 0:
+            return False
+        esper.remove_component(ent, Settled)
+        return esper.has_component(ent, Asleep)
 
     def _accrue(self, ent: int, needs: Needs, scale: float, night: bool) -> bool:
         """Age one creature's needs by ``scale`` baseline turns. Returns True if it
@@ -2579,6 +2662,12 @@ class NeedsProcessor(esper.Processor):
         night = is_night(clock)
         woke: list[int] = []
         for ent, needs in self._ticking_entities(self._player_region()):
+            # Same receipt as the region pass: turns a compacted activity already
+            # applied must not be applied again by the whole-world tick either.
+            if esper.has_component(ent, Settled):
+                if self._burn_settled_turn(ent):
+                    woke.append(ent)
+                continue
             if self._accrue(ent, needs, scale, night):
                 woke.append(ent)
 

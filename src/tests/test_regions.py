@@ -16,6 +16,7 @@ from components import Diet, NPC, Needs, Player, Position, Tree, WorldClock
 from game_map import GameMap
 from regions import RegionScheduler, all_region_ids, in_region_with_margin, region_at, region_grid_size
 from systems import FishAiProcessor, NeedsProcessor, NpcAiProcessor, world_clock
+import spatial
 
 pytestmark = pytest.mark.unrendered
 
@@ -277,3 +278,54 @@ def test_sleep_catches_up_every_region_not_just_the_players() -> None:
     assert npc_ai.scheduler.region_turn[far_region] == 10
     needs = esper.component_for_entity(npc, Needs)
     assert needs.hunger < 90.0  # grazed once its region was actually simulated
+
+
+def test_a_replayed_turn_is_dated_to_when_it_happened_not_when_it_is_replayed() -> None:
+    """Batch independence: a lagging region's turns must accrue the needs those
+    turns would have accrued, which means the time of *day* has to come from the
+    region's own cursor, not from the clock at the moment of the replay.
+
+    Without this, how much tiredness a night of debt costs depends on how far the
+    region happened to lag -- and that depends on the wall-clock budget the
+    background pump got, so the same seed and the same inputs give different
+    results on a faster machine.
+    """
+    esper.clear_database()
+    spatial.detach()
+    game_map = GameMap(240, 60)
+    clock = WorldClock(turn=0)
+    esper.create_entity(clock)
+    esper.create_entity(Position(2, 30), Player())
+
+    def tiredness_after_replaying_turn(cursor: int, now_turn: int) -> float:
+        """One region-turn's tiredness for a region sitting at ``cursor`` while the
+        true clock reads ``now_turn``."""
+        for ent, _comps in list(esper.get_components(Needs)):
+            esper.delete_entity(ent, immediate=True)
+        npc = esper.create_entity(
+            Position(200, 30), NPC(),
+            Needs(hunger=0.0, thirst=0.0, tiredness=0.0,
+                  hunger_rate=0.0, thirst_rate=0.0, tiredness_rate=1.0),
+        )
+        scheduler = RegionScheduler(game_map, 0)
+        needs_processor = NeedsProcessor(game_map)
+        needs_processor.register_region_step(scheduler)
+        region = region_at(game_map, 200, 30)
+        scheduler.region_turn[region] = cursor
+        clock.turn = now_turn
+        scheduler.advance_region(region)
+        return esper.component_for_entity(npc, Needs).tiredness
+
+    night_cursor = int(0.85 * clock.day_length) // BASE_ACTION_COST   # 0.85 -> Night
+    daytime_cursor = int(0.30 * clock.day_length) // BASE_ACTION_COST  # 0.30 -> Day
+    # A whole day past the daytime cursor is still the middle of a day, so this is
+    # the same night-time turn replayed while the true clock reads broad daylight --
+    # exactly what a region that fell a day behind gets handed.
+    a_day_later_at_noon = daytime_cursor * BASE_ACTION_COST + clock.day_length
+
+    on_time = tiredness_after_replaying_turn(night_cursor, night_cursor * BASE_ACTION_COST)
+    replayed_late = tiredness_after_replaying_turn(night_cursor, a_day_later_at_noon)
+    by_day = tiredness_after_replaying_turn(daytime_cursor, daytime_cursor * BASE_ACTION_COST)
+
+    assert on_time == replayed_late, "the turn's own time of day decides, not the replay's"
+    assert on_time > by_day, "and it really is the night rate, not a trivial pass"

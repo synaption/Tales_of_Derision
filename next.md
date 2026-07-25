@@ -36,4 +36,7 @@ STILL OPEN:
   TreeGrowth's and Reproduction's own per-region day tracking, would make the
   partition structural rather than a rule each system has to follow.
 
-I want to change how scanning works for things like tree growth.  instead of llitterating over every tree and deciding if that tree spawns a new tree, or going over every tile and deciding if a tree grows there, the scanning should just keep track of how many trees there are on a map tile, and then figure out how many new trees there should be and then grow that many trees.  
+I want to change how scanning works for things like tree growth.  instead of llitterating over every tree and deciding if that tree spawns a new tree, or going over every tile and deciding if a tree grows there, the scanning should just keep track of how many trees there are on a map tile, and then figure out how many new trees there should be and then grow that many trees.  This should apply to everything that scanns like trees.  
+
+
+A* needs to handle different types of ground have different walk speed bonuses?

@@ -273,6 +273,29 @@ class Asleep:
 
 
 @dataclass
+class Settled:
+    """The next ``turns`` region-turns of this entity have **already been
+    simulated**, all at once, by a *compacted activity*.
+
+    Out where the player can't watch, an activity that is N region-turns of
+    identical repetition is settled in a single turn and its whole effect applied
+    in closed form (see the compaction notes in ``ai``). This component is the
+    receipt: while it is present, per-turn systems must **skip** the entity, or
+    they would live those turns a second time. Each region-turn burns one off it,
+    and removing the last one ends the activity.
+
+    Only for activities whose per-turn effects were applied up front. Compacted
+    *travel* deliberately doesn't use this -- a walk's needs really do accrue over
+    the turns it takes, so a traveller keeps being simulated normally and is held
+    still by its energy debt instead.
+
+    ``activity`` names what is being slept/worked through, for tests and debugging.
+    """
+    activity: str = ""
+    turns: int = 0
+
+
+@dataclass
 class Chest:
     """Tag component: a storage container. Pairs with ``Inventory`` to hold
     items the player (or an NPC) can loot, like a corpse's inventory."""

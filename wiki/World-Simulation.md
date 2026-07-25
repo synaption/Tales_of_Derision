@@ -25,10 +25,9 @@ Owns each region's *"simulated up to turn N"* cursor and pays down debt.
 
 - **`register(name, step)`** — add a per-region single-turn step (run in order).
 - **`advance_region(region_id)`** — run every step for that region's next turn, then
-  bump its cursor. Catch-up always **replays** turn N, N+1, N+2 … in strict order —
-  never an analytic shortcut — so state one step builds (NPC positions, needs) stays
-  consistent for the next. Different regions sit at different cursors at the same real
-  moment; that's the whole point.
+  bump its cursor. Steps run in order, so state one step builds (NPC positions,
+  needs) stays consistent for the next. Different regions sit at different cursors at
+  the same real moment; that's the whole point.
 - **`catch_up_region(region_id, target_turn)`** — block until one region reaches a
   turn. **Used when you enter a region**: bring that whole 120×60 area fully up to
   date before it's shown/played.
@@ -55,16 +54,63 @@ the whole world up to date on sleep.*
 ## Compacted activities
 
 A region-turn is not the same thing as an NPC decision. Outside the full-simulation
-box a *walk* is settled as one activity — the NPC covers the whole leg and is charged
-the whole leg's travel time, so it sits out the region-turns the walk consumed
-instead of being woken once per tile to re-decide its life. Arrival turn and next
-action are identical either way; the per-tile deciding is what's gone. See
-[Action Economy](Action-Economy.md#compacted-travel-one-activity-many-turns-worth-of-time)
-for the mechanism and the measurements.
+box an activity that is N turns of the same unobservable repetition is settled in
+**one** region-turn, and the actor is charged the whole N — so it sits out the turns
+the activity consumed instead of being woken to re-decide its life once per tile,
+per log, or per hour of sleep. Arrival turn and next action are identical either
+way; the repeated *deciding* is what's gone.
+
+Three activities use it today — travel, hauling wood to a blueprint, and sleeping —
+through two mechanisms: billing the time against `Actor.energy`, or settling the
+turns in closed form and marking the entity `Settled`. See
+[Action Economy](Action-Economy.md#compacted-activities-one-turn-many-turns-worth-of-time)
+for the mechanism, how to add a fourth, and the measurements (travel is a large win;
+sleep and hauling measured as no change, and the section says why).
 
 This is the counterpart to paying region debt down faster: the pump, region entry
 and sleep all get cheaper per region-turn because the far world thinks less often,
 not because it simulates less.
+
+## Analytic shortcuts and what actually has to hold
+
+A step may work out where N turns of something end up instead of living them one at
+a time. Compacted activities are the first users; tree growth and other scan-shaped
+systems are the obvious next ones.
+
+The constraint is **not** "replay every turn". It is **batch independence**:
+
+> the result must not depend on how the turns were divided up.
+
+That is what keeps the world deterministic, because *how many turns a region
+advances in one go is not deterministic*. `pump_background` spends a real-time
+budget and live region entry is capped per input frame, so the same seed and the
+same player inputs batch differently on a faster machine, or a busier one. A
+shortcut whose answer changes with the batching would make the world change with the
+frame rate. One that doesn't is indistinguishable from replaying, and free.
+
+Two ways that bites in practice:
+
+- **Take the length from the activity, not from the batch.** Settle a whole night's
+  sleep because the sleeper needs N turns of it — never "however many turns the
+  scheduler is handing me right now". This is not just theoretical: `x + rate * N`
+  is not bit-identical to two halves added in turn, so a float need settled in two
+  batches drifts from the same need settled in one.
+- **Draw randomness as a function of (state, N)**, not once per call, or splitting a
+  shortcut in two changes the RNG stream — and with it every downstream roll.
+- **Date a replayed turn to when it happened, not to when it is replayed.** A
+  lagging region's turns must read the world clock at *their* position, which is
+  what `NpcAiProcessor._advance_region` and `NeedsProcessor._as_of_clock` both build
+  from the region's own cursor. Reading the true clock instead means a region that
+  fell a day behind accrues its night-time tiredness at the daytime rate — and how
+  far it fell behind is a wall-clock quantity.
+
+Compacted activities satisfy this by construction: each one is settled once, at its
+own natural length (a whole walk, a whole round trip, a whole night), decided by the
+actor rather than by the scheduler's budget.
+
+The other half of determinism is unchanged: it is seeded (`rng.py`), and only player
+actions may change the course of events — the goal that time travel and undo are
+built on ([Roadmap](Roadmap.md)).
 
 ## Cost & correctness notes
 

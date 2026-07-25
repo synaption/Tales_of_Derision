@@ -19,7 +19,7 @@ import esper
 from components import (
     Actor, Asleep, BerryBush, BlocksMovement, Blueprint, Corpse, Deer, Diet, DriveProfile,
     Enemy, Fish, Friendly, Home, Inventory, NPC, Needs, Personality, Player, Position,
-    Relationships, Resident, Seaweed, Stove, Tree, Vision, WorldClock,
+    Relationships, Resident, Seaweed, Settled, Stove, Tree, Vision, WorldClock,
 )
 from game_map import GameMap
 from content.drives import DriveDef, all_drives
@@ -36,7 +36,8 @@ from systems import (
     _SOCIAL_COOLDOWN, _SOCIAL_DISTANCE_PENALTY, _SOCIAL_SIGHT, _STATIC_SNAPSHOT_REFRESH_CALLS,
     _TURN_ACTIONS, _WORLD_SNAPSHOT_REFRESH_CALLS, _chebyshev, _current_region_turn,
     _set_blueprint_stocked, friendship, go_to_sleep, interact, owned_bed_of,
-    pick_berries, raise_blueprint, slay_entity, try_marry, try_mate, world_clock,
+    pick_berries, raise_blueprint, settle_sleep, slay_entity, sleep_turns_needed,
+    try_marry, try_mate, world_clock,
 )
 
 # How far the occupant-aware fallback pathfind may search around a creature. Big
@@ -60,6 +61,56 @@ _FULL_SIM_HALF_H = 40   # 80 tall
 # drives a few times -- an NPC shouldn't cross an island without noticing it grew
 # hungry on the way -- and so the time debt a single decision can incur is bounded.
 _COMPACTED_TRAVEL_STEPS = 32
+
+# ---------------------------------------------------------------------------
+# Compacted activities
+# ---------------------------------------------------------------------------
+# Outside the full-simulation box nobody can watch an NPC spend its turns; only
+# the outcome is ever observed. So an activity that is N region-turns of the same
+# unobservable repetition -- walking a road, hauling load after load of wood,
+# sleeping a night through -- is *settled* in a single region-turn and the actor
+# is then billed the whole N. The NPC ends up where and how it would have ended
+# up, on the turn it would have got there; what disappears is N-1 rounds of
+# re-ranking its drives and re-scanning its surroundings, which is the expensive
+# part.
+#
+# There are exactly two mechanisms, and a new activity picks whichever fits:
+#
+#  1. **Bill the time** -- ``_charge_activity(ent, turns)``. This is the whole
+#     scheduler: the charge overdraws ``Actor.energy``, and ``_advance_region``'s
+#     energy loop simply doesn't call the NPC again until the following
+#     region-turns have paid the balance off. That *is* "busy for the next N
+#     turns", with no second clock, no busy flag and no queue to keep in sync.
+#     Needs keep accruing throughout, so the activity is genuinely tiring.
+#     Used by travel and hauling, whose per-turn effects really do happen over
+#     those turns.
+#
+#  2. **Settle the turns** -- apply the whole activity's effect in closed form and
+#     tag the entity ``Settled(activity, turns)``. Per-turn systems skip a
+#     ``Settled`` entity and burn one turn off the receipt instead, so they can't
+#     live those turns twice. Used by sleep, which is pure arithmetic and whose
+#     "busy" state is already the ``Asleep`` tag.
+#
+# For repeating activities the generic driver is ``_run_compacted``: hand it the
+# activity's ordinary one-turn body and it runs turns of it until the body says
+# there's nothing left to do, then bills the difference. An activity written that
+# way never has to know it's being compacted.
+#
+# Every activity has a ``_COMPACTED_*`` cap, all for the same reason: an activity
+# settled in one decision is a decision made without noticing anything that
+# happens during it, so a long one is broken into legs that re-decide.
+
+# How many turns of a repeating activity ``_run_compacted`` may fold into one
+# region-turn. Deliberately smaller than the travel cap: each of these turns can
+# contain a whole travel leg of its own, so a hauling round trip already spans
+# far more than eight tiles.
+_COMPACTED_ACTIVITY_TURNS = 8
+
+# The longest sleep settled as one activity. A full night is ~34 turns (100
+# tiredness at _SLEEP_RECOVERY = 3 a turn); the cap only bites on a creature that
+# lies down utterly spent, and keeps a single decision from writing off a whole
+# day in which the world around it moved on.
+_COMPACTED_SLEEP_TURNS = 120
 
 
 class NpcAiProcessor(esper.Processor):
@@ -339,12 +390,11 @@ class NpcAiProcessor(esper.Processor):
             return False
 
         xy = (pos.x, pos.y)
-        if self._far_from_player(xy):
+        if self._compactable(xy):
             # Beyond the full-sim box: no per-turn pathfinding, and no per-tile
             # turns. Walk the whole leg at once and bill the traveller for it.
             tiles = self._far_travel(ent, pos, goal, occupied)
-            if tiles > 1:
-                self._charge_travel(ent, tiles - 1)
+            self._charge_activity(ent, tiles - 1)
             return tiles > 0
 
         step = self._greedy_step_toward(ent, xy, goal, occupied)
@@ -638,7 +688,14 @@ class NpcAiProcessor(esper.Processor):
         trees: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
     ) -> bool:
-        trees = self._reachable(pos, trees)
+        # Drop trees that have already been felled. ``trees`` is the region's
+        # cached static list, which is only rebuilt between region-turns -- fine
+        # when this ran once a turn, but a compacted haul fells several in one
+        # turn and would otherwise keep "chopping" a stump for free wood. Filtering
+        # the copy ``_reachable`` returns, never the cached list itself.
+        trees = [
+            item for item in self._reachable(pos, trees) if esper.entity_exists(item[1])
+        ]
         if not trees:
             return False
         target_xy, tree_ent = min(trees, key=lambda t: _chebyshev((pos.x, pos.y), t[0]))
@@ -706,19 +763,18 @@ class NpcAiProcessor(esper.Processor):
     ) -> bool:
         """A tired NPC heads for bed. It prefers its home tile, walking there a
         step at a time; homeless creatures (and any too exhausted to make it
-        home) camp where they stand."""
+        home) camp where they stand. Lying down out of sight sleeps the whole
+        rest through at once (``_bed_down``)."""
         home = None
         if esper.has_component(ent, Home):
             home = esper.component_for_entity(ent, Home)
 
         if home is None:
-            go_to_sleep(ent, in_camp=True, game_map=self.game_map)
-            return True
+            return self._bed_down(ent, pos, needs, in_camp=True)
 
         home_xy = (home.x, home.y)
         if (pos.x, pos.y) == home_xy:
-            go_to_sleep(ent, in_camp=False, game_map=self.game_map)
-            return True
+            return self._bed_down(ent, pos, needs, in_camp=False)
 
         if self._step_toward(ent, pos, home_xy, occupied):
             return True
@@ -727,9 +783,30 @@ class NpcAiProcessor(esper.Processor):
         # home is genuinely unreachable (blocked by water/walls) -- better to camp
         # and recover than to idle at a barrier, pinning tiredness and starving.
         if needs.tiredness >= _EXHAUSTED_THRESHOLD or not self._same_region_cached((pos.x, pos.y), home_xy):
-            go_to_sleep(ent, in_camp=True, game_map=self.game_map)
-            return True
+            return self._bed_down(ent, pos, needs, in_camp=True)
         return False
+
+    def _bed_down(self, ent: int, pos: Position, needs: Needs, in_camp: bool) -> bool:
+        """Put an NPC to sleep, compacting the whole rest into this turn when
+        nobody is watching.
+
+        A night's sleep is the purest compactable activity there is: its only
+        effects are the three needs, none of which depends on anything that
+        happens during it, so the turns it takes can be run as arithmetic
+        (``settle_sleep``) rather than as that many region-turns of accrual. The
+        sleeper is then tagged ``Settled`` for exactly those turns, so the per-turn
+        systems skip it and wake it on the turn it would have woken anyway.
+
+        No energy charge here, unlike travel and hauling: ``Asleep`` already keeps
+        a sleeper out of the AI's turn, and putting it in arrears on top would
+        leave it standing around after waking.
+        """
+        go_to_sleep(ent, in_camp=in_camp, game_map=self.game_map)
+        if self._compactable((pos.x, pos.y)):
+            turns = min(_COMPACTED_SLEEP_TURNS, sleep_turns_needed(needs))
+            settle_sleep(needs, turns)
+            esper.add_component(ent, Settled(activity="sleep", turns=turns))
+        return True
 
     def _ensure_inventory(self, ent: int) -> Inventory:
         if esper.has_component(ent, Inventory):
@@ -747,19 +824,56 @@ class NpcAiProcessor(esper.Processor):
         esper.add_component(ent, actor)
         return actor
 
-    def _charge_travel(self, ent: int, extra_actions: int) -> None:
-        """Bill ``ent`` for the tiles of a compacted journey beyond the first.
+    def _compactable(self, xy: tuple[int, int]) -> bool:
+        """True when an NPC standing at ``xy`` may settle a whole activity in one
+        region-turn -- that is, when nobody can see it happen.
+
+        Today that is exactly "outside the full-simulation box", the same line
+        that decides cached-route versus full pathfinding. With no player at all
+        (unit tests, whole-world catch-up) nothing is compacted, so those paths
+        keep running the exact, unabridged turn-at-a-time simulation.
+        """
+        return self._far_from_player(xy)
+
+    def _charge_activity(self, ent: int, extra_turns: int) -> None:
+        """Bill ``ent`` for the region-turns of a compacted activity beyond the
+        one it is already being charged for.
 
         ``_advance_region`` grants one baseline action's worth of energy per
-        region-turn and charges one action's cost per turn taken; the first tile of
-        a walk is already paid for that way. Overdrawing the account by the rest
-        puts the traveller in arrears, and the energy loop simply doesn't call it
-        again until the following region-turns have paid the balance back off --
-        which is precisely "this NPC is busy walking for the next N turns", with no
-        second clock to keep in sync. Needs keep accruing throughout (they belong to
-        the region's turn, not the NPC's), so a long journey is genuinely tiring.
+        region-turn and charges one action's cost per turn taken, so the first
+        turn of any activity is already paid for the ordinary way. Overdrawing the
+        account by the rest puts the actor in arrears, and the energy loop simply
+        doesn't call it again until the following region-turns have paid the
+        balance back off -- which is precisely "this NPC is busy for the next N
+        turns", with no second clock to keep in sync. Needs keep accruing
+        throughout (they belong to the region's turn, not the NPC's), so a long
+        activity is genuinely tiring.
         """
-        self._actor_of(ent).energy -= extra_actions * action_cost(ent, None)
+        if extra_turns > 0:
+            self._actor_of(ent).energy -= extra_turns * action_cost(ent, None)
+
+    def _run_compacted(
+        self, ent: int, pos: Position, cap: int, one_turn: Callable[[], bool]
+    ) -> bool:
+        """Run up to ``cap`` region-turns of a repeating activity in this one, and
+        bill the actor for all of them. Returns True if it did anything.
+
+        ``one_turn`` is the activity's ordinary single-turn body: it returns True
+        when it did a turn's work and False when there is nothing left to do. That
+        is the whole contract -- an activity written the normal way is compacted by
+        being handed to this, and never has to know about it.
+
+        The loop stops early if the activity walks its actor into the watched
+        world, so nothing is ever fast-forwarded in front of the player: the
+        remainder is handed straight back to ordinary per-turn simulation.
+        """
+        turns = 0
+        while turns < cap and one_turn():
+            turns += 1
+            if not self._compactable((pos.x, pos.y)):
+                break
+        self._charge_activity(ent, turns - 1)
+        return turns > 0
 
     def _should_build(self, ent: int) -> bool:
         """True when raising a home is this NPC's job right now: a resident that
@@ -805,6 +919,12 @@ class NpcAiProcessor(esper.Processor):
         isn't wasted and the shell keeps rising as far as the materials reached;
         an unstocked piece stays a walkable gap, so raising the stocked ones
         never seals off the rest.
+
+        Out of sight the hauling is compacted: supplying a piece is a round trip
+        of pure travel -- out to the woods, a swing of the axe, back to the site,
+        once per log -- and every one of those turns is the same unobservable
+        errand. ``_run_compacted`` runs the whole trip now and bills the worker for
+        the turns it really took, so a haul costs one decision instead of a dozen.
         """
         ghosts = self._reachable_ghosts(pos)
         if not ghosts:
@@ -813,8 +933,17 @@ class NpcAiProcessor(esper.Processor):
         # Keep hauling while the woods can still supply the unfinished pieces;
         # _haul_to_ghosts returns False once there's no wood on hand and nothing
         # reachable to fell, at which point we raise whatever is already stocked.
-        if unstocked and self._haul_to_ghosts(ent, pos, unstocked, trees, occupied):
-            return True
+        if unstocked:
+            def haul() -> bool:
+                return self._haul_to_ghosts(ent, pos, unstocked, trees, occupied)
+
+            hauled = (
+                self._run_compacted(ent, pos, _COMPACTED_ACTIVITY_TURNS, haul)
+                if self._compactable((pos.x, pos.y))
+                else haul()
+            )
+            if hauled:
+                return True
         stocked = {gxy: g_ent for g_ent, gxy, bp in ghosts if bp.stocked}
         if stocked:
             return self._raise_nearby_ghost(ent, pos, stocked, occupied)
@@ -830,7 +959,15 @@ class NpcAiProcessor(esper.Processor):
     ) -> bool:
         """Carry wood to the proto-structure: gather a batch, walk it to the
         nearest ghost lacking materials, and drop it off -- each wood delivered
-        lights one ghost up as "ready"."""
+        lights one ghost up as "ready". One turn's worth of that per call.
+
+        ``unstocked`` is consumed as pieces are supplied, so calling this again
+        (which ``_work_blueprints`` does, to compact a whole round trip into one
+        region-turn) picks up where the last delivery left off instead of
+        re-delivering to a piece that already has its wood.
+        """
+        if not unstocked:
+            return False  # everything reachable is supplied; nothing left to haul
         inventory = self._ensure_inventory(ent)
         wood = inventory.items.count(WOOD)
         batch = min(_HAUL_BATCH, len(unstocked))
@@ -847,7 +984,7 @@ class NpcAiProcessor(esper.Processor):
                 if WOOD not in inventory.items:
                     break
                 inventory.items.remove(WOOD)
-                _set_blueprint_stocked(unstocked[gxy], True)
+                _set_blueprint_stocked(unstocked.pop(gxy), True)
                 stocked_any = True
             return stocked_any
         # Ghost tiles don't block, so the worker can walk right up to the site.

@@ -93,13 +93,36 @@ def _chebyshev(a: RegionId, b: RegionId) -> int:
 class RegionScheduler:
     """Owns each region's "simulated up to turn N" cursor and pays down debt.
 
-    Each registered step is a plain, region-scoped single turn of work; catch-
-    up always replays turn N, then N+1, then N+2 ... in strict order -- never
-    an analytic shortcut -- so state one step builds (e.g. NPC positions) is
-    always consistent for the next step and the next turn. Different regions
-    can sit at different turn cursors at the same real moment; that's the
-    entire point (true global lockstep would mean simulating everything every
-    turn, i.e. no optimization at all).
+    Each registered step is a plain, region-scoped single turn of work, run in
+    order, so state one step builds (e.g. NPC positions) is consistent for the
+    next step and the next turn. Different regions can sit at different turn
+    cursors at the same real moment; that's the entire point (true global
+    lockstep would mean simulating everything every turn, i.e. no optimization
+    at all).
+
+    **Analytic shortcuts are allowed.** A step is free to work out where N turns
+    of something end up rather than living them one at a time -- that is how
+    compacted activities work (see the compaction notes in ``ai``). The rule a
+    shortcut must obey is not "replay every turn", it is **batch independence**:
+
+        the result must not depend on how the turns were divided up.
+
+    That is what keeps the world deterministic, because how many turns a region
+    advances in one go is *not*. ``pump_background`` spends a real-time budget
+    and live catch-up is capped per input frame, so the same seed and the same
+    player inputs will batch differently on a faster machine or a busier one. A
+    shortcut whose answer changes with the batching would make the world change
+    with the frame rate; one that doesn't is indistinguishable from replaying.
+
+    Two ways that bites in practice:
+
+    * **Length the activity chooses, not the batch it landed in.** Settle a
+      whole night's sleep because the sleeper needs N turns of it -- never
+      "however many turns the scheduler happens to be handing me right now".
+      Float arithmetic makes the difference real as well as theoretical:
+      ``x + rate * N`` is not bit-identical to two halves added in turn.
+    * **Randomness must be drawn as a function of (state, N)**, not once per
+      call, or splitting a shortcut in two changes the RNG stream.
     """
 
     def __init__(self, game_map: GameMap, current_turn: int):
