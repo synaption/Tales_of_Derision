@@ -118,6 +118,12 @@ def read_command_line() -> argparse.Namespace:
 # input. Shorter than the shortest status frame; only used while animating.
 _STATUS_ANIM_POLL_SECONDS = 0.2
 
+# Frame cadence while a newly entered region replays its backlog. The replay is
+# a blocking stretch that shows the world fast-forwarding, so it wants a
+# watchable rate, not one frame per simulated turn -- see
+# ``_catch_up_entered_region_cooperatively``.
+_CATCHUP_FRAME_SECONDS = 0.1
+
 
 def _await_action_or_idle(renderer: Renderer, idle_timeout: float) -> str | None:
     """Like ``_await_action`` but returns ``None`` after ``idle_timeout`` seconds
@@ -181,8 +187,17 @@ def _catch_up_entered_region_cooperatively(renderer: Renderer, region_id: tuple[
 
     Region entry is one of the few moments where the off-screen simulation must
     become authoritative before the next player command. Do that as a sequence of
-    small deterministic scheduler advances, rendering between chunks so the UI
-    keeps responding instead of freezing for the whole backlog.
+    small deterministic scheduler advances, rendering between chunks so the player
+    watches the backlog resolve instead of staring at a frozen window.
+
+    The frames are paced by the wall clock, not by the chunk count. Chunks are
+    deliberately tiny (``ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT`` is 1, so the
+    replay stays interruptible at the finest possible grain), and drawing one
+    frame per chunk meant a full render per replayed region-turn -- at a hundred
+    islands that was ~80% of the entire stall spent on thousands of frames nobody
+    could see, and it grew with the debt. Progress feedback only needs to arrive
+    at a watchable rate; the simulation is unaffected either way, because
+    ``esper.process(None)`` is render-only.
     """
     if region_id is None:
         return
@@ -196,6 +211,7 @@ def _catch_up_entered_region_cooperatively(renderer: Renderer, region_id: tuple[
     ]
     if not processors:
         return
+    last_frame = 0.0  # draw the first chunk's frame immediately
     while True:
         any_lagging = False
         for processor in processors:
@@ -208,7 +224,10 @@ def _catch_up_entered_region_cooperatively(renderer: Renderer, region_id: tuple[
                 )
         if not any_lagging:
             return
-        esper.process(None)
+        now = time.monotonic()
+        if now - last_frame >= _CATCHUP_FRAME_SECONDS:
+            last_frame = now
+            esper.process(None)
 
 
 def _pump_background_regions(budget_seconds: float) -> None:

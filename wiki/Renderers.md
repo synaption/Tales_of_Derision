@@ -66,6 +66,31 @@ Implements the interface with pygame and owns the key map, plus:
    `PygameRenderer` — the only line that names a backend. Systems and map code stay
    unchanged.
 
+## Video driver on WSL
+
+`PygameRenderer._prefer_x11_on_wsl()` pins `SDL_VIDEODRIVER=x11` (and defaults
+`DISPLAY` to `:0`) when running under WSL.
+
+WSLg publishes both a Wayland and an X11 display. On Wayland SDL backs the window
+with EGL/OpenGL, which the WSLg Mesa stack fails to create:
+
+```
+libEGL warning: failed to get driver name for fd -1
+MESA: error: ZINK: failed to choose pdev
+libEGL warning: egl: failed to create dri2 screen
+```
+
+SDL does **not** treat that as an error. `set_mode` returns a good surface, every
+frame draws and flips, and nothing ever appears — the game runs on invisibly, audio
+and input included. Under X11 the same window is a plain software surface and works.
+
+Which driver SDL picks depends on what the launching shell exported (`DISPLAY`
+present → X11; absent with `WAYLAND_DISPLAY` set → Wayland), so the same build showed
+a window from one terminal and stayed invisible from another. Defaults only: an
+explicit `SDL_VIDEODRIVER` — the `dummy` used by `--screenshot` and the test suite —
+always wins, as does an existing `DISPLAY`. Held by
+[src/tests/test_video_driver_choice.py](../src/tests/test_video_driver_choice.py).
+
 ## Turn loop note
 
 The current [turn loop](Architecture.md#the-turn-loop) is turn-driven and waits for

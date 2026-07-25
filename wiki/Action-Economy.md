@@ -51,3 +51,35 @@ accrue over time (needs) can use the exact elapsed span.
   each region-turn `BASE_ACTION_COST` of `Actor.energy` per NPC and spends the action
   cost per action — a quicker creature banks the surplus and acts again. Same cost
   model, cheaper bookkeeping for crowds.
+
+## Compacted travel: one activity, many turns' worth of time
+
+Out where nobody is watching, a walk is settled as a **single activity** rather than
+a turn per tile. An NPC beyond the full-simulation box that decides to travel covers
+the whole leg at once (`NpcAiProcessor._far_travel`, capped at
+`_COMPACTED_TRAVEL_STEPS = 32` tiles) and is then billed for the tiles it didn't pay
+for the ordinary way — `_charge_travel` simply overdraws its `Actor.energy`.
+
+That overdraft *is* the "busy walking" state: the energy loop won't call the NPC
+again until the following region-turns have paid the balance back off. No second
+clock, no busy flag, no queue.
+
+The schedule is unchanged by this. Twelve tiles a turn at a time means an NPC that
+decides to travel on region-turn *N* arrives on *N+11* and does the next thing on
+*N+12*; compacted, it arrives on *N* but stays in arrears until *N+12* — same next
+action, same turn. What disappears is eleven rounds of re-ranking its drives and
+re-scanning its surroundings, which is the expensive part.
+
+Two deliberate limits:
+
+- The cap keeps a long trek from being decided once and blindly executed — a
+  traveller stops to take stock every 32 tiles, so it can notice it got hungry.
+- A leg **stops on the threshold of the full-sim box**, so a creature walking toward
+  the player never materializes mid-stride in front of them; the last stretch is
+  walked a tile at a time like anything else on screen.
+
+Measured on a 9-island world after 200 turns of walking (3300 region-turns of debt):
+catch-up **2.20 s vs 3.17 s**, i.e. 0.67 vs 0.95 ms per region-turn. Per-turn cost
+while walking is unchanged (~2.8 ms) — the player's own region is never compacted.
+Time is conserved: action slots spent per energy grant is 1.02 with compaction and
+1.02 without.

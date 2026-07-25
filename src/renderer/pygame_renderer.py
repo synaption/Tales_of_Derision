@@ -11,6 +11,7 @@ from collections import deque
 import json
 import os
 from pathlib import Path
+import sys
 
 from paths import resource_root
 
@@ -762,6 +763,35 @@ class PygameRenderer(Renderer):
             if "use_bg_fill" in fallback_payload:
                 self._fallback_fill_bg = bool(fallback_payload.get("use_bg_fill"))
 
+    @staticmethod
+    def _prefer_x11_on_wsl() -> None:
+        """On WSL, ask SDL for X11 rather than letting it choose.
+
+        WSLg publishes both a Wayland and an X11 display. Given the choice SDL
+        may take Wayland -- and there its window is EGL/OpenGL-backed, which this
+        Mesa stack cannot create ("failed to create dri2 screen", "ZINK: failed
+        to choose pdev"). SDL does not treat that as an error: ``set_mode``
+        returns a perfectly good surface, every frame is drawn and flipped, and
+        *nothing ever appears on screen* -- the game runs on invisibly, audio and
+        all. Under X11 the same window is a plain software surface and works.
+
+        Which driver SDL picks depends on what the launching shell exports, so
+        the same build shows a window from one terminal and not from another.
+        Pinning it here makes that reproducible. Defaults only: an explicit
+        ``SDL_VIDEODRIVER`` (including the ``dummy`` used for screenshots and
+        tests) always wins, and so does an existing ``DISPLAY``.
+        """
+        if sys.platform != "linux" or os.environ.get("SDL_VIDEODRIVER"):
+            return
+        try:
+            on_wsl = "microsoft" in Path("/proc/version").read_text(errors="ignore").lower()
+        except OSError:
+            on_wsl = False
+        if not on_wsl:
+            return
+        os.environ.setdefault("DISPLAY", ":0")  # WSLg always publishes :0
+        os.environ["SDL_VIDEODRIVER"] = "x11"
+
     def setup(self) -> None:
         pygame = __import__("pygame")
 
@@ -769,12 +799,37 @@ class PygameRenderer(Renderer):
         # letting the OS rescale the window (fixes blurry/wrong-sized display
         # on multi-monitor / high-DPI setups).
         os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
+        self._prefer_x11_on_wsl()
 
         pygame.init()
         pygame.display.set_caption("Tales of Derision")
 
         self._pygame = pygame
         self.apply_options(self._options)
+        self._report_display_target()
+
+    def _report_display_target(self) -> None:
+        """Say once, on stderr, where the game is drawing.
+
+        A pygame game can render flawlessly into a surface nobody will ever see --
+        a headless driver, or a window the compositor never puts up -- and from the
+        inside that is indistinguishable from working: frames draw, input arrives,
+        audio plays. This one line turns "the GUI isn't booting" from a guess into
+        a fact, and names the two drivers that are *guaranteed* to show nothing.
+        """
+        if self._pygame is None:
+            return
+        driver = self._pygame.display.get_driver()
+        size = self._screen.get_size() if self._screen is not None else None
+        where = f"{size[0]}x{size[1]}" if size else "no surface"
+        print(f"Display: SDL driver {driver!r}, window {where}", file=sys.stderr)
+        if driver in {"dummy", "offscreen"}:
+            print(
+                f"  WARNING: the {driver!r} driver draws to memory only -- no window "
+                "will ever appear, though the game runs normally behind it. "
+                "Unset SDL_VIDEODRIVER (or set it to x11) and run again.",
+                file=sys.stderr,
+            )
 
     def teardown(self) -> None:
         if self._pygame is None:

@@ -52,8 +52,31 @@ This realises the design goals in `next.md`: *simulate the whole world, prioriti
 nearest tiles (not the stalest), bring a region fully up to date on entry, and bring
 the whole world up to date on sleep.*
 
+## Compacted activities
+
+A region-turn is not the same thing as an NPC decision. Outside the full-simulation
+box a *walk* is settled as one activity — the NPC covers the whole leg and is charged
+the whole leg's travel time, so it sits out the region-turns the walk consumed
+instead of being woken once per tile to re-decide its life. Arrival turn and next
+action are identical either way; the per-tile deciding is what's gone. See
+[Action Economy](Action-Economy.md#compacted-travel-one-activity-many-turns-worth-of-time)
+for the mechanism and the measurements.
+
+This is the counterpart to paying region debt down faster: the pump, region entry
+and sleep all get cheaper per region-turn because the far world thinks less often,
+not because it simulates less.
+
 ## Cost & correctness notes
 
+- **Region entry draws frames on the wall clock, not per replayed turn.**
+  `ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT` is 1, so the replay stays interruptible at
+  the finest grain — but that used to mean one full render per replayed region-turn.
+  At 100 islands that was ~80% of the whole stall spent on frames nobody could see,
+  and it grew with the debt: stepping into the next region cost 0.72 s after 100
+  turns of play (250 frames) and 1.66 s after 300 (450 frames). Pacing the progress
+  frames at `_CATCHUP_FRAME_SECONDS` (0.1 s) makes those 0.14 s / 2 frames and
+  0.24 s / 3 frames. `esper.process(None)` is render-only, so the simulation is
+  identical either way.
 - Catch-up cost concentrates on **region entry** (entering a lagging region replays
   every missed turn at once) — this is where pathfinding cost shows up. Kept in check
   by A* + reused flow fields (see [Game Map](Game-Map.md), [Performance](Performance.md)).

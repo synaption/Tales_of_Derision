@@ -52,6 +52,15 @@ _LOCAL_PATH_RADIUS = 12
 _FULL_SIM_HALF_W = 80   # 160 wide
 _FULL_SIM_HALF_H = 40   # 80 tall
 
+# How many tiles of a trip an unwatched NPC may walk in a single region-turn.
+# Outside the full-simulation box nobody can see the walk, only its outcome, so a
+# journey is settled as one *activity*: the NPC arrives and is charged the whole
+# journey's time (see ``_far_travel``), instead of being woken to re-decide its
+# life once per tile. The cap exists so a very long trek still re-evaluates its
+# drives a few times -- an NPC shouldn't cross an island without noticing it grew
+# hungry on the way -- and so the time debt a single decision can incur is bounded.
+_COMPACTED_TRAVEL_STEPS = 32
+
 
 class NpcAiProcessor(esper.Processor):
     """Drives NPC behaviour each turn.
@@ -237,50 +246,72 @@ class NpcAiProcessor(esper.Processor):
             return False
         return abs(xy[0] - p[0]) > _FULL_SIM_HALF_W or abs(xy[1] - p[1]) > _FULL_SIM_HALF_H
 
-    def _far_path_step(
+    def _far_travel(
         self,
         ent: int,
         pos: Position,
         goal: tuple[int, int],
         occupied: dict[tuple[int, int], int],
-    ) -> bool:
-        """Move one tile toward ``goal`` for an NPC beyond the full-sim box, using a
-        cached concrete route and paying a real ``find_path`` only on a cache miss.
+    ) -> int:
+        """Walk a whole leg of a trip toward ``goal`` in one region-turn, for an NPC
+        beyond the full-sim box. Returns the number of tiles covered (0 = it didn't
+        move); the caller charges the traveller for all of them.
 
-        The distant world doesn't need optimal, occupant-aware routing every turn:
-        once a valid path to the goal is found it stays valid until a tile on it is
-        edited, so the NPC just walks it step by step for free. Dynamic occupants
-        (other movers) are ignored out here -- invisible off-screen and never
-        recorded in ``occupied`` anyway -- so a cached route is only invalidated by
-        a static tile change, i.e. essentially never mid-trip. On a miss it pays one
-        occupant-blind ``find_path`` (unbounded -- it runs once per trip, not per
-        turn) and caches the result."""
+        Out here the walk itself is unobservable -- nobody is watching an NPC on
+        another island put one foot in front of the other -- so there is nothing to
+        gain from spending a region-turn per tile, and a great deal to lose: every
+        one of those turns re-ranks the creature's drives and re-scans its
+        surroundings. Instead the journey is settled as a single activity. The NPC
+        moves to the end of the leg and pays that leg's travel time, which keeps it
+        out of the simulation for exactly as many region-turns as the walk would
+        have taken. Same time spent, same arrival turn, a fraction of the work.
+
+        The distant world doesn't need optimal, occupant-aware routing either: once
+        a valid path to the goal is found it stays valid until a tile on it is
+        edited, so the route is cached and a real ``find_path`` is paid only on a
+        miss (once per trip, not per turn) -- unbounded, because it is that rare.
+        Dynamic occupants are ignored out here (invisible off-screen and never
+        recorded in ``occupied`` anyway), so only a static tile change can spoil a
+        route mid-trip; the walk below stops short if it meets one.
+        """
         xy = (pos.x, pos.y)
+        path: list[tuple[int, int]] | None = None
+        cursor = 0
         cached = self._trip_cache.get(ent)
         if cached is not None:
-            c_goal, path, cursor = cached
-            # Re-usable iff it's the same trip, the NPC is still standing on the
-            # route, and the next tile hasn't become unwalkable since it was built.
-            if (
-                c_goal == goal
-                and cursor + 1 < len(path)
-                and path[cursor] == xy
-                and self.game_map.is_walkable(path[cursor + 1][0], path[cursor + 1][1])
-            ):
-                nxt = path[cursor + 1]
-                self._commit_step(ent, pos, nxt, occupied)
-                self._trip_cache[ent] = (goal, path, cursor + 1)
-                return True
-        # Cache miss: compute one route (start-inclusive so path[0] == xy), cache
-        # it, and take the first step.
-        route = self.game_map.find_path(xy, goal)
-        if not route:
+            c_goal, c_path, c_cursor = cached
+            # Re-usable iff it's the same trip and the NPC is still on the route.
+            if c_goal == goal and c_cursor + 1 < len(c_path) and c_path[c_cursor] == xy:
+                path, cursor = c_path, c_cursor
+        if path is None:
+            route = self.game_map.find_path(xy, goal)
+            if not route:
+                self._trip_cache.pop(ent, None)
+                return 0
+            path, cursor = [xy, *route], 0
+
+        end = cursor
+        limit = min(len(path) - 1, cursor + _COMPACTED_TRAVEL_STEPS)
+        while end < limit:
+            nxt = path[end + 1]
+            if not self.game_map.is_walkable(nxt[0], nxt[1]):
+                break  # the world changed under the route; re-path next turn
+            end += 1
+            if not self._far_from_player(nxt):
+                # This leg reaches the watched world. Stop on its threshold and
+                # hand the rest of the trip back to full per-tile simulation, so
+                # an NPC never materializes mid-stride in front of the player.
+                break
+        if end == cursor:
             self._trip_cache.pop(ent, None)
-            return False
-        path = [xy, *route]
-        self._commit_step(ent, pos, path[1], occupied)
-        self._trip_cache[ent] = (goal, path, 1)
-        return True
+            return 0
+
+        self._commit_step(ent, pos, path[end], occupied)
+        if end + 1 < len(path):
+            self._trip_cache[ent] = (goal, path, end)
+        else:
+            self._trip_cache.pop(ent, None)  # arrived
+        return end - cursor
 
     def _step_toward(
         self,
@@ -309,9 +340,12 @@ class NpcAiProcessor(esper.Processor):
 
         xy = (pos.x, pos.y)
         if self._far_from_player(xy):
-            # Beyond the full-sim box: no per-turn pathfinding. Walk a cached route
-            # toward the goal, paying a real pathfind only when none applies.
-            return self._far_path_step(ent, pos, goal, occupied)
+            # Beyond the full-sim box: no per-turn pathfinding, and no per-tile
+            # turns. Walk the whole leg at once and bill the traveller for it.
+            tiles = self._far_travel(ent, pos, goal, occupied)
+            if tiles > 1:
+                self._charge_travel(ent, tiles - 1)
+            return tiles > 0
 
         step = self._greedy_step_toward(ent, xy, goal, occupied)
         if step is not None:
@@ -712,6 +746,20 @@ class NpcAiProcessor(esper.Processor):
         actor = Actor()
         esper.add_component(ent, actor)
         return actor
+
+    def _charge_travel(self, ent: int, extra_actions: int) -> None:
+        """Bill ``ent`` for the tiles of a compacted journey beyond the first.
+
+        ``_advance_region`` grants one baseline action's worth of energy per
+        region-turn and charges one action's cost per turn taken; the first tile of
+        a walk is already paid for that way. Overdrawing the account by the rest
+        puts the traveller in arrears, and the energy loop simply doesn't call it
+        again until the following region-turns have paid the balance back off --
+        which is precisely "this NPC is busy walking for the next N turns", with no
+        second clock to keep in sync. Needs keep accruing throughout (they belong to
+        the region's turn, not the NPC's), so a long journey is genuinely tiring.
+        """
+        self._actor_of(ent).energy -= extra_actions * action_cost(ent, None)
 
     def _should_build(self, ent: int) -> bool:
         """True when raising a home is this NPC's job right now: a resident that
