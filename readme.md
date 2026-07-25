@@ -16,7 +16,7 @@ extend it" reference.
 ## Quick start
 
 ```bash
-python3 -m pip install --user esper pygame pytest
+./scripts/install.sh
 
 python3 src/main.py                                   # play
 python3 src/main.py --save_file src/data/saves/x.json # load a save (skips menus)
@@ -52,6 +52,46 @@ inventory, **C** status, **R** sleep, **Esc** pause. Full controls and the survi
 
 **Reading order of authority** (per `notes4LLMs.md`): `notes4LLMs.md` → this
 README → the wiki.
+
+
+## Windows executable packaging
+
+Build a standalone Windows executable from Linux with Docker:
+
+```bash
+./scripts/build_windows.sh
+```
+
+The script builds a Wine-based Linux container, installs Windows Python plus the
+packaging dependencies inside that container, and writes `dist/TalesOfDerision.exe`.
+It only builds the executable; it does not attempt to launch it under Linux. Copy
+the resulting executable to Windows to run it.
+
+The builder intentionally uses the version of `pip` bundled with Windows Python.
+Do not upgrade it in Wine: newer `pip` versions can call the Windows `CopyFile2`
+API, which is not implemented by the Ubuntu Wine version and can leave Wine's
+debugger waiting indefinitely. If an older build stopped at a `CopyFile2` error,
+press **Ctrl+C**, pull this version of the script, and run the build again.
+
+Dependency installation and PyInstaller run under one virtual X server. Starting
+each Wine command with a separate `xvfb-run` can shut down the first display while
+Wine is still using it, resulting in `X connection ... broken` followed by a hang.
+The image shuts down its setup-time Wine server before it is saved, and the build
+prints progress before each Wine command. Dependency installation times out after
+15 minutes and packaging after 30 minutes rather than waiting forever.
+Before packaging, the builder verifies that Windows Python imports the complete
+`pygame` package. The PyInstaller specification explicitly collects pygame's
+Python modules, data, and native DLLs because the game imports pygame dynamically.
+It likewise collects the complete `content` package because the content loader
+discovers core creatures, items, effects, flora, and features by module name at
+runtime rather than through static imports.
+At runtime, the frozen application resolves tiles and sounds from PyInstaller's
+bundle directory. Saves and options—including tile scale—are stored persistently
+under `%LOCALAPPDATA%\TalesOfDerision` instead of the temporary bundle directory.
+
+GitHub Actions uses the same Linux build script and uploads the executable artifact
+through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and
+pushes to `dev` or `work`.
 
 ---
 
