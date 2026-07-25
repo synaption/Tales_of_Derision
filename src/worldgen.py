@@ -21,6 +21,7 @@ from items import WOOD
 from onymancer import make_onymancer
 from queries import first_player_entity
 from rng import world_rng
+import spatial
 from systems import born_turn_for_age, furnish_house, set_bed_owner
 from content.items import default_equipment_slots
 from content.kits import person_kit
@@ -179,6 +180,11 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     # the whole (80k-entity) table.
     for interior in game_map.find_enclosed_rooms():
         furnish_house(game_map, interior, occupied)
+
+    # Index the finished world by region. This is the one whole-world scan the game
+    # is allowed: after it, systems ask ``spatial`` for a region's entities instead
+    # of walking the entity table every turn (see spatial.py).
+    spatial.attach(game_map)
 
     return 1
 

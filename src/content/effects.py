@@ -19,7 +19,8 @@ from dataclasses import dataclass
 
 import esper
 
-from components import Asleep, OnFire, Position
+from components import Asleep, OnFire, Player, Position
+import spatial
 
 RGB = tuple[int, int, int]
 
@@ -109,15 +110,57 @@ def remove_effect(ent: int, effect_id: str) -> None:
 
 
 class EffectsProcessor(esper.Processor):
-    """Ticks the ``on_tick`` of every component-marked effect once per real turn.
+    """Ticks the ``on_tick`` of every component-marked effect once per turn *of the
+    region the affected thing is standing in*.
+
     A no-op until an effect registers behaviour (e.g. fire that burns); the seam is
-    here so it can be added as pure data + a handler without touching the loop."""
+    here so it can be added as pure data + a handler without touching the loop. It
+    is region-scoped from the outset so that when behaviour does arrive, a fire
+    burning on a far island burns on that island's turns -- in the background pump,
+    on region entry, or during sleep -- and never on the player's keypress.
+    """
+
+    def __init__(self, game_map=None) -> None:
+        # With a map, effects belong to a region's turn (see ``register_region_step``).
+        # Without one -- a processor built directly in a unit test -- they tick
+        # world-wide per turn, the original behaviour.
+        self.game_map = game_map
+        self._scheduler_driven = False
+
+    def register_region_step(self, scheduler) -> None:
+        """Make effects part of a region's turn."""
+        scheduler.register("effects", self.advance_region)
+        self._scheduler_driven = True
+
+    @staticmethod
+    def _tickable():
+        return [
+            defn for defn in _EFFECTS.values()
+            if defn.on_tick is not None and defn.component is not None
+        ]
+
+    def advance_region(self, region_id) -> None:
+        """One region-turn of every active effect on that region's entities."""
+        if self.game_map is None:
+            return
+        tickable = self._tickable()
+        if not tickable:
+            return  # nothing declares behaviour: don't even ask the index
+        index = spatial.ensure(self.game_map)
+        for defn in tickable:
+            for ent in sorted(index.entities_in(region_id)):
+                if esper.entity_exists(ent) and esper.has_component(ent, defn.component):
+                    defn.on_tick(ent)
 
     def process(self, action: str | None = None) -> None:
         if action is None:
             return  # menu refreshes advance nothing
-        for defn in _EFFECTS.values():
-            if defn.on_tick is None or defn.component is None:
+        for defn in self._tickable():
+            if self._scheduler_driven:
+                # Every creature's effects tick with its own region; the player's
+                # tick here, because the player's turn *is* the turn.
+                for ent, _ in esper.get_components(defn.component, Player):
+                    defn.on_tick(ent)
                 continue
             for ent, _ in esper.get_components(defn.component):
                 defn.on_tick(ent)

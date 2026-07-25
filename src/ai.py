@@ -24,6 +24,7 @@ from components import (
 from game_map import GameMap
 from content.drives import DriveDef, all_drives
 from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin
+import spatial
 from action import BASE_ACTION_COST, action_cost
 from items import WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
 from rng import world_rng
@@ -103,32 +104,23 @@ class NpcAiProcessor(esper.Processor):
             self._shore_by_region.setdefault(
                 self.scheduler.region_at(shore[0], shore[1]), []
             ).append(shore)
-        # A world-wide, region-bucketed snapshot (occupied tiles + every goal
-        # kind + every NPC), rebuilt from scratch only every
-        # _WORLD_SNAPSHOT_REFRESH_CALLS advances instead of on every single
-        # one -- a catch-up burst (region-entry, sleep) advances many regions
-        # many turns each, and re-scanning literally every entity in the world
-        # for each of those individual turns is the dominant cost at any real
-        # population (bounded staleness traded for that no longer happening).
-        self._world_snapshot: dict[str, dict] | None = None
-        self._world_snapshot_calls_left = 0
-        # The near-static half of the snapshot (trees, stoves) is rebuilt far less
-        # often -- see _STATIC_SNAPSHOT_REFRESH_CALLS -- since re-scanning the ~68k
-        # trees every dynamic refresh was most of the snapshot cost.
-        self._static_snapshot: dict[str, dict] | None = None
-        self._static_snapshot_calls_left = 0
-        # The static+dynamic halves merged into one dict, re-merged only when a half
-        # is rebuilt (the halves hold live refs -- occupied is mutated in place, NPC
-        # positions are live -- so the cached merge stays correct between rebuilds).
-        self._merged_snapshot: dict[str, dict] | None = None
-        # Bumped every time the merged snapshot is rebuilt. Keys the widened
-        # per-region bucket cache below: a catch-up burst replays one region many
-        # turns in a row against the same snapshot, and re-running the (up to
-        # 9-bucket, margin-filtered) widening every replayed turn was the dominant
-        # catch-up cost. region_id -> (generation, the 7 widened item lists).
-        self._snapshot_generation = 0
-        self._region_bucket_cache: dict[
-            RegionId, tuple[int, tuple[list, ...]]
+        # What a region's NPCs can see, gathered from the spatial index and kept
+        # per region -- never from a world scan. This replaced a pair of snapshots
+        # that rebuilt every entity bucket in the world on a timer: correct, but
+        # its cost was the world's population, so simulating one island's turn got
+        # slower every time another island was added.
+        #
+        # Two caches, because the two halves go stale for different reasons:
+        #  * static (trees, ovens, shore) can only change when its nine regions
+        #    gain or lose something, so it is keyed on the index's version of that
+        #    neighbourhood -- exact, and usually untouched for hundreds of turns.
+        #  * dynamic (deer, corpses, berry bushes, people) drifts as things move
+        #    and ripen, so it is refreshed every _WORLD_SNAPSHOT_REFRESH_CALLS
+        #    advances of *this* region -- the same staleness the world-wide
+        #    snapshot allowed, now paid per region instead of per world.
+        self._static_region_cache: dict[RegionId, tuple[tuple[int, ...], tuple[list, ...]]] = {}
+        self._dynamic_region_cache: dict[
+            RegionId, tuple[tuple[int, ...], int, tuple[list, ...]]
         ] = {}
         # goal xy -> (connectivity revision key, the flow field itself). Shared
         # across every NPC heading to the same goal, not per-entity -- a distance field
@@ -326,7 +318,12 @@ class NpcAiProcessor(esper.Processor):
             self._commit_step(ent, pos, step, occupied)
             return True
 
-        blocked = {xy2 for xy2, occ_ent in occupied.items() if occ_ent != ent}
+        # Only blockers the bounded search can actually reach matter: ``find_path``
+        # never expands past a Chebyshev window of _LOCAL_PATH_RADIUS around ``xy``,
+        # so gathering the window's tiles (a few hundred dict lookups) is exactly
+        # equivalent to -- and at archipelago scale thousands of times cheaper than --
+        # iterating every static blocker in the world, which is what this did.
+        blocked = self._blockers_within(xy, _LOCAL_PATH_RADIUS, occupied, ignore=ent)
         # Bound the occupant-aware fallback to a local window: it only needs to steer
         # around nearby blockers (the cached flow field already handles long-range
         # routing). This caps a fallback at O(radius^2) instead of flooding the whole
@@ -345,6 +342,24 @@ class NpcAiProcessor(esper.Processor):
         return True
 
     @staticmethod
+    def _blockers_within(
+        origin: tuple[int, int],
+        radius: int,
+        occupied: dict[tuple[int, int], int],
+        ignore: int | None = None,
+    ) -> set[tuple[int, int]]:
+        """The occupied tiles inside a Chebyshev window -- the only ones a
+        radius-bounded ``find_path`` can ever expand into."""
+        ox, oy = origin
+        found: set[tuple[int, int]] = set()
+        for y in range(oy - radius, oy + radius + 1):
+            for x in range(ox - radius, ox + radius + 1):
+                occ = occupied.get((x, y))
+                if occ is not None and occ != ignore:
+                    found.add((x, y))
+        return found
+
+    @staticmethod
     def _commit_step(
         ent: int, pos: Position, next_xy: tuple[int, int], occupied: dict[tuple[int, int], int]
     ) -> None:
@@ -352,7 +367,11 @@ class NpcAiProcessor(esper.Processor):
         # deliberately do NOT record movers in it -- creatures are free to share a
         # tile (invisible off-screen, harmless on-screen), and not tracking them is
         # what lets ``occupied`` be a cheap, rarely-rebuilt static cache.
+        old_xy = (pos.x, pos.y)
         pos.x, pos.y = next_xy
+        # One of the three places anything moves: tell the index, so no system ever
+        # has to rescan the world to find out who is standing where (spatial.py).
+        spatial.moved(ent, old_xy, next_xy)
 
     def _region_of_cached(self, xy: tuple[int, int]) -> int | None:
         if self._region_of_cache_revision != self.game_map.revision:
@@ -659,12 +678,12 @@ class NpcAiProcessor(esper.Processor):
             home = esper.component_for_entity(ent, Home)
 
         if home is None:
-            go_to_sleep(ent, in_camp=True)
+            go_to_sleep(ent, in_camp=True, game_map=self.game_map)
             return True
 
         home_xy = (home.x, home.y)
         if (pos.x, pos.y) == home_xy:
-            go_to_sleep(ent, in_camp=False)
+            go_to_sleep(ent, in_camp=False, game_map=self.game_map)
             return True
 
         if self._step_toward(ent, pos, home_xy, occupied):
@@ -674,7 +693,7 @@ class NpcAiProcessor(esper.Processor):
         # home is genuinely unreachable (blocked by water/walls) -- better to camp
         # and recover than to idle at a barrier, pinning tiredness and starving.
         if needs.tiredness >= _EXHAUSTED_THRESHOLD or not self._same_region_cached((pos.x, pos.y), home_xy):
-            go_to_sleep(ent, in_camp=True)
+            go_to_sleep(ent, in_camp=True, game_map=self.game_map)
             return True
         return False
 
@@ -706,7 +725,11 @@ class NpcAiProcessor(esper.Processor):
         villagers converge on whatever proto-structure is nearest."""
         here = (pos.x, pos.y)
         out: list[tuple[int, tuple[int, int], Blueprint]] = []
-        for g_ent, (g_pos, bp) in esper.get_components(Position, Blueprint):
+        # A ghost this worker can walk to is on this island, so it is in this
+        # region or one bordering it -- never on the far side of the sea, which is
+        # what scanning every blueprint in the world was paying for.
+        region = self.scheduler.region_at(pos.x, pos.y)
+        for g_ent, (g_pos, bp) in self._widen_components(region, Blueprint):
             gxy = (g_pos.x, g_pos.y)
             if self.game_map.tile_at(gxy[0], gxy[1]) == bp.tile:
                 continue  # already raised elsewhere; ignore this stale ghost
@@ -924,99 +947,120 @@ class NpcAiProcessor(esper.Processor):
             return True
         return self._step_toward(ent, pos, (partner_pos.x, partner_pos.y), occupied)
 
-    def _build_static_snapshot(self) -> dict[str, dict]:
-        """The near-static buckets -- trees, stoves, and the ``occupied`` blocker
-        map -- bucketed by region. These barely change (trees only on a day
-        boundary, stoves/furniture never), so they are rescanned only every
-        _STATIC_SNAPSHOT_REFRESH_CALLS: the ~68k tree scan was the bulk of the old
-        whole-snapshot cost.
+    # --- what a region can see -------------------------------------------
 
-        ``occupied`` deliberately holds only the STATIC blockers -- every
-        ``BlocksMovement`` entity that is not a creature (no ``NPC``/``Player``).
-        Moving creatures are ignored entirely: they never stack-collide with each
-        other, which costs nothing off-screen and is invisible on-screen, and it
-        means we never rescan all ~85k blockers every dynamic refresh just to track
-        movers. What this still guarantees is the thing that matters -- nobody walks
-        onto a tree/well/oven/furniture tile, and (with the wall/water/door tiles the
-        map itself enforces) nobody reaches somewhere they shouldn't."""
-        region_at = self.scheduler.region_at
-        # Static blockers: every BlocksMovement entity that is not a creature. One
-        # scan of all ~85k, but only every _STATIC_SNAPSHOT_REFRESH_CALLS.
-        occupied: dict[tuple[int, int], int] = {
-            (pos.x, pos.y): ent
-            for ent, (pos, _b) in esper.get_components(Position, BlocksMovement)
-            if not esper.has_component(ent, NPC) and not esper.has_component(ent, Player)
-        }
-        trees: dict[RegionId, list] = {}
-        for ent, (pos, _t) in esper.get_components(Position, Tree):
-            trees.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
-        stoves: dict[RegionId, list] = {}
-        for ent, (pos, _s) in esper.get_components(Position, Stove):
-            stoves.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
-        return {"trees": trees, "stoves": stoves, "occupied": occupied}
+    def _index(self):
+        return spatial.ensure(self.game_map)
 
-    def _build_dynamic_snapshot(self) -> dict[str, dict]:
-        """The fast-changing buckets -- blocked tiles, moving prey/NPCs, appearing
-        corpses, toggling berry bushes -- bucketed by each entity's *exact* region
-        (margin is applied at lookup in ``_region_bucket``). Rescanned every
-        _WORLD_SNAPSHOT_REFRESH_CALLS; the static half comes from
-        ``_build_static_snapshot`` (which also owns ``occupied`` now)."""
-        region_at = self.scheduler.region_at
-        prey: dict[RegionId, list] = {}
-        for ent, (pos, _d) in esper.get_components(Position, Deer):
-            prey.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
-        corpses: dict[RegionId, list] = {}
-        for ent, (pos, _c, inv) in esper.get_components(Position, Corpse, Inventory):
-            if any(is_raw_meat(item) or is_cooked_meat(item) for item in inv.items):
-                corpses.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
-        bushes: dict[RegionId, list] = {}
-        for ent, (pos, bush) in esper.get_components(Position, BerryBush):
-            if bush.has_berries:
-                bushes.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
-        # Sentients/NPCs keep the live Position object, not a frozen (x, y) --
-        # they move every turn, so a snapshot reused for many calls must keep
-        # reading their *current* position, not the one at snapshot time.
-        sentients: dict[RegionId, list] = {}
-        for ent, (pos, _p) in esper.get_components(Position, Personality):
-            sentients.setdefault(region_at(pos.x, pos.y), []).append((ent, pos))
-        npcs: dict[RegionId, list] = {}
-        for ent, (pos, _npc) in esper.get_components(Position, NPC):
-            npcs.setdefault(region_at(pos.x, pos.y), []).append((ent, pos))
-        return {
-            "prey": prey,
-            "corpses": corpses,
-            "bushes": bushes,
-            "sentients": sentients,
-            "npcs": npcs,
-        }
+    @staticmethod
+    def _has_meat(ent: int) -> bool:
+        if not esper.has_component(ent, Inventory):
+            return False
+        items = esper.component_for_entity(ent, Inventory).items
+        return any(is_raw_meat(item) or is_cooked_meat(item) for item in items)
 
-    def _world_snapshot_for_this_call(self) -> dict[str, dict]:
-        rebuilt = False
-        if self._static_snapshot is None or self._static_snapshot_calls_left <= 0:
-            self._static_snapshot = self._build_static_snapshot()
-            self._static_snapshot_calls_left = _STATIC_SNAPSHOT_REFRESH_CALLS
-            rebuilt = True
-        else:
-            self._static_snapshot_calls_left -= 1
-        if self._world_snapshot is None or self._world_snapshot_calls_left <= 0:
-            self._world_snapshot = self._build_dynamic_snapshot()
-            self._world_snapshot_calls_left = _WORLD_SNAPSHOT_REFRESH_CALLS
-            rebuilt = True
-        else:
-            self._world_snapshot_calls_left -= 1
-        if rebuilt or self._merged_snapshot is None:
-            self._merged_snapshot = {**self._static_snapshot, **self._world_snapshot}
-            # New bucket dicts -> every cached widening is stale.
-            self._snapshot_generation += 1
-        return self._merged_snapshot
+    @staticmethod
+    def _has_berries(ent: int) -> bool:
+        return esper.component_for_entity(ent, BerryBush).has_berries
+
+    def _widen(
+        self,
+        index,
+        region_id: RegionId,
+        kind: type,
+        predicate: Callable[[int], bool] | None = None,
+        live_position: bool = False,
+    ) -> list:
+        """Every entity of one kind in ``region_id``, plus those within
+        ``_REGION_BORDER_MARGIN`` of it in the eight neighbouring regions -- so a
+        creature standing near a seam still sees a resource just across it.
+
+        Nine index buckets are read; the world is not. Entities come out in id
+        order so a region's turn plays out the same way every run, which the
+        seeded-determinism guarantee depends on.
+        """
+        game_map = self.game_map
+        margin = _REGION_BORDER_MARGIN
+        cx, cy = region_id
+        items: list = []
+        for ny in range(cy - 1, cy + 2):
+            for nx in range(cx - 1, cx + 2):
+                own_region = (nx, ny) == region_id
+                for ent in sorted(index.of_kind((nx, ny), kind)):
+                    if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
+                        continue
+                    pos = esper.component_for_entity(ent, Position)
+                    if not own_region and not in_region_with_margin(
+                        game_map, region_id, pos.x, pos.y, margin
+                    ):
+                        continue
+                    if predicate is not None and not predicate(ent):
+                        continue
+                    items.append((ent, pos) if live_position else ((pos.x, pos.y), ent))
+        return items
+
+    def _widen_components(self, region_id: RegionId, kind: type):
+        """``(entity, (Position, kind))`` for a region and its neighbours -- the
+        regional form of ``esper.get_components(Position, kind)``."""
+        index = self._index()
+        cx, cy = region_id
+        for ny in range(cy - 1, cy + 2):
+            for nx in range(cx - 1, cx + 2):
+                for ent in sorted(index.of_kind((nx, ny), kind)):
+                    if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
+                        continue
+                    yield ent, (
+                        esper.component_for_entity(ent, Position),
+                        esper.component_for_entity(ent, kind),
+                    )
+
+    def _static_region_items(self, region_id: RegionId) -> tuple[list, list, list]:
+        """``(trees, stoves, shore)`` around a region. None of these move, so this
+        is rebuilt only when the index says one of the nine regions involved gained
+        or lost something -- not on a timer, and never from a world scan."""
+        index = self._index()
+        key = index.neighborhood_version(region_id)
+        cached = self._static_region_cache.get(region_id)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        items = (
+            self._widen(index, region_id, Tree),
+            self._widen(index, region_id, Stove),
+            list(self._region_bucket(self._shore_by_region, region_id, lambda s: s)),
+        )
+        self._static_region_cache[region_id] = (key, items)
+        return items
+
+    def _dynamic_region_items(self, region_id: RegionId) -> tuple[list, list, list, list]:
+        """``(prey, corpses, bushes, sentients)`` around a region.
+
+        These drift without anything entering or leaving -- a deer wanders, a bush
+        ripens -- so they are refreshed every ``_WORLD_SNAPSHOT_REFRESH_CALLS``
+        advances of this region, exactly the staleness the old world-wide snapshot
+        traded for, except the refresh now costs one region rather than one world.
+        A membership change (a birth, a death, someone crossing the seam) refreshes
+        it immediately regardless.
+        """
+        index = self._index()
+        key = index.neighborhood_version(region_id)
+        cached = self._dynamic_region_cache.get(region_id)
+        if cached is not None and cached[0] == key and cached[1] > 0:
+            self._dynamic_region_cache[region_id] = (key, cached[1] - 1, cached[2])
+            return cached[2]
+        items = (
+            self._widen(index, region_id, Deer),
+            self._widen(index, region_id, Corpse, predicate=self._has_meat),
+            self._widen(index, region_id, BerryBush, predicate=self._has_berries),
+            self._widen(index, region_id, Personality, live_position=True),
+        )
+        self._dynamic_region_cache[region_id] = (key, _WORLD_SNAPSHOT_REFRESH_CALLS, items)
+        return items
 
     def _region_bucket(
         self, buckets: dict[RegionId, list], region_id: RegionId, xy_of: Callable[[object], tuple[int, int]]
     ) -> list:
-        """This region's own bucketed items, widened by ``_REGION_BORDER_MARGIN``
-        into the (up to 8) neighbouring regions' buckets -- so a creature near a
-        seam still sees a resource one tile into the next region. Only the
-        handful of neighbouring buckets are scanned, never the whole world."""
+        """The margin-widened items of a pre-bucketed *static tile* map (the shore
+        list). Entity kinds go through ``_widen`` and the index instead."""
         game_map = self.game_map
         margin = _REGION_BORDER_MARGIN
         cx, cy = region_id
@@ -1031,46 +1075,20 @@ class NpcAiProcessor(esper.Processor):
                         items.append(item)
         return items
 
-    def _widened_buckets(
-        self, snapshot: dict[str, dict], region_id: RegionId
-    ) -> tuple[list, list, list, list, list, list, list]:
-        """The seven margin-widened per-region item lists (trees, prey, corpses,
-        stoves, bushes, sentients, shore), memoised per snapshot generation.
-
-        Every list is a pure function of its underlying (per-generation immutable)
-        bucket dict plus ``region_id`` -- the item lists are read-only targets, and
-        the sentient/NPC live positions they carry already tolerate snapshot-window
-        staleness by design -- so within one snapshot generation the widening is
-        identical for a region. A catch-up burst replays a region many turns
-        against the same snapshot, so caching collapses those N widenings to one."""
-        cached = self._region_bucket_cache.get(region_id)
-        if cached is not None and cached[0] == self._snapshot_generation:
-            return cached[1]
-        xy_of_pair = lambda item: item[0]  # noqa: E731 -- ((x, y), ent) items
-        xy_of_pos = lambda item: (item[1].x, item[1].y)  # noqa: E731 -- (ent, Position)
-        widened = (
-            self._region_bucket(snapshot["trees"], region_id, xy_of_pair),
-            self._region_bucket(snapshot["prey"], region_id, xy_of_pair),
-            self._region_bucket(snapshot["corpses"], region_id, xy_of_pair),
-            self._region_bucket(snapshot["stoves"], region_id, xy_of_pair),
-            self._region_bucket(snapshot["bushes"], region_id, xy_of_pair),
-            self._region_bucket(snapshot["sentients"], region_id, xy_of_pos),
-            self._region_bucket(self._shore_by_region, region_id, lambda s: s),
-        )
-        self._region_bucket_cache[region_id] = (self._snapshot_generation, widened)
-        return widened
-
     def _advance_region(self, region_id: RegionId) -> None:
-        """Run one turn of NPC AI for the NPCs standing in ``region_id``,
-        using a periodically-refreshed world snapshot rather than rescanning
-        every entity in the world on every single call (see
-        ``_world_snapshot_for_this_call``). ``player_xy`` is fetched fresh
-        every call regardless -- it's a single cheap lookup, not a full scan,
-        and hostile-chase distance is short-range enough that staleness here
-        would actually be noticeable.
+        """Run one turn of NPC AI for the NPCs standing in ``region_id``.
+
+        Everything this turn reads comes from that region and its immediate
+        neighbours (see ``_static_region_items``/``_dynamic_region_items``), so the
+        cost of simulating an island is what that island holds -- not what the
+        world holds. ``player_xy`` is fetched fresh every call regardless: it's a
+        single cheap lookup, and hostile-chase distance is short-range enough that
+        staleness there would actually be noticeable.
         """
-        snapshot = self._world_snapshot_for_this_call()
-        occupied = snapshot["occupied"]
+        # The blocker map is the index's own live tile map: exact at all times, and
+        # never rebuilt. It used to be a copy of every blocking entity in the world,
+        # refreshed on a timer.
+        occupied = self._index().blockers
 
         # This region's own logical turn: during a catch-up burst this replays
         # turn N, N+1, N+2 ... in order, each with its own as-of clock, so
@@ -1087,14 +1105,21 @@ class NpcAiProcessor(esper.Processor):
         # Per-NPC full-vs-cached-path movement keys off distance to this tile.
         self._player_xy = player_xy
 
-        trees, prey, corpses, stoves, bushes, sentients, shore = self._widened_buckets(
-            snapshot, region_id
-        )
+        trees, stoves, shore = self._static_region_items(region_id)
+        prey, corpses, bushes, sentients = self._dynamic_region_items(region_id)
 
         # NPCs acting this turn are exactly this region's own bucket (no
         # margin) -- a border-straddling NPC must belong to exactly one
-        # region's turn, never both, or it would act twice.
-        for ent, pos in list(snapshot["npcs"].get(region_id, ())):
+        # region's turn, never both, or it would act twice. Read fresh from the
+        # index every turn: who stands here is the one thing that must never be
+        # stale, and it is a single bucket lookup.
+        index = self._index()
+        acting = [
+            (ent, esper.component_for_entity(ent, Position))
+            for ent in sorted(index.of_kind(region_id, NPC))
+            if esper.entity_exists(ent) and esper.has_component(ent, Position)
+        ]
+        for ent, pos in acting:
             if not esper.entity_exists(ent):
                 continue
             # Sleepers skip their turn; NeedsProcessor recovers and wakes them.
@@ -1289,7 +1314,8 @@ class NpcAiProcessor(esper.Processor):
         world = esper.current_world
         if world != self._trip_cache_world:
             self._trip_cache.clear()
-            self._region_bucket_cache.clear()
+            self._static_region_cache.clear()
+            self._dynamic_region_cache.clear()
             self._trip_cache_world = world
 
         player_xy = self._find_player_position()
@@ -1356,60 +1382,63 @@ class FishAiProcessor(esper.Processor):
         self._wall_clock = clock if clock is not None else time.monotonic
         self.scheduler = RegionScheduler(game_map, _current_region_turn())
         self.scheduler.register("fish", self._advance_region)
-        # Rebuilt from scratch only every _WORLD_SNAPSHOT_REFRESH_CALLS
-        # advances rather than on every single one -- see the identical cache
-        # on NpcAiProcessor for why a catch-up burst makes this matter.
-        self._world_snapshot: dict[str, dict] | None = None
-        self._world_snapshot_calls_left = 0
-        # Seaweed is static (it never moves), so -- like the land AI's trees -- it is
-        # rescanned only every _STATIC_SNAPSHOT_REFRESH_CALLS instead of every dynamic
-        # refresh; only the moving fish are rebucketed often.
-        self._seaweed_snapshot: dict[RegionId, list] | None = None
-        self._seaweed_snapshot_calls_left = 0
-        self._merged_snapshot: dict[str, dict] | None = None
+        # Which fish is on which tile, world-wide -- the one thing here that isn't
+        # per-region, because a fish must not swim onto a neighbour resting in a
+        # region nobody is simulating. Rebuilt only when the shoal gains or loses a
+        # member; swimming updates it a tile at a time (see ``_move``).
+        self._fish_tiles: dict[tuple[int, int], int] | None = None
+        self._fish_population = -1
+        # Per-region seaweed, cached against the index's version of the region.
+        self._seaweed_by_region: dict[RegionId, tuple[tuple[int, ...], list]] = {}
 
-    def _build_fish_snapshot(self) -> dict[str, dict]:
-        region_at = self.scheduler.region_at
-        fish_by_region: dict[RegionId, list] = {}
-        occupied: dict[tuple[int, int], int] = {}
-        for ent, (pos, _f) in esper.get_components(Position, Fish):
-            fish_by_region.setdefault(region_at(pos.x, pos.y), []).append((ent, pos))
-            occupied[(pos.x, pos.y)] = ent
-        return {"fish": fish_by_region, "occupied": occupied}
+    def _fish_occupied(self) -> dict[tuple[int, int], int]:
+        """Tile -> fish, world-wide, so a fish never swims onto a resting neighbour
+        even one in a region nobody is simulating. Rebuilt only when the shoal's
+        population changes; fish that merely swam are moved tile to tile by
+        ``_move``, which is the only thing that relocates one."""
+        population = spatial.component_population(Fish)
+        if self._fish_tiles is None or self._fish_population != population:
+            self._fish_tiles = {}
+            for ent, (pos, _f) in esper.get_components(Position, Fish):
+                self._fish_tiles[(pos.x, pos.y)] = ent
+            self._fish_population = population
+        return self._fish_tiles
 
-    def _build_seaweed_snapshot(self) -> dict[RegionId, list]:
-        region_at = self.scheduler.region_at
-        seaweed_by_region: dict[RegionId, list] = {}
-        for ent, (pos, _s) in esper.get_components(Position, Seaweed):
-            seaweed_by_region.setdefault(region_at(pos.x, pos.y), []).append(((pos.x, pos.y), ent))
-        return seaweed_by_region
+    def _region_fish(self, region_id: RegionId) -> list:
+        """The fish swimming in one region, straight from the index."""
+        index = spatial.ensure(self.game_map)
+        return [
+            (ent, esper.component_for_entity(ent, Position))
+            for ent in sorted(index.of_kind(region_id, Fish))
+            if esper.entity_exists(ent) and esper.has_component(ent, Position)
+        ]
 
-    def _world_snapshot_for_this_call(self) -> dict[str, dict]:
-        rebuilt = False
-        if self._seaweed_snapshot is None or self._seaweed_snapshot_calls_left <= 0:
-            self._seaweed_snapshot = self._build_seaweed_snapshot()
-            self._seaweed_snapshot_calls_left = _STATIC_SNAPSHOT_REFRESH_CALLS
-            rebuilt = True
-        else:
-            self._seaweed_snapshot_calls_left -= 1
-        if self._world_snapshot is None or self._world_snapshot_calls_left <= 0:
-            self._world_snapshot = self._build_fish_snapshot()
-            self._world_snapshot_calls_left = _WORLD_SNAPSHOT_REFRESH_CALLS
-            rebuilt = True
-        else:
-            self._world_snapshot_calls_left -= 1
-        if rebuilt or self._merged_snapshot is None:
-            self._merged_snapshot = {**self._world_snapshot, "seaweed": self._seaweed_snapshot}
-        return self._merged_snapshot
+    def _region_seaweed(self, region_id: RegionId) -> list:
+        """The seaweed growing in one region. Seaweed never moves, so this is
+        cached until the region's membership changes (a frond eaten bare, a new
+        one seeded)."""
+        index = spatial.ensure(self.game_map)
+        version = index.neighborhood_version(region_id)
+        cached = self._seaweed_by_region.get(region_id)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        fronds = [
+            ((pos.x, pos.y), ent)
+            for ent, pos in (
+                (e, esper.component_for_entity(e, Position))
+                for e in sorted(index.of_kind(region_id, Seaweed))
+                if esper.entity_exists(e) and esper.has_component(e, Position)
+            )
+        ]
+        self._seaweed_by_region[region_id] = (version, fronds)
+        return fronds
 
     def _advance_region(self, region_id: RegionId) -> None:
-        snapshot = self._world_snapshot_for_this_call()
-        fish = list(snapshot["fish"].get(region_id, ()))
-        seaweed = list(snapshot["seaweed"].get(region_id, ()))
-        # Shared across the whole world so a fish never swims onto a resting
-        # neighbour, even one in a region we're not simulating right now.
-        occupied = snapshot["occupied"]
-        self._simulate_area(fish, seaweed, occupied)
+        """One turn of fish for one region, reading only that region's fish and
+        seaweed out of the index rather than re-bucketing every fish in the sea."""
+        self._simulate_area(
+            self._region_fish(region_id), self._region_seaweed(region_id), self._fish_occupied()
+        )
 
     def process(self, action: str | None = None) -> None:
         # Fish move only on real turns -- never on idle/menu ticks -- so the
@@ -1545,8 +1574,10 @@ class FishAiProcessor(esper.Processor):
     def _move(
         self, ent: int, pos: Position, nx: int, ny: int, occupied: dict[tuple[int, int], int]
     ) -> None:
-        occupied.pop((pos.x, pos.y), None)
+        old_xy = (pos.x, pos.y)
+        occupied.pop(old_xy, None)
         pos.x, pos.y = nx, ny
         occupied[(nx, ny)] = ent
+        spatial.moved(ent, old_xy, (nx, ny))
 
 

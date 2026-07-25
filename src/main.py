@@ -53,7 +53,7 @@ def main() -> None:
                 if short_by > 0:
                     time.sleep(short_by)
                     now = datetime.now()
-                #print(f"Time since last turn: {now - last_turn}")
+                print(f"Time since last turn: {now - last_turn}")
                 last_turn = now
                 game.redraw()  # this turn's frame, on the beat
             elif intent.redraw:

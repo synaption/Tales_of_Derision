@@ -240,6 +240,11 @@ def _pump_background_regions(budget_seconds: float) -> None:
     flora = esper.get_processor(TreeGrowthProcessor)
     if flora is not None:
         flora.pump_flora(budget_seconds, player_xy, time.monotonic)
+    # So do births: a baby due in a region the player isn't standing in arrives
+    # here, in spare time, instead of on the keypress that crossed the day line.
+    births = esper.get_processor(ReproductionProcessor)
+    if births is not None:
+        births.pump_births(player_xy)
 
 
 @dataclass(frozen=True)
@@ -447,11 +452,11 @@ class GameSession:
         self._held_directions.clear()
         nearby_bed = _bed_near_player()
         if nearby_bed is None:
-            _sleep_player(self.renderer, in_camp=True)
+            _sleep_player(self.renderer, in_camp=True, game_map=self.game_map)
             return HANDLED
         if not _confirm_if_owned_by_other(self.renderer, nearby_bed, "bed", "sleep here"):
             return REDRAW
-        _sleep_player(self.renderer, in_camp=False)
+        _sleep_player(self.renderer, in_camp=False, game_map=self.game_map)
         return HANDLED
 
     def _interact_with_faced_tile(self) -> TurnIntent | None:
@@ -522,7 +527,7 @@ class GameSession:
             self._held_directions.clear()
             if not _confirm_if_owned_by_other(self.renderer, bed, "bed", "sleep here"):
                 return REDRAW
-            _sleep_player(self.renderer, in_camp=False)
+            _sleep_player(self.renderer, in_camp=False, game_map=self.game_map)
             return HANDLED
 
         return None
@@ -573,20 +578,32 @@ def _register_processors(game_map: GameMap, combat_sfx: CombatSfxPlayer) -> None
     # Housing runs before the AI so a villager that just claimed a home
     # can start heading there this turn.
     esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
-    esper.add_processor(
-        NpcAiProcessor(game_map, max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT),
-        priority=0,
+    npc_ai = NpcAiProcessor(
+        game_map, max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT
     )
+    esper.add_processor(npc_ai, priority=0)
     esper.add_processor(
         FishAiProcessor(game_map, max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT),
         priority=0,
     )
-    esper.add_processor(NeedsProcessor(game_map), priority=0)
+    needs = NeedsProcessor(game_map)
+    esper.add_processor(needs, priority=0)
     # Ticks registered status effects (fire, poison, ...). A no-op until an
     # effect declares behaviour; the seam lives in content.effects.
-    esper.add_processor(EffectsProcessor(), priority=0)
+    effects = EffectsProcessor(game_map)
+    esper.add_processor(effects, priority=0)
     esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
-    esper.add_processor(ReproductionProcessor(), priority=0)
+    esper.add_processor(ReproductionProcessor(game_map), priority=0)
+
+    # Needs and status effects belong to a *region's* turn, not the world's: they
+    # are registered as steps on the region scheduler, so they run wherever that
+    # region is allowed to run -- the live region each turn, and everywhere else in
+    # the idle pump, on region entry, and during sleep. Registered after the AI's
+    # own step so a region's people act and then get hungry, the order they take
+    # within a turn. Without this a sleeping region never got hungry at all, and
+    # woke up on catch-up with the appetites it had when the player walked away.
+    needs.register_region_step(npc_ai.scheduler)
+    effects.register_region_step(npc_ai.scheduler)
 
 
 @contextmanager

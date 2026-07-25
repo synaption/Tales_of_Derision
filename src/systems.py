@@ -19,6 +19,7 @@ from onymancer import make_onymancer
 from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin, region_at
 from renderer.base import Renderer, memory_color
 from rng import world_rng
+import spatial
 from content.effects import (
     STATUS_BASE_SECONDS,
     active_effects,
@@ -354,21 +355,32 @@ _CAMP_GLYPH = "^"
 _CAMP_ORANGE = (210, 130, 60)
 
 
-def _camp_at(x: int, y: int) -> int | None:
+def _camp_at(x: int, y: int, game_map: GameMap | None = None) -> int | None:
+    """The campfire on a tile, if any. With a map this asks the index for that
+    tile's own region -- a camp pitched on another island can't be on this tile,
+    and every camp in the world is a lot to walk through to learn that."""
+    if game_map is not None:
+        for ent, (pos, _camp) in spatial.ensure(game_map).components(
+            region_at(game_map, x, y), Position, Camp
+        ):
+            if pos.x == x and pos.y == y:
+                return ent
+        return None
     for ent, (pos, _camp) in esper.get_components(Position, Camp):
         if (pos.x, pos.y) == (x, y):
             return ent
     return None
 
 
-def go_to_sleep(ent: int, in_camp: bool) -> None:
+def go_to_sleep(ent: int, in_camp: bool, game_map: GameMap | None = None) -> None:
     """Put a character to sleep. Camping pitches a campfire on its tile (if one
-    isn't already there); sleeping at home just marks it ``Asleep``."""
+    isn't already there); sleeping at home just marks it ``Asleep``. Pass the map
+    so the "is one already here" check stays regional."""
     if not esper.has_component(ent, Asleep):
         esper.add_component(ent, Asleep(in_camp=in_camp))
     if in_camp and esper.has_component(ent, Position):
         pos = esper.component_for_entity(ent, Position)
-        if _camp_at(pos.x, pos.y) is None:
+        if _camp_at(pos.x, pos.y, game_map) is None:
             esper.create_entity(
                 Position(pos.x, pos.y),
                 Renderable(_CAMP_GLYPH, fg=_CAMP_ORANGE),
@@ -377,7 +389,7 @@ def go_to_sleep(ent: int, in_camp: bool) -> None:
             )
 
 
-def wake_up(ent: int) -> None:
+def wake_up(ent: int, game_map: GameMap | None = None) -> None:
     """Wake a sleeper: drop the ``Asleep`` tag, break any camp it pitched, and
     (for the player) log that it rose. Safe to call on an already-awake entity."""
     in_camp = False
@@ -386,7 +398,7 @@ def wake_up(ent: int) -> None:
         esper.remove_component(ent, Asleep)
     if in_camp and esper.has_component(ent, Position):
         pos = esper.component_for_entity(ent, Position)
-        camp_ent = _camp_at(pos.x, pos.y)
+        camp_ent = _camp_at(pos.x, pos.y, game_map)
         if camp_ent is not None:
             esper.delete_entity(camp_ent, immediate=True)
     if esper.has_component(ent, Player):
@@ -456,19 +468,53 @@ def bed_owner(bed_ent: int) -> int | None:
     return None
 
 
+# Who owns which bed, the other way round: owner -> bed. ``owned_bed_of`` is asked
+# once per resident per turn and used to answer it by walking every owned bed in the
+# world; at a hundred islands that is a few hundred beds per villager per turn to
+# learn one fact this dict holds outright. Verified on read (the bed must still
+# exist and still be theirs), so a stale entry can never hand back a wrong home.
+_bed_of_owner: dict[int, int] = {}
+
+
 def set_bed_owner(bed_ent: int, owner: int) -> None:
     if esper.has_component(bed_ent, Owned):
         esper.component_for_entity(bed_ent, Owned).owner = owner
     else:
         esper.add_component(bed_ent, Owned(owner))
+    # Chests are owned through this same call; only a bed is somebody's *home*.
+    if esper.has_component(bed_ent, Bed):
+        _bed_of_owner[owner] = bed_ent
+
+
+# The population of ``Owned`` at the last full sweep. While it holds, the map above
+# is known complete -- which is what lets "this villager owns nothing" (the common
+# answer, asked of every homeless resident every turn) be answered without a scan.
+_bed_owner_sweep_population = -1
 
 
 def owned_bed_of(ent: int) -> int | None:
     """The bed a person owns (their house), or ``None`` if they own none."""
-    for bed_ent, (owned, _bed) in esper.get_components(Owned, Bed):
-        if owned.owner == ent and esper.entity_exists(bed_ent):
+    global _bed_owner_sweep_population
+    bed_ent = _bed_of_owner.get(ent)
+    if bed_ent is not None:
+        if (
+            esper.entity_exists(bed_ent)
+            and esper.has_component(bed_ent, Bed)
+            and esper.has_component(bed_ent, Owned)
+            and esper.component_for_entity(bed_ent, Owned).owner == ent
+        ):
             return bed_ent
-    return None
+        del _bed_of_owner[ent]  # the bed burned down, or changed hands
+
+    population = spatial.component_population(Owned)
+    if population == _bed_owner_sweep_population:
+        return None  # nothing has been claimed since the sweep: they own nothing
+    _bed_of_owner.clear()
+    for owned_ent, (owned, _bed) in esper.get_components(Owned, Bed):
+        if esper.entity_exists(owned_ent):
+            _bed_of_owner[owned.owner] = owned_ent
+    _bed_owner_sweep_population = population
+    return _bed_of_owner.get(ent)
 
 
 def house_is_owned(interior: frozenset[tuple[int, int]]) -> bool:
@@ -630,6 +676,47 @@ def _blueprint_tiles(game_map: GameMap, ox: int, oy: int) -> tuple[list[tuple[in
     return build, interior
 
 
+# How far from a villager ``choose_build_site`` can possibly place a cabin: its
+# outermost search ring (21) plus the cabin's own footprint and margin. Anything
+# occupied further out than this cannot affect the choice, so gathering blockers
+# is bounded by this window rather than by the size of the world.
+_BUILD_SEARCH_REACH = 30
+
+
+def occupied_near(
+    game_map: GameMap, center: tuple[int, int], radius: int
+) -> set[tuple[int, int]]:
+    """Every tile within a Chebyshev window of ``center`` that something sits on.
+
+    The static blockers come off the spatial index's tile map; corpses, saplings
+    and blueprint ghosts don't block movement but must not be built over either,
+    so they come from the index's buckets for the window's regions. This used to
+    be built by scanning every blocking entity in the world -- for a search that
+    can only ever look thirty tiles.
+    """
+    index = spatial.ensure(game_map)
+    cx, cy = center
+    blockers = index.blockers
+    occupied = {
+        (x, y)
+        for y in range(cy - radius, cy + radius + 1)
+        for x in range(cx - radius, cx + radius + 1)
+        if (x, y) in blockers
+    }
+    home_region = region_at(game_map, cx, cy)
+    rx, ry = home_region
+    for ny in range(ry - 1, ry + 2):
+        for nx in range(rx - 1, rx + 2):
+            for kind in (Corpse, Sapling, Blueprint):
+                for ent in index.of_kind((nx, ny), kind):
+                    if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
+                        continue
+                    pos = esper.component_for_entity(ent, Position)
+                    if abs(pos.x - cx) <= radius and abs(pos.y - cy) <= radius:
+                        occupied.add((pos.x, pos.y))
+    return occupied
+
+
 def choose_build_site(game_map: GameMap, near: tuple[int, int], occupied: set[tuple[int, int]]) -> tuple[int, int] | None:
     """Find a clear top-left corner for a cabin near ``near``: a WxH block of
     open floor tiles (no water, walls, borders, or occupants) with a one-tile
@@ -736,38 +823,32 @@ def stock_blueprint(ghost_ent: int) -> None:
     _set_blueprint_stocked(ghost_ent, True)
 
 
-# Per-turn index of obstruction tiles -> the entities on them. During a building
-# burst ``_clear_tile_obstructions`` is called many times (every ghost raised, every
-# finished-house interior tile); scanning every entity per call was a top cost at
-# archipelago scale. Obstructions (trees/bushes/corpses/saplings) never move and none
-# are created before the AI builds within a turn, so one scan per turn serves all of
-# that turn's clears as O(1) tile lookups. The key includes the esper world and the
-# clock turn, so a stale index is never carried across a world switch/clear or into a
-# new turn (which would risk esper's recycled entity ids pointing at the wrong tile).
-_obstruction_index_key: tuple[str, int] | None = None
-_obstruction_index: dict[tuple[int, int], list[int]] = {}
+def _obstructions_at(game_map: GameMap, x: int, y: int) -> list[int]:
+    """Trees, corpses, bushes and saplings sitting on one tile.
+
+    Asks the spatial index for that tile's own region rather than indexing every
+    obstruction in the world: a wall is raised on one tile, and what stands a
+    hundred tiles of ocean away can never be on it.
+    """
+    index = spatial.ensure(game_map)
+    region = region_at(game_map, x, y)
+    found: list[int] = []
+    for comp in _OBSTRUCTION_COMPONENTS:
+        for ent in sorted(index.of_kind(region, comp)):
+            if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
+                continue
+            pos = esper.component_for_entity(ent, Position)
+            if pos.x == x and pos.y == y:
+                found.append(ent)
+    return found
 
 
-def _obstructions_at(x: int, y: int) -> list[int]:
-    global _obstruction_index_key, _obstruction_index
-    clock = world_clock()
-    key = (esper.current_world, clock.turn if clock is not None else -1)
-    if key != _obstruction_index_key:
-        index: dict[tuple[int, int], list[int]] = {}
-        for comp in _OBSTRUCTION_COMPONENTS:
-            for ent, (pos, _c) in esper.get_components(Position, comp):
-                index.setdefault((pos.x, pos.y), []).append(ent)
-        _obstruction_index = index
-        _obstruction_index_key = key
-    return _obstruction_index.get((x, y), [])
-
-
-def _clear_tile_obstructions(x: int, y: int) -> None:
+def _clear_tile_obstructions(game_map: GameMap, x: int, y: int) -> None:
     """Delete any tree/corpse/bush/sapling sitting on (x, y) so it can't get
     sealed into a wall or trapped inside a house being raised over it."""
-    for ent in _obstructions_at(x, y):
+    for ent in _obstructions_at(game_map, x, y):
         # Guard entity_exists: a listed obstruction may have been eaten/cleared
-        # earlier this same turn (the index is a turn-start snapshot).
+        # earlier in this same building burst.
         if esper.entity_exists(ent) and any(
             esper.has_component(ent, comp) for comp in _OBSTRUCTION_COMPONENTS
         ):
@@ -797,7 +878,7 @@ def _complete_site(game_map: GameMap, site_ent: int) -> None:
     site = esper.component_for_entity(site_ent, ConstructionSite)
     interior = frozenset(site.interior)
     for (ix, iy) in interior:
-        _clear_tile_obstructions(ix, iy)  # nothing gets trapped indoors
+        _clear_tile_obstructions(game_map, ix, iy)  # nothing gets trapped indoors
     furnish_house(game_map, interior)
     esper.delete_entity(site_ent, immediate=True)
     _push_turn_event("A new cabin is finished.")
@@ -813,7 +894,7 @@ def raise_blueprint(game_map: GameMap, ghost_ent: int) -> bool:
     bp = esper.component_for_entity(ghost_ent, Blueprint)
     pos = esper.component_for_entity(ghost_ent, Position)
     x, y = pos.x, pos.y
-    _clear_tile_obstructions(x, y)
+    _clear_tile_obstructions(game_map, x, y)
     game_map.set_tile(x, y, bp.tile)
     site_ent = bp.site
     esper.delete_entity(ghost_ent, immediate=True)
@@ -941,22 +1022,22 @@ class MovementProcessor(esper.Processor):
             return
         dx, dy = delta
 
-        occupied = {
-            (pos.x, pos.y): ent
-            for ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
-        }
-
         for _ent, (pos, _player) in esper.get_components(Position, Player):
             nx, ny = pos.x + dx, pos.y + dy
-            target_occupied = (nx, ny) in occupied and occupied[(nx, ny)] != _ent
+            # Who is on the tile we're stepping onto. This used to build a dict of
+            # every blocking entity in the world on every single keypress -- ~85k
+            # entries on the big archipelago, for one tile's worth of question.
+            target_ent = self._blocker_at(nx, ny)
+            target_occupied = target_ent is not None and target_ent != _ent
             # The player can swim, so movement uses is_passable (land + water);
             # walls still block. NPCs keep using is_walkable (land only).
             if self.game_map.is_passable(nx, ny):
                 if not target_occupied:
+                    old_xy = (pos.x, pos.y)
                     pos.x, pos.y = nx, ny
+                    spatial.moved(_ent, old_xy, (nx, ny))
                     continue
 
-                target_ent = occupied[(nx, ny)]
                 target_name = "Unknown"
                 if esper.has_component(target_ent, Name):
                     target_name = esper.component_for_entity(target_ent, Name).value
@@ -979,6 +1060,25 @@ class MovementProcessor(esper.Processor):
                     continue
 
                 _push_turn_event("Something blocks your way.")
+
+    def _blocker_at(self, x: int, y: int) -> int | None:
+        """Whoever blocks the tile ``(x, y)``, or ``None``.
+
+        Two cheap questions instead of one whole-world dict: the static furniture
+        (trees, wells, beds, walls-in-a-box) comes straight off the index by tile,
+        and creatures -- which move too often to key by tile -- are checked against
+        that tile's own region only, a few dozen entities.
+        """
+        index = spatial.ensure(self.game_map)
+        static = index.blocker_at(x, y)
+        if static is not None:
+            return static
+        for ent, (pos, _npc, _blocks) in index.components(
+            region_at(self.game_map, x, y), Position, NPC, BlocksMovement
+        ):
+            if pos.x == x and pos.y == y:
+                return ent
+        return None
 
 
 # How far into a neighbouring region an NPC's goal search still looks, so
@@ -1547,28 +1647,26 @@ class HousingProcessor(esper.Processor):
         # again, so we skip it until it moves to a new cell or the terrain there
         # changes (either of which could open a spot). See ``_ensure_site_for``.
         self._no_site: dict[int, tuple[RegionId, int]] = {}
+        # Region buckets for the two things that aren't positioned entities and so
+        # can't live in the spatial index: house interiors (rebuilt on a map edit)
+        # and construction sites (rebuilt when one is staked or finished).
+        self._houses_by_region: dict[RegionId, list[frozenset[tuple[int, int]]]] | None = None
+        self._houses_by_region_rev: int = -1
+        self._sites_by_region: dict[RegionId, list[tuple[int, ConstructionSite]]] = {}
+        self._all_sites: list[tuple[int, ConstructionSite]] = []
+        self._sites_population: int = -1
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
             return
         active_region = self._player_region() if self.live_region_only else None
-        houses = houses_for(self.game_map, self._cache)
-        if active_region is not None:
-            houses = [
-                interior for interior in houses
-                if interior and region_at(self.game_map, *next(iter(interior))) == active_region
-            ]
-        sites = [(e, comp) for e, (comp,) in esper.get_components(ConstructionSite)]
-        if active_region is not None:
-            sites = [
-                (e, comp) for e, comp in sites
-                if comp.pieces and region_at(self.game_map, *next(iter(comp.pieces))) == active_region
-            ]
+        houses = self._houses_in(active_region)
+        sites = self._sites_in(active_region)
         # Compute the unowned houses ONCE per turn (interior + bed tile), rather than
         # having every homeless resident rescan every house. Each resident then just
         # picks the nearest reachable one and pops it from this shared list, so the
         # whole housing pass is O(houses + residents), not O(houses x residents).
-        beds_by_pos = beds_by_position()
+        beds_by_pos = self._beds_in(active_region)
         unowned_houses: list[tuple[frozenset[tuple[int, int]], tuple[int, int]]] = []
         for interior in houses:
             bed_ent = _bed_in_interior(interior, beds_by_pos)
@@ -1577,9 +1675,7 @@ class HousingProcessor(esper.Processor):
             bed_pos = esper.component_for_entity(bed_ent, Position)
             unowned_houses.append((interior, (bed_pos.x, bed_pos.y)))
 
-        for ent, (_res,) in list(esper.get_components(Resident)):
-            if active_region is not None and not self._entity_in_region(ent, active_region):
-                continue
+        for ent, _res in self._residents_in(active_region):
             if owned_bed_of(ent) is not None:
                 continue  # already owns a house -- never re-claim or rebuild
             if self._handle_spouse_housing(ent):
@@ -1593,13 +1689,65 @@ class HousingProcessor(esper.Processor):
             return region_at(self.game_map, pos.x, pos.y)
         return None
 
-    def _entity_in_region(self, ent: int, region_id: RegionId) -> bool:
-        if esper.has_component(ent, Player):
-            return True
-        if not esper.has_component(ent, Position):
-            return False
-        pos = esper.component_for_entity(ent, Position)
-        return region_at(self.game_map, pos.x, pos.y) == region_id
+    # The four things a housing turn needs -- houses, build sites, beds, residents --
+    # each scoped to the live region. Whole-world versions of all four used to run
+    # every turn and then throw away everything that wasn't local.
+
+    def _residents_in(self, active_region: RegionId | None):
+        if active_region is None:  # whole-world mode (tests, headless tools)
+            yield from ((ent, res) for ent, (res,) in list(esper.get_components(Resident)))
+            return
+        index = spatial.ensure(self.game_map)
+        yield from ((ent, comps[0]) for ent, comps in list(index.components(active_region, Resident)))
+
+    def _houses_in(self, active_region: RegionId | None) -> list[frozenset[tuple[int, int]]]:
+        """The region's houses, bucketed once per map revision. House interiors are
+        tiles, not entities, so this is a geometry cache rather than an index --
+        but it is rebuilt on a map edit, not walked every turn."""
+        houses = houses_for(self.game_map, self._cache)
+        if active_region is None:
+            return houses
+        revision = getattr(self.game_map, "revision", 0)
+        if self._houses_by_region_rev != revision or self._houses_by_region is None:
+            buckets: dict[RegionId, list[frozenset[tuple[int, int]]]] = {}
+            for interior in houses:
+                if not interior:
+                    continue
+                region = region_at(self.game_map, *next(iter(interior)))
+                buckets.setdefault(region, []).append(interior)
+            self._houses_by_region = buckets
+            self._houses_by_region_rev = revision
+        return self._houses_by_region.get(active_region, [])
+
+    def _sites_in(self, active_region: RegionId | None) -> list[tuple[int, ConstructionSite]]:
+        """This region's construction sites. ``ConstructionSite`` has no position of
+        its own (it is a set of tiles), so it is bucketed here and rebuilt only when
+        a site is created or finished -- an O(1) population check, not a scan."""
+        population = spatial.component_population(ConstructionSite)
+        if self._sites_population != population:
+            buckets: dict[RegionId, list[tuple[int, ConstructionSite]]] = {}
+            everything: list[tuple[int, ConstructionSite]] = []
+            for ent, (site,) in esper.get_components(ConstructionSite):
+                everything.append((ent, site))
+                if site.pieces:
+                    region = region_at(self.game_map, *next(iter(site.pieces)))
+                    buckets.setdefault(region, []).append((ent, site))
+            self._sites_by_region = buckets
+            self._all_sites = everything
+            self._sites_population = population
+        if active_region is None:
+            return list(self._all_sites)
+        return list(self._sites_by_region.get(active_region, []))
+
+    def _beds_in(self, active_region: RegionId | None) -> dict[tuple[int, int], int]:
+        """Tile -> bed entity for the live region. Beds never move, so with an index
+        this is that region's bed bucket instead of every bed in the world."""
+        if active_region is None:
+            return beds_by_position()
+        beds: dict[tuple[int, int], int] = {}
+        for ent, (pos, _bed) in spatial.ensure(self.game_map).components(active_region, Position, Bed):
+            beds[(pos.x, pos.y)] = ent
+        return beds
 
     def _handle_spouse_housing(self, ent: int) -> bool:
         """Keep a married couple under one roof. Returns True (handled: skip
@@ -1677,12 +1825,9 @@ class HousingProcessor(esper.Processor):
         if self._no_site.get(ent) == (cell, rev):
             return
 
-        occupied = {(p.x, p.y) for _e, (p, _b) in esper.get_components(Position, BlocksMovement)}
-        # Non-blocking things must not be walled in either -- keep new sites off
-        # corpses, saplings, and other blueprints.
-        for comp in (Corpse, Sapling, Blueprint):
-            occupied |= {(p.x, p.y) for _e, (p, _c) in esper.get_components(Position, comp)}
-        origin = choose_build_site(self.game_map, here, occupied)
+        origin = choose_build_site(
+            self.game_map, here, occupied_near(self.game_map, here, _BUILD_SEARCH_REACH)
+        )
         if origin is None:
             self._no_site[ent] = (cell, rev)  # remember: nowhere here, for now
             return
@@ -1936,6 +2081,9 @@ class TreeGrowthProcessor(esper.Processor):
                     rend.fg = _TREE_GREEN
                 if esper.has_component(ent, Name):
                     esper.component_for_entity(ent, Name).value = "Tree"
+            # It was a sapling and is now a tree or a bush that blocks the way:
+            # the index buckets it by what it is, so it has to be told.
+            spatial.reclassify(ent)
 
     def _kill_flora(self, region_id: RegionId, ctx: dict) -> None:
         for ent in ctx["trees"].get(region_id, []):
@@ -2079,8 +2227,19 @@ class ReproductionProcessor(esper.Processor):
     wired to both parents. Newborns live at the mother's home and grow up on the
     world clock; they are not ``Resident`` (a baby doesn't build its own cabin)."""
 
-    def __init__(self) -> None:
+    def __init__(self, game_map: GameMap | None = None) -> None:
         self._last_day: int | None = None
+        # In live play, pass a map: only the region the player is in delivers on the
+        # keypress. Everywhere else a birth is a thing that happened while nobody was
+        # looking, and is delivered when that region is caught up (``pump_births``,
+        # region entry, or sleep). Omit the map for the old whole-world behaviour,
+        # which is what the unit tests drive.
+        self.game_map = game_map
+        # The day each region last delivered, so a region can lag the world clock
+        # and be brought current off the keypress path -- the same bookkeeping the
+        # flora uses (see TreeGrowthProcessor).
+        self._baseline_day: int | None = None
+        self._region_day: dict[RegionId, int] = {}
         # A private onymancer for naming newborns, seeded off the world seed so
         # the whole reproduction chain (conception -> birth -> name) is
         # reproducible for a given seed.
@@ -2095,19 +2254,77 @@ class ReproductionProcessor(esper.Processor):
         day = current_day(clock)
         if self._last_day is None:
             self._last_day = day
+            self._baseline_day = day
             return
         if day == self._last_day:
             return
         self._last_day = day
-        self._deliver_due_pregnancies(clock)
+        active = self._player_region()
+        if active is None:
+            self._deliver_due_pregnancies(clock)  # no player: unpartitioned pass
+            return
+        # Strictly the live region only. The rest of the world's babies arrive when
+        # their region does (pump_births / catch_up_all_births).
+        self._deliver_due_pregnancies(clock, region_id=active)
+        self._region_day[active] = day
 
-    def _deliver_due_pregnancies(self, clock: WorldClock) -> None:
+    def _player_region(self) -> RegionId | None:
+        if self.game_map is None:
+            return None
+        for _ent, (pos, _player) in esper.get_components(Position, Player):
+            return region_at(self.game_map, pos.x, pos.y)
+        return None
+
+    def pump_births(self, player_xy: tuple[int, int] | None = None) -> None:
+        """Deliver the babies owed by regions the player isn't standing in --
+        nearest first, like every other background catch-up. Called from the main
+        loop's idle pump, so an off-screen birth costs spare time, never a turn."""
+        clock = world_clock()
+        if clock is None or self.game_map is None or self._baseline_day is None:
+            return
+        day = current_day(clock)
+        lagging = [
+            r for r in all_region_ids(self.game_map)
+            if self._region_day.get(r, self._baseline_day) < day
+        ]
+        if not lagging:
+            return
+        if player_xy is not None:
+            here = region_at(self.game_map, player_xy[0], player_xy[1])
+            lagging.sort(key=lambda r: max(abs(r[0] - here[0]), abs(r[1] - here[1])))
+        for region_id in lagging:
+            self._deliver_due_pregnancies(clock, region_id=region_id)
+            self._region_day[region_id] = day
+
+    def catch_up_all_births(self) -> None:
+        """Bring the whole world's pregnancies current -- what sleeping does."""
+        self.pump_births(None)
+
+    def _deliver_due_pregnancies(
+        self, clock: WorldClock, region_id: RegionId | None = None
+    ) -> None:
         term = _GESTATION_DAYS * max(1, clock.day_length)
-        for mother, (pregnant,) in list(esper.get_components(Pregnant)):
+        for mother, pregnant in self._pregnancies(region_id):
             if clock.turn - pregnant.conceived_turn < term:
                 continue
             esper.remove_component(mother, Pregnant)
             self._give_birth(mother, pregnant.father, clock)
+
+    def _pregnancies(self, region_id: RegionId | None):
+        """Expectant mothers, in one region or (with no map) the whole world.
+
+        ``Pregnant`` comes and goes at runtime so it isn't a bucketed kind; the
+        region's *people* are, and there are only ever a few dozen of those.
+        """
+        if region_id is None or self.game_map is None:
+            yield from (
+                (ent, comps[0]) for ent, comps in list(esper.get_components(Pregnant))
+            )
+            return
+        index = spatial.ensure(self.game_map)
+        for ent in sorted(index.of_kind(region_id, Personality)):
+            if esper.entity_exists(ent) and esper.has_component(ent, Pregnant):
+                yield ent, esper.component_for_entity(ent, Pregnant)
 
     def _give_birth(self, mother: int, father: int, clock: WorldClock) -> None:
         if not esper.entity_exists(mother):
@@ -2231,14 +2448,90 @@ class NeedsProcessor(esper.Processor):
     """
 
     def __init__(self, game_map: GameMap | None = None) -> None:
-        # In live play, pass a map to tick only the player's active simulation
-        # region. Off-screen regions are allowed to lag and are caught up by
-        # their region schedulers when explicitly needed, so the player's input
-        # frame never pays hunger/thirst/tiredness costs for every island. Unit
-        # tests and tools can keep the old whole-world behaviour by omitting it.
+        # In live play, pass a map: needs then belong to a *region's* turn rather
+        # than the world's, and are advanced wherever that region's turn is run.
+        # Unit tests and tools can keep the old whole-world pass by omitting it.
         self.game_map = game_map
         # World-clock TU at the last accrual, so we can charge only the elapsed span.
         self._last_turn: int | None = None
+        # Set once this processor is registered as a region step (see
+        # ``register_region_step``). From then on a *turn* only ticks the player --
+        # every other creature gets hungry as its own region is simulated, which is
+        # what lets a region that has been asleep for a thousand turns wake up with
+        # a thousand turns of hunger instead of the hunger it had when you left.
+        self._scheduler_driven = False
+
+    def register_region_step(self, scheduler) -> None:
+        """Make needs part of a region's turn.
+
+        Registered on the region scheduler, so hunger accrues in exactly the places
+        a region is allowed to simulate: the live region each turn, and everywhere
+        else in the background pump, on region entry, and during sleep.
+        """
+        scheduler.register("needs", self.advance_region)
+        self._scheduler_driven = True
+
+    def advance_region(self, region_id: RegionId) -> None:
+        """One region-turn of hunger, thirst and tiredness for one region.
+
+        A region-turn is one baseline action's worth of time (``BASE_ACTION_COST``),
+        so replaying a region's backlog accrues exactly the needs those turns would
+        have accrued had they been simulated as they happened.
+
+        The player is excluded: their needs follow the world clock in ``process``,
+        because a slow action must make *them* proportionally hungrier -- an NPC has
+        no such thing as a slow action, it has region-turns.
+        """
+        if self.game_map is None:
+            return
+        night = is_night(world_clock())
+        woke: list[int] = []
+        for ent, (needs,) in spatial.ensure(self.game_map).components(region_id, Needs):
+            if esper.has_component(ent, Player):
+                continue
+            if self._accrue(ent, needs, scale=1.0, night=night):
+                woke.append(ent)
+        for ent in woke:
+            wake_up(ent, self.game_map)
+
+    def _accrue(self, ent: int, needs: Needs, scale: float, night: bool) -> bool:
+        """Age one creature's needs by ``scale`` baseline turns. Returns True if it
+        has now slept itself rested and should wake."""
+        prev_hunger = needs.hunger
+        prev_thirst = needs.thirst
+        prev_tiredness = needs.tiredness
+        asleep = esper.has_component(ent, Asleep)
+        rested = False
+
+        # Hunger and thirst creep up whether awake or asleep.
+        needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate * scale)
+        needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate * scale)
+
+        if asleep:
+            # Sleeping pays down tiredness; waking is handled by the caller.
+            needs.tiredness = max(0.0, needs.tiredness - _SLEEP_RECOVERY * scale)
+            rested = needs.tiredness <= 0.0
+        else:
+            rate = needs.tiredness_rate * (_NIGHT_TIREDNESS_MULTIPLIER if night else 1.0)
+            needs.tiredness = min(needs.max_value, needs.tiredness + rate * scale)
+
+        # Every creature accumulates needs, but only the player's are surfaced as
+        # log warnings -- a hungry goblin shouldn't print "You are starving!".
+        if esper.has_component(ent, Player):
+            hunger_msg = _crossed_warning(prev_hunger, needs.hunger, _HUNGER_WARNINGS)
+            if hunger_msg is not None:
+                _push_turn_event(hunger_msg)
+            thirst_msg = _crossed_warning(prev_thirst, needs.thirst, _THIRST_WARNINGS)
+            if thirst_msg is not None:
+                _push_turn_event(thirst_msg)
+            # Tiredness warnings only make sense while awake (it falls in sleep).
+            if not asleep:
+                tired_msg = _crossed_warning(
+                    prev_tiredness, needs.tiredness, _TIREDNESS_WARNINGS
+                )
+                if tired_msg is not None:
+                    _push_turn_event(tired_msg)
+        return rested
 
     def _player_region(self) -> RegionId | None:
         if self.game_map is None:
@@ -2247,15 +2540,23 @@ class NeedsProcessor(esper.Processor):
             return region_at(self.game_map, pos.x, pos.y)
         return None
 
-    def _should_tick_entity(self, ent: int, active_region: RegionId | None) -> bool:
+    def _ticking_entities(self, active_region: RegionId | None):
+        """Whose needs this *turn* advances.
+
+        Driven by the region scheduler, that is the player alone -- everyone else
+        is the business of their own region's turn. Without a scheduler (a
+        processor built directly in a unit test) it is the old whole-world pass,
+        which is what those tests assert.
+        """
+        if self._scheduler_driven:
+            for ent, (needs, _player) in esper.get_components(Needs, Player):
+                yield ent, needs
+            return
         if self.game_map is None or active_region is None:
-            return True
-        if esper.has_component(ent, Player):
-            return True
-        if not esper.has_component(ent, Position):
-            return False
-        pos = esper.component_for_entity(ent, Position)
-        return region_at(self.game_map, pos.x, pos.y) == active_region
+            yield from ((ent, needs) for ent, (needs,) in esper.get_components(Needs))
+            return
+        for ent, (needs,) in spatial.ensure(self.game_map).components(active_region, Needs):
+            yield ent, needs
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
@@ -2276,50 +2577,13 @@ class NeedsProcessor(esper.Processor):
         scale = elapsed / BASE_ACTION_COST
 
         night = is_night(clock)
-        active_region = self._player_region()
         woke: list[int] = []
-
-        for ent, (needs,) in esper.get_components(Needs):
-            if not self._should_tick_entity(ent, active_region):
-                continue
-            prev_hunger = needs.hunger
-            prev_thirst = needs.thirst
-            prev_tiredness = needs.tiredness
-            asleep = esper.has_component(ent, Asleep)
-
-            # Hunger and thirst creep up whether awake or asleep.
-            needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate * scale)
-            needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate * scale)
-
-            if asleep:
-                # Sleeping pays down tiredness; waking is handled after the loop.
-                needs.tiredness = max(0.0, needs.tiredness - _SLEEP_RECOVERY * scale)
-                if needs.tiredness <= 0.0:
-                    woke.append(ent)
-            else:
-                rate = needs.tiredness_rate * (_NIGHT_TIREDNESS_MULTIPLIER if night else 1.0)
-                needs.tiredness = min(needs.max_value, needs.tiredness + rate * scale)
-
-            # Every creature accumulates needs, but only the player's are
-            # surfaced as log warnings -- a hungry goblin shouldn't print
-            # "You are starving!" to the player.
-            if not esper.has_component(ent, Player):
-                continue
-
-            hunger_msg = _crossed_warning(prev_hunger, needs.hunger, _HUNGER_WARNINGS)
-            if hunger_msg is not None:
-                _push_turn_event(hunger_msg)
-            thirst_msg = _crossed_warning(prev_thirst, needs.thirst, _THIRST_WARNINGS)
-            if thirst_msg is not None:
-                _push_turn_event(thirst_msg)
-            # Tiredness warnings only make sense while awake (it falls in sleep).
-            if not asleep:
-                tired_msg = _crossed_warning(prev_tiredness, needs.tiredness, _TIREDNESS_WARNINGS)
-                if tired_msg is not None:
-                    _push_turn_event(tired_msg)
+        for ent, needs in self._ticking_entities(self._player_region()):
+            if self._accrue(ent, needs, scale, night):
+                woke.append(ent)
 
         for ent in woke:
-            wake_up(ent)
+            wake_up(ent, self.game_map)
 
 
 # RenderProcessor live in render.py; imported here so

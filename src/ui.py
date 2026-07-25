@@ -31,7 +31,8 @@ from queries import entity_name, first_player_entity
 from renderer.base import Renderer
 from rng import world_rng
 from systems import (
-    FishAiProcessor, NpcAiProcessor, RenderProcessor, TreeGrowthProcessor, WAIT_ACTION,
+    FishAiProcessor, NpcAiProcessor, RenderProcessor, ReproductionProcessor,
+    TreeGrowthProcessor, WAIT_ACTION,
     bed_owner, go_to_sleep, queue_message, wake_up, world_clock,
 )
 from interactions import (
@@ -661,7 +662,7 @@ def _confirm(renderer: Renderer, title: str, lines: list[str]) -> bool:
             return options[selected] == "Yes"
 
 
-def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
+def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = None) -> None:
     """Send the player to sleep and fast-forward turns until they wake rested.
 
     The whole world keeps simulating during the rest (NPCs act, needs shift, the
@@ -681,7 +682,7 @@ def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
     queue_message(
         "You set up camp and settle in to rest." if in_camp else "You climb into bed and close your eyes."
     )
-    go_to_sleep(player_ent, in_camp=in_camp)
+    go_to_sleep(player_ent, in_camp=in_camp, game_map=game_map)
 
     turns = 0
     while esper.has_component(player_ent, Asleep) and turns < _SLEEP_MAX_TURNS:
@@ -690,7 +691,7 @@ def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
 
     # Safety net: never leave the player stuck asleep past the cap.
     if esper.has_component(player_ent, Asleep):
-        wake_up(player_ent)
+        wake_up(player_ent, game_map)
 
     # A night's sleep resolves the *whole* world, not just the region the bed
     # sits in -- region-aware processors otherwise only keep the player's
@@ -707,6 +708,11 @@ def _sleep_player(renderer: Renderer, in_camp: bool) -> None:
     flora = esper.get_processor(TreeGrowthProcessor)
     if flora is not None:
         flora.catch_up_all_flora()
+    # Births lag per region the same way -- the world's babies due while you slept
+    # are all delivered here rather than on some later keypress.
+    births = esper.get_processor(ReproductionProcessor)
+    if births is not None:
+        births.catch_up_all_births()
 
     esper.process(None)
 

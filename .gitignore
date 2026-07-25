@@ -34,3 +34,7 @@ data/saves/*.json
 src/data/config/options.json
 src/data/saves/*.json
 !src/data/saves/default_save.json
+
+# build outputs
+*.exe
+*.pyc

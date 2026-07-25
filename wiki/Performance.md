@@ -70,8 +70,12 @@ fall back to the per-region-revision + countdown hedge. Result: **357 → 13** b
 skipped rebuilds would have produced the same field), no regression to the living world.
 
 **Measured, not guessed:** an entity spatial index (per-tile buckets to replace the
-O(n) `get_components(Position)` scans) was on the roadmap, but the profile shows those
-scans are *not* the bottleneck — pathfinding is. So it isn't warranted yet.
+O(n) `get_components(Position)` scans) was long deferred, because at one island the
+profile said pathfinding dominated and the scans did not. That held until the world got
+big: measured across 1 / 4 / 9 islands, the scans were what grew (`MovementProcessor`
+rebuilt a dict of *every* blocking entity in the world on each keypress: 0.08 → 1.63
+ms/turn), while the per-island work stayed flat. The index now exists — see
+[`src/spatial.py`](../src/spatial.py) and "Regional entity index" below.
 
 The BFS hot loops (`distance_field`, `_compute_regions`) inline their neighbour/bounds/
 walkability tests the same way `find_path` does — that alone cut the normal case from
@@ -88,10 +92,29 @@ What has actually dominated, and the fixes already in place:
   Cost now concentrates only in cross-region catch-up. Reuse **flow fields**
   (`distance_field`) across travellers/turns instead of re-pathing.
 
-Remaining per-turn cost is spread thin (no single dominant): per-region bucket rebuilds
-(`_region_bucket`), `distance_field` builds, and region-geometry helpers
-(`region_bounds`/`region_grid_size`/`in_region_with_margin`, called ~1.25M times over
-300 turns). These are the next levers.
+Remaining per-turn cost is spread thin (no single dominant): `distance_field` builds
+(now ~43% of a turn at 9 islands), per-island connectivity relabels
+(`_compute_island_regions`, `find_enclosed_rooms`) after a villager lays a wall, and
+region-geometry helpers (`region_bounds`/`region_grid_size`/`in_region_with_margin`).
+All of these are bounded by one island, so they no longer grow with the archipelago.
+
+### Strict active/inactive partitioning
+
+`esper.process(action)` simulates the region the player stands in and nothing else.
+Everywhere else advances only where the design allows it to: `simulate_idle`'s
+background pump, `_catch_up_entered_region_cooperatively` on region entry, and sleep.
+`src/tests/test_active_region_partition.py` holds the turn path to that rule.
+
+Needs and status effects are **registered steps on the region scheduler**
+(`NeedsProcessor.register_region_step` / `EffectsProcessor.register_region_step`, wired
+in `game._register_processors`), so they run wherever a region's turn actually runs: the
+live region each turn, and everywhere else in the pump, on entry, and during sleep. That
+closed a real gap — an inactive region's needs used to not tick *at all*, so villagers
+caught up after a long absence replayed with the appetites they had when you walked
+away and simply stood about. A region now accrues one baseline turn of hunger per
+region-turn it owed. The player is the exception: their needs still tick against the
+world clock in `process`, because a slow action has to make *them* proportionally
+hungrier — an NPC has no slow actions, only region-turns.
 
 ## Scaling levers (in profile-justified order)
 
@@ -103,9 +126,14 @@ Remaining per-turn cost is spread thin (no single dominant): per-region bucket r
   the affected component instead.
 - **Scheduler heap** — `next_actor()`'s O(n) scan → a heap (the interface already
   anticipates it; see [Action Economy](Action-Economy.md)).
-- **Entity spatial index** — per-tile buckets for `get_components(Position)` scans.
-  *Deferred:* the profile shows these scans are not the bottleneck (pathfinding is);
-  revisit only if a measurement says otherwise.
+- **Regional entity index** — *done* (`src/spatial.py`): every positioned entity
+  bucketed by simulation region and by kind, built once at worldgen and maintained
+  incrementally (three movement hooks; creation and deletion are noticed from esper's
+  own id counter, so no call site has to remember). Systems ask for a region's
+  entities instead of the world's. Measured over 300 turns after a 150-turn settle,
+  at 9 islands: `MovementProcessor` 1.63 → 0.02 ms/turn, `NeedsProcessor` 0.15 → 0.03,
+  `HousingProcessor` 0.88 → 0.47, whole turn 10.8 → 8.2 ms. What remains in a turn is
+  bounded per-island tile work (`distance_field` floods), not entity scans.
 - **Everything in memory at startup** — sounds, tiles, state (per `next.md`).
 
 See [Roadmap](Roadmap.md) for sequencing.
