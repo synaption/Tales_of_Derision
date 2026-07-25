@@ -248,10 +248,16 @@ def _pump_background_regions(budget_seconds: float) -> None:
         flora.pump_flora(budget_seconds, player_xy, time.monotonic)
 
 
-def play_game(args: argparse.Namespace) -> None:
+def play_game(
+    *,
+    save_file: Path | None,
+    screenshot: Path | None,
+    rat_flood: bool,
+    seed: int | None,
+) -> None:
     bootstrap_files(MAP_WIDTH, MAP_HEIGHT)
     options = load_options()
-    if args.screenshot is not None:
+    if screenshot is not None:
         # Run screenshot capture off-screen.
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -263,15 +269,15 @@ def play_game(args: argparse.Namespace) -> None:
 
     game_map = GameMap(MAP_WIDTH, MAP_HEIGHT, layout=WORLD_LAYOUT)
     player_position = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
-    startup_save_file = args.save_file
-    if args.screenshot is not None and startup_save_file is None:
+    startup_save_file = save_file
+    if screenshot is not None and startup_save_file is None:
         startup_save_file = DEFAULT_SAVE_FILE
 
     # Install the world seed before any worldgen. For now the whole game uses one
     # fixed seed -- every game (new or loaded) regenerates the same world -- unless
     # --seed overrides it. Saves still record the seed for when we later restore
     # per-save worlds; that stored seed is intentionally ignored for now.
-    set_world_rng(args.seed if args.seed is not None else DEFAULT_WORLD_SEED)
+    set_world_rng(seed if seed is not None else DEFAULT_WORLD_SEED)
 
     try:
         with PygameRenderer(options=options) as renderer:
@@ -284,12 +290,12 @@ def play_game(args: argparse.Namespace) -> None:
             if not startup_ok:
                 return
 
-            if args.screenshot is None:
+            if screenshot is None:
                 pygame_module = start_background_music(options)
                 combat_sfx = CombatSfxPlayer(pygame_module, options)
 
-            rat_count = _setup_world(game_map, player_position, rat_flood=args.rat_flood)
-            if args.rat_flood:
+            rat_count = _setup_world(game_map, player_position, rat_flood=rat_flood)
+            if rat_flood:
                 print(f"Rat flood mode enabled: spawned {rat_count} cave rats.", file=sys.stderr)
             esper.add_processor(
                 MovementProcessor(
@@ -332,7 +338,7 @@ def play_game(args: argparse.Namespace) -> None:
             # settle turns advance the world without drawing the game. Skipped for
             # screenshot capture (needs an immediate frame) and the rat-flood stress
             # test (no villagers to settle).
-            if args.screenshot is None and not args.rat_flood:
+            if screenshot is None and not rat_flood:
                 if not run_world_generation(renderer, WORLD_SETTLE_TURNS):
                     return
 
@@ -340,8 +346,8 @@ def play_game(args: argparse.Namespace) -> None:
 
             esper.process()  # initial frame
             current_player_region = _player_region_for_processors(first_player_position())
-            if args.screenshot is not None:
-                _capture_frame_screenshot(renderer, args.screenshot)
+            if screenshot is not None:
+                _capture_frame_screenshot(renderer, screenshot)
                 return
 
             held_directions: set[str] = set()
