@@ -23,12 +23,23 @@ LAND_HEIGHT = 60
 # either; the whole map is open sea with the islands dropped in, an OCEAN_GAP-wide
 # channel of water between neighbours (and half that inset from the map edge).
 # Selected explicitly via ``GameMap(..., layout="islands")`` (never inferred from size).
-ARCHIPELAGO_GRID = 10  # ARCHIPELAGO_GRID**2 islands (10x10 = 100)
+ARCHIPELAGO_GRID = 10  # default grid: ARCHIPELAGO_GRID**2 islands (10x10 = 100).
+# The player picks the grid when starting a new game (see ui._draw_new_game_menu);
+# the map is then built at ``archipelago_size(grid)`` and ``_build_islands`` derives
+# the grid back from those dimensions, so no size is baked in beyond the default.
 OCEAN_GAP = 20  # open-sea channel between adjacent island cells
 _CELL_W = LAND_WIDTH + OCEAN_GAP
 _CELL_H = LAND_HEIGHT + OCEAN_GAP
-ARCHIPELAGO_WIDTH = _CELL_W * ARCHIPELAGO_GRID
-ARCHIPELAGO_HEIGHT = _CELL_H * ARCHIPELAGO_GRID
+
+
+def archipelago_size(grid: int) -> tuple[int, int]:
+    """Map dimensions holding a ``grid`` x ``grid`` archipelago (``grid**2`` islands),
+    each island in its own cell with an ``OCEAN_GAP`` channel around it."""
+    grid = max(1, int(grid))
+    return (_CELL_W * grid, _CELL_H * grid)
+
+
+ARCHIPELAGO_WIDTH, ARCHIPELAGO_HEIGHT = archipelago_size(ARCHIPELAGO_GRID)
 
 
 def world_land_rect(width: int, height: int) -> tuple[int, int, int, int] | None:

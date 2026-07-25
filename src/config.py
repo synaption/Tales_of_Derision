@@ -2,15 +2,25 @@
 else) can import them without importing each other."""
 from __future__ import annotations
 
-from game_map import ARCHIPELAGO_HEIGHT, ARCHIPELAGO_WIDTH
+from game_map import ARCHIPELAGO_GRID, ARCHIPELAGO_HEIGHT, ARCHIPELAGO_WIDTH
 
-# Scale-test world: an archipelago of 100 copies of the classic 120x60 island
-# (10x10 grid), each with its own coastline, houses, lakes/river, village and
-# wildlife, all in open sea with no wall border. Swap WORLD_LAYOUT back to "auto"
-# for the original single-island 360x180 world. See ``GameMap`` layout="islands".
+# Scale-test world: an archipelago of copies of the classic 120x60 island, each with
+# its own coastline, houses, lakes/river, village and wildlife, all in open sea with
+# no wall border. Swap WORLD_LAYOUT back to "auto" for the original single-island
+# 360x180 world. See ``GameMap`` layout="islands".
+# MAP_WIDTH/MAP_HEIGHT are the *default* archipelago size: the size a new game starts
+# on when nothing else is chosen, and the fallback for a save that doesn't record one.
+# A new game asks for its own grid size (WORLD_GRID_CHOICES) and builds the map at
+# ``game_map.archipelago_size`` of that choice.
 MAP_WIDTH = ARCHIPELAGO_WIDTH
 MAP_HEIGHT = ARCHIPELAGO_HEIGHT
 WORLD_LAYOUT = "islands"
+
+# Island-grid sizes offered on the new-game screen: an N x N grid is N**2 islands, so
+# the largest is a hundred-island scale test that takes a while to generate, and the
+# smallest is a single classic island for quick play/testing.
+WORLD_GRID_CHOICES = (1, 2, 3, 5, 10)
+DEFAULT_WORLD_GRID = ARCHIPELAGO_GRID
 
 # Turns to pre-simulate behind a "Generating world..." screen before play, so the
 # startup building boom (every homeless villager raising a home at once) happens

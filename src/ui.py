@@ -21,8 +21,10 @@ from components import (
     Asleep, Corpse, Dialogue, Equipment, Inventory, Needs, Personality, Player,
     Position,
 )
-from config import MAP_HEIGHT, MAP_WIDTH, WORLD_LAYOUT
-from game_map import GameMap
+from config import (
+    DEFAULT_WORLD_GRID, MAP_HEIGHT, MAP_WIDTH, WORLD_GRID_CHOICES, WORLD_LAYOUT,
+)
+from game_map import GameMap, archipelago_size
 from items import WOOD, craft_cost, default_equipment_slots, is_placeable
 from persistence import DEFAULT_SAVE_FILE, load_game, save_game, save_options
 from queries import entity_name, first_player_entity
@@ -329,6 +331,50 @@ def _draw_main_menu(renderer: Renderer) -> str:
             return options[selected][0]
 
 
+def _world_size_label(grid: int) -> str:
+    """One row of the new-game size menu: the grid, how many islands that is, and
+    how many tiles across the world ends up."""
+    width, height = archipelago_size(grid)
+    islands = grid * grid
+    noun = "island" if islands == 1 else "islands"
+    return f"{grid:>2} x {grid:<2}   {islands:>3} {noun:<7}   {width} x {height} tiles"
+
+
+def _draw_new_game_menu(renderer: Renderer) -> int | str:
+    """Ask how big the new world should be. Returns the chosen island-grid size,
+    ``"back"`` (Esc -- return to the main menu) or ``"quit"``."""
+    grids = list(WORLD_GRID_CHOICES)
+    # Start on the configured default, so just pressing Enter gives the standard world.
+    selected = grids.index(DEFAULT_WORLD_GRID) if DEFAULT_WORLD_GRID in grids else 0
+    items = [_world_size_label(grid) for grid in grids] + ["Back"]
+
+    while True:
+        x, y, width, _height = _draw_menu_shell(
+            renderer,
+            title="NEW GAME - WORLD SIZE",
+            subtitle="How big an archipelago? Larger worlds take longer to generate.",
+            footer="[W/S] move   [Enter/Space] select   [Esc] back",
+            width=72,
+            height=22,
+        )
+        _draw_menu_options(renderer, x + 4, y + 7, width - 8, items, selected)
+        renderer.present()
+
+        action = _await_action(renderer)
+        if action == "quit":  # window close
+            return "quit"
+        if action == "open_pause_menu":
+            return "back"
+        if action == "move_up":
+            selected = (selected - 1) % len(items)
+        elif action == "move_down":
+            selected = (selected + 1) % len(items)
+        elif action in {"menu_select", "confirm_action"}:
+            if selected == len(grids):  # "Back"
+                return "back"
+            return grids[selected]
+
+
 def _draw_options_menu(renderer: Renderer, options: dict) -> str:
     def apply_renderer_options() -> None:
         apply_fn = getattr(renderer, "apply_options", None)
@@ -441,12 +487,28 @@ def _draw_pause_menu(renderer: Renderer, options: dict) -> str:
             return chosen
 
 
+def new_game_map(grid: int) -> tuple[GameMap, Position]:
+    """Build a fresh archipelago of ``grid`` x ``grid`` islands, with the player
+    dropped at the middle of the map (worldgen nudges that onto the nearest land)."""
+    width, height = archipelago_size(grid)
+    return (
+        GameMap(width, height, layout=WORLD_LAYOUT),
+        Position(width // 2, height // 2),
+    )
+
+
 def _run_startup_flow(
     renderer: Renderer,
     requested_save_file: Path | None,
-    game_map: GameMap,
-    player_position: Position,
-) -> tuple[bool, GameMap, Position, Path]:
+) -> tuple[bool, GameMap | None, Position | None, Path]:
+    """Title screen and main menu, ending in the world to play.
+
+    Returns ``(ok, game_map, player_position, save_file)``; the map is built here
+    rather than by the caller because a new game only knows how big it is once the
+    player has picked a world size, and generating a hundred-island world to throw
+    it away would be the slowest thing in startup. ``ok`` is False when the player
+    backed out, and the map/position are then ``None``.
+    """
     selected_save_file = requested_save_file or DEFAULT_SAVE_FILE
     if requested_save_file is not None:
         loaded_map, loaded_player_position = load_game(
@@ -458,24 +520,33 @@ def _run_startup_flow(
         return (True, loaded_map, loaded_player_position, selected_save_file)
 
     if not _draw_title_screen(renderer):
-        return (False, game_map, player_position, selected_save_file)
+        return (False, None, None, selected_save_file)
 
-    menu_choice = _draw_main_menu(renderer)
-    if menu_choice == "quit":
-        return (False, game_map, player_position, selected_save_file)
-    if menu_choice == "continue":
-        loaded_map, loaded_player_position = load_game(
-            DEFAULT_SAVE_FILE,
-            MAP_WIDTH,
-            MAP_HEIGHT,
-            WORLD_LAYOUT,
-        )
-        return (True, loaded_map, loaded_player_position, selected_save_file)
-    if menu_choice == "new_game":
-        save_game(game_map, DEFAULT_SAVE_FILE, player_position, seed=world_rng().seed)
-        return (True, game_map, player_position, selected_save_file)
+    while True:
+        menu_choice = _draw_main_menu(renderer)
+        if menu_choice == "quit":
+            return (False, None, None, selected_save_file)
+        if menu_choice == "continue":
+            # A save records the size and layout it was made at, so continuing
+            # rebuilds whatever world that game chose.
+            loaded_map, loaded_player_position = load_game(
+                DEFAULT_SAVE_FILE,
+                MAP_WIDTH,
+                MAP_HEIGHT,
+                WORLD_LAYOUT,
+            )
+            return (True, loaded_map, loaded_player_position, selected_save_file)
+        if menu_choice == "new_game":
+            grid = _draw_new_game_menu(renderer)
+            if grid == "quit":
+                return (False, None, None, selected_save_file)
+            if grid == "back":
+                continue  # back to the main menu
+            game_map, player_position = new_game_map(int(grid))
+            save_game(game_map, DEFAULT_SAVE_FILE, player_position, seed=world_rng().seed)
+            return (True, game_map, player_position, selected_save_file)
 
-    return (False, game_map, player_position, selected_save_file)
+        return (False, None, None, selected_save_file)
 
 
 def _draw_generation_frame(renderer: Renderer, fraction: float) -> None:

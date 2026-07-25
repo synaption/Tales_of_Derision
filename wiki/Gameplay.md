@@ -146,7 +146,10 @@ hunger, thirst, tiredness, statuses including whether they're asleep).
 
 ## Menus
 
-- Startup: Title Screen → Main Menu (`Continue`, `New Game`, `Quit`).
+- Startup: Title Screen → Main Menu (`Continue`, `New Game`, `Quit`). `New Game` first
+  asks for the world size — an `N x N` grid of islands (1, 4, 9, 25 or 100 of them),
+  defaulting to the 10x10 archipelago; larger worlds take longer to generate. The
+  chosen size is saved, so `Continue` comes back to a world of the same size.
 - **Player menu** (`Tab`): tabbed — `Inventory`, `Craft`, `Status`, with `Map`,
   `Journal`, `Skills` stubbed. `Tab` reopens on the last tab and cycles; `I`/`C` jump
   to Inventory/Status (and toggle closed); `Esc` closes.

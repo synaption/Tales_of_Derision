@@ -591,8 +591,9 @@ def game_session(args: argparse.Namespace) -> Iterator[GameSession | None]:
     pygame_module = None
     combat_sfx = CombatSfxPlayer(None, options)
 
-    game_map = GameMap(MAP_WIDTH, MAP_HEIGHT, layout=WORLD_LAYOUT)
-    player_position = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
+    # The world itself is built by the startup flow: loading a save reconstructs the
+    # size it was made at, and a new game asks the player how big an archipelago to
+    # generate, so there is nothing to build until one of those has been answered.
     startup_save_file = args.save_file
     if args.screenshot is not None and startup_save_file is None:
         startup_save_file = DEFAULT_SAVE_FILE
@@ -608,10 +609,8 @@ def game_session(args: argparse.Namespace) -> Iterator[GameSession | None]:
             startup_ok, game_map, player_position, selected_save_file = _run_startup_flow(
                 renderer,
                 startup_save_file,
-                game_map,
-                player_position,
             )
-            if not startup_ok:
+            if not startup_ok or game_map is None or player_position is None:
                 yield None
                 return
 
