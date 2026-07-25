@@ -15,6 +15,10 @@ timeout --foreground 15m wine "$WINDOWS_PYTHON" -m pip install \
   -r requirements.txt \
   pyinstaller
 
+echo "Checking the Windows pygame installation..."
+timeout --foreground 2m wine "$WINDOWS_PYTHON" -c \
+  'import pygame; assert callable(pygame.init); print(pygame.version.ver)'
+
 echo "Building dist/TalesOfDerision.exe..."
 timeout --foreground 30m wine "$WINDOWS_PYTHON" -m PyInstaller \
   --clean \

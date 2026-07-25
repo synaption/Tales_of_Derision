@@ -79,6 +79,9 @@ Wine is still using it, resulting in `X connection ... broken` followed by a han
 The image shuts down its setup-time Wine server before it is saved, and the build
 prints progress before each Wine command. Dependency installation times out after
 15 minutes and packaging after 30 minutes rather than waiting forever.
+Before packaging, the builder verifies that Windows Python imports the complete
+`pygame` package. The PyInstaller specification explicitly collects pygame's
+Python modules, data, and native DLLs because the game imports pygame dynamically.
 
 GitHub Actions uses the same Linux build script and uploads the executable artifact
 through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and

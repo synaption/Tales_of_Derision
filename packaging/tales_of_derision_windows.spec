@@ -3,7 +3,7 @@
 #   pyinstaller --clean --noconfirm packaging/tales_of_derision_windows.spec
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path.cwd()
 
@@ -12,11 +12,13 @@ def tree_data(source: str, dest: str):
     return [(str(ROOT / source), dest)]
 
 
+pygame_datas, pygame_binaries, pygame_hiddenimports = collect_all("pygame")
+
 datas = [
     *tree_data("audio", "audio"),
     *tree_data("gfx", "gfx"),
     *tree_data("src/data", "src/data"),
-    *collect_data_files("pygame"),
+    *pygame_datas,
 ]
 
 block_cipher = None
@@ -24,9 +26,9 @@ block_cipher = None
 a = Analysis(
     [str(ROOT / "src" / "main.py")],
     pathex=[str(ROOT / "src")],
-    binaries=[],
+    binaries=pygame_binaries,
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=pygame_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
