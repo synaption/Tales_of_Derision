@@ -9,47 +9,12 @@ from __future__ import annotations
 import csv
 from collections import deque
 import json
+import os
 from pathlib import Path
-import sys
 
-from .base import Renderer
+from paths import resource_root
 
-
-# Under pygbag the browser canvas fills the page via CSS (width/height: 100%),
-# so the pygame surface resolution must match the visible canvas or the browser
-# scales it and the game looks wrong-sized.
-IS_WEB = sys.platform == "emscripten"
-
-
-def _apply_web_canvas_style() -> None:
-    """Tell the browser to scale the canvas with nearest-neighbor sampling.
-
-    The canvas is CSS-scaled to fit the page; the browser's default smoothing
-    blurs upscaled pixels and text. `image-rendering: pixelated` keeps them crisp.
-    """
-    try:
-        import platform as _platform  # pygbag-injected; has .window.canvas on web
-
-        _platform.window.canvas.style.imageRendering = "pixelated"
-    except Exception:
-        pass
-
-
-def _web_display_size(default: tuple[int, int] = (1280, 720)) -> tuple[int, int]:
-    """Visible browser canvas size (CSS pixels) for the pygbag build.
-
-    Falls back to a sane default off-web or if the JS bridge is unavailable.
-    """
-    try:
-        import platform as _platform  # pygbag injects a `window` proxy here
-
-        width = int(_platform.window.innerWidth)
-        height = int(_platform.window.innerHeight)
-        if width > 0 and height > 0:
-            return (width, height)
-    except Exception:
-        pass
-    return default
+from .base import MEMORY_DESATURATE, MEMORY_DIM, Renderer, memory_color
 
 
 _DEFAULT_ACTION_KEYBINDS: dict[str, list[str]] = {
@@ -59,7 +24,11 @@ _DEFAULT_ACTION_KEYBINDS: dict[str, list[str]] = {
     "move_right": ["d"],
     "confirm_action": ["space"],
     "menu_select": ["enter", "kp_enter"],
+    "open_menu": ["tab"],
     "open_inventory": ["i"],
+    "open_status": ["c"],
+    "look": ["l"],
+    "sleep": ["r"],
     "open_pause_menu": ["esc"],
     "tile_scale_up": ["equals", "kp_plus"],
     "tile_scale_down": ["minus", "kp_minus"],
@@ -246,7 +215,7 @@ class PygameRenderer(Renderer):
         self._next_confirm_repeat_ms = 0
         self._pending_actions: deque[str] = deque()
 
-        project_root = Path(__file__).resolve().parents[2]
+        project_root = resource_root()
         self._tile_config_path = project_root / "gfx" / "tilesets" / "pygame_tileset_config.json"
         self._fallback_sheet_path = str(project_root / "gfx" / "tilesets" / "Bisasam_16x16.png")
         self._fallback_tile_size = 16
@@ -282,6 +251,13 @@ class PygameRenderer(Renderer):
         # Cached fully-drawn map; walking blits regions of it instead of
         # re-drawing every visible tile (see capture_map_surface).
         self._map_surface = None
+        # Remembered ("fog of war") tiles: terrain is faded in place per on-screen
+        # region (see apply_memory_fade -- cheap, no per-mutation cost); scenery
+        # sprites reuse this per-tile cache of the same desaturate+dim transform.
+        # ``_memory_cache`` holds the whole rendered remembered layer for the
+        # current view so idle frames blit it instead of re-fading every frame.
+        self._memory_cache = None
+        self._desaturated_tiles: dict[int, object] = {}
 
     def apply_options(self, options: dict) -> None:
         self._options = dict(options)
@@ -306,19 +282,37 @@ class PygameRenderer(Renderer):
         self._sidebar_width_ratio = min(0.5, max(0.14, ratio))
 
         fullscreen = bool(self._options.get("fullscreen", False))
-        if IS_WEB:
-            # Browser "fullscreen" isn't a real display mode. Match the surface to
-            # the visible canvas so 1 surface px == 1 CSS px; otherwise the browser
-            # rescales an oversized surface and the whole game looks tiny.
-            window_w, window_h = _web_display_size()
-            self._screen = self._pygame.display.set_mode((window_w, window_h))
-            _apply_web_canvas_style()
-        elif fullscreen:
-            self._screen = self._pygame.display.set_mode((0, 0), self._pygame.FULLSCREEN)
+        try:
+            display_index = max(0, int(self._options.get("display_index", 0)))
+        except (TypeError, ValueError):
+            display_index = 0
+        num_displays = self._pygame.display.get_num_displays() if hasattr(self._pygame.display, "get_num_displays") else 1
+        display_index = min(display_index, max(0, num_displays - 1))
+
+        if fullscreen:
+            self._screen = self._pygame.display.set_mode(
+                (0, 0), self._pygame.FULLSCREEN, display=display_index
+            )
         else:
             window_w = max(640, self._cols * self._cell_w)
             window_h = max(480, self._rows * self._cell_h)
-            self._screen = self._pygame.display.set_mode((window_w, window_h))
+            # Cap to 90% of the target display so the window never spans
+            # multiple monitors and leaves a little breathing room.
+            try:
+                desktop_sizes = self._pygame.display.get_desktop_sizes()
+                if display_index < len(desktop_sizes):
+                    max_w, max_h = desktop_sizes[display_index]
+                    window_w = min(window_w, int(max_w * 0.9))
+                    window_h = min(window_h, int(max_h * 0.9))
+            except AttributeError:
+                info = self._pygame.display.Info()
+                if info.current_w > 0:
+                    window_w = min(window_w, int(info.current_w * 0.9))
+                if info.current_h > 0:
+                    window_h = min(window_h, int(info.current_h * 0.9))
+            self._screen = self._pygame.display.set_mode(
+                (window_w, window_h), display=display_index
+            )
 
         if self._screen is not None:
             screen_w = self._screen.get_width()
@@ -342,6 +336,8 @@ class PygameRenderer(Renderer):
         # wrong size / cell scale.
         self._backdrop_snapshot = None
         self._map_surface = None
+        self._memory_cache = None
+        self._desaturated_tiles = {}
         self._load_tileset_config()
 
         self._keydown_to_action, self._keyup_to_action = _build_key_mappings(self._pygame, self._options)
@@ -462,7 +458,7 @@ class PygameRenderer(Renderer):
                 return ""
             sheet_path = Path(sheet_value)
             if not sheet_path.is_absolute():
-                sheet_path = Path(__file__).resolve().parents[2] / sheet_path
+                sheet_path = resource_root() / sheet_path
             return str(sheet_path)
 
         sheet_aliases: dict[str, str] = {}
@@ -497,7 +493,7 @@ class PygameRenderer(Renderer):
         if isinstance(raw_tile_index, str) and raw_tile_index.strip():
             candidate = Path(raw_tile_index.strip())
             if not candidate.is_absolute():
-                candidate = Path(__file__).resolve().parents[2] / candidate
+                candidate = resource_root() / candidate
             tile_index_path = candidate
         elif default_sheet:
             default_sheet_path = Path(resolve_sheet(default_sheet))
@@ -769,6 +765,11 @@ class PygameRenderer(Renderer):
     def setup(self) -> None:
         pygame = __import__("pygame")
 
+        # Tell Windows to report real physical pixels per monitor instead of
+        # letting the OS rescale the window (fixes blurry/wrong-sized display
+        # on multi-monitor / high-DPI setups).
+        os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
+
         pygame.init()
         pygame.display.set_caption("Tales of Derision")
 
@@ -976,6 +977,7 @@ class PygameRenderer(Renderer):
         classification: str,
         fg: tuple[int, int, int] | None = None,
         bg: tuple[int, int, int] | None = None,
+        force_glyph: bool = False,
     ) -> None:
         explicit_fg = fg is not None
         if fg is None:
@@ -987,7 +989,11 @@ class PygameRenderer(Renderer):
         if bg is not None:
             self._fill_glyph_background(x, y, resolved_bg)
 
-        tile, source = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
+        # force_glyph renders the literal glyph (e.g. a status identifier like
+        # "~"): resolve with no classification so it can't fall back to the
+        # classification's sprite, which would otherwise mask the glyph.
+        resolve_classification = None if force_glyph else classification
+        tile, source = self._resolve_tile_surface(glyph, resolve_classification, resolved_fg, resolved_bg)
         if self._screen is not None and tile is not None:
             draw_tile = tile
             if explicit_fg and source in {"glyph", "class"}:
@@ -1177,6 +1183,27 @@ class PygameRenderer(Renderer):
     def invalidate_map_surface(self) -> None:
         self._map_surface = None
 
+    def redraw_map_cells(self, cells, draw_cell) -> bool:
+        """Repaint just ``cells`` (world (x, y) tuples) on the cached map surface,
+        leaving the rest untouched. ``draw_cell(wx, wy)`` renders one tile at its
+        world cell. Cheap incremental update for a handful of edited tiles, versus
+        rebuilding the whole world surface. No-op (returns False) if no surface is
+        cached yet."""
+        if self._pygame is None or self._map_surface is None:
+            return False
+        saved_screen = self._screen
+        self._screen = self._map_surface
+        try:
+            for wx, wy in cells:
+                rect = self._pygame.Rect(
+                    wx * self._cell_w, wy * self._cell_h, self._cell_w, self._cell_h
+                )
+                self._map_surface.fill(self._bg, rect)
+                draw_cell(wx, wy)
+        finally:
+            self._screen = saved_screen
+        return True
+
     def blit_map_region(
         self,
         world_x: int,
@@ -1207,6 +1234,260 @@ class PygameRenderer(Renderer):
             return
         rect = self._pygame.Rect(vx * self._cell_w, vy * self._cell_h, self._cell_w, self._cell_h)
         self._screen.fill(self._bg, rect)
+
+    def _desaturate_surface(self, surface: object) -> object:
+        """A desaturated, dimmed copy of ``surface`` -- the "remembered" tone.
+        Blends the surface toward its greyscale by ``MEMORY_DESATURATE`` then
+        multiplies brightness by ``MEMORY_DIM``, matching ``base.memory_color``.
+
+        Only used on small, cached sprite tiles (remembered scenery). Terrain is
+        NOT desaturated this way: greyscaling the whole world-sized map surface
+        costs hundreds of ms and would have to be redone every time the living
+        world edits a tile, so remembered terrain uses the cheap ``apply_memory
+        _veil`` region wash instead.
+        """
+        result = surface.copy()
+        # Blend toward greyscale (partial desaturation) via a per-surface-alpha
+        # overlay; falls back to no desaturation if the transform is unavailable.
+        grayscale = getattr(self._pygame.transform, "grayscale", None)
+        if callable(grayscale):
+            gray = grayscale(result)
+            gray.set_alpha(int(round(255 * MEMORY_DESATURATE)))
+            result.blit(gray, (0, 0))
+        # Dim: multiply every channel by the brightness factor.
+        dim = max(0, min(255, int(round(255 * MEMORY_DIM))))
+        result.fill((dim, dim, dim), special_flags=self._pygame.BLEND_RGB_MULT)
+        return result
+
+    def apply_memory_fade(self, vx: int, vy: int, w_cells: int, h_cells: int) -> None:
+        """Fade an already-drawn block of lit terrain into its "remembered" tone:
+        desaturate each pixel toward its OWN luminance (a grayscale blend), then
+        dim by a brightness multiply. Operates only on the on-screen region, so it
+        stays cheap (a viewport-sized greyscale, not a whole-map transform), and --
+        unlike a flat grey overlay -- it leaves black backgrounds black and keeps
+        contrast, matching the per-sprite fade used for remembered scenery.
+        ``(vx, vy)`` is the top-left cell in the *view* (scroll offset already
+        applied by the caller)."""
+        if self._pygame is None or self._screen is None:
+            return
+        w_px = max(0, w_cells) * self._cell_w
+        h_px = max(0, h_cells) * self._cell_h
+        if w_px == 0 or h_px == 0:
+            return
+        rect = self._pygame.Rect(vx * self._cell_w, vy * self._cell_h, w_px, h_px)
+        rect = rect.clip(self._screen.get_rect())
+        if rect.width == 0 or rect.height == 0:
+            return
+        grayscale = getattr(self._pygame.transform, "grayscale", None)
+        if callable(grayscale):
+            # Blend the region toward its greyscale by MEMORY_DESATURATE (partial
+            # desaturation toward per-pixel luminance -- keeps relative brightness).
+            gray = grayscale(self._screen.subsurface(rect))
+            gray.set_alpha(max(0, min(255, int(round(255 * MEMORY_DESATURATE)))))
+            self._screen.blit(gray, rect.topleft)
+        # Dim: multiply every channel (black stays black, no washed-out lift).
+        dim = max(0, min(255, int(round(255 * MEMORY_DIM))))
+        self._screen.fill((dim, dim, dim), rect, special_flags=self._pygame.BLEND_RGB_MULT)
+
+    def capture_memory_layer(self, w_cells: int, h_cells: int, draw_callback) -> None:
+        """Render the remembered-tile layer once into an off-screen, viewport-sized
+        surface (world-to-view offset already baked into ``draw_callback``'s
+        coords). Mirrors ``build_map_surface``: redirect the draw target, run the
+        callback, restore. The layer only changes when the player moves or the map
+        is edited, so caching it turns the per-frame grayscale fade -- the dominant
+        remembered-tile cost -- into a cheap blit (see ``blit_memory_cache``)."""
+        if self._pygame is None:
+            return
+        w_px = max(1, w_cells * self._cell_w)
+        h_px = max(1, h_cells * self._cell_h)
+        cache = self._memory_cache
+        if cache is None or cache.get_width() != w_px or cache.get_height() != h_px:
+            cache = self._pygame.Surface((w_px, h_px))
+            self._memory_cache = cache
+        cache.fill(self._bg)
+        saved_screen = self._screen
+        self._screen = cache
+        try:
+            draw_callback()
+        finally:
+            self._screen = saved_screen
+
+    def has_memory_cache(self) -> bool:
+        return self._memory_cache is not None
+
+    def blit_memory_cache(self) -> None:
+        """Blit the whole cached remembered-tile layer to the screen (it is aligned
+        to the viewport, so no offset)."""
+        if self._screen is None or self._memory_cache is None:
+            return
+        self._screen.blit(self._memory_cache, (0, 0))
+
+    def blit_memory_cache_cell(self, vx: int, vy: int) -> None:
+        """Blit a single cell of the cached remembered layer back onto the screen
+        (restores a shadow cell the lit-FOV region blit painted over)."""
+        if self._screen is None or self._memory_cache is None:
+            return
+        x = vx * self._cell_w
+        y = vy * self._cell_h
+        self._screen.blit(self._memory_cache, (x, y), self._pygame.Rect(x, y, self._cell_w, self._cell_h))
+
+    def _desaturate_tile(self, tile: object):
+        """Cached desaturated copy of a resolved sprite tile, for remembered
+        scenery. Keyed by tile identity like ``_tint_tile``."""
+        cached = self._desaturated_tiles.get(id(tile))
+        if cached is not None:
+            return cached
+        desaturated = self._desaturate_surface(tile)
+        self._desaturated_tiles[id(tile)] = desaturated
+        return desaturated
+
+    def draw_glyph_memory(
+        self,
+        x: int,
+        y: int,
+        glyph: str,
+        classification: str,
+        fg: tuple[int, int, int] | None = None,
+        bg: tuple[int, int, int] | None = None,
+    ) -> None:
+        """Draw a glyph in its "remembered" tone: resolve the same sprite
+        ``draw_glyph_classified`` would, then desaturate and dim the whole tile so
+        recalled scenery matches the desaturated terrain around it."""
+        if fg is None:
+            resolved_fg = self._class_colors.get(classification, self._default_fg)
+        else:
+            resolved_fg = _coerce_rgb(fg, self._default_fg)
+        resolved_bg = _coerce_rgb(bg, self._bg)
+
+        tile, source = self._resolve_tile_surface(glyph, classification, resolved_fg, resolved_bg)
+        if self._screen is not None and tile is not None:
+            draw_tile = tile
+            # Tint first (so a glyph/class sprite keeps its hue) then desaturate,
+            # exactly as the lit path tints -- the memory pass just adds the fade.
+            if fg is not None and source in {"glyph", "class"}:
+                draw_tile = self._tint_tile(tile, resolved_fg)
+            self._blit_world_tile(x, y, self._desaturate_tile(draw_tile), None)
+            return
+
+        self._blit_text(x, y, glyph, memory_color(resolved_fg))
+
+    def draw_cursor(
+        self,
+        vx: int,
+        vy: int,
+        color: tuple[int, int, int] = (255, 236, 100),
+    ) -> None:
+        """Outline a single map cell to mark the "look" cursor. Non-destructive
+        (an outline box), so whatever occupies the cell stays visible inside it."""
+        if self._pygame is None or self._screen is None:
+            return
+        rect = self._pygame.Rect(vx * self._cell_w, vy * self._cell_h, self._cell_w, self._cell_h)
+        thickness = max(2, self._cell_w // 8)
+        self._pygame.draw.rect(self._screen, color, rect, width=thickness)
+
+    def _bubble_dims(self, text: str, indicator: str) -> tuple[int, int, int, int, int, int, int, int, int]:
+        """Geometry for a speech bubble holding ``text`` (+ optional ``indicator``):
+        ``(body_w, body_h, tail, pad_x, pad_y, border, gap, text_w, text_h)`` in
+        world pixels. Shared by ``measure_world_label`` (layout) and
+        ``draw_world_label`` (drawing) so the two never drift."""
+        tw, th = self._font.size(text) if self._font is not None else (len(text) * 6, 10)
+        iw = self._font.size(indicator)[0] if (indicator and self._font is not None) else 0
+        gap = max(3, self._font.size(" ")[0]) if (indicator and self._font is not None) else 0
+        pad_x = max(4, self._cell_w // 5)
+        pad_y = max(3, self._cell_h // 6)
+        border = max(2, self._cell_w // 14)
+        tail = max(4, self._cell_h // 5)
+        body_w = tw + gap + iw + pad_x * 2
+        body_h = th + pad_y * 2
+        return body_w, body_h, tail, pad_x, pad_y, border, gap, tw, th
+
+    def measure_world_label(self, text: str, indicator: str = "") -> tuple[int, int, int]:
+        """The ``(body_w, body_h, tail)`` pixel footprint of a bubble, so the caller
+        can lay bubbles out without overlap before drawing them."""
+        body_w, body_h, tail, *_ = self._bubble_dims(text, indicator)
+        return body_w, body_h, tail
+
+    def draw_world_label(
+        self,
+        vx: int,
+        vy: int,
+        text: str,
+        fg: tuple[int, int, int] | None = None,
+        indicator: str = "",
+        indicator_color: tuple[int, int, int] | None = None,
+        lift: int = 0,
+        alpha: int = 255,
+        bg: tuple[int, int, int] = (40, 40, 46),
+    ) -> None:
+        """Draw a speech bubble (translucent dark-gray body, dark outline, a tail
+        pointing down-right at the top-right corner of the speaker's tile) centred
+        above map cell ``(vx, vy)``, in world/tile pixel space so it aligns with the
+        character on that tile (the UI text grid is a different size).
+
+        ``text`` is the white gibberish; ``indicator`` (e.g. ``"++"``) trails it in
+        ``indicator_color``. ``lift`` raises the whole bubble by that many pixels so
+        the caller can stack bubbles that would otherwise overlap (a newer bubble is
+        drawn lower and shoves older ones up). ``alpha`` (0-255) fades the whole
+        bubble uniformly, for a smooth fade-out near end of life."""
+        pygame = self._pygame
+        if pygame is None or self._screen is None or self._font is None or not text or alpha <= 0:
+            return
+
+        outline = (18, 18, 22, 225)
+        fill = (*_coerce_rgb(bg, (40, 40, 46)), 175)  # translucent dark gray
+        text_surf = self._font.render(text, True, _coerce_rgb(fg, (245, 245, 245)))  # white gibberish
+        ind_surf = None
+        if indicator:
+            ind_surf = self._font.render(indicator, True, _coerce_rgb(indicator_color, (245, 245, 245)))
+
+        body_w, body_h, tail, pad_x, pad_y, border, gap, tw, _th = self._bubble_dims(text, indicator)
+        radius = max(3, self._cell_w // 8)
+
+        cx = vx * self._cell_w + self._cell_w // 2
+        bx = cx - body_w // 2
+        by = vy * self._cell_h - body_h - tail - lift  # always above the tile, raised by lift
+
+        # Compose on a per-pixel-alpha surface so the bubble is translucent (and can
+        # be faded as a whole), then blit it once. Local coords leave a margin plus
+        # room for the tail below the body.
+        margin = border + 1
+        surf = pygame.Surface((body_w + margin * 2, body_h + tail + margin * 2), pygame.SRCALPHA)
+        body = pygame.Rect(margin, margin, body_w, body_h)
+
+        # The tail tip lands on the top-right corner of the speaker's tile; its base
+        # sits on the bubble's bottom edge, so it slants down-right toward the tile.
+        tile_corner_x = (vx + 1) * self._cell_w
+        tail_x = margin + (tile_corner_x - bx)
+        tail_x = max(margin + tail + border, min(margin + body_w - tail - border, tail_x))
+        tip = (tail_x, margin + body_h + tail)
+        base_y = margin + body_h - border
+        fill_base_y = margin + body_h - border * 2
+        fill_tip = (tip[0], tip[1] - border)
+
+        # 1. dark outline (tail then body), 2. translucent fill (body then tail),
+        # so the fills merge across the tail base with no visible seam.
+        pygame.draw.polygon(surf, outline, [tip, (tail_x - tail, base_y), (tail_x + tail, base_y)])
+        pygame.draw.rect(surf, outline, body, border_radius=radius)
+        pygame.draw.rect(
+            surf, fill, body.inflate(-border * 2, -border * 2),
+            border_radius=max(2, radius - border),
+        )
+        pygame.draw.polygon(
+            surf, fill,
+            [fill_tip, (tail_x - tail + border, fill_base_y), (tail_x + tail - border, fill_base_y)],
+        )
+
+        # Text/indicator go onto the same surface so the fade multiply below covers
+        # them too.
+        surf.blit(text_surf, (margin + pad_x, margin + pad_y))
+        if ind_surf is not None:
+            surf.blit(ind_surf, (margin + pad_x + tw + gap, margin + pad_y))
+
+        if alpha < 255:
+            # Scale every pixel's alpha by alpha/255, fading the whole bubble evenly.
+            surf.fill((255, 255, 255, alpha), special_flags=pygame.BLEND_RGBA_MULT)
+
+        self._screen.blit(surf, (bx - margin, by - margin))
 
     def set_map_clip(self, w_cells: int, h_cells: int) -> None:
         """Restrict drawing to the map viewport (top-left w_cells x h_cells) so a

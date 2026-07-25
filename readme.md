@@ -1,306 +1,172 @@
 # Tales of Derision
 
-GOALS:
-- use ecs, esper
-- make a roguelike game in pygame-ce.
-- start with very basic and go from there
-- wasd movement, fully configurable configurable controls, controller support eventually
-- lot's of simulation, testing, and prcedural generation
-- mods are a first class priority.  anybody should easily be able to add there own files to add or change content.
-- seed based
-## Run
-
-Install dependencies:
-
-  python3 -m pip install --user esper pygame
-
-  python3 src/main.py
-
-Or bypass the title screen/main menu and load a specific save file:
-
-  python3 src/main.py --save_file src/data/saves/my_run.json
-
-Stress test with cave rats on every walkable map square:
-
-  python3 src/main.py --rat-flood
-
-Move: hold WASD, press Space to take a step. Menu: Esc. Inventory: I.
-
-## Web build (pygbag)
-
-Install pygbag (once):
-
-  python3 -m pip install --user pygbag esper
-
-Build the web bundle:
-
-  bash scripts/build_pygbag.sh
-
-Output is written to:
-
-  build/web
-
-Preview locally (build + serve + open, frees the port and cleans up on exit):
-
-  ./online.sh
-
-Then open `http://localhost:8000` in your browser. `online.sh` serves via
-`scripts/serve_coi.py`, which sets cross-origin isolation headers (COOP/COEP); a
-plain server also works:
-
-  python3 -m http.server --directory build/web 8000
-
-Use port `8000` for local preview. This pygbag runtime rewrites package fetches
-to `http://localhost:8000/cdn/...` while booting; serving on other ports can
-leave the page stuck at `Loading, please wait ...`.
-
-If you still see an old screen that does not advance, do a hard refresh
-(`Ctrl+Shift+R`) to clear cached web assets.
-
-Running `python3 -m pygbag ...` directly from repo root can regenerate
-`build/web` with a different layout while debugging — prefer `./online.sh` or the
-static server above.
-
-### Web build architecture (emscripten / pygbag)
-
-Pygbag runs the **entire** game on the browser's single main thread, and audio is
-mixed on that same thread (no SharedArrayBuffer / worker threads in this runtime).
-Every decision below exists to keep that one thread responsive. Desktop is
-unaffected — these paths are gated on `IS_WEB` (`sys.platform == "emscripten"`),
-so the native build keeps its original blocking/threaded behavior.
-
-**Cooperative async loop (or the tab freezes).**
-- Entry is async: `main.py` -> `src/main.py:main`, run via `asyncio.run`.
-- All input waits go through `_await_action`. On web it polls non-blocking and
-  `await asyncio.sleep(_WEB_IDLE_POLL_SECONDS)` (~1/60 s, a *real* frame) between
-  polls, and yields once before returning each action.
-- **Never** add blocking loops (`while True: renderer.poll_action()`,
-  `pygame.time.wait`, `time.sleep`) in the input path — on pygbag they never
-  yield and freeze the page at `Loading, please wait ...`. New menus/loops must
-  be `async def` and use `await _await_action(renderer)`.
-- Why a real frame and not `asyncio.sleep(0)`: a zero-delay spin pegs the single
-  thread and starves the audio mixer, causing clicks/pops.
-
-**Display sizing & crispness.**
-- Browser "fullscreen" isn't a real mode. On web the surface is sized to the
-  visible canvas (`window.innerWidth/innerHeight`) so 1 surface px ~= 1 CSS px;
-  an oversized surface gets scaled down and everything looks tiny.
-- The canvas gets `image-rendering: pixelated` after each `set_mode` so text and
-  tiles stay crisp instead of blurred by the browser's default smoothing.
-
-**Audio.**
-- Music is a **44.1 kHz OGG** played as a looped in-memory `Sound` on a reserved
-  channel — *not* `pygame.mixer.music` (streaming is unreliable in pygbag) and
-  *not* mp3 (often won't decode). The OGG matches the mixer rate (44100) so there
-  is no resampling crackle. Desktop still streams `mixer.music`.
-- The web mixer uses a moderate/large buffer (`WEB_AUDIO_BUFFER`, overridable via
-  `web_audio_buffer` in `options.json`) and opens with
-  `AUDIO_ALLOW_FREQUENCY_CHANGE` so SDL matches the browser's device sample rate
-  instead of resampling every callback.
-- Any residual occasional pop is pygbag's main-thread audio jitter. True threaded
-  audio needs cross-origin isolation (COOP/COEP), which did not engage in pygbag
-  0.9.3; `scripts/serve_coi.py` serves those headers locally and is kept for a
-  future runtime that supports it.
-
-**Render cost (keep per-turn work small so it can't starve audio).**
-- Field-of-view is memoized per player position; wall autotile masks are cached
-  (static map); non-visible cells are skipped (`clear()` already blacks them).
-- The map is composited from a cached **world-coordinate** surface: a walking
-  step blits the visible FOV box (offset by the camera scroll) plus a few shadow
-  fills, instead of re-drawing hundreds of tiles. The blit is **clipped to the
-  viewport** so it can't bleed into the sidebar when zoomed/scrolled.
-- Menus with a game backdrop snapshot the scene once (`capture_backdrop`) and
-  reuse it, instead of re-rendering the whole game every keypress.
-- Invariant: keep the caches invalidated correctly if you touch tiles, scale, or
-  camera — `invalidate_map_surface` / `invalidate_backdrop` run on `set_mode`,
-  and the FOV/map caches assume a static map (walls don't change mid-session).
-
-**Build.**
-- `scripts/build_pygbag.sh` bundles the pygame-ce wasm wheel + esper, vendors
-  `browserfs.min.js`, and prunes redundant music sources from the web bundle
-  (drops `.wav`/`.mp3` when an `.ogg` sibling exists) to shrink the download.
-
-## GitHub Pages deployment
-
-- Workflow file: `.github/workflows/pygbag-pages.yml`
-- Trigger: push to `main`/`master` (or run manually from Actions)
-- One-time setup: repo Settings -> Pages -> Source -> GitHub Actions
-- Optional auto-enable: add repository secret `PAGES_ADMIN_TOKEN` (PAT with repo + pages admin/write permissions)
-
-After the workflow finishes, the deploy job prints the final Pages URL.
-
-## Audio
-
-- On startup, the game now attempts to play the first supported file found in
-  `audio/music/` on loop (`.mp3`, `.ogg`, `.wav`, `.flac`, `.m4a`).
-- If no audio file is found, `pygame` audio init fails, or the mixer cannot
-  open a device,
-  the game continues silently.
-- `audio_buffer` in `src/data/config/options.json` controls mixer buffer size
-  (default `16384` in this build). If audio is still choppy, increase it.
-
-## Tilesets
-
-- Render flow now follows:
-  `Game object -> glyph + fg + bg -> tileset lookup -> PNG tile blit`.
-- `Renderable` supports optional `fg` and `bg` values.
-- `gfx/tilesets/pygame_tileset_config.json` now supports `tile_id` entries
-  from `gfx/tilesets/Hexany/tile_index.csv`.
-- If a glyph is not found in configured lookup tables, renderer falls back to
-  `gfx/tilesets/Bisasam_16x16.png` by default.
-- The fallback sheet is configurable and can be replaced with another
-  dwarf-fortress style CP437 tilesheet via the config `fallback` section.
-
-## Testing
-
-Tests are headless and do not require a live game window. They use a fake
-renderer test double to validate ECS movement + render-loop behavior.
-
-Install pytest (once):
-
-  python3 -m pip install --user pytest
-
-Run tests:
-
-  ./run_tests.sh
-
-This shows per-test status (`PASSED`/`FAILED`) and basic timing metrics.
-
-Run only headless renderer integration tests:
-
-  ./run_tests.sh headless
-
-Run only totally unrendered logic/data tests:
-
-  ./run_tests.sh unrendered
-
-## Menus
-
-- Startup flow: Title Screen -> Main Menu (`Continue`, `New Game`, `Quit`)
-- In-game menu: press `Esc` to open Pause Menu (`Options`, `Quit`)
-- Pause menu navigation: WASD to move selection, Enter to select, `Esc` to resume game
-- Options menu: toggle `Fullscreen` and `Show FPS`; changes are written to working options file
-
-## Saves and options
-
-- The game should save at the end of every turn.
-- Default save file: `src/data/saves/default_save.json`
-- Default options file: `src/data/config/default_options.json`
-- Working options file: `src/data/config/options.json`
-- On startup, if `src/data/config/options.json` is missing, it is copied from
-  `src/data/config/default_options.json`.
-- User save files can live in `src/data/saves/*.json` and can be loaded directly
-  with `--save_file`.
-- `--save_file` also bypasses title screen and main menu.
-- Keybinds are action-based in `src/data/config/options.json` (`move_up`,
-  `confirm_action`, `open_pause_menu`, etc.).
-
-## Documentation
-
-Full docs live in the [wiki/](wiki/Home.md) — architecture, ECS model, per-module
-reference, how to add a renderer backend, and the roadmap.
-
-## Layout
-
-| file                   | role                                                      |
-|------------------------|-----------------------------------------------------------|
-| `src/main.py`              | entry point + turn loop                               |
-| `src/components.py`        | ECS data: `Position`, `Renderable`, `Player`          |
-| `src/game_map.py`          | tile grid (renderer-agnostic)                         |
-| `src/systems.py`           | `MovementProcessor`, `RenderProcessor` (esper processors) |
-| `src/renderer/base.py`     | `Renderer` interface seam                              |
-| `src/renderer/pygame_renderer.py` | pygame implementation of `Renderer`          |
-
-ECS via [esper](https://github.com/benmoran56/esper) (3.x, module-level API).
-
-## Swapping renderers later
-
-Game/system code stays renderer-agnostic. The current runtime uses
-`PygameRenderer`, but future backends can still implement the same
-`Renderer` interface (`setup/teardown/clear/draw_glyph/draw_text/present/
-poll_action`) and be passed to `RenderProcessor`.
-
-## Inspiration
-- Caves of Qud
-- Lord of the Rings
-- DaFluffyPotato
-- Minecraft
-- Rimworld
-- Dwarf Fortress
-- Song of Syx
-- Infectionator World Dominator
-- Earth Defense Force
-- chrono trigger
-- zelda
-
-
-## Themes
-Fantasy
-
-Time Travel
-- [BRAINSTORM] Time is cyclical.  Hyper advanced civilization makes floating islands, destroys the planet, and then inteligently redesigns new planets from their floating society.  These floating societies tend to be sparcely populated by a few super adept NPCs.  These "gods" die and inhabit the same reincarnation loop as you.  i.e. you are a reincanant.  You have of course forgotten this.  
-
-Zombie
-
-MacGuffins/Plot Coupons
-- the one ring
-- the infinity stones
-- dragon balls
-
-Knowledge and Teaching
-
-Music, and Comrodery
-
-Ballence and Equilibrium
-
-Karma and Reincarnation
-
-
-## Design Goals Big Picture
-Thousands of Years Simulations
-
-Economy, Money, Banking, Farming, Hunting, Fishing, Thirst, Hunger
-
-Action Economy:
-- There is a certain amount of time in a day.
-- There is a turn order.
-- Actions take a certain amount of time based on a number of factors, quickness, movement speed, agility, ect.
-- Turn order is decided based on when actions are completed.  So everything is in action or it's waiting for it's next turn. 
-- The effects of the action are immediate.  i.e. an attack happens, the damage is done immediately, the attacker is in the attack state for a certain amount of time units, and then they are in a wait state until it is there turn.   
-- I will try to balance the action economy so that one day of typical gameplay ends up being 1 hour in real life.  
-- animations happen either in order, or multiple at the same time, depending on what they are.  
-
-Targets
-- desktop fully rendered on windows and linux
-- steam
-- itch.io via Pygbag
-- github pages via Pygbag
-
-All NPCs are playable.
-
-Players and NPCs have the same needs as the player like food and water.
-
-When the player dies they become a random sentiaent NPC somewhere in the world.  It's like "Roy" from Rick and Morty.  
-
-Morrorwind style leveling.  You level up individual skills, when you level up those skills you gain a character level and can upgrade attributes str, dex, con, int, wis, char.  You also get more health and magic if you have magic.  
+A turn-based, procedurally-generated roguelike **world simulation** in Python
+(pygame-ce + [esper](https://github.com/benmoran56/esper) ECS). A living island of
+villagers, wildlife, and monsters that eat, drink, sleep, forage, cook, build
+houses, form families, and reproduce — all while the whole map keeps simulating
+around you, seed-deterministic from top to bottom.
+
+This README is the **high-level design document and the entry point** to the rest
+of the project docs. It holds the vision and the running brain-dump of ideas; the
+[wiki/](wiki/Home.md) holds the concrete "how it works / how to play / how to
+extend it" reference.
+
+---
+
+## Quick start
+
+```bash
+./scripts/install.sh
+
+python3 src/main.py                                   # play
+python3 src/main.py --save_file src/data/saves/x.json # load a save (skips menus)
+python3 src/main.py --rat-flood                        # stress test: a rat on every tile
+./run_tests.sh                                         # 236 headless tests, ~1s
+```
+
+Move: hold **WASD**, press **Space** to step (or Space with no direction to wait a
+turn). **Enter** interacts with the tile you face. **Tab** player menu, **I**
+inventory, **C** status, **R** sleep, **Esc** pause. Full controls and the survival
+/ building / social loops are in [wiki/Gameplay](wiki/Gameplay.md).
+
+---
+
+## Documentation (the wiki)
+
+| Page | What it covers |
+|------|----------------|
+| [Home](wiki/Home.md) | Wiki landing page and status |
+| [Getting Started](wiki/Getting-Started.md) | Install, run, controls, saves/options |
+| [Gameplay](wiki/Gameplay.md) | The player-facing manual: survival, day/night, houses, building, the ecosystem |
+| [Architecture](wiki/Architecture.md) | ECS model, the layer DAG, the turn loop, data flow |
+| [Components](wiki/Components.md) | Every data component entities are built from |
+| [Systems](wiki/Systems.md) | Every processor + free-function subsystem |
+| [Game Map](wiki/Game-Map.md) | Ocean/island world, pathfinding, regions, enclosed rooms |
+| [Renderers](wiki/Renderers.md) | The renderer seam and how to add a backend |
+| [Action Economy](wiki/Action-Economy.md) | Time-unit turn scheduling (speed, action cost) |
+| [World Simulation](wiki/World-Simulation.md) | Region scheduler, background catch-up, "living world" |
+| [Content & Mods](wiki/Content-and-Mods.md) | Prefabs, kits, effects, items — adding/modding content |
+| [Performance](wiki/Performance.md) | Caching invariants and the per-turn cost budget |
+| [Autotiling](wiki/47-tile_autotiling.md) · [Gibberish](wiki/Gibberish.md) | The 47-tile wall/water masks; the fake NPC language |
+| [Roadmap](wiki/Roadmap.md) | What's done and what's next |
+
+**Reading order of authority** (per `notes4LLMs.md`): `notes4LLMs.md` → this
+README → the wiki.
+
+
+## Windows executable packaging
+
+Build a standalone Windows executable from Linux with Docker:
+
+```bash
+./scripts/build_windows.sh
+```
+
+The script builds a Wine-based Linux container, installs Windows Python plus the
+packaging dependencies inside that container, and writes `dist/TalesOfDerision.exe`.
+It only builds the executable; it does not attempt to launch it under Linux. Copy
+the resulting executable to Windows to run it.
+
+The builder intentionally uses the version of `pip` bundled with Windows Python.
+Do not upgrade it in Wine: newer `pip` versions can call the Windows `CopyFile2`
+API, which is not implemented by the Ubuntu Wine version and can leave Wine's
+debugger waiting indefinitely. If an older build stopped at a `CopyFile2` error,
+press **Ctrl+C**, pull this version of the script, and run the build again.
+
+Dependency installation and PyInstaller run under one virtual X server. Starting
+each Wine command with a separate `xvfb-run` can shut down the first display while
+Wine is still using it, resulting in `X connection ... broken` followed by a hang.
+The image shuts down its setup-time Wine server before it is saved, and the build
+prints progress before each Wine command. Dependency installation times out after
+15 minutes and packaging after 30 minutes rather than waiting forever.
+Before packaging, the builder verifies that Windows Python imports the complete
+`pygame` package. The PyInstaller specification explicitly collects pygame's
+Python modules, data, and native DLLs because the game imports pygame dynamically.
+It likewise collects the complete `content` package because the content loader
+discovers core creatures, items, effects, flora, and features by module name at
+runtime rather than through static imports.
+At runtime, the frozen application resolves tiles and sounds from PyInstaller's
+bundle directory. Saves and options—including tile scale—are stored persistently
+under `%LOCALAPPDATA%\TalesOfDerision` instead of the temporary bundle directory.
+
+GitHub Actions uses the same Linux build script and uploads the executable artifact
+through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and
+pushes to `dev` or `work`.
+
+---
+
+## Design goals — big picture
+
+- **Thousands-of-years simulations.** Full simulation of every map tile, eventually.
+  The world should keep living whether or not you're watching, and do *more*
+  simulation when little is happening — prioritising the tiles **nearest** the
+  player, not the stalest ones. Entering a new region brings that whole region up to
+  date; sleeping brings the **whole world** up to date.
+- **Memory over disk.** Move everything into memory at startup (sounds, tiles, state)
+  wherever it helps.
+- **Mods are first-class.** Anybody should be able to drop in their own files to add
+  or change content — creatures, items, effects — either as readable data or as
+  Python, the same way the core game does it. See [Content & Mods](wiki/Content-and-Mods.md).
+- **Seed-based determinism.** One master seed reproduces the entire world (the
+  foundation for reproducible saves and, later, time travel). All simulation
+  randomness flows through `rng.world_rng().stream(name)`.
+- **Everyone is playable.** All NPCs have the same needs as the player. When the
+  player dies they become a random sentient NPC somewhere in the world (the "Roy"
+  from Rick and Morty premise).
+- **Economy & survival.** Money, banking, farming, hunting, fishing; hunger, thirst,
+  tiredness.
+- **Morrowind-style leveling.** Level individual skills; skill-ups grant character
+  levels and attribute points (STR, DEX, CON, INT, WIS, CHA), plus health/magic.
+
+### Action economy
+- A day holds a fixed amount of time; there is a turn order.
+- Actions take time based on quickness, movement speed, agility, etc.
+- Turn order is by **completion time**: everything is either mid-action or waiting
+  for its next turn. Effects are immediate — an attack lands now, the attacker sits
+  in an "attack" state for some time units, then waits for its next turn.
+- Target: one day of typical play ≈ one real-life hour.
+- Animations play in order or concurrently depending on what they are.
+
+### Targets
+- Desktop, fully rendered, Windows + Linux. Steam.
+
+---
 
 ## Style
-Pixel Art
 
-HD text
-
-shader effects, lighting
-
-basic animations, or no animations at all
-
-characters face the direction they are going, either just left or right, or up, down, left, and right, or all 8 directions depending on the sprite.  
-
-Dialogue in a fake gibberish language "##!/$*~# GH01^@"  
-
-speach bubbles, and sims like symbol popups i.e. ++ 
+Pixel art. HD text. Shader effects and lighting. Basic animations, or none at all.
+Characters face the way they move (left/right, the four, or all eight directions
+depending on the sprite). Dialogue in a fake gibberish language
+(`##!/$*~# GH01^@`), speech bubbles, and Sims-like symbol popups (`++`, `--`).
 
 ## Characters
-Wizards
-Great Fairy
-NPCs
-Mostly Farmers
+Wizards · Great Fairy · NPCs · mostly Farmers.
+
+## Inspiration
+Caves of Qud · Lord of the Rings · DaFluffyPotato · Minecraft · Rimworld · Dwarf
+Fortress · Song of Syx · Infectionator World Dominator · Earth Defense Force ·
+Chrono Trigger · Zelda.
+
+---
+
+## Themes & brainstorms (idea dump)
+
+**Fantasy.**
+
+**Time travel — time is cyclical.** A hyper-advanced civilization builds floating
+islands, destroys the planet, then intelligently redesigns new planets from their
+floating society. These floating societies are sparsely populated by a few
+super-adept NPCs. These "gods" die and enter the same reincarnation loop as you —
+i.e. *you are a reincarnant* who has forgotten it.
+
+**Zombie.**
+
+**MacGuffins / plot coupons** — the one ring, the infinity stones, the dragon balls.
+
+**Knowledge and teaching. Music and comradery. Balance and equilibrium. Karma and
+reincarnation.**
+
+**Open questions / TODO thoughts** (see also `next.md`):
+- Rename to *Seeds of Derision*?
+- Make sure people (NPCs) never get permanently stuck.
+- Can `tcod` help — pathfinding especially?

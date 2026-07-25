@@ -7,7 +7,8 @@ import pytest
 
 from components import Enemy, NPC, Player, Position
 from game_map import GameMap
-from main import _action_from_held_keys, _setup_world
+from interactions import _action_from_held_keys
+from worldgen import _setup_world
 from persistence import load_game, save_game
 from systems import MovementProcessor
 
@@ -20,6 +21,32 @@ def test_gamemap_has_walls_on_border_and_floor_inside() -> None:
     assert game_map.tile_at(0, 0) == game_map.WALL
     assert game_map.tile_at(7, 5) == game_map.WALL
     assert game_map.tile_at(1, 1) == game_map.FLOOR
+
+
+def test_world_map_sets_land_island_in_a_vast_ocean() -> None:
+    # A map twice the land in each dimension becomes the ocean world: a centred
+    # 120x60 land island ringed by open sea (the eight surrounding sections).
+    game_map = GameMap(360, 180)
+
+    assert game_map.has_ocean is True
+    assert (game_map.land_x0, game_map.land_y0) == (120, 60)
+    assert (game_map.land_w, game_map.land_h) == (120, 60)
+
+    # Land centre is dry ground; the sea far outside the island is open ocean.
+    assert game_map.tile_at(180, 90) == game_map.FLOOR
+    assert game_map.is_ocean(10, 10) is True
+    # The island's edge is a water coastline (not ocean, since it's inside the
+    # land rectangle), and only the map's outermost ring stays wall.
+    assert game_map.tile_at(120, 90) == game_map.WATER
+    assert game_map.is_ocean(120, 90) is False
+    assert game_map.tile_at(0, 0) == game_map.WALL
+
+
+def test_small_maps_stay_a_plain_walled_room() -> None:
+    game_map = GameMap(40, 20)
+    assert game_map.has_ocean is False
+    assert game_map.tile_at(0, 0) == game_map.WALL
+    assert game_map.tile_at(20, 10) == game_map.FLOOR
 
 
 def test_movement_processor_moves_player_without_renderer() -> None:
@@ -153,16 +180,77 @@ def test_find_path_routes_around_obstacle() -> None:
     assert (4, 3) not in path
 
 
+def _bfs_path_len(game_map: GameMap, start, goal) -> int:
+    """Reference shortest 8-way path length via plain BFS -- the ground truth A*
+    must match. Kept local to the test so it can't drift from the production
+    heuristic search it's checking."""
+    from collections import deque
+
+    if start == goal:
+        return 0
+    seen = {start: 0}
+    q = deque([start])
+    while q:
+        cur = q.popleft()
+        if cur == goal:
+            return seen[cur]
+        for nxt in game_map.neighbors_8(*cur):
+            if nxt not in seen and game_map.is_walkable(*nxt):
+                seen[nxt] = seen[cur] + 1
+                q.append(nxt)
+    return seen.get(goal, -1)
+
+
+def test_find_path_is_optimal_like_bfs_through_a_maze() -> None:
+    # A* must return a path of the *same length* BFS would; the heuristic and the
+    # tie-break only change which equal-length route is chosen, never its cost.
+    import random
+
+    rng = random.Random(1234)
+    game_map = GameMap(30, 20)
+    for _ in range(120):  # scatter interior walls to force real routing
+        x, y = rng.randint(1, 28), rng.randint(1, 18)
+        if (x, y) not in ((1, 1), (28, 18)):
+            game_map.tiles[y][x] = game_map.WALL
+
+    start, goal = (1, 1), (28, 18)
+    path = game_map.find_path(start, goal)
+    expected = _bfs_path_len(game_map, start, goal)
+
+    if expected == -1:
+        assert path == []
+    else:
+        assert path and path[-1] == goal
+        assert start not in path
+        assert len(path) == expected  # optimal, matches BFS
+
+
+def test_find_path_takes_diagonals_at_unit_cost() -> None:
+    # Open ground: (1,1)->(5,5) is four diagonal steps, so a shortest path is
+    # length 4 (Chebyshev), not the 8 a 4-directional search would need.
+    game_map = GameMap(9, 9)
+    path = game_map.find_path((1, 1), (5, 5))
+    assert len(path) == 4
+    assert path[-1] == (5, 5)
+
+
+def test_find_path_returns_empty_when_goal_is_walled_off() -> None:
+    game_map = GameMap(9, 7)
+    for y in range(1, 6):  # wall off the right half completely
+        game_map.tiles[y][5] = game_map.WALL
+    assert game_map.find_path((2, 3), (7, 3)) == []
+
+
 def test_large_default_map_contains_buildings() -> None:
     game_map = GameMap(40, 20)
 
     assert game_map.tile_at(4, 3) == game_map.WALL
     assert game_map.tile_at(12, 8) == game_map.WALL
-    assert game_map.tile_at(8, 8) == game_map.FLOOR
+    assert game_map.tile_at(8, 8) == game_map.DOOR  # carved doorway
 
     assert game_map.tile_at(26, 5) == game_map.WALL
     assert game_map.tile_at(35, 11) == game_map.WALL
-    assert game_map.tile_at(30, 11) == game_map.FLOOR
+    assert game_map.tile_at(30, 11) == game_map.DOOR
 
 
 def test_setup_world_rat_flood_spawns_rat_on_every_walkable_tile() -> None:

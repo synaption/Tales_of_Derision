@@ -4,7 +4,7 @@ import pytest
 import esper
 
 from components import Corpse, Equipment, Inventory, Name, NPC, Player, Position, Renderable
-from main import (
+from interactions import (
     _equip_inventory_item,
     _find_interaction_npc,
     _find_interaction_corpse,

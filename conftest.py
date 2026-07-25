@@ -1,9 +1,8 @@
-"""Test bootstrap: make ``src`` win over the repo root on ``sys.path``.
+"""Test bootstrap: put ``src`` first on ``sys.path``.
 
-``python3 -m pytest`` puts the repo root (cwd) on ``sys.path`` first, where the
-pygbag launcher ``main.py`` lives. That shadows ``src/main.py``, so imports like
-``from main import _setup_world`` would resolve to the launcher. Prepending
-``src`` here makes ``main`` resolve to the game module during tests.
+The game modules live in ``src`` (``main``, ``game_map``, ``systems`` ...), so
+tests import them as top-level modules (``from main import _setup_world``).
+Prepending ``src`` here makes those imports resolve during ``python3 -m pytest``.
 """
 
 from __future__ import annotations
