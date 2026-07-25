@@ -41,7 +41,7 @@ Owns each region's *"simulated up to turn N"* cursor and pays down debt.
 ## Idle background pumping (the "more sim when idle" goal)
 
 Idle time — the player thinking, or away from the keyboard — is exactly when there's
-the most spare time to pay down simulation debt. The turn loop (`main.py`) polls input
+the most spare time to pay down simulation debt. The turn loop (`game.py`) polls input
 on a short timeout; on each idle tick with no input it calls `pump_background` with a
 budget that **ramps up** the longer nothing happens (`_idle_pump_budget`,
 `_IDLE_PUMP_BASE_BUDGET` → `_IDLE_PUMP_MAX_BUDGET` by `_IDLE_PUMP_RAMP`). So a still

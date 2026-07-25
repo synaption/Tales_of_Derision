@@ -3,7 +3,7 @@
 Every bit of *simulation* randomness must flow through here so a world is fully
 reproducible from its seed -- the foundation for reproducible saves and, later,
 time travel (a saved seed + input log reconstructs the world). Do NOT call the
-global ``random`` module from simulation code (``systems.py`` / ``main.py``); draw
+global ``random`` module from simulation code (``systems.py`` / ``game.py``); draw
 from ``world_rng().stream(name)`` instead.
 
 Streams are isolated by name so adding a draw in one domain never shifts another

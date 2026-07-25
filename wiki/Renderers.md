@@ -62,7 +62,7 @@ Implements the interface with pygame and owns the key map, plus:
 2. Implement the abstract methods: `setup`/`teardown` open/close the window;
    `draw_glyph` draws `glyph` at `(x*cell, y*cell)`; `poll_action` reads input and
    returns the same action strings.
-3. In [src/main.py](../src/main.py) construct your renderer instead of
+3. In [src/game.py](../src/game.py) construct your renderer instead of
    `PygameRenderer` — the only line that names a backend. Systems and map code stay
    unchanged.
 

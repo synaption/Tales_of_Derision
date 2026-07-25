@@ -35,7 +35,7 @@ L2 content      content/ (registry · kits · effects · items · prefabs · loa
 L3 systems      systems.py (core hub) · render.py (RenderProcessor) · ai.py (creature AI)
 L4 logic        interactions.py (renderer-free gameplay logic)
 L5 presentation ui.py (screens/menus/widgets) · audio.py
-L6 app          main.py (entry point + turn loop) · worldgen.py (world setup)
+L6 app          main.py (entry point) · game.py (runtime + turn loop) · worldgen.py (world setup)
    persistence.py depends only on components + game_map
 ```
 
@@ -51,7 +51,7 @@ The game is turn-based: it waits for actionable input, runs the systems once, an
 repeats. A single call to `esper.process(action)` runs **every** processor in
 priority order, so one keypress advances time, AI, needs, and the frame together.
 
-Processor registration and priorities (`main.py`, high runs first):
+Processor registration and priorities (`game.py`, high runs first):
 
 | Priority | Processor | Role |
 |---------:|-----------|------|
@@ -79,7 +79,7 @@ spends the spare time paying down background region-simulation debt
 
 1. `PygameRenderer.poll_action()` reads pygame events and emits an abstract action
    string (`move_left`, `menu_select`, `confirm_action`, `sleep`, `look`, …).
-2. `main.py` handles UI-state actions (inventory/pause/options/dialogue/look/
+2. `game.py` handles UI-state actions (inventory/pause/options/dialogue/look/
    interactions) and routes gameplay actions into `esper.process(...)`.
 3. `TimeProcessor` advances the clock; `MovementProcessor` moves the player (or bumps
    an adjacent creature into a melee attack); the AI/needs/flora/reproduction systems

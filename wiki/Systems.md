@@ -129,7 +129,7 @@ call. They'll become the modules of the future `systems/` package:
 ## Adding a system
 
 1. Subclass `esper.Processor` and implement `process(self, action=None)`.
-2. Register it in `main.py` with a `priority` placing it correctly relative to
+2. Register it in `game.py` with a `priority` placing it correctly relative to
    Time (2), Movement (1), and Render (0).
 3. Query the components it needs with `esper.get_components(...)`; gate time-advancing
    work on `action in _TURN_ACTIONS`.
