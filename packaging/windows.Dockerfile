@@ -24,4 +24,5 @@ ENV WINEDEBUG=-all \
 RUN wget -q "https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-amd64.exe" -O /tmp/python-installer.exe \
     && xvfb-run -a wine /tmp/python-installer.exe /quiet InstallAllUsers=1 PrependPath=1 Include_pip=1 TargetDir=C:\\Python312 \
     && rm /tmp/python-installer.exe \
-    && xvfb-run -a wine C:\\Python312\\python.exe -m pip --version
+    && xvfb-run -a wine C:\\Python312\\python.exe -m pip --version \
+    && wineserver -k

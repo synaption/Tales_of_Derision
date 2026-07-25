@@ -18,7 +18,7 @@ docker build \
   -f packaging/windows.Dockerfile \
   packaging
 
-docker run --rm \
+docker run --rm --init \
   -v "$REPO_ROOT:/workspace" \
   -w /workspace \
   "$IMAGE_NAME" \

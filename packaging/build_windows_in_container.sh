@@ -7,15 +7,18 @@ WINDOWS_PYTHON='C:\Python312\python.exe'
 # background server for a prefix, so using separate xvfb-run calls can leave it
 # connected to an X display that has already shut down.
 trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+wineserver -k >/dev/null 2>&1 || true
 
-wine "$WINDOWS_PYTHON" -m pip install \
+echo "Installing Windows packaging dependencies..."
+timeout --foreground 15m wine "$WINDOWS_PYTHON" -m pip install \
   --disable-pip-version-check \
   -r requirements.txt \
   pyinstaller
 
-wine "$WINDOWS_PYTHON" -m PyInstaller \
+echo "Building dist/TalesOfDerision.exe..."
+timeout --foreground 30m wine "$WINDOWS_PYTHON" -m PyInstaller \
   --clean \
   --noconfirm \
   packaging/tales_of_derision_windows.spec
 
-wineserver -w
+echo "Windows executable build completed."

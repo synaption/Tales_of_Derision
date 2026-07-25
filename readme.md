@@ -76,6 +76,9 @@ press **Ctrl+C**, pull this version of the script, and run the build again.
 Dependency installation and PyInstaller run under one virtual X server. Starting
 each Wine command with a separate `xvfb-run` can shut down the first display while
 Wine is still using it, resulting in `X connection ... broken` followed by a hang.
+The image shuts down its setup-time Wine server before it is saved, and the build
+prints progress before each Wine command. Dependency installation times out after
+15 minutes and packaging after 30 minutes rather than waiting forever.
 
 GitHub Actions uses the same Linux build script and uploads the executable artifact
 through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and
