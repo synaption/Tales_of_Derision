@@ -139,10 +139,24 @@ class RegionScheduler:
         processor would."""
         return max(observed_turn, self.region_turn.get(region_id, observed_turn) + 1)
 
-    def catch_up_region(self, region_id: RegionId, target_turn: int) -> None:
-        """Block until ``region_id`` has been simulated up to ``target_turn``."""
+    def catch_up_region(
+        self, region_id: RegionId, target_turn: int, max_advances: int | None = None
+    ) -> bool:
+        """Advance ``region_id`` toward ``target_turn``.
+
+        With ``max_advances=None`` this preserves the old blocking behaviour and
+        returns only once the region is fully current. Passing a finite cap lets
+        live play prioritize the player's input frame: it performs a deterministic
+        number of replayed region-turns, returns whether the region is current,
+        and leaves the remaining debt for later frames.
+        """
+        advances = 0
         while self.region_turn.get(region_id, target_turn) < target_turn:
+            if max_advances is not None and advances >= max_advances:
+                return False
             self.advance_region(region_id)
+            advances += 1
+        return True
 
     def catch_up_all(self, target_turn: int) -> None:
         """Block until every region has been simulated up to ``target_turn``."""

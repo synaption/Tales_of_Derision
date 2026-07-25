@@ -12,12 +12,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from paths import resource_root
+
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_SAMPLE_SIZE = -16
 AUDIO_CHANNELS = 2
 AUDIO_BUFFER_SIZES = (16384, 8192, 4096, 2048)
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = resource_root()
 
 
 def _audio_driver_order() -> list[str | None]:

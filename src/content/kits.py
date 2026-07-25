@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from components import (
-    Attributes, BlocksMovement, Deer, Dialogue, Diet, Enemy, Equipment, Family,
+    Attributes, BlocksMovement, Deer, Dialogue, Diet, DriveProfile, Enemy, Equipment, Family,
     Fish, Friendly, Gender, Inventory, Meat, NPC, Needs, Personality,
     Relationships, Resident, Vision,
 )
@@ -36,6 +36,7 @@ def predator_kit(
     comps: list = [
         NPC(), Diet("carnivore"), Meat(meat), Vision(vision), BlocksMovement(),
         Needs(hunger=hunger, thirst=thirst),
+        DriveProfile({"drink": 1, "graze": 0, "hunt_or_scavenge": 1, "build_house": 0, "socialize": 0}),
     ]
     if enemy:
         comps.append(Enemy())
@@ -56,6 +57,7 @@ def grazer_kit(
     return [
         NPC(), Deer(), Diet("herbivore"), Vision(vision), BlocksMovement(),
         Meat(meat), Needs(hunger=hunger, thirst=thirst),
+        DriveProfile({"drink": 1, "graze": 1, "hunt_or_scavenge": 0, "build_house": 0, "cook": 0, "socialize": 0}),
     ]
 
 
@@ -84,6 +86,7 @@ def person_kit(*, gender: str, traits: list[str], surname: str) -> list:
         Resident(),
         Personality(traits=list(traits)),
         Relationships(),
+        DriveProfile({"drink": 1, "graze": 0, "hunt_or_scavenge": 0, "build_house": 1, "cook": 1, "socialize": 1}),
     ]
 
 

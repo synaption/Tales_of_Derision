@@ -20,3 +20,9 @@ WORLD_SETTLE_TURNS = 150
 # Fixed world seed for a new game with no --seed, so every new game regenerates the
 # same world for now. (Swap to rng.new_seed() for randomized worlds.)
 DEFAULT_WORLD_SEED = 0x7A1E5  # "TALES"
+
+# Live-play catch-up budget for region-aware AI when the player enters or walks
+# inside a region that is behind. ``None`` would replay the whole debt in one
+# input frame; a small deterministic cap prioritizes the player's action and
+# amortizes old off-screen debt over subsequent turns/idle pumps.
+ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT = 1

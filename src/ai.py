@@ -17,11 +17,12 @@ from dataclasses import replace
 import esper
 
 from components import (
-    Actor, Asleep, BerryBush, BlocksMovement, Blueprint, Corpse, Deer, Diet, Enemy,
-    Fish, Friendly, Home, Inventory, NPC, Needs, Personality, Player, Position,
+    Actor, Asleep, BerryBush, BlocksMovement, Blueprint, Corpse, Deer, Diet, DriveProfile,
+    Enemy, Fish, Friendly, Home, Inventory, NPC, Needs, Personality, Player, Position,
     Relationships, Resident, Seaweed, Stove, Tree, Vision, WorldClock,
 )
 from game_map import GameMap
+from content.drives import DriveDef, all_drives
 from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin
 from action import BASE_ACTION_COST, action_cost
 from items import WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
@@ -64,8 +65,14 @@ class NpcAiProcessor(esper.Processor):
     pathfind, not a full-map rescan every turn.
     """
 
-    def __init__(self, game_map: GameMap, wall_clock: Callable[[], float] | None = None):
+    def __init__(
+        self,
+        game_map: GameMap,
+        wall_clock: Callable[[], float] | None = None,
+        max_entry_catchup_advances: int | None = None,
+    ):
         self.game_map = game_map
+        self._max_entry_catchup_advances = max_entry_catchup_advances
         self._shore_tiles: list[tuple[int, int]] = self._compute_shore_tiles()
         self._wall_clock = wall_clock if wall_clock is not None else time.monotonic
         # The player's tile as of the region-advance in flight. An NPC within the
@@ -123,18 +130,27 @@ class NpcAiProcessor(esper.Processor):
         self._region_bucket_cache: dict[
             RegionId, tuple[int, tuple[list, ...]]
         ] = {}
-        # goal xy -> (region edit revision near goal, world edit revision, calls
-        # left before a routine refresh, the flow field itself). Shared across
-        # every NPC heading to the same goal, not per-entity -- a distance field
+        # goal xy -> (connectivity revision key, the flow field itself). Shared
+        # across every NPC heading to the same goal, not per-entity -- a distance field
         # rooted at a (largely static) goal stays valid for any traveller
         # approaching it from anywhere, so many NPCs reuse the one flood.
         self._field_cache: dict[
-            tuple[int, int], tuple[int, int, int, dict[tuple[int, int], int]]
+            tuple[int, int], tuple[tuple[int | None, int], dict[tuple[int, int], int]]
         ] = {}
+        # Per-map-revision memo for walkable connected-region ids. Many drives
+        # filter dozens of local resource candidates with same-region checks;
+        # caching the labels for each tile turns those scans into dict lookups
+        # and avoids repeatedly touching GameMap's island flood-fill cache.
+        self._region_of_cache_revision = -1
+        self._region_of_cache: dict[tuple[int, int], int | None] = {}
         # ent -> the tile it stood on at the start of its previous turn. Used to
         # forbid an immediate one-tile reversal (see ``_advance_region``), which
         # is the only way an NPC ends up flip-flopping between two tiles forever.
         self._prev_turn_pos: dict[int, tuple[int, int]] = {}
+        # Debug/inspection hook for data-driven AI: ent -> per-drive allow/weight
+        # records from its most recent decision. Tests and a future UI panel can
+        # read this without re-running any triggers.
+        self.last_decisions: dict[int, list[dict]] = {}
 
     def _compute_shore_tiles(self) -> list[tuple[int, int]]:
         shore: list[tuple[int, int]] = []
@@ -165,44 +181,21 @@ class NpcAiProcessor(esper.Processor):
     def _distance_field_for(self, goal: tuple[int, int]) -> dict[tuple[int, int], int]:
         """A cached flow field to ``goal`` (see ``GameMap.distance_field``).
 
-        ``distance_field`` is a pure function of the goal and the (static-per-
-        turn) tile grid, so a cached field is valid exactly as long as no tile
-        it could cover has changed. Two revisions gate reuse:
-
-        * **World edit revision** (``GameMap.revision``, bumped on *any* tile
-          edit anywhere). If it hasn't moved since the field was built, nothing
-          in the world changed, so the field is provably identical -- reuse it
-          indefinitely, no rebuild. This is the dominant case: during a
-          catch-up burst the player stands still and NPCs edit no tiles, so one
-          flood toward the player serves every chaser across the whole burst
-          instead of being rebuilt dozens of times.
-        * **Region edit revision** near the goal. When the world *has* been
-          edited somewhere, the field spans more than the goal's own region
-          cell, so a per-cell revision can't prove the edit missed it. We then
-          fall back to a bounded-staleness reuse (``calls_left`` refreshes)
-          exactly as before -- no regression for the living, self-editing world.
+        ``distance_field`` is a pure function of the goal and the walkable
+        connected component that contains it. The archipelago's components never
+        cross the water between islands, so an edit on another island cannot
+        affect this field. Cache by ``GameMap.connectivity_revision`` instead of
+        the global map revision to avoid rebuilding every flow field whenever an
+        unrelated off-screen villager raises a wall.
         """
-        region_revision = self.game_map.region_edit_revision(goal[0], goal[1])
-        world_revision = self.game_map.revision
+        connectivity_rev = self.game_map.connectivity_revision(goal[0], goal[1])
         cached = self._field_cache.get(goal)
         if cached is not None:
-            cached_region_rev, cached_world_rev, calls_left, field = cached
-            if cached_region_rev == region_revision:
-                if cached_world_rev == world_revision:
-                    # No tile anywhere edited since the build -> byte-identical.
-                    return field
-                if calls_left > 0:
-                    # Edited somewhere, but not in the goal's cell we can see;
-                    # reuse under the staleness bound (keep the old world rev so
-                    # the countdown still eventually rebuilds to pick it up).
-                    self._field_cache[goal] = (
-                        cached_region_rev, cached_world_rev, calls_left - 1, field
-                    )
-                    return field
+            cached_rev, field = cached
+            if cached_rev == connectivity_rev:
+                return field
         field = self.game_map.distance_field(goal)
-        self._field_cache[goal] = (
-            region_revision, world_revision, _PATH_FIELD_REFRESH_CALLS, field
-        )
+        self._field_cache[goal] = (connectivity_rev, field)
         return field
 
     def _greedy_step_toward(
@@ -361,12 +354,25 @@ class NpcAiProcessor(esper.Processor):
         # what lets ``occupied`` be a cheap, rarely-rebuilt static cache.
         pos.x, pos.y = next_xy
 
+    def _region_of_cached(self, xy: tuple[int, int]) -> int | None:
+        if self._region_of_cache_revision != self.game_map.revision:
+            self._region_of_cache.clear()
+            self._region_of_cache_revision = self.game_map.revision
+        if xy not in self._region_of_cache:
+            self._region_of_cache[xy] = self.game_map.region_of(xy[0], xy[1])
+        return self._region_of_cache[xy]
+
+    def _same_region_cached(self, a: tuple[int, int], b: tuple[int, int]) -> bool:
+        region = self._region_of_cached(a)
+        return region is not None and region == self._region_of_cached(b)
+
     def _reachable(
         self, pos: Position, items: list[tuple[tuple[int, int], int]]
     ) -> list[tuple[tuple[int, int], int]]:
         """Keep only ``(xy, ent)`` targets in the same walkable region as ``pos``,
         so a creature never fixates on food/water across a river it can't cross."""
-        return [item for item in items if self.game_map.same_region((pos.x, pos.y), item[0])]
+        here = (pos.x, pos.y)
+        return [item for item in items if self._same_region_cached(here, item[0])]
 
     def _seek_water(
         self,
@@ -387,7 +393,7 @@ class NpcAiProcessor(esper.Processor):
         reachable = [
             s
             for s in shore
-            if s not in occupied and self.game_map.same_region((pos.x, pos.y), s)
+            if s not in occupied and self._same_region_cached((pos.x, pos.y), s)
         ]
         target = self._nearest((pos.x, pos.y), reachable)
         if target is None:
@@ -667,7 +673,7 @@ class NpcAiProcessor(esper.Processor):
         # Couldn't advance toward home. Camp where we stand if we're spent, or if
         # home is genuinely unreachable (blocked by water/walls) -- better to camp
         # and recover than to idle at a barrier, pinning tiredness and starving.
-        if needs.tiredness >= _EXHAUSTED_THRESHOLD or not self.game_map.same_region((pos.x, pos.y), home_xy):
+        if needs.tiredness >= _EXHAUSTED_THRESHOLD or not self._same_region_cached((pos.x, pos.y), home_xy):
             go_to_sleep(ent, in_camp=True)
             return True
         return False
@@ -704,7 +710,7 @@ class NpcAiProcessor(esper.Processor):
             gxy = (g_pos.x, g_pos.y)
             if self.game_map.tile_at(gxy[0], gxy[1]) == bp.tile:
                 continue  # already raised elsewhere; ignore this stale ghost
-            if here == gxy or self.game_map.same_region(here, gxy):
+            if here == gxy or self._same_region_cached(here, gxy):
                 out.append((g_ent, gxy, bp))
         return out
 
@@ -842,7 +848,7 @@ class NpcAiProcessor(esper.Processor):
         # pathfind every single turn it keeps watching. Reachability is a
         # cheap, cached lookup (GameMap.region_of); check it before ever
         # calling into pathfinding.
-        if not self.game_map.same_region((pos.x, pos.y), player_xy):
+        if not self._same_region_cached((pos.x, pos.y), player_xy):
             return False
         if _chebyshev((pos.x, pos.y), player_xy) == 1:
             return False  # adjacent: hold (player-facing combat is player-driven)
@@ -870,7 +876,7 @@ class NpcAiProcessor(esper.Processor):
             dist = _chebyshev((pos.x, pos.y), (other_pos.x, other_pos.y))
             if dist > _SOCIAL_SIGHT:
                 continue
-            if not self.game_map.same_region((pos.x, pos.y), (other_pos.x, other_pos.y)):
+            if not self._same_region_cached((pos.x, pos.y), (other_pos.x, other_pos.y)):
                 continue
             # Prefer friends: friendship pulls the score up, distance pushes it
             # down. A stranger (0 friendship) is still chosen when nobody
@@ -1137,6 +1143,112 @@ class NpcAiProcessor(esper.Processor):
                     del occupied[guard]
                 self._prev_turn_pos[ent] = start_xy
 
+    def _drive_factor(self, ent: int, drive_id: str) -> float:
+        if not esper.has_component(ent, DriveProfile):
+            return 1.0
+        return float(esper.component_for_entity(ent, DriveProfile).drives.get(drive_id, 1.0))
+
+    def _has_inventory_food(self, ent: int) -> bool:
+        if not esper.has_component(ent, Inventory):
+            return False
+        return any(
+            not is_raw_meat(item) and hunger_restored(item) is not None
+            for item in esper.component_for_entity(ent, Inventory).items
+        )
+
+    def _trigger_passes(self, ent: int, trigger: tuple, ctx: dict) -> bool:
+        name, *args = trigger
+        needs = ctx.get("needs")
+        diet_kind = ctx.get("diet_kind")
+        if name == "tiredness_at_least":
+            return needs is not None and needs.tiredness >= float(args[0])
+        if name == "thirst_at_least":
+            return needs is not None and needs.thirst >= float(args[0])
+        if name == "hunger_at_least":
+            return needs is not None and needs.hunger >= float(args[0])
+        if name == "thirst_beats_hunger":
+            return needs is not None and needs.thirst >= needs.hunger
+        if name == "has_diet":
+            return diet_kind == args[0]
+        if name == "diet_in":
+            return diet_kind in args
+        if name == "is_starving":
+            return needs is not None and needs.hunger >= needs.max_value * 0.9
+        if name == "has_inventory_food":
+            return self._has_inventory_food(ent)
+        if name == "region_has_trees":
+            return bool(ctx["trees"])
+        if name == "region_has_bushes":
+            return bool(ctx["bushes"])
+        if name == "region_has_meat":
+            return bool(ctx["prey"] or ctx["corpses"])
+        if name == "region_has_shore":
+            return bool(ctx["shore"])
+        if name == "should_build":
+            return self._should_build(ent)
+        if name == "can_socialize":
+            return esper.has_component(ent, Personality) and esper.has_component(ent, Friendly)
+        if name == "has_player":
+            return ctx["player_xy"] is not None
+        if name == "is_enemy":
+            return esper.has_component(ent, Enemy)
+        raise KeyError(f"unknown AI trigger {name!r}")
+
+    def _score_drive(self, ent: int, drive: DriveDef, ctx: dict) -> tuple[float | None, dict]:
+        factor = self._drive_factor(ent, drive.id)
+        allow_results = [
+            {"trigger": trigger, "passed": self._trigger_passes(ent, trigger, ctx)}
+            for trigger in drive.allow
+        ]
+        if factor <= 0.0 or not all(item["passed"] for item in allow_results):
+            return None, {
+                "drive": drive.id, "factor": factor, "allow": allow_results, "weight": None,
+            }
+        weight = drive.weight.base * factor
+        for modifier in drive.weight.modifiers:
+            if self._trigger_passes(ent, modifier.trigger, ctx):
+                weight *= modifier.factor
+        return weight, {
+            "drive": drive.id, "factor": factor, "allow": allow_results, "weight": weight,
+        }
+
+    def _rank_drives(self, ent: int, ctx: dict) -> list[DriveDef]:
+        scored = []
+        debug = []
+        for drive in all_drives():
+            weight, record = self._score_drive(ent, drive, ctx)
+            debug.append(record)
+            if weight is not None and weight > 0.0:
+                scored.append((weight, drive.id, drive))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        self.last_decisions[ent] = debug
+        return [drive for _weight, _id, drive in scored]
+
+    def _execute_drive(self, drive: DriveDef, ent: int, pos: Position, occupied: dict, ctx: dict) -> bool:
+        needs = ctx.get("needs")
+        if drive.act == "seek_sleep" and needs is not None:
+            return self._seek_sleep(ent, pos, needs, occupied)
+        if drive.act == "seek_water" and needs is not None:
+            return self._seek_water(ent, pos, needs, occupied, ctx["shore"])
+        if drive.act == "eat_from_inventory" and needs is not None:
+            return self._eat_from_inventory(ent, needs)
+        if drive.act == "forage_berries" and needs is not None:
+            return self._forage_berries(ent, pos, needs, ctx["bushes"], occupied, ctx["clock"])
+        if drive.act == "graze" and needs is not None:
+            return self._graze(ent, pos, needs, ctx["trees"], occupied)
+        if drive.act == "seek_food" and needs is not None:
+            return self._seek_food(ent, pos, needs, ctx["prey"], ctx["corpses"], occupied)
+        if drive.act == "feed_cook":
+            return self._feed_cook(ent, pos, ctx["prey"], ctx["corpses"], ctx["trees"], ctx["stoves"], occupied)
+        if drive.act == "work_blueprints":
+            return self._work_blueprints(ent, pos, ctx["trees"], occupied)
+        if drive.act == "socialize":
+            return self._socialize(ent, pos, occupied, ctx["sentients"], ctx["logical_turn"], ctx["clock"])
+        if drive.act == "chase_player":
+            self._chase_player(ent, pos, ctx["player_xy"], occupied)
+            return True
+        raise KeyError(f"unknown AI action {drive.act!r}")
+
     def _take_turn(
         self,
         ent: int,
@@ -1148,65 +1260,25 @@ class NpcAiProcessor(esper.Processor):
         logical_turn: int,
         clock: "WorldClock | None",
     ) -> None:
-        """One NPC's single-turn behaviour: the priority ladder of survival
-        drives, then building, then leisure, then hostile pursuit. Split out of
-        ``_advance_region`` so the per-turn anti-oscillation guard there can wrap
-        it cleanly."""
+        """Select and execute one declarative drive for an NPC.
+
+        The selector is deterministic highest-weight scoring. The old priority
+        ladder is represented by data in ``content.drives`` with widely spaced
+        base weights, so changing species/personality behavior no longer needs a
+        new branch here.
+        """
         trees, prey, corpses, stoves, bushes, sentients = diet_buckets
-        acted = False
-
-        if esper.has_component(ent, Needs):
-            needs = esper.component_for_entity(ent, Needs)
-            diet_kind = None
-            if esper.has_component(ent, Diet):
-                diet_kind = esper.component_for_entity(ent, Diet).kind
-
-            # Sleep is the strongest drive: a spent creature beds down before
-            # it forages, preferring its home over camping.
-            if needs.tiredness >= _SLEEP_THRESHOLD:
-                acted = self._seek_sleep(ent, pos, needs, occupied)
-            # Thirst wins ties -- a parched animal drinks before it eats.
-            elif needs.thirst >= _FORAGE_THRESHOLD and needs.thirst >= needs.hunger:
-                acted = self._seek_water(ent, pos, needs, occupied, shore)
-            elif needs.hunger >= _FORAGE_THRESHOLD:
-                # Eat prepared food already carried; otherwise forage by diet.
-                if self._eat_from_inventory(ent, needs):
-                    acted = True
-                elif diet_kind == "herbivore":
-                    # Ripe berries first (quick food); else graze a tree.
-                    acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
-                    if not acted:
-                        acted = self._graze(ent, pos, needs, trees, occupied)
-                elif diet_kind == "carnivore":
-                    # Predator: eats raw meat on the spot.
-                    acted = self._seek_food(ent, pos, needs, prey, corpses, occupied)
-                elif diet_kind == "cook":
-                    # Villager: pick ripe berries when handy, else cook meat.
-                    acted = self._forage_berries(ent, pos, needs, bushes, occupied, clock)
-                    if not acted:
-                        acted = self._feed_cook(ent, pos, prey, corpses, trees, stoves, occupied)
-
-        # Building a house is the lowest-priority survival drive: a homeless
-        # resident helps raise the nearest blueprint only once fed, watered,
-        # and rested. Labour is shared -- several villagers can work one site.
-        if not acted and self._should_build(ent):
-            acted = self._work_blueprints(ent, pos, trees, occupied)
-
-        # Leisure: a fed, rested, non-hostile being with a personality seeks
-        # out company -- preferring beings it already likes. Lowest priority
-        # of all, so survival and building always come first.
-        if (
-            not acted
-            and esper.has_component(ent, Personality)
-            and esper.has_component(ent, Friendly)
-        ):
-            acted = self._socialize(ent, pos, occupied, sentients, logical_turn, clock)
-
-        if acted:
-            return
-
-        if player_xy is not None and esper.has_component(ent, Enemy):
-            self._chase_player(ent, pos, player_xy, occupied)
+        needs = esper.component_for_entity(ent, Needs) if esper.has_component(ent, Needs) else None
+        diet_kind = esper.component_for_entity(ent, Diet).kind if esper.has_component(ent, Diet) else None
+        ctx = {
+            "needs": needs, "diet_kind": diet_kind, "trees": trees, "prey": prey,
+            "corpses": corpses, "stoves": stoves, "bushes": bushes,
+            "sentients": sentients, "shore": shore, "player_xy": player_xy,
+            "logical_turn": logical_turn, "clock": clock,
+        }
+        for drive in self._rank_drives(ent, ctx):
+            if self._execute_drive(drive, ent, pos, occupied, ctx):
+                return
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
@@ -1236,10 +1308,12 @@ class NpcAiProcessor(esper.Processor):
 
         target_turn = self.scheduler.next_turn_for(player_region, _current_region_turn())
 
-        # The player's own region is always fully live -- this also covers
-        # "just entered a new region": catch_up_region replays every turn the
-        # region missed, in order, right here.
-        self.scheduler.catch_up_region(player_region, target_turn)
+        # The player's own region gets first priority. In tests/default construction
+        # this fully catches up; live play may cap the replay count so entering a
+        # stale region does not block a walking frame for the whole debt.
+        self.scheduler.catch_up_region(
+            player_region, target_turn, max_advances=self._max_entry_catchup_advances
+        )
 
         # Background: nudge the *nearest* other lagging regions along, closest
         # to the player first (never the stalest). Bounded, so it can never
@@ -1274,8 +1348,10 @@ class FishAiProcessor(esper.Processor):
         game_map: GameMap,
         rng: Callable[[], float] | None = None,
         clock: Callable[[], float] | None = None,
+        max_entry_catchup_advances: int | None = None,
     ):
         self.game_map = game_map
+        self._max_entry_catchup_advances = max_entry_catchup_advances
         self._rng = rng if rng is not None else world_rng().stream("ai").random
         self._wall_clock = clock if clock is not None else time.monotonic
         self.scheduler = RegionScheduler(game_map, _current_region_turn())
@@ -1355,10 +1431,12 @@ class FishAiProcessor(esper.Processor):
 
         target_turn = self.scheduler.next_turn_for(player_region, _current_region_turn())
 
-        # The player's own region is always fully live -- this also covers
-        # "just entered a new region": catch_up_region replays every turn the
-        # region missed, in order, right here.
-        self.scheduler.catch_up_region(player_region, target_turn)
+        # The player's own region gets first priority. In tests/default construction
+        # this fully catches up; live play may cap the replay count so entering a
+        # stale region does not block a walking frame for the whole debt.
+        self.scheduler.catch_up_region(
+            player_region, target_turn, max_advances=self._max_entry_catchup_advances
+        )
 
         # Background: nudge the *nearest* other lagging regions along, closest
         # to the player first. Zero by default (see _FISH_BACKGROUND_BUDGET): an

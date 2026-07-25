@@ -15,7 +15,7 @@ from action import BASE_ACTION_COST
 from components import Diet, NPC, Needs, Player, Position, Tree, WorldClock
 from game_map import GameMap
 from regions import RegionScheduler, all_region_ids, in_region_with_margin, region_at, region_grid_size
-from systems import FishAiProcessor, NpcAiProcessor, world_clock
+from systems import FishAiProcessor, NeedsProcessor, NpcAiProcessor, world_clock
 
 pytestmark = pytest.mark.unrendered
 
@@ -83,6 +83,21 @@ def test_catch_up_region_replays_every_missing_turn_in_order() -> None:
     # Replayed turn by turn (0, 1, 2, 3) -- never skipped or batched.
     assert seen == [0, 1, 2, 3]
     assert scheduler.region_turn[(1, 0)] == 4
+
+
+def test_catch_up_region_can_be_capped_for_live_turn_budget() -> None:
+    game_map = GameMap(240, 60)
+    scheduler = RegionScheduler(game_map, 0)
+    seen: list[int] = []
+    scheduler.register("record", lambda region_id: seen.append(scheduler.region_turn[region_id]))
+
+    assert scheduler.catch_up_region((1, 0), target_turn=5, max_advances=2) is False
+    assert seen == [0, 1]
+    assert scheduler.region_turn[(1, 0)] == 2
+
+    assert scheduler.catch_up_region((1, 0), target_turn=5, max_advances=3) is True
+    assert seen == [0, 1, 2, 3, 4]
+    assert scheduler.region_turn[(1, 0)] == 5
 
 
 def test_catch_up_all_brings_every_region_up_to_date() -> None:
@@ -202,6 +217,32 @@ def test_npc_near_a_region_seam_still_reaches_a_resource_just_across_it() -> Non
     # region -- without the border margin this tree would be invisible and
     # the NPC would never move.
     assert pos.x > 119
+
+
+def test_live_needs_processor_ticks_only_the_players_region() -> None:
+    game_map = GameMap(240, 60)
+    player = esper.create_entity(Position(10, 30), Player(), Needs(hunger=0.0, thirst=0.0))
+    near_npc = esper.create_entity(Position(20, 30), NPC(), Needs(hunger=10.0, thirst=10.0))
+    far_npc = esper.create_entity(Position(200, 30), NPC(), Needs(hunger=20.0, thirst=20.0))
+
+    NeedsProcessor(game_map).process("wait")
+
+    assert esper.component_for_entity(player, Needs).hunger > 0.0
+    assert esper.component_for_entity(near_npc, Needs).hunger > 10.0
+    assert esper.component_for_entity(far_npc, Needs).hunger == 20.0
+    assert esper.component_for_entity(far_npc, Needs).thirst == 20.0
+
+
+def test_default_needs_processor_keeps_whole_world_semantics() -> None:
+    game_map = GameMap(240, 60)
+    esper.create_entity(Position(10, 30), Player(), Needs(hunger=0.0, thirst=0.0))
+    far_npc = esper.create_entity(Position(200, 30), NPC(), Needs(hunger=20.0, thirst=20.0))
+
+    NeedsProcessor().process("wait")
+
+    assert region_at(game_map, 200, 30) == (1, 0)
+    assert esper.component_for_entity(far_npc, Needs).hunger > 20.0
+    assert esper.component_for_entity(far_npc, Needs).thirst > 20.0
 
 
 def test_sleep_catches_up_every_region_not_just_the_players() -> None:

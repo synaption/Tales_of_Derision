@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, "src"))
 import esper  # noqa: E402
 
 from components import Position  # noqa: E402
-from config import MAP_HEIGHT, MAP_WIDTH  # noqa: E402
+from config import ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT, MAP_HEIGHT, MAP_WIDTH  # noqa: E402
 from game_map import GameMap  # noqa: E402
 from rng import set_world_rng  # noqa: E402
 from renderer.base import Renderer  # noqa: E402
@@ -51,7 +51,7 @@ class _NullRenderer(Renderer):
     def poll_action(self): return None
 
 
-def build(flood: bool, render: bool) -> GameMap:
+def build(flood: bool, render: bool, active_cap: int | None = None) -> GameMap:
     esper.clear_database()
     set_world_rng(0x7A1E5)
     game_map = GameMap(MAP_WIDTH, MAP_HEIGHT)
@@ -59,10 +59,14 @@ def build(flood: bool, render: bool) -> GameMap:
     count = _setup_world(game_map, player, rat_flood=flood)
     esper.add_processor(TimeProcessor(), priority=2)
     esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(HousingProcessor(game_map), priority=0)
-    esper.add_processor(NpcAiProcessor(game_map), priority=0)
-    esper.add_processor(FishAiProcessor(game_map), priority=0)
-    esper.add_processor(NeedsProcessor(), priority=0)
+    esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
+    esper.add_processor(
+        NpcAiProcessor(game_map, max_entry_catchup_advances=active_cap), priority=0
+    )
+    esper.add_processor(
+        FishAiProcessor(game_map, max_entry_catchup_advances=active_cap), priority=0
+    )
+    esper.add_processor(NeedsProcessor(game_map), priority=0)
     esper.add_processor(EffectsProcessor(), priority=0)
     esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
     esper.add_processor(ReproductionProcessor(), priority=0)
@@ -88,9 +92,21 @@ def main() -> None:
     ap.add_argument("--render", action="store_true")
     ap.add_argument("--sort", default="tottime", choices=["tottime", "cumulative", "ncalls"])
     ap.add_argument("--lines", type=int, default=25)
+    ap.add_argument(
+        "--active-cap",
+        type=int,
+        default=None,
+        help=(
+            "Max player-region catch-up advances per input. Omit for the old fully "
+            "blocking catch-up; use the config value to profile live-play pacing."
+        ),
+    )
     args = ap.parse_args()
 
-    build(args.flood, args.render)
+    active_cap = args.active_cap
+    if active_cap is None and args.render:
+        active_cap = ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT
+    build(args.flood, args.render, active_cap=active_cap)
     profiler = cProfile.Profile()
     profiler.enable()
     run(args.turns)

@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 
+from paths import resource_root
+
 from .base import MEMORY_DESATURATE, MEMORY_DIM, Renderer, memory_color
 
 
@@ -213,7 +215,7 @@ class PygameRenderer(Renderer):
         self._next_confirm_repeat_ms = 0
         self._pending_actions: deque[str] = deque()
 
-        project_root = Path(__file__).resolve().parents[2]
+        project_root = resource_root()
         self._tile_config_path = project_root / "gfx" / "tilesets" / "pygame_tileset_config.json"
         self._fallback_sheet_path = str(project_root / "gfx" / "tilesets" / "Bisasam_16x16.png")
         self._fallback_tile_size = 16
@@ -456,7 +458,7 @@ class PygameRenderer(Renderer):
                 return ""
             sheet_path = Path(sheet_value)
             if not sheet_path.is_absolute():
-                sheet_path = Path(__file__).resolve().parents[2] / sheet_path
+                sheet_path = resource_root() / sheet_path
             return str(sheet_path)
 
         sheet_aliases: dict[str, str] = {}
@@ -491,7 +493,7 @@ class PygameRenderer(Renderer):
         if isinstance(raw_tile_index, str) and raw_tile_index.strip():
             candidate = Path(raw_tile_index.strip())
             if not candidate.is_absolute():
-                candidate = Path(__file__).resolve().parents[2] / candidate
+                candidate = resource_root() / candidate
             tile_index_path = candidate
         elif default_sheet:
             default_sheet_path = Path(resolve_sheet(default_sheet))

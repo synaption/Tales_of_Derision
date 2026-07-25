@@ -18,7 +18,7 @@ from collections.abc import Callable
 
 import esper
 
-from components import Enemy, Friendly, NPC, Name, Needs, Player, Position, Renderable, Vision
+from components import Corpse, Enemy, Friendly, NPC, Name, Needs, Player, Position, Renderable, Vision
 from game_map import GameMap
 from renderer.base import Renderer
 from content.effects import STATUS_BASE_SECONDS, effect_display
@@ -55,6 +55,10 @@ class RenderProcessor(esper.Processor):
         self._last_player_pos: tuple[int, int] | None = None
         self._seen_entity_ids: set[int] = set()
         self._visible_tiles: set[tuple[int, int]] = set()
+        self._visible_npcs_cache: list[tuple[int, str, str, str, int, int, int, int]] = []
+        self._nearby_cache: list[_NearbyEntry] = []
+        self._static_renderables_by_xy: dict[tuple[int, int], list[tuple[int, Renderable]]] = {}
+        self._static_renderables_revision = -1
         # Tile memory ("fog of war"): every tile ever in view is "explored" and
         # keeps being drawn -- desaturated -- once it drops out of line of sight.
         # ``_tile_memory`` remembers the last static scenery (tree, furniture,
@@ -192,6 +196,69 @@ class RenderProcessor(esper.Processor):
                 self._append_message("You bump into a wall.")
 
         self._last_player_pos = (player_pos.x, player_pos.y)
+
+    def _rebuild_static_renderables(self, player_ent: int | None) -> None:
+        """Index non-character renderables by tile so drawing only touches view cells.
+
+        The archipelago has tens of thousands of static renderables (trees, bushes,
+        furniture, seaweed). Scanning all of them every frame just to discard the
+        off-screen ones was a visible walking-frame stutter. Characters and corpses
+        remain dynamic ECS queries; static scenery is looked up by visible tile.
+        """
+        by_xy: dict[tuple[int, int], list[tuple[int, Renderable]]] = {}
+        for ent, (pos, rend) in esper.get_components(Position, Renderable):
+            if ent == player_ent:
+                continue
+            if esper.has_component(ent, NPC) or esper.has_component(ent, Corpse):
+                continue
+            by_xy.setdefault((pos.x, pos.y), []).append((ent, rend))
+        self._static_renderables_by_xy = by_xy
+        self._static_renderables_revision = self.game_map.revision
+
+    def _iter_visible_renderables(
+        self, player_ent: int | None
+    ) -> list[tuple[int, Position, Renderable]]:
+        """Return renderables that can affect this frame: visible statics + dynamics."""
+        out: list[tuple[int, Position, Renderable]] = []
+        seen: set[int] = set()
+
+        for xy in self._visible_tiles:
+            entries = self._static_renderables_by_xy.get(xy)
+            if not entries:
+                continue
+            live_entries: list[tuple[int, Renderable]] = []
+            for ent, rend in entries:
+                if not esper.entity_exists(ent):
+                    continue
+                live_entries.append((ent, rend))
+                out.append((ent, Position(xy[0], xy[1]), rend))
+                seen.add(ent)
+            if len(live_entries) != len(entries):
+                if live_entries:
+                    self._static_renderables_by_xy[xy] = live_entries
+                else:
+                    self._static_renderables_by_xy.pop(xy, None)
+
+        for ent, (pos, rend, _npc) in esper.get_components(Position, Renderable, NPC):
+            if ent in seen or (pos.x, pos.y) not in self._visible_tiles:
+                continue
+            out.append((ent, pos, rend))
+            seen.add(ent)
+
+        for ent, (pos, rend, _corpse) in esper.get_components(Position, Renderable, Corpse):
+            if ent in seen or (pos.x, pos.y) not in self._visible_tiles:
+                continue
+            out.append((ent, pos, rend))
+            seen.add(ent)
+
+        if player_ent is not None and esper.entity_exists(player_ent):
+            if esper.has_component(player_ent, Position) and esper.has_component(player_ent, Renderable):
+                out.append((
+                    player_ent,
+                    esper.component_for_entity(player_ent, Position),
+                    esper.component_for_entity(player_ent, Renderable),
+                ))
+        return out
 
     def _collect_nearby_objects(
         self,
@@ -700,9 +767,8 @@ class RenderProcessor(esper.Processor):
 
         nearby_data: list[_NearbyEntry] = []
         if player_pos is not None:
-            visible_npcs = self._collect_visible_npcs(player_pos)
-            self._update_sighting_events(visible_npcs)
-            nearby_data = self._collect_nearby_objects(player_pos)
+            self._update_sighting_events(self._visible_npcs_cache)
+            nearby_data = self._nearby_cache
 
         nearby_lines: list[str] = []
 
@@ -1092,6 +1158,12 @@ class RenderProcessor(esper.Processor):
             # (Unlike FOV this can't be memoized per position: the explored set
             # keeps growing, so a revisited tile may recall more than last time.)
             self._compute_memory_geometry()
+        static_index_missing = self._static_renderables_revision < 0
+        safe_to_refresh_static_index = (
+            action is None and self._static_renderables_revision != self.game_map.revision
+        )
+        if static_index_missing or safe_to_refresh_static_index:
+            self._rebuild_static_renderables(player_ent)
         draw_autotile_variant = getattr(r, "draw_autotile_variant", None)
 
         self._render_map_layer(r, draw_autotile_variant)
@@ -1100,17 +1172,26 @@ class RenderProcessor(esper.Processor):
         DrawData = tuple[int, int, str, str, tuple[int, int, int] | None, tuple[int, int, int] | None, bool]
         player_draw: DrawData | None = None
         character_draws: list[DrawData] = []
+        visible_npcs: list[tuple[int, str, str, str, int, int, int, int]] = []
+        nearby_entries: list[_NearbyEntry] = []
         # Static scenery seen this frame, keyed by tile -- folded into tile memory
         # after drawing so it can be recalled once the tile leaves view. Gathered
         # here to piggyback on the entity scan rather than sweep every entity twice.
         seen_scenery: dict[tuple[int, int], tuple[str, str, tuple[int, int, int] | None, tuple[int, int, int] | None]] = {}
-        for ent, (pos, rend) in esper.get_components(Position, Renderable):
-            is_player = esper.has_component(ent, Player)
-            is_character = is_player or esper.has_component(ent, NPC)
-            if (pos.x, pos.y) not in self._visible_tiles and not is_player:
+        for ent, pos, rend in self._iter_visible_renderables(player_ent):
+            is_player = ent == player_ent
+            visible = (pos.x, pos.y) in self._visible_tiles
+            if not visible and not is_player:
                 continue
 
-            if (pos.x, pos.y) in self._visible_tiles and is_memorable_scenery(ent):
+            # Avoid component lookups for the thousands of off-screen renderables
+            # on the archipelago. The old order asked esper whether every tree,
+            # bush, fish and villager was an NPC/friendly/enemy before checking
+            # visibility, which made walking stutter even though only a viewport's
+            # worth of entities can ever be drawn.
+            is_character = is_player or esper.has_component(ent, NPC)
+
+            if visible and is_memorable_scenery(ent):
                 seen_scenery[(pos.x, pos.y)] = (rend.glyph, "default", rend.fg, rend.bg)
 
             view_xy = self._world_to_view(pos.x, pos.y)
@@ -1128,6 +1209,20 @@ class RenderProcessor(esper.Processor):
             else:
                 glyph, fg, force_glyph = rend.glyph, rend.fg, False
 
+            if visible and player_pos is not None and not is_player:
+                dx = pos.x - player_pos.x
+                dy = pos.y - player_pos.y
+                arrow = self._direction_arrow(player_pos, pos)
+                name = "Unknown"
+                if esper.has_component(ent, Name):
+                    name = esper.component_for_entity(ent, Name).value
+                mdist = abs(dx) + abs(dy)
+                cdist = max(abs(dx), abs(dy))
+                if is_character:
+                    visible_npcs.append((ent, glyph, arrow, name, mdist, cdist, pos.x, pos.y))
+                if cdist == 1:
+                    nearby_entries.append((ent, glyph, arrow, name, mdist, cdist, classification, fg, rend.bg))
+
             if is_player:
                 if view_xy is not None:
                     player_draw = (view_xy[0], view_xy[1], glyph, classification, fg, rend.bg, force_glyph)
@@ -1142,6 +1237,11 @@ class RenderProcessor(esper.Processor):
                         draw_data[0], draw_data[1], draw_data[2], draw_data[3],
                         fg=draw_data[4], bg=draw_data[5], force_glyph=draw_data[6],
                     )
+
+        visible_npcs.sort(key=lambda item: (item[4], item[5], item[3]))
+        nearby_entries.sort(key=lambda item: (item[4], item[5], item[3]))
+        self._visible_npcs_cache = visible_npcs
+        self._nearby_cache = nearby_entries
 
         for draw_data in character_draws:
             r.draw_glyph_classified(
