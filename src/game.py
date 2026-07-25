@@ -1,9 +1,15 @@
 """Tales of Derision runtime.
 
-Turn loop: show title/menu, then block for an action, run the systems, repeat.
-The game logic stays renderer-agnostic while the default runtime uses pygame.
+Startup, and the pieces of one turn: wait for a command, interpret it (menus and
+world interactions resolve here), then advance the world if it cost a turn. The
+loop that strings those together is ``main.main`` -- this module deliberately
+does not hide it. The game logic stays renderer-agnostic while the default
+runtime uses pygame.
 """
 import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
+from collections.abc import Iterator
 import os
 from pathlib import Path
 import sys
@@ -205,18 +211,6 @@ def _catch_up_entered_region_cooperatively(renderer: Renderer, region_id: tuple[
         esper.process(None)
 
 
-def _process_player_turn(
-    action: str | None, renderer: Renderer, previous_region: tuple[int, int] | None
-) -> tuple[int, int] | None:
-    """Run one input frame, then cooperatively settle a newly entered region."""
-    esper.process(action)
-    player_pos = first_player_position()
-    current_region = _player_region_for_processors(player_pos)
-    if current_region != previous_region:
-        _catch_up_entered_region_cooperatively(renderer, current_region)
-    return current_region
-
-
 def _pump_background_regions(budget_seconds: float) -> None:
     """Spend up to ``budget_seconds`` advancing the nearest lagging region for
     each region-aware processor, closest to the player first. Safe to call
@@ -248,7 +242,343 @@ def _pump_background_regions(budget_seconds: float) -> None:
         flora.pump_flora(budget_seconds, player_xy, time.monotonic)
 
 
-def play_game(args: argparse.Namespace) -> None:
+@dataclass(frozen=True)
+class TurnIntent:
+    """What the turn loop should do with the command the player just gave.
+
+    ``GameSession.interpret`` resolves the command itself -- menus, dialogue,
+    looting, chopping a tree -- so all that's left for the loop is the world:
+    does time pass (``world_action``), does the frame need a redraw, or are we
+    done playing.
+    """
+
+    quit: bool = False
+    world_action: str | None = None
+    redraw: bool = False
+
+
+# Stop playing (quit key, or a menu that quit out).
+QUIT_GAME = TurnIntent(quit=True)
+# Fully handled, and the screen is already current: whatever ran (sleeping,
+# placing a building) drew its own final frame.
+HANDLED = TurnIntent()
+# A free action -- opening a menu, turning to face a tile, chopping a tree.
+# Nothing in the world moves; the frame just needs redrawing.
+REDRAW = TurnIntent(redraw=True)
+
+
+def _spend_turn(action: str) -> TurnIntent:
+    """The command costs a turn: the systems run with ``action`` and the clock
+    advances."""
+    return TurnIntent(world_action=action)
+
+
+class GameSession:
+    """One live game: the renderer, the world, and the input state that has to
+    survive between commands (held directions, which menu tab was last open,
+    which region the player is standing in).
+
+    Every method here is one step of the turn loop in ``main.main``; the loop
+    stays there so the shape of a turn is readable in one screen.
+    """
+
+    def __init__(
+        self,
+        renderer: Renderer,
+        game_map: GameMap,
+        options: dict,
+        save_file: Path,
+        fallback_position: Position,
+    ) -> None:
+        self.renderer = renderer
+        self.game_map = game_map
+        self.options = options
+        self.save_file = save_file
+        self._fallback_position = fallback_position
+        self._held_directions: set[str] = set()
+        self._direction_pressed_order = {
+            "move_up": -1,
+            "move_down": -1,
+            "move_left": -1,
+            "move_right": -1,
+        }
+        self._press_order_counter = 0
+        # The player menu (Tab) reopens on whatever tab you left it on.
+        self._last_menu_tab = "inventory"
+        self._player_region = _player_region_for_processors(first_player_position())
+        self._idle_ticks = 0
+        self._idle_is_animated = False
+
+    # --- 1. input ---------------------------------------------------------
+
+    def next_action(self) -> str | None:
+        """Wait briefly for a command. ``None`` means the player didn't act --
+        an idle tick, not a turn.
+
+        The wait is a short poll rather than desktop's old fully-blocking one:
+        true idle time (the player thinking, or away from the keyboard) is
+        exactly when there's the most spare time to simulate off-screen regions.
+        """
+        # Live play has (re)rendered the game, so any menu backdrop snapshot is
+        # stale; the next menu to open will re-capture.
+        invalidate_backdrop = getattr(self.renderer, "invalidate_backdrop", None)
+        if callable(invalidate_backdrop):
+            invalidate_backdrop()
+        # With an active status animation (swimming, on fire, ...) idle ticks
+        # come on a shorter timeout so the identifiers cycle without input.
+        self._idle_is_animated = player_is_animated(self.game_map) or bubbles_active()
+        timeout = _STATUS_ANIM_POLL_SECONDS if self._idle_is_animated else _IDLE_POLL_SECONDS
+        action = _await_action_or_idle(self.renderer, timeout)
+        if action is not None:
+            # A long idle spell must never dump one big simulation burst onto
+            # the player's next turn, so the ramp resets the moment they act.
+            self._idle_ticks = 0
+        return action
+
+    # --- 2. idle ----------------------------------------------------------
+
+    def simulate_idle(self) -> None:
+        """Spend an idle tick paying down off-screen simulation debt, ramping up
+        the budget the longer the player goes without acting."""
+        if self._idle_is_animated:
+            _pump_background_regions(_IDLE_PUMP_BASE_BUDGET)
+            esper.process(None)  # keep the status animation cycling
+            return
+        self._idle_ticks += 1
+        _pump_background_regions(_idle_pump_budget(self._idle_ticks))
+
+    # --- 3. interpret -----------------------------------------------------
+
+    def interpret(self, action: str) -> TurnIntent:
+        """Resolve one command, running any menu or interaction it opens, and
+        report what the world should do about it."""
+        if action == "quit":
+            return QUIT_GAME
+        if action in {"tile_scale_up", "tile_scale_down", "ui_layout_changed"}:
+            return self._change_display(action)
+        if action == "sleep":
+            return self._sleep()
+        if action == "look":
+            self._held_directions.clear()
+            if _look_mode(self.renderer, self.game_map) == "quit":
+                return QUIT_GAME
+            return REDRAW
+        if action in _CARDINAL_ACTION_DELTAS:
+            # Facing is free: pressing a direction turns the player, and the
+            # held keys decide where "confirm" walks or swings.
+            self._held_directions.add(action)
+            self._press_order_counter += 1
+            self._direction_pressed_order[action] = self._press_order_counter
+            return REDRAW
+        if action in _RELEASE_TO_DIRECTION:
+            self._held_directions.discard(_RELEASE_TO_DIRECTION[action])
+            return REDRAW
+        if action == "confirm_action":
+            # No direction held: wait in place, passing a turn (needs rise, NPCs
+            # act) instead of a no-op refresh.
+            return _spend_turn(self._faced_action() or WAIT_ACTION)
+        if action == "menu_select":
+            intent = self._interact_with_faced_tile()
+            if intent is not None:
+                return intent
+            # Nothing to interact with: fall through and let the systems handle it.
+        if action in {"open_menu", "open_inventory", "open_status"}:
+            return self._open_player_menu(action)
+        if action == "open_pause_menu":
+            return self._open_pause_menu()
+        return _spend_turn(action)
+
+    # --- 4. apply ---------------------------------------------------------
+
+    def redraw(self) -> None:
+        """Refresh the frame without advancing the world."""
+        esper.process(None)
+
+    def take_turn(self, action: str) -> None:
+        """Run the systems for one player action, then cooperatively settle a
+        newly entered region before the next command."""
+        esper.process(action)
+        current_region = _player_region_for_processors(first_player_position())
+        if current_region != self._player_region:
+            _catch_up_entered_region_cooperatively(self.renderer, current_region)
+        self._player_region = current_region
+
+    # --- command handlers -------------------------------------------------
+
+    def _faced_action(self) -> str | None:
+        """The direction the player is facing, from the keys they're holding."""
+        return _action_from_held_keys(self._held_directions, self._direction_pressed_order)
+
+    def _change_display(self, action: str) -> TurnIntent:
+        if action in {"tile_scale_up", "tile_scale_down"}:
+            self.options["tile_scale"] = _next_scale(
+                _coerce_scale(self.options.get("tile_scale", 1.0)),
+                direction=1 if action == "tile_scale_up" else -1,
+            )
+            save_options(self.options)
+            apply_fn = getattr(self.renderer, "apply_options", None)
+            if callable(apply_fn):
+                apply_fn(self.options)
+        else:  # ui_layout_changed: the renderer already moved the panels.
+            save_options(self.options)
+        return REDRAW
+
+    def _sleep(self) -> TurnIntent:
+        """Sleep in a bed if one's at hand (warning first if it's not yours);
+        otherwise pitch a camp."""
+        self._held_directions.clear()
+        nearby_bed = _bed_near_player()
+        if nearby_bed is None:
+            _sleep_player(self.renderer, in_camp=True)
+            return HANDLED
+        if not _confirm_if_owned_by_other(self.renderer, nearby_bed, "bed", "sleep here"):
+            return REDRAW
+        _sleep_player(self.renderer, in_camp=False)
+        return HANDLED
+
+    def _interact_with_faced_tile(self) -> TurnIntent | None:
+        """Interact with whatever the player is facing. ``None`` means there was
+        nothing there to interact with."""
+        faced = self._faced_action()
+
+        creature = _find_interaction_creature(faced)
+        if creature is not None:
+            self._held_directions.clear()
+            if esper.has_component(creature, Friendly):
+                # Friendlies: full dialogue (which shows their status).
+                choice = _draw_dialogue_menu(self.renderer, self.game_map, creature)
+            else:
+                # Wild/hostile creatures: read-only examine of status.
+                name = entity_name(creature, fallback="Creature")
+                choice = _draw_info_screen(
+                    self.renderer,
+                    title=f"EXAMINE - {name}",
+                    lines=_creature_status_lines(self.game_map, creature),
+                    subtitle="What you can tell at a glance",
+                )
+            return QUIT_GAME if choice == "quit" else REDRAW
+
+        corpse = _find_interaction_corpse(faced)
+        if corpse is not None:
+            loot_choice = _draw_loot_menu(self.renderer, corpse)
+            self._held_directions.clear()
+            return QUIT_GAME if loot_choice == "quit" else REDRAW
+
+        chest = _find_adjacent_feature(faced, Chest)
+        if chest is not None:
+            self._held_directions.clear()
+            if _confirm_if_owned_by_other(self.renderer, chest, "chest", "open it"):
+                if _draw_loot_menu(self.renderer, chest) == "quit":
+                    return QUIT_GAME
+            return REDRAW
+
+        # Environment features: chop a faced tree, drink from a faced well, or
+        # cook at a faced stove. Each queues a log line and refreshes the frame
+        # (a free action, like looting).
+        player_ent = first_player_entity()
+        if player_ent is None:
+            return None
+
+        # A faced blueprint ghost: haul wood into it, or raise it. Building is
+        # labour -- a successful haul/raise spends a turn (the world simulates a
+        # step); a no-op stays free.
+        ghost = _find_adjacent_feature(faced, Blueprint)
+        if ghost is not None:
+            message, took_turn = _work_blueprint(ghost, player_ent, self.game_map)
+            queue_message(message)
+            return _spend_turn(WAIT_ACTION) if took_turn else REDRAW
+
+        for component, interact in (
+            (Tree, _chop_tree),
+            (BerryBush, _harvest_bush),
+            (Well, _drink_from_well),
+            (Stove, _cook_at_stove),
+        ):
+            feature = _find_adjacent_feature(faced, component)
+            if feature is not None:
+                queue_message(interact(feature, player_ent))
+                return REDRAW
+
+        bed = _find_adjacent_feature(faced, Bed)
+        if bed is not None:
+            self._held_directions.clear()
+            if not _confirm_if_owned_by_other(self.renderer, bed, "bed", "sleep here"):
+                return REDRAW
+            _sleep_player(self.renderer, in_camp=False)
+            return HANDLED
+
+        return None
+
+    def _open_player_menu(self, action: str) -> TurnIntent:
+        # Tab reopens on the last tab; I/C jump straight to a tab.
+        if action == "open_inventory":
+            start_tab = "inventory"
+        elif action == "open_status":
+            start_tab = "status"
+        else:
+            start_tab = self._last_menu_tab
+        menu_choice, self._last_menu_tab = _draw_player_menu(self.renderer, self.game_map, start_tab)
+        self._held_directions.clear()
+        if menu_choice == "quit":
+            return QUIT_GAME
+        if menu_choice.startswith("place:"):
+            # The player chose a buildable in the inventory; ask for a direction
+            # and build it on that tile.
+            _place_from_inventory(self.renderer, self.game_map, menu_choice[len("place:"):])
+            return HANDLED
+        return REDRAW
+
+    def _open_pause_menu(self) -> TurnIntent:
+        pause_choice = _draw_pause_menu(self.renderer, self.options)
+        self._held_directions.clear()
+        if pause_choice == "save_game":
+            player_pos = first_player_position() or self._fallback_position
+            save_game(self.game_map, self.save_file, player_pos, seed=world_rng().seed)
+        elif pause_choice == "quit":
+            return QUIT_GAME
+        return REDRAW
+
+
+def _register_processors(game_map: GameMap, combat_sfx: CombatSfxPlayer) -> None:
+    """Install the simulation systems, in the order one turn runs them."""
+    esper.add_processor(
+        MovementProcessor(
+            game_map,
+            on_melee_attack=combat_sfx.play_melee_attack,
+            on_enemy_death=combat_sfx.play_death,
+        ),
+        priority=1,
+    )
+    # TimeProcessor runs first (priority above movement) so the clock is
+    # current before needs/AI read the time of day this turn.
+    esper.add_processor(TimeProcessor(), priority=2)
+    # Housing runs before the AI so a villager that just claimed a home
+    # can start heading there this turn.
+    esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
+    esper.add_processor(
+        NpcAiProcessor(game_map, max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT),
+        priority=0,
+    )
+    esper.add_processor(
+        FishAiProcessor(game_map, max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT),
+        priority=0,
+    )
+    esper.add_processor(NeedsProcessor(game_map), priority=0)
+    # Ticks registered status effects (fire, poison, ...). A no-op until an
+    # effect declares behaviour; the seam lives in content.effects.
+    esper.add_processor(EffectsProcessor(), priority=0)
+    esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
+    esper.add_processor(ReproductionProcessor(), priority=0)
+
+
+@contextmanager
+def game_session(args: argparse.Namespace) -> Iterator[GameSession | None]:
+    """Bring up a playable game and hand it to the turn loop, tearing the
+    renderer and audio back down on the way out.
+
+    Yields ``None`` when there's nothing to play: the player backed out of the
+    title screen, or ``--screenshot`` captured its one frame and is done.
+    """
     bootstrap_files(MAP_WIDTH, MAP_HEIGHT)
     options = load_options()
     if args.screenshot is not None:
@@ -282,6 +612,7 @@ def play_game(args: argparse.Namespace) -> None:
                 player_position,
             )
             if not startup_ok:
+                yield None
                 return
 
             if args.screenshot is None:
@@ -291,40 +622,7 @@ def play_game(args: argparse.Namespace) -> None:
             rat_count = _setup_world(game_map, player_position, rat_flood=args.rat_flood)
             if args.rat_flood:
                 print(f"Rat flood mode enabled: spawned {rat_count} cave rats.", file=sys.stderr)
-            esper.add_processor(
-                MovementProcessor(
-                    game_map,
-                    on_melee_attack=combat_sfx.play_melee_attack,
-                    on_enemy_death=combat_sfx.play_death,
-                ),
-                priority=1,
-            )
-            # TimeProcessor runs first (priority above movement) so the clock is
-            # current before needs/AI read the time of day this turn.
-            esper.add_processor(TimeProcessor(), priority=2)
-            # Housing runs before the AI so a villager that just claimed a home
-            # can start heading there this turn.
-            esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
-            esper.add_processor(
-                NpcAiProcessor(
-                    game_map,
-                    max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT,
-                ),
-                priority=0,
-            )
-            esper.add_processor(
-                FishAiProcessor(
-                    game_map,
-                    max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT,
-                ),
-                priority=0,
-            )
-            esper.add_processor(NeedsProcessor(game_map), priority=0)
-            # Ticks registered status effects (fire, poison, ...). A no-op until an
-            # effect declares behaviour; the seam lives in content.effects.
-            esper.add_processor(EffectsProcessor(), priority=0)
-            esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
-            esper.add_processor(ReproductionProcessor(), priority=0)
+            _register_processors(game_map, combat_sfx)
 
             # Pre-simulate the world behind a "Generating world..." screen so the
             # startup building boom happens during loading, not as lag on the first
@@ -334,242 +632,23 @@ def play_game(args: argparse.Namespace) -> None:
             # test (no villagers to settle).
             if args.screenshot is None and not args.rat_flood:
                 if not run_world_generation(renderer, WORLD_SETTLE_TURNS):
+                    yield None
                     return
 
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
             esper.process()  # initial frame
-            current_player_region = _player_region_for_processors(first_player_position())
             if args.screenshot is not None:
                 _capture_frame_screenshot(renderer, args.screenshot)
+                yield None
                 return
 
-            held_directions: set[str] = set()
-            direction_pressed_order = {
-                "move_up": -1,
-                "move_down": -1,
-                "move_left": -1,
-                "move_right": -1,
-            }
-            press_order_counter = 0
-            # The player menu (Tab) reopens on whatever tab you left it on.
-            last_menu_tab = "inventory"
-            invalidate_backdrop = getattr(renderer, "invalidate_backdrop", None)
-            idle_ticks = 0
-            while True:
-                # Live play has (re)rendered the game, so any menu backdrop
-                # snapshot is stale; the next menu to open will re-capture.
-                if callable(invalidate_backdrop):
-                    invalidate_backdrop()
-                # When the player has an active status animation (swimming, on
-                # fire, ...), poll on a short timeout and re-render on each idle
-                # tick so the identifiers cycle without input.
-                if player_is_animated(game_map) or bubbles_active():
-                    action = _await_action_or_idle(renderer, _STATUS_ANIM_POLL_SECONDS)
-                    if action is None:
-                        _pump_background_regions(_IDLE_PUMP_BASE_BUDGET)
-                        esper.process(None)
-                        continue
-                else:
-                    # Otherwise poll on a short timeout too, rather than desktop's
-                    # old fully-blocking wait: true idle time (the player thinking,
-                    # or away from the keyboard) is exactly when there's the most
-                    # spare time to pay down region simulation debt in the
-                    # background, ramping up the longer nothing happens.
-                    action = _await_action_or_idle(renderer, _IDLE_POLL_SECONDS)
-                    if action is None:
-                        idle_ticks += 1
-                        _pump_background_regions(_idle_pump_budget(idle_ticks))
-                        continue
-                idle_ticks = 0
-                if action == "quit":
-                    break
-                if action == "tile_scale_up":
-                    options["tile_scale"] = _next_scale(_coerce_scale(options.get("tile_scale", 1.0)), direction=1)
-                    save_options(options)
-                    apply_fn = getattr(renderer, "apply_options", None)
-                    if callable(apply_fn):
-                        apply_fn(options)
-                    esper.process(None)
-                    continue
-                if action == "tile_scale_down":
-                    options["tile_scale"] = _next_scale(_coerce_scale(options.get("tile_scale", 1.0)), direction=-1)
-                    save_options(options)
-                    apply_fn = getattr(renderer, "apply_options", None)
-                    if callable(apply_fn):
-                        apply_fn(options)
-                    esper.process(None)
-                    continue
-                if action == "ui_layout_changed":
-                    save_options(options)
-                    esper.process(None)
-                    continue
-                if action == "sleep":
-                    held_directions.clear()
-                    # Sleep in a bed if one's at hand (warning first if it's not
-                    # yours); otherwise pitch a camp.
-                    nearby_bed = _bed_near_player()
-                    if nearby_bed is not None:
-                        if _confirm_if_owned_by_other(renderer, nearby_bed, "bed", "sleep here"):
-                            _sleep_player(renderer, in_camp=False)
-                        else:
-                            esper.process(None)
-                    else:
-                        _sleep_player(renderer, in_camp=True)
-                    continue
-                if action == "look":
-                    held_directions.clear()
-                    look_choice = _look_mode(renderer, game_map)
-                    if look_choice == "quit":
-                        break
-                    esper.process(None)
-                    continue
-                if action in _CARDINAL_ACTION_DELTAS:
-                    held_directions.add(action)
-                    press_order_counter += 1
-                    direction_pressed_order[action] = press_order_counter
-                    esper.process(None)
-                    continue
-                if action in _RELEASE_TO_DIRECTION:
-                    held_directions.discard(_RELEASE_TO_DIRECTION[action])
-                    esper.process(None)
-                    continue
-                if action == "confirm_action":
-                    live_action = _action_from_held_keys(held_directions, direction_pressed_order)
-                    if live_action is not None:
-                        current_player_region = _process_player_turn(
-                            live_action, renderer, current_player_region
-                        )
-                    else:
-                        # No direction held: wait in place, passing a turn (needs
-                        # rise, NPCs act) instead of a no-op refresh.
-                        current_player_region = _process_player_turn(
-                            WAIT_ACTION, renderer, current_player_region
-                        )
-                    continue
-                if action == "menu_select":
-                    interact_action = _action_from_held_keys(held_directions, direction_pressed_order)
-                    interact_creature = _find_interaction_creature(interact_action)
-                    if interact_creature is not None:
-                        held_directions.clear()
-                        if esper.has_component(interact_creature, Friendly):
-                            # Friendlies: full dialogue (which shows their status).
-                            choice = _draw_dialogue_menu(renderer, game_map, interact_creature)
-                        else:
-                            # Wild/hostile creatures: read-only examine of status.
-                            name = entity_name(interact_creature, fallback="Creature")
-                            choice = _draw_info_screen(
-                                renderer,
-                                title=f"EXAMINE - {name}",
-                                lines=_creature_status_lines(game_map, interact_creature),
-                                subtitle="What you can tell at a glance",
-                            )
-                        if choice == "quit":
-                            break
-                        esper.process(None)
-                        continue
-
-                    interact_corpse = _find_interaction_corpse(interact_action)
-                    if interact_corpse is not None:
-                        loot_choice = _draw_loot_menu(renderer, interact_corpse)
-                        held_directions.clear()
-                        if loot_choice == "quit":
-                            break
-                        esper.process(None)
-                        continue
-
-                    interact_chest = _find_adjacent_feature(interact_action, Chest)
-                    if interact_chest is not None:
-                        held_directions.clear()
-                        if _confirm_if_owned_by_other(renderer, interact_chest, "chest", "open it"):
-                            loot_choice = _draw_loot_menu(renderer, interact_chest)
-                            if loot_choice == "quit":
-                                break
-                        esper.process(None)
-                        continue
-
-                    # Environment features: chop a faced tree, drink from a faced
-                    # well, or cook at a faced stove. Each queues a log line and
-                    # refreshes the frame (a free action, like looting).
-                    player_ent = first_player_entity()
-                    if player_ent is not None:
-                        # A faced blueprint ghost: haul wood into it, or raise it.
-                        # Building is labour -- a successful haul/raise spends a
-                        # turn (the world simulates a step); a no-op stays free.
-                        interact_ghost = _find_adjacent_feature(interact_action, Blueprint)
-                        if interact_ghost is not None:
-                            message, took_turn = _work_blueprint(interact_ghost, player_ent, game_map)
-                            queue_message(message)
-                            if took_turn:
-                                current_player_region = _process_player_turn(
-                                    WAIT_ACTION, renderer, current_player_region
-                                )
-                            else:
-                                esper.process(None)
-                            continue
-
-                        interact_tree = _find_adjacent_feature(interact_action, Tree)
-                        if interact_tree is not None:
-                            queue_message(_chop_tree(interact_tree, player_ent))
-                            esper.process(None)
-                            continue
-
-                        interact_bush = _find_adjacent_feature(interact_action, BerryBush)
-                        if interact_bush is not None:
-                            queue_message(_harvest_bush(interact_bush, player_ent))
-                            esper.process(None)
-                            continue
-
-                        interact_well = _find_adjacent_feature(interact_action, Well)
-                        if interact_well is not None:
-                            queue_message(_drink_from_well(interact_well, player_ent))
-                            esper.process(None)
-                            continue
-
-                        interact_stove = _find_adjacent_feature(interact_action, Stove)
-                        if interact_stove is not None:
-                            queue_message(_cook_at_stove(interact_stove, player_ent))
-                            esper.process(None)
-                            continue
-
-                        interact_bed = _find_adjacent_feature(interact_action, Bed)
-                        if interact_bed is not None:
-                            held_directions.clear()
-                            if _confirm_if_owned_by_other(renderer, interact_bed, "bed", "sleep here"):
-                                _sleep_player(renderer, in_camp=False)
-                            else:
-                                esper.process(None)
-                            continue
-
-                if action in {"open_menu", "open_inventory", "open_status"}:
-                    # Tab reopens on the last tab; I/C jump straight to a tab.
-                    if action == "open_inventory":
-                        start_tab = "inventory"
-                    elif action == "open_status":
-                        start_tab = "status"
-                    else:
-                        start_tab = last_menu_tab
-                    menu_choice, last_menu_tab = _draw_player_menu(renderer, game_map, start_tab)
-                    held_directions.clear()
-                    if menu_choice == "quit":
-                        break
-                    if menu_choice.startswith("place:"):
-                        # The player chose a buildable in the inventory; ask for a
-                        # direction and build it on that tile.
-                        _place_from_inventory(renderer, game_map, menu_choice[len("place:"):])
-                        continue
-                    esper.process(None)
-                    continue
-                if action == "open_pause_menu":
-                    pause_choice = _draw_pause_menu(renderer, options)
-                    held_directions.clear()
-                    if pause_choice == "save_game":
-                        player_pos = first_player_position() or player_position
-                        save_game(game_map, selected_save_file, player_pos, seed=world_rng().seed)
-                    elif pause_choice == "quit":
-                        break
-                    esper.process(None)
-                    continue
-                current_player_region = _process_player_turn(action, renderer, current_player_region)
+            yield GameSession(
+                renderer,
+                game_map,
+                options,
+                selected_save_file,
+                fallback_position=player_position,
+            )
     finally:
         stop_background_music(pygame_module)
