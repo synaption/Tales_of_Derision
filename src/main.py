@@ -1,13 +1,23 @@
 """Start Tales of Derision, and run its turn loop."""
 
-from datetime import datetime
 import time
 from game import game_session, read_command_line
 
-# Wall-clock floor for one *turn*, so the world can't run away from the player
-# when they hold a key down. Only turns are paced: facing, key releases and menu
-# work are free, and throttling those would make input feel like it's lagging
-# several presses behind.
+# Wall-clock floor for one turn the *player* spent, so the world can't run away
+# from them when they hold a key down.
+#
+# This paces player actions and nothing else. Facing, key releases and menu work
+# are free -- throttling those would make input feel several presses behind --
+# and so is every turn the world takes on its own: the regions the background
+# pump advances while the player thinks, the backlog an entered region replays,
+# and the night a sleep passes. Those are not the player's turns to wait for, and
+# a sleep is one action however many turns of world time it covers.
+#
+# World work done *during* a player's action still counts toward this budget
+# rather than being added on top of it, because the floor is measured from the
+# end of the previous turn: a turn that took 40 ms to simulate waits 60 ms, not
+# 100. So a slow turn is never slower than a fast one, which is the whole point
+# -- movement should look even.
 SECONDS_PER_TURN = 0.1
 
 
@@ -24,7 +34,7 @@ def main() -> None:
         if game is None:
             return  # startup was cancelled, or --screenshot captured its frame
 
-        last_turn = datetime.now()
+        last_turn = time.monotonic()
         while True:
 
             # 1. Wait for a command. None means the player didn't act, and idle
@@ -45,15 +55,16 @@ def main() -> None:
             #    the beat instead of as soon as its simulation finished.
             if intent.world_action is not None:
                 game.take_turn(intent.world_action, draw=False)
-                # 4. Hold the turn to its minimum length. Measured from the end
-                #    of the previous turn, so the world's own work counts toward
-                #    the budget instead of being added on top of it.
-                now = datetime.now()
-                short_by = SECONDS_PER_TURN - (now - last_turn).total_seconds()
+                # 4. Hold the turn to its minimum length -- once, for the one
+                #    action the player just spent, however many turns of world
+                #    time it covered. Measured from the end of the previous turn,
+                #    so the world's own work counts toward the budget instead of
+                #    being added on top of it.
+                now = time.monotonic()
+                short_by = SECONDS_PER_TURN - (now - last_turn)
                 if short_by > 0:
                     time.sleep(short_by)
-                    now = datetime.now()
-                print(f"Time since last turn: {now - last_turn}")
+                    now = time.monotonic()
                 last_turn = now
                 game.redraw()  # this turn's frame, on the beat
             elif intent.redraw:

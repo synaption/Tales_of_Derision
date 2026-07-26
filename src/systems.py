@@ -3126,6 +3126,16 @@ class NeedsProcessor(esper.Processor):
         for ent, (needs,) in spatial.ensure(self.game_map).components(active_region, Needs):
             yield ent, needs
 
+    def resync_to(self, turn: int) -> None:
+        """Treat world time up to ``turn`` as already charged.
+
+        For a caller that settled a span of the player's needs in closed form and
+        jumped the clock over it (sleep does exactly that). Without this the next
+        turn would look back at a clock that leapt a whole night and charge the
+        player for it a second time.
+        """
+        self._last_turn = turn
+
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
             return

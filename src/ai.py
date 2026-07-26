@@ -22,7 +22,7 @@ from components import (
     Enemy, Fish, Friendly, Home, Inventory, NPC, Needs, Personality, Player, Position,
     Relationships, Resident, Seaweed, Settled, Stove, Tree, Vision, WorldClock,
 )
-from game_map import GameMap
+from game_map import DistanceField, GameMap
 from content.drives import DriveDef, all_drives
 from regions import (
     _UNBOUNDED, RegionId, RegionScheduler, all_region_ids, in_region_with_margin,
@@ -47,6 +47,26 @@ from systems import (
 # enough to round any local cluster of blockers, small enough that the search is
 # cheap; long-range travel rides the cached flow field, not this fallback.
 _LOCAL_PATH_RADIUS = 12
+
+# How far a flow field is flooded around its goal, as a few shared sizes. A field
+# only has to reach the creature using it, and nine out of ten of them are within
+# a dozen tiles of what they're walking to -- but rounding up to buckets keeps a
+# crowd converging on one goal sharing a single flood instead of each triggering
+# its own. Beyond the largest, the field covers the whole island as it always did.
+_FIELD_RADIUS_BUCKETS = (12, 24, 48)
+# Slack past the creature so the field has room to route around what's between it
+# and the goal, rather than dead-ending at the window edge.
+_FIELD_RADIUS_MARGIN = 4
+
+
+def _field_radius_for(reach: int) -> int | None:
+    """The flood radius that comfortably covers a creature ``reach`` tiles from
+    its goal, or ``None`` for "flood the island" when it is a long way off."""
+    needed = reach + _FIELD_RADIUS_MARGIN
+    for bucket in _FIELD_RADIUS_BUCKETS:
+        if needed <= bucket:
+            return bucket
+    return None
 
 # Full-simulation box (width x height) centred on the player. An NPC inside it
 # gets full, occupant-aware, flow-field pathfinding every turn; one outside walks
@@ -195,7 +215,8 @@ class NpcAiProcessor(esper.Processor):
         # rooted at a (largely static) goal stays valid for any traveller
         # approaching it from anywhere, so many NPCs reuse the one flood.
         self._field_cache: dict[
-            tuple[int, int], tuple[tuple[int | None, int], dict[tuple[int, int], int]]
+            tuple[tuple[int, int], int | None],
+            tuple[tuple[int | None, int], DistanceField],
         ] = {}
         # Goal maps (see ``_goal_map``): (kind, region) -> (key, source tiles,
         # multi-source distance field). One flood answers "where is the nearest
@@ -246,8 +267,11 @@ class NpcAiProcessor(esper.Processor):
                 best = cand
         return best
 
-    def _distance_field_for(self, goal: tuple[int, int]) -> dict[tuple[int, int], int]:
-        """A cached flow field to ``goal`` (see ``GameMap.distance_field``).
+    def _distance_field_for(
+        self, goal: tuple[int, int], reach: int = 0
+    ) -> DistanceField:
+        """A cached flow field to ``goal`` (see ``GameMap.distance_field``),
+        flooded only as far out as somebody actually needs it.
 
         ``distance_field`` is a pure function of the goal and the walkable
         connected component that contains it. The archipelago's components never
@@ -255,15 +279,26 @@ class NpcAiProcessor(esper.Processor):
         affect this field. Cache by ``GameMap.connectivity_revision`` instead of
         the global map revision to avoid rebuilding every flow field whenever an
         unrelated off-screen villager raises a wall.
+
+        ``reach`` is how far the caller is from ``goal``. Flooding a whole 7200
+        tile island to route a creature standing three steps away was most of
+        what the flow fields cost -- and a chase pays it again every time the
+        quarry moves, because a new goal is a new field. The radius is rounded up
+        to one of a few sizes (``_FIELD_RADIUS_BUCKETS``) so that everyone
+        converging on the same goal still shares one flood rather than each
+        getting a bespoke one; past the largest bucket the field is unbounded,
+        which is the old behaviour for a genuinely long haul.
         """
+        radius = _field_radius_for(reach)
+        key = (goal, radius)
         connectivity_rev = self.game_map.connectivity_revision(goal[0], goal[1])
-        cached = self._field_cache.get(goal)
+        cached = self._field_cache.get(key)
         if cached is not None:
             cached_rev, field = cached
             if cached_rev == connectivity_rev:
                 return field
-        field = self.game_map.distance_field(goal)
-        self._field_cache[goal] = (connectivity_rev, field)
+        field = self.game_map.distance_field(goal, max_radius=radius)
+        self._field_cache[key] = (connectivity_rev, field)
         return field
 
     # --- Goal maps ----------------------------------------------------------
@@ -282,6 +317,17 @@ class NpcAiProcessor(esper.Processor):
     # *walking*, not by straight line, and a source across a river or behind a
     # wall simply isn't in the field -- which is the same thing ``_reachable``
     # was doing with an O(sources) same-region scan per creature per turn.
+
+    def _island_walk_revision(self, island: int | None) -> int:
+        """How many edits have changed what is walkable on ``island`` (a
+        ``GameMap.region_of`` label). Goal maps key on this: it is the only thing
+        about the terrain a distance field depends on, so an edit anywhere else
+        in the world -- or one that leaves every step unchanged -- leaves their
+        floods alone."""
+        if island is None:
+            return self.game_map.revision
+        index = island // GameMap._REGION_ID_STRIDE
+        return self.game_map._island_walk_rev.get(index, 0)
 
     def _goal_map(
         self,
@@ -304,10 +350,12 @@ class NpcAiProcessor(esper.Processor):
 
         Keyed on the index's **per-kind** neighbourhood version (``index_kind``;
         terrain sources like the shore have none and key on the map alone) plus
-        the map revision. So the flood is rebuilt exactly when a source of this
-        kind appears or disappears nearby, or a tile edit changes what can reach
-        what -- and never merely because some deer crossed a seam, which is what
-        the region-wide version would have meant.
+        the island's *walkability* revision. So the flood is rebuilt exactly when
+        a source of this kind appears or disappears nearby, or a tile edit on this
+        island changes what can reach what -- and never merely because some deer
+        crossed a seam (which is what the region-wide version would have meant),
+        nor because a villager 90 islands away raised a wall, nor because a tile
+        changed in a way no walker can tell apart (a floor becoming a door).
 
         A source being *depleted* rather than removed (a tree losing a log) moves
         neither key, so the map holds still while creatures work through it.
@@ -319,7 +367,7 @@ class NpcAiProcessor(esper.Processor):
             self._index().kind_neighborhood_version(region_id, index_kind)
             if index_kind is not None
             else (),
-            self.game_map.revision,
+            self._island_walk_revision(island),
         )
         cached = self._goal_map_cache.get((kind, region_id, island))
         if cached is not None and cached[0] == key:
@@ -487,7 +535,9 @@ class NpcAiProcessor(esper.Processor):
         third-closest is usually just as good and is right here in the same
         cached field.
         """
-        field = self._distance_field_for(goal)
+        field = self._distance_field_for(
+            goal, max(abs(xy[0] - goal[0]), abs(xy[1] - goal[1]))
+        )
         here = field.get(xy)
         if here is None:
             return None

@@ -13,10 +13,10 @@ better pathfinding, better fov (not tcod)
 
 Everything takes a certain amount of time.  
 
-Lets give this a try.  There are a few things I think it's important to preserve.  There needs to be seed based determinism for time traveling purposes.  Only the players actions should change the course of events.  I want to be able to go back in time and change outcomes.  
+Use seeds to make things at least close to deterministic for time traveling purposes.  Players actions should change the course of events.  I want to be able to go back in time and change outcomes.  
 
 
-ctrl-z like undo for time travel.  
+ctrl-z like undo for time travel?  
 - Treat each player action plus all resulting simulation as one undoable turn.
 - Keep all gameplay data in one authoritative GameState; exclude particles, sound, and UI animation.
 - Start by saving a full snapshot before each turn in a limited history buffer.
@@ -42,3 +42,7 @@ A* needs to handle different types of ground have different walk speed bonuses?
 
 
 I've given up on pure determinism.  What I want to keep deterministic is the family trees.  Pairs of parents might not always get together in different timelines, but if they do the children they have and the order they have them in will be the same.  
+
+Here is how I want the simulation to work.  I want to come up with procedurally generated cities, that can be regenerated while in intermediate states, as needs change.  Then I want to calculate the cost in time/energy of the variouse steps of realizing the cities.  As needs change, and capabilities advance, I want to recalculate the procedural generation.  
+
+Switch to the paradigm of generating personal records, resource and population simulations

@@ -53,6 +53,134 @@ def world_land_rect(width: int, height: int) -> tuple[int, int, int, int] | None
     return None
 
 
+# Tile characters that block movement, as a 256-byte translation table: a row of
+# tiles encoded to bytes and passed through this becomes a row of 1s (blocked)
+# and 0s (walkable) in one C-level call, instead of a Python loop testing each
+# tile against three constants. Used to build the flood masks below.
+_BLOCKED_TILE_CHARS = "#~o"  # GameMap.WALL, GameMap.WATER, GameMap.WINDOW
+_BLOCKED_TRANSLATION = bytes(
+    1 if chr(i) in _BLOCKED_TILE_CHARS else 0 for i in range(256)
+)
+
+# A flood lays a flat list over its rect, so a rect far bigger than the area it
+# actually reaches would cost more to allocate than to walk. Island rects are
+# 120x60; anything larger than this falls back to the output-sensitive dict BFS.
+_MAX_FLAT_FLOOD_CELLS = 1 << 16
+
+# One island's connected-region labels: (labels, x0, y0, w, h, stride), laid out
+# exactly like that island's blocked mask so the two can be walked together.
+_IslandLabels = tuple[list[int], int, int, int, int, int]
+
+
+class DistanceField:
+    """The result of a flood: walking distance from a set of sources to every
+    tile that can reach them.
+
+    Backed by a **flat list indexed by tile**, not a dict keyed by ``(x, y)``.
+    Every flood in this module covers one island's land rect, so a tile's slot
+    is plain arithmetic on its coordinates -- which skips the tuple allocation
+    and hash that dominated the old dict-of-tuples BFS (measured 4.11 -> 1.42 ms
+    per island flood, identical output). ``at(x, y)`` is the cheap accessor;
+    ``get``/``in``/``[]`` keep the mapping interface the old return value had, so
+    callers and tests that treat a field as a read-only dict still work.
+
+    The backing list is padded by one blocked cell on every side (see
+    ``GameMap._blocked_mask``), which is what lets the flood skip bounds tests.
+    A tile outside the rect is simply not in the field -- the same way an
+    unreachable tile isn't, and for the same reason: the flood cannot leave the
+    island it started on.
+    """
+
+    __slots__ = ("_dist", "_x0", "_y0", "_w", "_h", "_stride", "_map")
+
+    def __init__(
+        self,
+        dist: list[int],
+        x0: int,
+        y0: int,
+        w: int,
+        h: int,
+        stride: int,
+    ) -> None:
+        self._dist = dist
+        self._x0 = x0
+        self._y0 = y0
+        self._w = w
+        self._h = h
+        self._stride = stride
+        self._map: dict[tuple[int, int], int] | None = None
+
+    @classmethod
+    def from_mapping(cls, mapping: dict[tuple[int, int], int]) -> "DistanceField":
+        """Wrap an already-computed ``(x, y) -> distance`` dict. Used by the
+        whole-map fallback flood, which has no small rect to lay a flat list
+        over (see ``GameMap.distance_field_from``)."""
+        field = cls([], 0, 0, 0, 0, 0)
+        field._map = mapping
+        return field
+
+    def at(self, x: int, y: int) -> int | None:
+        """Distance at ``(x, y)``, or ``None`` if it can't reach any source."""
+        if self._map is not None:
+            return self._map.get((x, y))
+        col = x - self._x0
+        row = y - self._y0
+        if col < 0 or row < 0 or col >= self._w or row >= self._h:
+            return None
+        d = self._dist[(row + 1) * self._stride + col + 1]
+        return None if d < 0 else d
+
+    # --- read-only mapping interface (what the old dict return value gave) ---
+
+    def get(self, xy: tuple[int, int], default: int | None = None) -> int | None:
+        d = self.at(xy[0], xy[1])
+        return default if d is None else d
+
+    def __getitem__(self, xy: tuple[int, int]) -> int:
+        d = self.at(xy[0], xy[1])
+        if d is None:
+            raise KeyError(xy)
+        return d
+
+    def __contains__(self, xy: tuple[int, int]) -> bool:
+        return self.at(xy[0], xy[1]) is not None
+
+    def as_dict(self) -> dict[tuple[int, int], int]:
+        if self._map is not None:
+            return dict(self._map)
+        stride, x0, y0, dist = self._stride, self._x0, self._y0, self._dist
+        return {
+            (x0 + col, y0 + row): d
+            for row in range(self._h)
+            for col in range(self._w)
+            if (d := dist[(row + 1) * stride + col + 1]) >= 0
+        }
+
+    def keys(self):
+        return self.as_dict().keys()
+
+    def items(self):
+        return self.as_dict().items()
+
+    def __iter__(self):
+        return iter(self.as_dict())
+
+    def __len__(self) -> int:
+        if self._map is not None:
+            return len(self._map)
+        return sum(1 for d in self._dist if d >= 0)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, DistanceField):
+            return self.as_dict() == other.as_dict()
+        if isinstance(other, dict):
+            return self.as_dict() == other
+        return NotImplemented
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"DistanceField({len(self)} tiles)"
+
+
 class GameMap:
     WALL = "#"
     FLOOR = "."
@@ -91,14 +219,29 @@ class GameMap:
         # on one island doesn't force a re-flood of all 100 (the whole-map recompute
         # was the dominant per-turn cost at archipelago scale). ``region_of`` returns
         # ``island_index * _REGION_ID_STRIDE + local_id`` so ids stay globally unique.
-        self._island_region_cache: dict[int, dict[tuple[int, int], int]] = {}
+        self._island_region_cache: dict[int, _IslandLabels] = {}
         self._island_region_rev: dict[int, int] = {}
         self._island_edit_rev: dict[int, int] = {}
+        # Edits that changed a tile's *walkability* (not e.g. a floor becoming a
+        # door), per island. Connectivity, flow fields and the flood masks all
+        # depend on exactly this and not on any other edit.
+        self._island_walk_rev: dict[int, int] = {}
+        # Next unused local label per island, so a newly opened tile that touches
+        # nothing can start its own region without a relabel.
+        self._island_next_label: dict[int, int] = {}
+        # Per-island walkability masks for the flat floods (see ``_blocked_mask``),
+        # rebuilt on the same ``_island_edit_rev`` key the labels use.
+        self._flood_mask_cache: dict[
+            int, tuple[int, tuple[bytearray, int, int, int, int, int]]
+        ] = {}
         # Enclosed-room (house) detection is likewise cached per island and rebuilt
         # only for an edited island (see ``enclosed_rooms``), instead of re-flooding
         # every island's floor whenever one tile changes anywhere.
         self._island_rooms_cache: dict[int, list[frozenset[tuple[int, int]]]] = {}
-        self._island_rooms_rev: dict[int, int] = {}
+        # Tiles edited since that island's rooms were last brought up to date.
+        # The next ``enclosed_rooms`` re-floods around exactly these instead of
+        # re-scanning the island for floor to seed.
+        self._island_rooms_dirty: dict[int, set[tuple[int, int]]] = {}
         # Memoised concatenation of every island's rooms; the same object is handed
         # back until some island's rooms are rebuilt (callers rely on that identity).
         self._all_rooms_cache: list[frozenset[tuple[int, int]]] | None = None
@@ -365,17 +508,28 @@ class GameMap:
             return False
         if x == 0 or y == 0 or x == self.width - 1 or y == self.height - 1:
             return False  # keep the world border intact
-        if self.tiles[y][x] == tile:
+        previous = self.tiles[y][x]
+        if previous == tile:
             return False
         self.tiles[y][x] = tile
         self.revision += 1
         self._dirty_tiles.add((x, y))
         region = self._edit_region_of(x, y)
         self._region_edit_revision[region] = self._region_edit_revision.get(region, 0) + 1
-        # Invalidate only the edited island's connected-region cache (see region_of).
+        # Invalidate only the edited island's caches (see region_of), and only the
+        # ones this particular edit can actually have changed.
         island = self._island_index_of(x, y)
-        if island is not None:
+        if island is not None and island < len(self.islands):
             self._island_edit_rev[island] = self._island_edit_rev.get(island, 0) + 1
+            # Any edit can change a house (a floor becoming a door reshapes no
+            # region but very much reshapes a room), so rooms track every tile.
+            self._island_rooms_dirty.setdefault(island, set()).add((x, y))
+            blocking = (self.WALL, self.WATER, self.WINDOW)
+            was_walkable = previous not in blocking
+            is_walkable = tile not in blocking
+            if was_walkable != is_walkable:
+                self._island_walk_rev[island] = self._island_walk_rev.get(island, 0) + 1
+                self._apply_walkability_edit(island, x, y, is_walkable)
         return True
 
     def _edit_region_of(self, x: int, y: int) -> tuple[int, int]:
@@ -394,7 +548,9 @@ class GameMap:
         it."""
         return self._region_edit_revision.get(self._edit_region_of(x, y), 0)
 
-    def distance_field(self, goal: tuple[int, int]) -> dict[tuple[int, int], int]:
+    def distance_field(
+        self, goal: tuple[int, int], max_radius: int | None = None
+    ) -> DistanceField:
         """BFS distance (8-directional steps) from ``goal`` to every walkable
         tile that can reach it -- i.e. "how far is this tile from goal" for a
         whole region, computed once. Ignores dynamic occupants, same as
@@ -402,28 +558,101 @@ class GameMap:
         occupants before committing). A caller can reuse this "flow field" for
         many turns and many travellers: from any current position, stepping to
         the neighbour with the smallest value here always makes progress
-        toward ``goal``, without a fresh pathfind."""
-        return self.distance_field_from((goal,))
+        toward ``goal``, without a fresh pathfind.
 
-    def distance_field_from(
-        self, sources: Iterable[tuple[int, int]]
-    ) -> dict[tuple[int, int], int]:
-        """BFS distance to the **nearest of many** sources at once -- a *goal
-        map*. Every source starts at distance 0 in one shared queue, so the value
-        at any tile is its walking distance to whichever source is closest, and
-        stepping downhill from anywhere walks to that one.
+        ``max_radius`` bounds the flood to a window around ``goal`` for a caller
+        that is already close to it -- see ``distance_field_from``."""
+        return self.distance_field_from((goal,), max_radius=max_radius)
 
-        This is the same flood as ``distance_field`` and costs the same (each
-        walkable tile is visited once, so seeding a thousand trees is no dearer
-        than seeding one), but it answers "go to the nearest tree" for *every*
-        creature on the island from a single field -- instead of one full flood
-        per creature per chosen target tile, which is what a per-goal field costs
-        when everyone picks a different tree.
+    # --- flood machinery -----------------------------------------------------
+    #
+    # Every flood in the game (flow fields, connected-region labels) covers the
+    # walkable tiles of ONE island: islands are ringed by open water, so a flood
+    # seeded on one can never step onto another. That shared shape is what these
+    # helpers exploit -- a per-island walkability mask, built once per edit and
+    # reused by every flood on that island, laid out flat so the flood itself is
+    # index arithmetic instead of tuple hashing.
 
-        It is also more truthful than picking a target by straight-line distance
-        and pathing to it: the winner here is nearest by *walking*, and a source
-        on the far side of a wall or a river simply never appears in the field.
+    def _blocked_mask(self, island: int) -> tuple[bytearray, int, int, int, int, int]:
+        """``(mask, x0, y0, w, h, stride)`` for one island's land rect.
+
+        ``mask[(row + 1) * stride + col + 1]`` is 1 where the tile blocks
+        movement. The rect is padded with a ring of blocked cells so a flood
+        needs no bounds test at all: a cell that is enqueued is never on the
+        border, so all eight of its neighbours are real slots in the list.
+
+        Cached per island against ``_island_edit_rev``, so the mask is rebuilt
+        only when a tile on *that* island changes -- the same invalidation the
+        region labels use.
         """
+        rev = self._island_edit_rev.get(island, 0)
+        cached = self._flood_mask_cache.get(island)
+        if cached is not None and cached[0] == rev:
+            return cached[1]
+
+        lx, ly, lw, lh = self.islands[island]
+        x0, y0 = max(0, lx), max(0, ly)
+        x1, y1 = min(self.width, lx + lw), min(self.height, ly + lh)
+        w, h = max(0, x1 - x0), max(0, y1 - y0)
+        stride = w + 2
+        mask = bytearray(b"\x01") * (stride * (h + 2))  # all blocked, incl. the ring
+        tiles = self.tiles
+        for row in range(h):
+            line = "".join(tiles[y0 + row][x0:x1]).encode("latin-1")
+            base = (row + 1) * stride + 1
+            mask[base:base + w] = line.translate(_BLOCKED_TRANSLATION)
+        built = (mask, x0, y0, w, h, stride)
+        self._flood_mask_cache[island] = (rev, built)
+        return built
+
+    def _window_mask(
+        self, island: int, wx0: int, wy0: int, wx1: int, wy1: int
+    ) -> tuple[bytearray, int, int, int, int, int]:
+        """The island's blocked mask, cropped to a sub-rect and re-padded.
+
+        A flood laid over this covers only the window: the fresh ring of blocked
+        cells around it stops the fill at the edge, at no per-step cost. Cropping
+        is a row-slice per line of the window (a C-level ``bytearray`` copy), so
+        a small window costs far less to prepare than the island-wide flood it
+        replaces -- which is the whole point of bounding a flood at all.
+        """
+        mask, x0, y0, w, h, stride = self._blocked_mask(island)
+        wx0, wy0 = max(x0, wx0), max(y0, wy0)
+        wx1, wy1 = min(x0 + w, wx1), min(y0 + h, wy1)
+        ww, wh = max(0, wx1 - wx0), max(0, wy1 - wy0)
+        wstride = ww + 2
+        window = bytearray(b"\x01") * (wstride * (wh + 2))
+        for row in range(wh):
+            src = (wy0 - y0 + row + 1) * stride + (wx0 - x0 + 1)
+            dst = (row + 1) * wstride + 1
+            window[dst:dst + ww] = mask[src:src + ww]
+        return window, wx0, wy0, ww, wh, wstride
+
+    def _flood_island(self, sources: list[tuple[int, int]]) -> int | None:
+        """The island whose land rect holds every source, or ``None`` when they
+        span more than one (or sit in open water) and the flood therefore can't
+        be scoped to a single rect. Cheap: one O(1) grid lookup plus a rect test
+        per source."""
+        if not sources:
+            return None
+        island = self._island_index_of(sources[0][0], sources[0][1])
+        if island is None or island >= len(self.islands):
+            return None
+        lx, ly, lw, lh = self.islands[island]
+        x1, y1 = lx + lw, ly + lh
+        if (x1 - lx) * (y1 - ly) > _MAX_FLAT_FLOOD_CELLS:
+            return None
+        for sx, sy in sources:
+            if not (lx <= sx < x1 and ly <= sy < y1):
+                return None
+        return island
+
+    def _distance_field_dict(
+        self, sources: list[tuple[int, int]]
+    ) -> dict[tuple[int, int], int]:
+        """The original dict-of-tuples flood, kept for sources that don't share
+        one island rect (a whole-map flood would allocate 1.12M slots to reach a
+        few thousand tiles, so there the output-sensitive version wins)."""
         width, height, tiles = self.width, self.height, self.tiles
         WALL, WATER, WINDOW = self.WALL, self.WATER, self.WINDOW
         distances: dict[tuple[int, int], int] = {}
@@ -439,9 +668,6 @@ class GameMap:
                 continue
             distances[source] = 0
             queue.append(source)
-        # The neighbour scan, bounds test and walkability test are inlined (rather
-        # than going through neighbors_8/is_walkable) because this is a hot BFS loop
-        # -- it avoids building a fresh candidate list and two method calls per tile.
         while queue:
             cx, cy = queue.popleft()
             nd = distances[(cx, cy)] + 1
@@ -460,6 +686,77 @@ class GameMap:
                 distances[nxt] = nd
                 queue.append(nxt)
         return distances
+
+    def distance_field_from(
+        self, sources: Iterable[tuple[int, int]], max_radius: int | None = None
+    ) -> DistanceField:
+        """BFS distance to the **nearest of many** sources at once -- a *goal
+        map*. Every source starts at distance 0 in one shared queue, so the value
+        at any tile is its walking distance to whichever source is closest, and
+        stepping downhill from anywhere walks to that one.
+
+        This is the same flood as ``distance_field`` and costs the same (each
+        walkable tile is visited once, so seeding a thousand trees is no dearer
+        than seeding one), but it answers "go to the nearest tree" for *every*
+        creature on the island from a single field -- instead of one full flood
+        per creature per chosen target tile, which is what a per-goal field costs
+        when everyone picks a different tree.
+
+        It is also more truthful than picking a target by straight-line distance
+        and pathing to it: the winner here is nearest by *walking*, and a source
+        on the far side of a wall or a river simply never appears in the field.
+
+        Runs over the flat, padded island mask (``_blocked_mask``) so the inner
+        loop is index arithmetic against a cached bytearray -- no tuple built, no
+        hash taken, no bounds test -- which is roughly 3x the dict version for
+        the same answer. Sources spanning more than one island have no single
+        rect to lay that list over and take the dict flood instead.
+
+        ``max_radius`` bounds the flood to that many tiles (Chebyshev) around the
+        sources, for a caller that only needs answers near them -- a creature
+        three steps from what it is walking to has no use for the far side of the
+        island. Tiles outside the window simply aren't in the field, the same as
+        unreachable ones, so a caller that finds itself out there falls back
+        exactly as it would for a goal across the water.
+        """
+        source_list = list(sources)
+        island = self._flood_island(source_list)
+        if island is None:
+            return DistanceField.from_mapping(self._distance_field_dict(source_list))
+
+        if max_radius is None:
+            mask, x0, y0, w, h, stride = self._blocked_mask(island)
+        else:
+            xs = [sx for sx, _sy in source_list]
+            ys = [sy for _sx, sy in source_list]
+            mask, x0, y0, w, h, stride = self._window_mask(
+                island,
+                min(xs) - max_radius, min(ys) - max_radius,
+                max(xs) + max_radius + 1, max(ys) + max_radius + 1,
+            )
+        dist = [-1] * len(mask)
+        queue: deque[int] = deque()
+        for sx, sy in source_list:
+            idx = (sy - y0 + 1) * stride + (sx - x0 + 1)
+            if mask[idx] or dist[idx] >= 0:
+                continue
+            dist[idx] = 0
+            queue.append(idx)
+        popleft, push = queue.popleft, queue.append
+        # The blocked ring around the rect is what makes the bare neighbour scan
+        # safe: anything popped here is an interior cell, so all eight offsets
+        # land inside the list, and the ring itself is never enqueued.
+        while queue:
+            c = popleft()
+            nd = dist[c] + 1
+            for n in (
+                c + 1, c - 1, c + stride, c - stride,
+                c + stride + 1, c + stride - 1, c - stride + 1, c - stride - 1,
+            ):
+                if dist[n] < 0 and not mask[n]:
+                    dist[n] = nd
+                    push(n)
+        return DistanceField(dist, x0, y0, w, h, stride)
 
     def consume_dirty_tiles(self) -> set[tuple[int, int]]:
         """Return (and clear) the tiles edited since the last call. The renderer
@@ -489,46 +786,169 @@ class GameMap:
             return j * (self.width // cell_w) + i
         return None
 
-    def _compute_island_regions(self, island: int) -> dict[tuple[int, int], int]:
+    def _compute_island_regions(self, island: int) -> _IslandLabels:
         """Label the walkable tiles of ONE island with connected-region ids
         (8-connectivity, matching ``find_path``), flood-filling only within that
         island's land rect. Two tiles share a label iff a walking path connects them;
-        because islands are ringed by water the fill can never leave the rect."""
-        lx, ly, lw, lh = self.islands[island]
-        x1, y1 = min(self.width, lx + lw), min(self.height, ly + lh)
-        tiles = self.tiles
-        WALL, WATER, WINDOW = self.WALL, self.WATER, self.WINDOW
+        because islands are ringed by water the fill can never leave the rect.
 
-        regions: dict[tuple[int, int], int] = {}
-        region_id = 0
-        for y in range(ly, y1):
-            for x in range(lx, x1):
-                if (x, y) in regions:
+        Labels live in a flat list laid out exactly like the island's blocked mask
+        (0 means "not walkable"), so a tile's label is index arithmetic and the
+        fill needs no bounds test -- see ``_blocked_mask``. This is the cold-start
+        path: an ordinary tile edit is patched in place by
+        ``_apply_walkability_edit`` instead of coming back through here.
+        """
+        mask, x0, y0, w, h, stride = self._blocked_mask(island)
+        labels = [0] * len(mask)
+        label = 0
+        for row in range(h):
+            base = (row + 1) * stride + 1
+            for col in range(w):
+                start = base + col
+                if mask[start] or labels[start]:
                     continue
-                t = tiles[y][x]
-                if t == WALL or t == WATER or t == WINDOW:
-                    continue
-                region_id += 1
-                queue: deque[tuple[int, int]] = deque([(x, y)])
-                regions[(x, y)] = region_id
-                # Inlined neighbour/walkability scan (hot flood-fill); mirrors
-                # find_path / distance_field for the same reason.
+                label += 1
+                labels[start] = label
+                queue: deque[int] = deque([start])
+                popleft, push = queue.popleft, queue.append
                 while queue:
-                    cx, cy = queue.popleft()
-                    for nx, ny in (
-                        (cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1),
-                        (cx + 1, cy + 1), (cx + 1, cy - 1), (cx - 1, cy + 1), (cx - 1, cy - 1),
+                    c = popleft()
+                    for n in (
+                        c + 1, c - 1, c + stride, c - stride,
+                        c + stride + 1, c + stride - 1, c - stride + 1, c - stride - 1,
                     ):
-                        if not (lx <= nx < x1 and ly <= ny < y1):
+                        if labels[n] or mask[n]:
                             continue
-                        if (nx, ny) in regions:
-                            continue
-                        nt = tiles[ny][nx]
-                        if nt == WALL or nt == WATER or nt == WINDOW:
-                            continue
-                        regions[(nx, ny)] = region_id
-                        queue.append((nx, ny))
-        return regions
+                        labels[n] = label
+                        push(n)
+        self._island_next_label[island] = label + 1
+        return (labels, x0, y0, w, h, stride)
+
+    # How far out the "did this wall split the island?" check is allowed to look
+    # before it gives up and pays for a full relabel. A wall raised in a village
+    # almost always has its two sides reconnecting within a couple of tiles; the
+    # window only has to be wide enough to walk around an ordinary building.
+    _SPLIT_CHECK_RADIUS = 10
+
+    def _apply_walkability_edit(self, island: int, x: int, y: int, walkable: bool) -> None:
+        """Keep this island's flood mask and region labels correct after ``(x, y)``
+        changed walkability -- patching them where the change provably can't have
+        altered *which tiles reach which*, and only re-flooding when it can.
+
+        This is the whole point of the exercise: villagers edit tiles constantly
+        (a wall at a time), and a full island relabel per wall was one of the two
+        biggest per-turn costs in the game. The three cases:
+
+        * **A tile stops blocking** (a wall comes down, a door is cut). Components
+          can only *merge*. Touching one existing label means the tile simply joins
+          it; touching none means it starts its own. Touching two or more really is
+          a merge, and that is the rare case worth a relabel.
+        * **A tile starts blocking** (the common one -- a villager raising a wall).
+          Components can only *split*, and a wall in the open splits nothing. The
+          check is local: with the tile already blocked, can its walkable
+          neighbours still reach each other within ``_SPLIT_CHECK_RADIUS``? If yes,
+          every path that used to run through the tile has a detour and every label
+          is still correct; drop the tile's own label and keep the rest.
+        * **Anything the check can't prove** falls back to a full relabel, so a
+          wrong answer is never possible -- only a slower one.
+        """
+        cached_mask = self._flood_mask_cache.get(island)
+        rev = self._island_walk_rev.get(island, 0)
+        if cached_mask is not None:
+            mask, x0, y0, w, h, stride = cached_mask[1]
+            col, row = x - x0, y - y0
+            if 0 <= col < w and 0 <= row < h:
+                mask[(row + 1) * stride + col + 1] = 0 if walkable else 1
+                self._flood_mask_cache[island] = (rev, cached_mask[1])
+            else:
+                self._flood_mask_cache.pop(island, None)
+
+        entry = self._island_region_cache.get(island)
+        if entry is None:
+            return  # nothing labelled yet; the first region_of will build it
+        labels, x0, y0, w, h, stride = entry
+        col, row = x - x0, y - y0
+        if not (0 <= col < w and 0 <= row < h):
+            return  # outside this island's rect: its labels can't be affected
+        c = (row + 1) * stride + col + 1
+        neighbours = (
+            c + 1, c - 1, c + stride, c - stride,
+            c + stride + 1, c + stride - 1, c - stride + 1, c - stride - 1,
+        )
+        if walkable:
+            adjacent = {labels[n] for n in neighbours if labels[n]}
+            if len(adjacent) > 1:
+                self._island_region_cache.pop(island, None)  # merge: relabel
+                return
+            if adjacent:
+                labels[c] = adjacent.pop()
+            else:
+                nxt = self._island_next_label.get(island, 1)
+                if nxt >= self._REGION_ID_STRIDE:
+                    self._island_region_cache.pop(island, None)  # ids exhausted
+                    return
+                labels[c] = nxt
+                self._island_next_label[island] = nxt + 1
+        else:
+            labels[c] = 0
+            if self._blocking_edit_may_split(island, c):
+                self._island_region_cache.pop(island, None)
+                return
+        self._island_region_rev[island] = rev
+
+    def _blocking_edit_may_split(self, island: int, c: int) -> bool:
+        """Whether blocking the tile at flat index ``c`` may have cut its region in
+        two. False means proven safe: every walkable neighbour of ``c`` still
+        reaches every other one without passing through it, so no tile anywhere
+        changed which component it belongs to. True means "couldn't prove it here"
+        -- the caller relabels.
+        """
+        mask, _x0, _y0, _w, _h, stride = self._blocked_mask(island)
+        targets = [
+            n for n in (
+                c + 1, c - 1, c + stride, c - stride,
+                c + stride + 1, c + stride - 1, c - stride + 1, c - stride - 1,
+            )
+            if not mask[n]
+        ]
+        if len(targets) <= 1:
+            return False  # nothing to disconnect from anything else
+        radius = self._SPLIT_CHECK_RADIUS
+        centre_row, centre_col = divmod(c, stride)
+        lo_index = (centre_row - radius) * stride
+        hi_index = (centre_row + radius) * stride + stride - 1
+        lo_col, hi_col = centre_col - radius, centre_col + radius
+        start = targets[0]
+        remaining = set(targets[1:])
+        seen = {start}
+        queue: deque[int] = deque([start])
+        popleft, push = queue.popleft, queue.append
+        while queue and remaining:
+            n0 = popleft()
+            for n in (
+                n0 + 1, n0 - 1, n0 + stride, n0 - stride,
+                n0 + stride + 1, n0 + stride - 1, n0 - stride + 1, n0 - stride - 1,
+            ):
+                if n in seen or n < lo_index or n > hi_index or mask[n]:
+                    continue
+                if not (lo_col <= n % stride <= hi_col):
+                    continue
+                seen.add(n)
+                remaining.discard(n)
+                push(n)
+        return bool(remaining)
+
+    def _island_labels(self, island: int) -> _IslandLabels:
+        """This island's connected-region labels, rebuilt only if no patched copy
+        is current (see ``_apply_walkability_edit``)."""
+        rev = self._island_walk_rev.get(island, 0)
+        cached = self._island_region_cache.get(island)
+        if cached is not None and self._island_region_rev.get(island) == rev:
+            return cached
+        built = self._compute_island_regions(island)
+        self._island_region_cache[island] = built
+        self._island_region_rev[island] = rev
+        return built
 
     def connectivity_revision(self, x: int, y: int) -> tuple[int | None, int]:
         """Return the island-local revision that controls walk connectivity here.
@@ -539,25 +959,30 @@ class GameMap:
         elsewhere in the world instead of falling back to the global map
         revision, which is exactly what caused catch-up bursts to rebuild flow
         fields after unrelated villagers edited their own houses.
+
+        Counts only edits that changed a tile's *walkability*: swapping a floor
+        for a door leaves every distance in the world exactly as it was, so a
+        cached path or flow field has no reason to be thrown away for it.
         """
         island = self._island_index_of(x, y)
         if island is None:
             return None, self.revision
-        return island, self._island_edit_rev.get(island, 0)
+        return island, self._island_walk_rev.get(island, 0)
 
     def region_of(self, x: int, y: int) -> int | None:
         """The connected-region id of a walkable tile, or ``None`` if the tile isn't
-        walkable. Labels are cached per island and rebuilt only when that island is
-        edited, so a build on one island doesn't invalidate the other 99."""
+        walkable. Labels are cached per island and, for an ordinary edit, patched
+        around the edited tile rather than recomputed -- so a villager raising a
+        wall doesn't re-flood 7200 tiles (nor the other 99 islands)."""
         island = self._island_index_of(x, y)
-        if island is None:
+        if island is None or island >= len(self.islands):
             return None
-        edit_rev = self._island_edit_rev.get(island, 0)
-        if self._island_region_rev.get(island) != edit_rev:
-            self._island_region_cache[island] = self._compute_island_regions(island)
-            self._island_region_rev[island] = edit_rev
-        local = self._island_region_cache[island].get((x, y))
-        return None if local is None else island * self._REGION_ID_STRIDE + local
+        labels, x0, y0, w, h, stride = self._island_labels(island)
+        col, row = x - x0, y - y0
+        if col < 0 or row < 0 or col >= w or row >= h:
+            return None
+        local = labels[(row + 1) * stride + col + 1]
+        return None if local == 0 else island * self._REGION_ID_STRIDE + local
 
     def same_region(self, a: tuple[int, int], b: tuple[int, int]) -> bool:
         """True when both tiles are walkable and mutually reachable on foot -- a
@@ -566,16 +991,26 @@ class GameMap:
         return ra is not None and ra == self.region_of(b[0], b[1])
 
     def enclosed_rooms(self, max_size: int = 400) -> list[frozenset[tuple[int, int]]]:
-        """All enclosed house interiors across the world, cached per island and
-        rebuilt only for islands edited since the last call (see ``set_tile``). A
-        build on one island no longer re-floods the other 99 -- the whole-map
-        re-detection was a top per-turn cost at archipelago scale."""
+        """All enclosed house interiors across the world.
+
+        Cached per island, and -- once an island has been scanned once -- updated
+        only *around the tiles that changed* rather than re-scanned. A villager
+        laying one wall used to cost a fresh flood over that island's 7200 tiles
+        looking for floor to seed; now it costs a flood of the room the wall
+        touches, which is bounded by ``max_size``.
+        """
         changed = self._all_rooms_cache is None
         for idx, rect in enumerate(self.islands):
-            rev = self._island_edit_rev.get(idx, 0)
-            if self._island_rooms_rev.get(idx) != rev or idx not in self._island_rooms_cache:
+            dirty = self._island_rooms_dirty.get(idx)
+            if idx not in self._island_rooms_cache:
                 self._island_rooms_cache[idx] = self.find_enclosed_rooms(max_size, bounds=rect)
-                self._island_rooms_rev[idx] = rev
+                self._island_rooms_dirty.pop(idx, None)
+                changed = True
+            elif dirty:
+                self._island_rooms_cache[idx] = self._rooms_after_edits(
+                    self._island_rooms_cache[idx], dirty, max_size
+                )
+                self._island_rooms_dirty.pop(idx, None)
                 changed = True
         if changed:
             rooms: list[frozenset[tuple[int, int]]] = []
@@ -583,6 +1018,103 @@ class GameMap:
                 rooms.extend(self._island_rooms_cache[idx])
             self._all_rooms_cache = rooms
         return self._all_rooms_cache
+
+    def _rooms_after_edits(
+        self,
+        rooms: list[frozenset[tuple[int, int]]],
+        dirty: set[tuple[int, int]],
+        max_size: int,
+    ) -> list[frozenset[tuple[int, int]]]:
+        """This island's rooms, updated for the tiles in ``dirty``.
+
+        Only the floor components touching an edited tile can have changed:
+        rooms are 4-connected floor components, so a tile edit can only affect a
+        component that either contains the tile or is 4-adjacent to it (a wall
+        sealing a room *is* adjacent to that room's floor -- if it were only
+        diagonally adjacent it could never have been on a 4-connected path in or
+        out of it). So re-flood from the edited tiles, and keep every cached room
+        the flood didn't reach.
+
+        Distinct components are disjoint, which is what makes "kept" safe even
+        when a flood aborts early on a too-large region: a partial flood of the
+        outdoors can never overlap a cached interior.
+        """
+        found: list[frozenset[tuple[int, int]]] = []
+        visited: set[tuple[int, int]] = set()
+        touched: set[tuple[int, int]] = set()
+        for x, y in dirty:
+            for sx, sy in ((x, y), (x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if not self.in_bounds(sx, sy) or (sx, sy) in visited:
+                    continue
+                if self.tiles[sy][sx] != self.FLOOR:
+                    continue
+                region, qualifies = self._flood_room(sx, sy, visited, max_size)
+                touched.update(region)
+                if qualifies:
+                    found.append(frozenset(region))
+        kept = [
+            room for room in rooms
+            if not (room & touched) and not (room & dirty)
+        ]
+        return kept + found
+
+    def _flood_room(
+        self,
+        sx: int,
+        sy: int,
+        visited: set[tuple[int, int]],
+        max_size: int,
+    ) -> tuple[list[tuple[int, int]], bool]:
+        """Flood one 4-connected floor component from ``(sx, sy)``, reporting its
+        tiles and whether they are a house interior.
+
+        A component qualifies when it never touches the map border, is reachable
+        from outside through at least one door, and is no bigger than
+        ``max_size``. Walls, windows, water and doors all stop the fill, which is
+        what keeps an inside from leaking out.
+
+        The fill gives up past ``max_size`` -- anything that big is the outdoors,
+        not a house -- and that early exit is why a component may be reached
+        again from a later seed: the tiles still on the queue were never walked.
+        Running into floor that *another* flood already claimed is exactly that
+        situation, and it disqualifies the region: those tiles are the far side
+        of a component too big to be a house, not a room of their own.
+        """
+        region: list[tuple[int, int]] = []
+        claimed: set[tuple[int, int]] = {(sx, sy)}
+        touches_border = False
+        has_door = False
+        continues_elsewhere = False
+        queue: deque[tuple[int, int]] = deque([(sx, sy)])
+        visited.add((sx, sy))
+        while queue:
+            cx, cy = queue.popleft()
+            region.append((cx, cy))
+            if cx == 0 or cy == 0 or cx == self.width - 1 or cy == self.height - 1:
+                touches_border = True
+            for nx, ny in self.neighbors_4(cx, cy):
+                neighbor_tile = self.tiles[ny][nx]
+                if neighbor_tile == self.DOOR:
+                    has_door = True
+                    continue
+                if neighbor_tile != self.FLOOR:
+                    continue
+                if (nx, ny) in visited:
+                    if (nx, ny) not in claimed:
+                        continues_elsewhere = True
+                    continue
+                visited.add((nx, ny))
+                claimed.add((nx, ny))
+                queue.append((nx, ny))
+            if len(region) > max_size:
+                break
+        qualifies = (
+            not touches_border
+            and has_door
+            and not continues_elsewhere
+            and len(region) <= max_size
+        )
+        return region, qualifies
 
     def find_enclosed_rooms(
         self,
@@ -601,8 +1133,8 @@ class GameMap:
 
         ``bounds`` (an ``(x0, y0, w, h)`` land rect) restricts the seed scan to one
         island; because islands are ringed by water the floor flood can't escape it,
-        so a scoped scan yields exactly that island's rooms. Prefer the cached
-        ``enclosed_rooms`` over calling this directly per turn.
+        so a scoped scan yields exactly that island's rooms. This is the full scan;
+        prefer the cached ``enclosed_rooms``, which only re-floods around edits.
         """
         rooms: list[frozenset[tuple[int, int]]] = []
         visited: set[tuple[int, int]] = set()
@@ -618,33 +1150,8 @@ class GameMap:
             for sx in range(x0, x1):
                 if (sx, sy) in visited or self.tiles[sy][sx] != self.FLOOR:
                     continue
-
-                region: list[tuple[int, int]] = []
-                touches_border = False
-                has_door = False
-                queue: deque[tuple[int, int]] = deque([(sx, sy)])
-                visited.add((sx, sy))
-
-                while queue:
-                    cx, cy = queue.popleft()
-                    region.append((cx, cy))
-                    if cx == 0 or cy == 0 or cx == self.width - 1 or cy == self.height - 1:
-                        touches_border = True
-                    for nx, ny in self.neighbors_4(cx, cy):
-                        neighbor_tile = self.tiles[ny][nx]
-                        if neighbor_tile == self.DOOR:
-                            has_door = True
-                            continue
-                        if neighbor_tile != self.FLOOR:
-                            continue
-                        if (nx, ny) in visited:
-                            continue
-                        visited.add((nx, ny))
-                        queue.append((nx, ny))
-                    if len(region) > max_size:
-                        break
-
-                if not touches_border and has_door and len(region) <= max_size:
+                region, qualifies = self._flood_room(sx, sy, visited, max_size)
+                if qualifies:
                     rooms.append(frozenset(region))
 
         return rooms

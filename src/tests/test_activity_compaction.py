@@ -35,8 +35,9 @@ from game_map import GameMap
 from items import WOOD
 from regions import region_at
 from systems import (
-    NeedsProcessor, NpcAiProcessor, _SLEEP_RECOVERY, create_construction_site,
-    settle_sleep, sleep_turns_needed, wake_up,
+    NeedsProcessor, NpcAiProcessor, TimeProcessor, _SLEEP_RECOVERY,
+    create_construction_site, go_to_sleep, settle_sleep, sleep_turns_needed,
+    wake_up, world_clock,
 )
 # ``ai`` is imported through ``systems`` (see its module docstring); importing it
 # first would hit the cycle. These tuning constants live there.
@@ -398,3 +399,84 @@ def test_hauling_never_delivers_to_the_same_piece_twice() -> None:
     wood_spent = wood_before - esper.component_for_entity(ent, Inventory).items.count(WOOD)
     assert wood_spent == pieces, "one log per piece, never two"
     assert not unstocked
+
+
+# --- the player's own sleep -------------------------------------------------
+#
+# The player used to be the one sleeper in the world that lived its night a turn
+# at a time: several hundred `esper.process` calls, each redrawing the frame and
+# re-running every system, to apply arithmetic. It now settles the rest exactly
+# as an NPC does. These pin that the shortcut costs the player the same night.
+
+
+def _sleeping_player(tiredness: float = 90.0) -> tuple[GameMap, int, Needs]:
+    """A tired player in a world with a clock and a needs processor -- the two
+    things a sleep has to move correctly."""
+    game_map = _world()
+    player_ent = next(ent for ent, _ in esper.get_component(Player))
+    needs = _tired(tiredness)
+    esper.add_component(player_ent, needs)
+    esper.add_processor(TimeProcessor(), priority=2)
+    esper.add_processor(NeedsProcessor(game_map), priority=0)
+    return game_map, player_ent, needs
+
+
+def test_the_player_sleeps_the_whole_night_in_one_turn() -> None:
+    """The point of the change: one turn of play, a whole night of world time."""
+    import ui
+
+    game_map, player_ent, needs = _sleeping_player()
+    expected_turns = sleep_turns_needed(needs)
+    started_at = world_clock().turn
+
+    ui._sleep_player(None, in_camp=True, game_map=game_map)
+
+    assert not esper.has_component(player_ent, Asleep), "and the player is up again"
+    assert needs.tiredness == 0.0, "rested"
+    assert world_clock().turn == started_at + expected_turns * BASE_ACTION_COST, (
+        "the night really passed, in world time"
+    )
+
+
+def test_the_players_compacted_sleep_costs_exactly_what_living_it_would() -> None:
+    """The equivalence that licenses the shortcut: same clock, same needs as the
+    turn-at-a-time loop it replaces."""
+    import ui
+
+    # Live it: one turn per call, waking when the tiredness is paid off.
+    game_map, player_ent, lived = _sleeping_player()
+    started_at = world_clock().turn
+    go_to_sleep(player_ent, in_camp=True, game_map=game_map)
+    turns = 0
+    while esper.has_component(player_ent, Asleep) and turns < 400:
+        esper.process("wait")
+        turns += 1
+    lived_clock = world_clock().turn - started_at
+    lived_needs = (lived.tiredness, lived.hunger, lived.thirst)
+
+    # Settle it.
+    game_map, player_ent, settled = _sleeping_player()
+    started_at = world_clock().turn
+    ui._sleep_player(None, in_camp=True, game_map=game_map)
+    settled_clock = world_clock().turn - started_at
+
+    assert settled_clock == lived_clock, "the same amount of world time passed"
+    assert settled.tiredness == pytest.approx(lived_needs[0])
+    assert settled.hunger == pytest.approx(lived_needs[1])
+    assert settled.thirst == pytest.approx(lived_needs[2])
+
+
+def test_waking_does_not_charge_the_night_a_second_time() -> None:
+    """The clock leaps a whole night, so the turn after waking must charge only
+    itself -- otherwise the player wakes rested and immediately starves."""
+    import ui
+
+    game_map, player_ent, needs = _sleeping_player()
+    ui._sleep_player(None, in_camp=True, game_map=game_map)
+    hunger_on_waking = needs.hunger
+
+    esper.process("wait")
+
+    assert needs.hunger == pytest.approx(hunger_on_waking + needs.hunger_rate), (
+        "one turn's hunger for one turn awake"
+    )

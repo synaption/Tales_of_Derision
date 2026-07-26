@@ -93,80 +93,108 @@ GitHub Actions uses the same Linux build script and uploads the executable artif
 through `.github/workflows/windows-exe.yml` on pull requests, manual dispatches, and
 pushes to `dev` or `work`.
 
----
+***
+## Design Goals Big Picture
+Thousands of Years Simulations
 
-## Design goals — big picture
+Economy, Money, Banking, Farming, Hunting, Fishing, Thirst, Hunger
 
-- **Thousands-of-years simulations.** Full simulation of every map tile, eventually.
-  The world should keep living whether or not you're watching, and do *more*
-  simulation when little is happening — prioritising the tiles **nearest** the
-  player, not the stalest ones. Entering a new region brings that whole region up to
-  date; sleeping brings the **whole world** up to date.
-- **Memory over disk.** Move everything into memory at startup (sounds, tiles, state)
-  wherever it helps.
-- **Mods are first-class.** Anybody should be able to drop in their own files to add
-  or change content — creatures, items, effects — either as readable data or as
-  Python, the same way the core game does it. See [Content & Mods](wiki/Content-and-Mods.md).
-- **Seed-based determinism.** One master seed reproduces the entire world (the
-  foundation for reproducible saves and, later, time travel). All simulation
-  randomness flows through `rng.world_rng().stream(name)`.
-- **Everyone is playable.** All NPCs have the same needs as the player. When the
-  player dies they become a random sentient NPC somewhere in the world (the "Roy"
-  from Rick and Morty premise).
-- **Economy & survival.** Money, banking, farming, hunting, fishing; hunger, thirst,
-  tiredness.
-- **Morrowind-style leveling.** Level individual skills; skill-ups grant character
-  levels and attribute points (STR, DEX, CON, INT, WIS, CHA), plus health/magic.
+Action Economy:
 
-### Action economy
-- A day holds a fixed amount of time; there is a turn order.
-- Actions take time based on quickness, movement speed, agility, etc.
-- Turn order is by **completion time**: everything is either mid-action or waiting
-  for its next turn. Effects are immediate — an attack lands now, the attacker sits
-  in an "attack" state for some time units, then waits for its next turn.
-- Target: one day of typical play ≈ one real-life hour.
-- Animations play in order or concurrently depending on what they are.
+There is a certain amount of time in a day.
+There is a turn order.
+Actions take a certain amount of time based on a number of factors, quickness, movement speed, agility, ect.
+Turn order is decided based on when actions are completed. So everything is in action or it's waiting for it's next turn.
+The effects of the action are immediate. i.e. an attack happens, the damage is done immediately, the attacker is in the attack state for a certain amount of time units, and then they are in a wait state until it is there turn.
+I will try to balance the action economy so that one day of typical gameplay ends up being 1 hour in real life.
+animations happen either in order, or multiple at the same time, depending on what they are.
 
-### Targets
-- Desktop, fully rendered, Windows + Linux. Steam.
+All NPCs are playable.
 
----
+Players and NPCs have the same needs as the player like food and water.
 
-## Style
+When the player dies they become a random sentiaent NPC somewhere in the world. It's like "Roy" from Rick and Morty.
 
-Pixel art. HD text. Shader effects and lighting. Basic animations, or none at all.
-Characters face the way they move (left/right, the four, or all eight directions
-depending on the sprite). Dialogue in a fake gibberish language
-(`##!/$*~# GH01^@`), speech bubbles, and Sims-like symbol popups (`++`, `--`).
+Morrorwind style leveling. You level up individual skills, when you level up those skills you gain a character level and can upgrade attributes str, dex, con, int, wis, char. You also get more health and magic if you have magic.
 
-## Characters
-Wizards · Great Fairy · NPCs · mostly Farmers.
 
-## Inspiration
-Caves of Qud · Lord of the Rings · DaFluffyPotato · Minecraft · Rimworld · Dwarf
-Fortress · Song of Syx · Infectionator World Dominator · Earth Defense Force ·
-Chrono Trigger · Zelda.
+### Inspiration
+Caves of Qud
+Lord of the Rings
+DaFluffyPotato
+Minecraft
+Rimworld
+Dwarf Fortress
+Song of Syx
+Infectionator World Dominator
+Earth Defense Force
+chrono trigger
+zelda
+Themes
+Fantasy
 
----
+Time Travel
 
-## Themes & brainstorms (idea dump)
+[BRAINSTORM] Time is cyclical. Hyper advanced civilization makes floating islands, destroys the planet, and then inteligently redesigns new planets from their floating society. These floating societies tend to be sparcely populated by a few super adept NPCs. These "gods" die and inhabit the same reincarnation loop as you. i.e. you are a reincanant. You have of course forgotten this.
+Zombie
 
-**Fantasy.**
+MacGuffins/Plot Coupons
 
-**Time travel — time is cyclical.** A hyper-advanced civilization builds floating
-islands, destroys the planet, then intelligently redesigns new planets from their
-floating society. These floating societies are sparsely populated by a few
-super-adept NPCs. These "gods" die and enter the same reincarnation loop as you —
-i.e. *you are a reincarnant* who has forgotten it.
+the one ring
+the infinity stones
+dragon balls
+Knowledge and Teaching
 
-**Zombie.**
+Music, and Comrodery
 
-**MacGuffins / plot coupons** — the one ring, the infinity stones, the dragon balls.
+Ballence and Equilibrium
 
-**Knowledge and teaching. Music and comradery. Balance and equilibrium. Karma and
-reincarnation.**
+Karma and Reincarnation
 
-**Open questions / TODO thoughts** (see also `next.md`):
-- Rename to *Seeds of Derision*?
-- Make sure people (NPCs) never get permanently stuck.
-- Can `tcod` help — pathfinding especially?
+Design Goals Big Picture
+Thousands of Years Simulations
+
+Economy, Money, Banking, Farming, Hunting, Fishing, Thirst, Hunger
+
+Action Economy:
+
+There is a certain amount of time in a day.
+There is a turn order.
+Actions take a certain amount of time based on a number of factors, quickness, movement speed, agility, ect.
+Turn order is decided based on when actions are completed. So everything is in action or it's waiting for it's next turn.
+The effects of the action are immediate. i.e. an attack happens, the damage is done immediately, the attacker is in the attack state for a certain amount of time units, and then they are in a wait state until it is there turn.
+I will try to balance the action economy so that one day of typical gameplay ends up being 1 hour in real life.
+animations happen either in order, or multiple at the same time, depending on what they are.
+Targets
+
+desktop fully rendered on windows and linux
+steam
+itch.io via Pygbag
+github pages via Pygbag
+All NPCs are playable.
+
+Players and NPCs have the same needs as the player like food and water.
+
+When the player dies they become a random sentiaent NPC somewhere in the world. It's like "Roy" from Rick and Morty.
+
+Morrorwind style leveling. You level up individual skills, when you level up those skills you gain a character level and can upgrade attributes str, dex, con, int, wis, char. You also get more health and magic if you have magic.
+
+fire emblem like evolutions, mainly asthetic.  
+
+Style
+Pixel Art
+
+HD text
+
+shader effects, lighting
+
+basic animations, or no animations at all
+
+characters face the direction they are going, either just left or right, or up, down, left, and right, or all 8 directions depending on the sprite.
+
+Dialogue in a fake gibberish language "##!/$*~# GH01^@"
+
+speach bubbles, and sims like symbol popups i.e. ++
+
+Characters
+Wizards Great Fairy NPCs Mostly Farmers

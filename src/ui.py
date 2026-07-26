@@ -31,9 +31,10 @@ from queries import entity_name, first_player_entity
 from renderer.base import Renderer
 from rng import world_rng
 from systems import (
-    FishAiProcessor, NpcAiProcessor, RenderProcessor, ReproductionProcessor,
-    TreeGrowthProcessor, WAIT_ACTION,
-    bed_owner, go_to_sleep, queue_message, wake_up, world_clock,
+    FishAiProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor,
+    ReproductionProcessor, TreeGrowthProcessor, WAIT_ACTION,
+    bed_owner, go_to_sleep, queue_message, settle_sleep, sleep_turns_needed,
+    wake_up, world_clock,
 )
 from interactions import (
     _CARDINAL_ACTION_DELTAS, _CRAFT_MENU, _apply_consumable, _chebyshev_from_player,
@@ -663,11 +664,22 @@ def _confirm(renderer: Renderer, title: str, lines: list[str]) -> bool:
 
 
 def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = None) -> None:
-    """Send the player to sleep and fast-forward turns until they wake rested.
+    """Send the player to sleep: one turn of play, a whole night of world time.
 
-    The whole world keeps simulating during the rest (NPCs act, needs shift, the
-    clock advances), so a night's sleep really passes the night. Each turn yields
-    to the browser so the web build's single thread stays responsive."""
+    Sleep is the purest compactable activity in the game -- its only effects on
+    the sleeper are the three needs, and none of them depends on anything that
+    happens during it -- so the rest is settled as arithmetic (``settle_sleep``,
+    the closed form of the per-turn accrual) rather than lived as several hundred
+    simulated turns. This is exactly how NPCs have always slept
+    (``NpcAiProcessor._bed_down``); the player just kept the loop.
+
+    Nothing about the *world* is skipped, and nothing is cheapened: the clock
+    advances by every turn the sleep took, the player wakes with the needs those
+    turns would have left them, and the catch-up below then makes every region
+    live that span. What's gone is only the player's own 34-to-400 iterations of
+    ``esper.process``, each of which redrew the frame and re-ran every system to
+    apply arithmetic we can do in one line.
+    """
     player_ent = first_player_entity()
     if player_ent is None:
         return
@@ -684,20 +696,28 @@ def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = 
     )
     go_to_sleep(player_ent, in_camp=in_camp, game_map=game_map)
 
-    turns = 0
-    while esper.has_component(player_ent, Asleep) and turns < _SLEEP_MAX_TURNS:
-        esper.process(WAIT_ACTION)
-        turns += 1
+    # How long the rest takes, by the same rule every sleeper in the world uses,
+    # and the needs it leaves behind -- tiredness paid off, hunger and thirst
+    # climbed for exactly those turns.
+    turns = min(_SLEEP_MAX_TURNS, sleep_turns_needed(needs))
+    settle_sleep(needs, turns)
 
-    # Safety net: never leave the player stuck asleep past the cap.
-    if esper.has_component(player_ent, Asleep):
-        wake_up(player_ent, game_map)
+    clock = world_clock()
+    if clock is not None:
+        # Time really passes: the same TU those turns would have cost, so the sun
+        # moves, the day advances, and the world below has that much to catch up on.
+        clock.turn += turns * BASE_ACTION_COST
+        # The player's needs for that span are already paid (``settle_sleep``), so
+        # the next turn must charge only the time after waking, not the night too.
+        needs_processor = esper.get_processor(NeedsProcessor)
+        if needs_processor is not None:
+            needs_processor.resync_to(clock.turn)
+    wake_up(player_ent, game_map)
 
     # A night's sleep resolves the *whole* world, not just the region the bed
     # sits in -- region-aware processors otherwise only keep the player's
     # immediate region fully live turn by turn, leaving everywhere else to
     # catch up gradually in the background.
-    clock = world_clock()
     if clock is not None:
         target_region_turn = clock.turn // BASE_ACTION_COST
         for processor in (esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor)):
