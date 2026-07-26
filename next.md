@@ -40,3 +40,8 @@ I want to change how scanning works for things like tree growth.  instead of lli
 
 
 A* needs to handle different types of ground have different walk speed bonuses?
+
+
+Multi-source goal maps — ~3× on every player turn, at every world size, and it also cuts the catch-up cost since _step_toward is 21% of that too.
+Analytic region catch-up — the only true scaling fix. Start with the cheap linear systems (needs, flora, ageing) to prove the batch-independence discipline, then the aggregate NPC model.
+_static_region_items (35% of catch-up, 40% miss rate) and graze's O(trees) nearest-target scan (36%) — both fall out naturally if goal maps replace nearest-target searches.

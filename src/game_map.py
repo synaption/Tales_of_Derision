@@ -6,6 +6,7 @@ render path.
 """
 import heapq
 from collections import deque
+from collections.abc import Iterable
 
 # The habitable land is a fixed-size island; a "world" map that is comfortably
 # larger than this gets the land dropped in its centre and the rest flooded into
@@ -402,18 +403,45 @@ class GameMap:
         many turns and many travellers: from any current position, stepping to
         the neighbour with the smallest value here always makes progress
         toward ``goal``, without a fresh pathfind."""
-        gx, gy = goal
+        return self.distance_field_from((goal,))
+
+    def distance_field_from(
+        self, sources: Iterable[tuple[int, int]]
+    ) -> dict[tuple[int, int], int]:
+        """BFS distance to the **nearest of many** sources at once -- a *goal
+        map*. Every source starts at distance 0 in one shared queue, so the value
+        at any tile is its walking distance to whichever source is closest, and
+        stepping downhill from anywhere walks to that one.
+
+        This is the same flood as ``distance_field`` and costs the same (each
+        walkable tile is visited once, so seeding a thousand trees is no dearer
+        than seeding one), but it answers "go to the nearest tree" for *every*
+        creature on the island from a single field -- instead of one full flood
+        per creature per chosen target tile, which is what a per-goal field costs
+        when everyone picks a different tree.
+
+        It is also more truthful than picking a target by straight-line distance
+        and pathing to it: the winner here is nearest by *walking*, and a source
+        on the far side of a wall or a river simply never appears in the field.
+        """
         width, height, tiles = self.width, self.height, self.tiles
         WALL, WATER, WINDOW = self.WALL, self.WATER, self.WINDOW
-        if not (0 <= gx < width and 0 <= gy < height):
-            return {}
-        if tiles[gy][gx] == WALL or tiles[gy][gx] == WATER or tiles[gy][gx] == WINDOW:
-            return {}
+        distances: dict[tuple[int, int], int] = {}
+        queue: deque[tuple[int, int]] = deque()
+        for sx, sy in sources:
+            if not (0 <= sx < width and 0 <= sy < height):
+                continue
+            t = tiles[sy][sx]
+            if t == WALL or t == WATER or t == WINDOW:
+                continue
+            source = (sx, sy)
+            if source in distances:
+                continue
+            distances[source] = 0
+            queue.append(source)
         # The neighbour scan, bounds test and walkability test are inlined (rather
         # than going through neighbors_8/is_walkable) because this is a hot BFS loop
         # -- it avoids building a fresh candidate list and two method calls per tile.
-        distances: dict[tuple[int, int], int] = {goal: 0}
-        queue: deque[tuple[int, int]] = deque([goal])
         while queue:
             cx, cy = queue.popleft()
             nd = distances[(cx, cy)] + 1

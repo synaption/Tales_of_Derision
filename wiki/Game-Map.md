@@ -53,7 +53,16 @@ forcing a global rebuild. `set_tile` maintains three signals:
 - **`distance_field(goal)`** — BFS distances from `goal` to every walkable tile that
   can reach it: a **flow field** computed once and reused by many travellers over
   many turns (step to the lowest-valued neighbour to make progress) without a fresh
-  pathfind.
+  pathfind. A one-source call to `distance_field_from`.
+- **`distance_field_from(sources)`** — the same flood seeded from **many** sources at
+  once, so the value at a tile is its walking distance to whichever is *nearest*: a
+  **goal map**. It costs the same as a one-source flood (each walkable tile is
+  visited once, so a thousand trees is no dearer than one) but answers "go to the
+  nearest tree" for every creature on the island from one field, rather than one
+  flood per creature per chosen target. It is also more truthful than picking a
+  target by straight-line distance and pathing to it: the winner is nearest by
+  *walking*, and a source behind a wall or across a river simply isn't in the field.
+  See [Performance](Performance.md#goal-maps) for how the AI caches these.
 - **`region_of(x,y)` / `same_region(a,b)`** — connected-component (8-connectivity)
   labels for walkable tiles, cached until the map changes. A cheap reachability test
   so NPCs never chase a resource across a river they can't cross. *(Distinct from the

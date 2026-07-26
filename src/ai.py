@@ -11,7 +11,7 @@ re-exports them), never directly, to keep module-load order sound.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 
 import esper
@@ -189,6 +189,14 @@ class NpcAiProcessor(esper.Processor):
         self._field_cache: dict[
             tuple[int, int], tuple[tuple[int | None, int], dict[tuple[int, int], int]]
         ] = {}
+        # Goal maps (see ``_goal_map``): (kind, region) -> (key, source tiles,
+        # multi-source distance field). One flood answers "where is the nearest
+        # tree/shore/bush" for every creature in the region at once, instead of a
+        # flood per creature per chosen target tile.
+        self._goal_map_cache: dict[
+            tuple[str, RegionId, int | None],
+            tuple[tuple, dict[tuple[int, int], int], dict[tuple[int, int], int]],
+        ] = {}
         # Per-map-revision memo for walkable connected-region ids. Many drives
         # filter dozens of local resource candidates with same-region checks;
         # caching the labels for each tile turns those scans into dict lookups
@@ -249,6 +257,207 @@ class NpcAiProcessor(esper.Processor):
         field = self.game_map.distance_field(goal)
         self._field_cache[goal] = (connectivity_rev, field)
         return field
+
+    # --- Goal maps ----------------------------------------------------------
+    #
+    # A *goal map* is one multi-source distance field per (resource kind, region):
+    # every tree (or shore tile, or ripe bush) around the region is seeded at
+    # distance 0 in a single flood, so the value at any tile is its walking
+    # distance to the nearest one and stepping downhill walks to it.
+    #
+    # It replaces the older shape -- pick the nearest candidate by straight-line
+    # distance, then flood the island to *that* tile -- which cost a full island
+    # BFS per creature per chosen target, because a dozen creatures choosing a
+    # dozen different trees is a dozen different goals. One flood now serves the
+    # whole region's population and every creature in it steps for the price of
+    # eight dict lookups. It is also more truthful: the winner is nearest by
+    # *walking*, not by straight line, and a source across a river or behind a
+    # wall simply isn't in the field -- which is the same thing ``_reachable``
+    # was doing with an O(sources) same-region scan per creature per turn.
+
+    def _goal_map(
+        self,
+        kind: str,
+        region_id: RegionId,
+        island: int | None,
+        build_sources: Callable[[], Iterable[tuple[tuple[int, int], int]]],
+        index_kind: type | None,
+    ) -> tuple[dict[tuple[int, int], int], dict[tuple[int, int], int]]:
+        """``(source tile -> entity, distance field)`` for ``kind`` around
+        ``region_id``, on the walkable component ``island``.
+
+        Seeds are filtered to ``island`` first. A region's widened source list can
+        straddle several islands, and seeding them all would flood every one of
+        them in a single pass -- measured at four islands' worth of tiles per
+        flood, four times the work for three islands' worth of answers nobody
+        standing here can walk to. This is the same "don't fixate on food across
+        the water" rule ``_reachable`` enforced, except it is now paid once per
+        flood instead of once per creature per turn.
+
+        Keyed on the index's **per-kind** neighbourhood version (``index_kind``;
+        terrain sources like the shore have none and key on the map alone) plus
+        the map revision. So the flood is rebuilt exactly when a source of this
+        kind appears or disappears nearby, or a tile edit changes what can reach
+        what -- and never merely because some deer crossed a seam, which is what
+        the region-wide version would have meant.
+
+        A source being *depleted* rather than removed (a tree losing a log) moves
+        neither key, so the map holds still while creatures work through it.
+
+        The tile -> entity map falls out of the same pass, and is what lets a
+        creature interact with what it arrived at without searching for it.
+        """
+        key = (
+            self._index().kind_neighborhood_version(region_id, index_kind)
+            if index_kind is not None
+            else (),
+            self.game_map.revision,
+        )
+        cached = self._goal_map_cache.get((kind, region_id, island))
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+        sources = {
+            xy: source_ent
+            for xy, source_ent in build_sources()
+            if self._region_of_cached(xy) == island
+        }
+        field = self.game_map.distance_field_from(sources)
+        self._goal_map_cache[(kind, region_id, island)] = (key, sources, field)
+        return sources, field
+
+    def _adjacent_source(
+        self, pos: Position, sources: dict[tuple[int, int], int]
+    ) -> tuple[int, int] | None:
+        """A source tile the creature is standing next to, or ``None``. Eight dict
+        lookups, where finding the nearest candidate used to be a scan of every
+        resource in the region followed by a distance sort."""
+        for nxy in self.game_map.neighbors_8(pos.x, pos.y):
+            if nxy in sources:
+                return nxy
+        return None
+
+    def _step_down(
+        self,
+        ent: int,
+        pos: Position,
+        field: dict[tuple[int, int], int],
+        occupied: dict[tuple[int, int], int],
+    ) -> bool:
+        """Take one step down ``field`` -- toward the nearest source of whatever
+        the map was built for. Returns True if it moved.
+
+        Ranks every downhill neighbour rather than only the best, and skips ones a
+        live occupant blocks, for the same reason ``_greedy_step_toward`` does: a
+        crowded resource shouldn't pin a creature in place when the second-best
+        step is just as good and already in the same field.
+        """
+        here = field.get((pos.x, pos.y))
+        if here is None:
+            return False  # nothing of this kind is reachable from where we stand
+        candidates = [
+            (dist, nxy)
+            for nxy in self.game_map.neighbors_8(pos.x, pos.y)
+            if (dist := field.get(nxy)) is not None and dist < here
+        ]
+        # Sort on the distance alone, so equal-distance neighbours keep
+        # ``neighbors_8`` order -- same tie-break as ``_greedy_step_toward``, which
+        # prefers the straight step over the diagonal that costs the same.
+        candidates.sort(key=lambda c: c[0])
+        for _dist, nxy in candidates:
+            if nxy not in occupied or occupied[nxy] == ent:
+                self._commit_step(ent, pos, nxy, occupied)
+                return True
+        return False
+
+    def _go_to_nearest(
+        self,
+        ent: int,
+        pos: Position,
+        kind: str,
+        build_sources: Callable[[], Iterable[tuple[tuple[int, int], int]]],
+        occupied: dict[tuple[int, int], int],
+        region_id: RegionId | None = None,
+        index_kind: type | None = None,
+        on_source: bool = False,
+    ) -> tuple[tuple[int, int] | None, int | None, bool]:
+        """Head for the nearest ``kind``. Returns ``(tile, entity, acted)``.
+
+        ``tile``/``entity`` are the source the creature has reached, or ``None``
+        if it hasn't yet. ``acted`` says whether the turn was spent -- False means
+        nothing of this kind is reachable and it couldn't even step, so the drive
+        should fail and let the next one have the turn.
+
+        Arrival is *beside* a source by default -- you chop a tree or pick a bush
+        from an adjacent tile, and its own tile is usually blocked anyway. Pass
+        ``on_source`` for the kinds you have to stand on, like a shore tile.
+
+        **Watched creatures use the goal map; unwatched ones don't**, and that
+        split is measured rather than aesthetic. A goal map costs one island-wide
+        flood and then serves every creature that shares it for eight dict lookups
+        a step -- an enormous win in the player's own region, which is simulated
+        every single turn by everyone standing in it (per-turn cost fell 2-13x).
+        Out in the lagging world a region gets one turn at a time and its trees
+        churn as its creatures eat them, so the same flood was bought over and
+        over for a handful of uses: 75 tree floods for ~205 uses, 2 ms each, and
+        whole-world catch-up went *up* 47%. There the old shape -- scan the
+        region's own short list for the nearest, walk it on a cached route -- is
+        simply cheaper, and nobody is watching the difference anyway.
+        """
+        if region_id is None:
+            region_id = self.scheduler.region_at(pos.x, pos.y)
+        island = self._region_of_cached((pos.x, pos.y))
+        if self._compactable((pos.x, pos.y)):
+            return self._go_to_nearest_unwatched(
+                ent, pos, island, build_sources, occupied, on_source
+            )
+        sources, field = self._goal_map(kind, region_id, island, build_sources, index_kind)
+        if not sources:
+            return None, None, False
+
+        def reached() -> tuple[int, int] | None:
+            here = (pos.x, pos.y)
+            if on_source:
+                return here if here in sources else None
+            return self._adjacent_source(pos, sources)
+
+        arrived = reached()
+        if arrived is not None:
+            return arrived, sources[arrived], True
+        moved = self._step_down(ent, pos, field, occupied)
+        arrived = reached()
+        return (arrived, sources[arrived] if arrived is not None else None, moved)
+
+    def _go_to_nearest_unwatched(
+        self,
+        ent: int,
+        pos: Position,
+        island: int | None,
+        build_sources: Callable[[], Iterable[tuple[tuple[int, int], int]]],
+        occupied: dict[tuple[int, int], int],
+        on_source: bool,
+    ) -> tuple[tuple[int, int] | None, int | None, bool]:
+        """``_go_to_nearest`` for a creature nobody can see: pick the nearest
+        source off the region's own list and walk to it on a cached route.
+
+        No goal map out here -- see ``_go_to_nearest`` for why it doesn't pay. The
+        list is already region-scoped, so this is a scan of what's nearby rather
+        than of the world, and the walk itself is compacted by ``_step_toward``
+        exactly as before.
+        """
+        here = (pos.x, pos.y)
+        sources = [
+            (xy, source_ent)
+            for xy, source_ent in build_sources()
+            if self._region_of_cached(xy) == island
+            and not (on_source and xy != here and xy in occupied)
+        ]
+        if not sources:
+            return None, None, False
+        target_xy, target_ent = min(sources, key=lambda item: _chebyshev(here, item[0]))
+        reach = 0 if on_source else 1
+        if _chebyshev(here, target_xy) <= reach:
+            return target_xy, target_ent, True
+        return None, None, self._step_toward(ent, pos, target_xy, occupied)
 
     def _greedy_step_toward(
         self,
@@ -484,24 +693,23 @@ class NpcAiProcessor(esper.Processor):
         needs: Needs,
         occupied: dict[tuple[int, int], int],
         shore: list[tuple[int, int]],
+        region_id: RegionId | None = None,
     ) -> bool:
         if any(self.game_map.is_water(nx, ny) for nx, ny in self.game_map.neighbors_8(pos.x, pos.y)):
             needs.thirst = max(0.0, needs.thirst - _DRINK_RESTORE)
             return True
-        # Drink from a shore tile we can actually stand on -- skip shores blocked
-        # by a tree/creature (trees cluster by water), or the animal would fixate
-        # on an unreachable spot and thrash on the bank without ever drinking.
-        # ``shore`` is already this region's local shore bucket, so the same_region
-        # filter runs over a handful of tiles, never every shore in the world.
-        reachable = [
-            s
-            for s in shore
-            if s not in occupied and self._same_region_cached((pos.x, pos.y), s)
-        ]
-        target = self._nearest((pos.x, pos.y), reachable)
-        if target is None:
-            return False
-        return self._step_toward(ent, pos, target, occupied)
+        # Walk down the shore goal map. The field is rooted at every local shore
+        # tile at once, so "the nearest bank I can actually walk to" is what
+        # stepping downhill means -- no candidate list, no same-region filter, and
+        # no fixating on a spot across the water that looked close in a straight
+        # line. Shores don't move, so this map is built once and reused for good.
+        # Blocked shore tiles (trees cluster by water) are still seeded: the animal
+        # walks up beside one and the ``is_water`` check above lets it drink.
+        _tile, _ent, acted = self._go_to_nearest(
+            ent, pos, "shore", lambda: ((s, -1) for s in shore), occupied,
+            region_id, on_source=True,
+        )
+        return acted
 
     def _graze(
         self,
@@ -510,21 +718,36 @@ class NpcAiProcessor(esper.Processor):
         needs: Needs,
         trees: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
+        region_id: RegionId | None = None,
     ) -> bool:
-        trees = self._reachable(pos, trees)
-        if not trees:
+        """Browse the nearest tree. Walks down the region's tree goal map rather
+        than scanning every tree for the closest one."""
+        target_xy, target_ent, acted = self._go_to_nearest(
+            ent, pos, "trees", lambda: trees, occupied, region_id, index_kind=Tree
+        )
+        if target_xy is None:
+            return acted
+        if not self._take_wood_from_tree(target_ent, target_xy, occupied):
+            return False  # the map named a stump; its version key already moved
+        needs.hunger = max(0.0, needs.hunger - _GRAZE_RESTORE)
+        return True
+
+    @staticmethod
+    def _take_wood_from_tree(
+        tree_ent: int | None, xy: tuple[int, int], occupied: dict[tuple[int, int], int]
+    ) -> bool:
+        """Strip one wood off the tree at ``xy``; delete it once it's bare.
+        Returns False if it has already gone (the goal map can be a turn stale)."""
+        if tree_ent is None or not esper.entity_exists(tree_ent):
             return False
-        target_xy, target_ent = min(trees, key=lambda item: _chebyshev((pos.x, pos.y), item[0]))
-        if _chebyshev((pos.x, pos.y), target_xy) == 1:
-            needs.hunger = max(0.0, needs.hunger - _GRAZE_RESTORE)
-            if esper.entity_exists(target_ent) and esper.has_component(target_ent, Tree):
-                tree = esper.component_for_entity(target_ent, Tree)
-                tree.wood -= 1
-                if tree.wood <= 0:
-                    esper.delete_entity(target_ent, immediate=True)  # grazed bare
-                    occupied.pop(target_xy, None)
-            return True
-        return self._step_toward(ent, pos, target_xy, occupied)
+        if not esper.has_component(tree_ent, Tree):
+            return False
+        tree = esper.component_for_entity(tree_ent, Tree)
+        tree.wood -= 1
+        if tree.wood <= 0:
+            esper.delete_entity(tree_ent, immediate=True)
+            occupied.pop(xy, None)
+        return True
 
     def _forage_berries(
         self,
@@ -534,6 +757,7 @@ class NpcAiProcessor(esper.Processor):
         bushes: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
         clock: WorldClock | None,
+        region_id: RegionId | None = None,
     ) -> bool:
         """Head to the nearest ripe berry bush and pick it clean. Bushes block
         their tile, so the forager eats from an adjacent one; the bush regrows a
@@ -544,15 +768,16 @@ class NpcAiProcessor(esper.Processor):
         replayed, not the true "now" -- using the real clock here would let a
         bush regrow based on time that, for this region, hasn't happened yet.
         """
-        bushes = self._reachable(pos, bushes)
-        if not bushes:
-            return False
-        target_xy, target_ent = min(bushes, key=lambda item: _chebyshev((pos.x, pos.y), item[0]))
-        if _chebyshev((pos.x, pos.y), target_xy) == 1:
-            if pick_berries(target_ent, clock):
-                needs.hunger = max(0.0, needs.hunger - _GRAZE_RESTORE)
-            return True
-        return self._step_toward(ent, pos, target_xy, occupied)
+        target_xy, target_ent, acted = self._go_to_nearest(
+            ent, pos, "bushes", lambda: bushes, occupied, region_id, index_kind=BerryBush
+        )
+        if target_xy is None:
+            return acted
+        if target_ent is None or not esper.entity_exists(target_ent):
+            return False  # the map named a bush that has gone; the key already moved
+        if pick_berries(target_ent, clock):
+            needs.hunger = max(0.0, needs.hunger - _GRAZE_RESTORE)
+        return True
 
     def _seek_food(
         self,
@@ -687,28 +912,25 @@ class NpcAiProcessor(esper.Processor):
         inventory: Inventory,
         trees: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
+        region_id: RegionId | None = None,
     ) -> bool:
-        # Drop trees that have already been felled. ``trees`` is the region's
-        # cached static list, which is only rebuilt between region-turns -- fine
-        # when this ran once a turn, but a compacted haul fells several in one
-        # turn and would otherwise keep "chopping" a stump for free wood. Filtering
-        # the copy ``_reachable`` returns, never the cached list itself.
-        trees = [
-            item for item in self._reachable(pos, trees) if esper.entity_exists(item[1])
-        ]
-        if not trees:
-            return False
-        target_xy, tree_ent = min(trees, key=lambda t: _chebyshev((pos.x, pos.y), t[0]))
-        if _chebyshev((pos.x, pos.y), target_xy) == 1:
-            inventory.items.append(WOOD)
-            if esper.entity_exists(tree_ent) and esper.has_component(tree_ent, Tree):
-                tree = esper.component_for_entity(tree_ent, Tree)
-                tree.wood -= 1
-                if tree.wood <= 0:
-                    esper.delete_entity(tree_ent, immediate=True)
-                    occupied.pop(target_xy, None)
-            return True
-        return self._step_toward(ent, pos, target_xy, occupied)
+        """Fell one log off the nearest tree, walking down the tree goal map.
+
+        ``_take_wood_from_tree`` returning False means the goal map named a tree
+        that has already been felled -- it is only rebuilt when the region's tree
+        list is, so a compacted haul that fells several in one turn walks on a map
+        that is briefly a stump or two out of date. Taking no wood for that step
+        is the honest answer; the next call sees a fresh map.
+        """
+        target_xy, tree_ent, acted = self._go_to_nearest(
+            ent, pos, "trees", lambda: trees, occupied, region_id, index_kind=Tree
+        )
+        if target_xy is None:
+            return acted
+        if not self._take_wood_from_tree(tree_ent, target_xy, occupied):
+            return False  # the map named a stump; its version key already moved
+        inventory.items.append(WOOD)
+        return True
 
     def _cook_at_stove(
         self,
@@ -717,19 +939,19 @@ class NpcAiProcessor(esper.Processor):
         inventory: Inventory,
         stoves: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
+        region_id: RegionId | None = None,
     ) -> bool:
-        stoves = self._reachable(pos, stoves)
-        if not stoves:
-            return False
-        target_xy, _stove_ent = min(stoves, key=lambda s: _chebyshev((pos.x, pos.y), s[0]))
-        if _chebyshev((pos.x, pos.y), target_xy) == 1:
-            raw = next((item for item in inventory.items if is_raw_meat(item)), None)
-            if raw is not None and WOOD in inventory.items:
-                inventory.items.remove(WOOD)
-                inventory.items.remove(raw)
-                inventory.items.append(cook_meat(raw))
-            return True
-        return self._step_toward(ent, pos, target_xy, occupied)
+        target_xy, _stove_ent, acted = self._go_to_nearest(
+            ent, pos, "stoves", lambda: stoves, occupied, region_id, index_kind=Stove
+        )
+        if target_xy is None:
+            return acted
+        raw = next((item for item in inventory.items if is_raw_meat(item)), None)
+        if raw is not None and WOOD in inventory.items:
+            inventory.items.remove(WOOD)
+            inventory.items.remove(raw)
+            inventory.items.append(cook_meat(raw))
+        return True
 
     def _feed_cook(
         self,
@@ -1343,6 +1565,7 @@ class NpcAiProcessor(esper.Processor):
                         ent, pos, occupied, player_xy, diet_buckets=(
                             trees, prey, corpses, stoves, bushes, sentients
                         ), shore=shore, logical_turn=logical_turn, clock=clock,
+                        region_id=region_id,
                     )
                     actor.energy -= cost
                     acted += 1
@@ -1439,13 +1662,15 @@ class NpcAiProcessor(esper.Processor):
         if drive.act == "seek_sleep" and needs is not None:
             return self._seek_sleep(ent, pos, needs, occupied)
         if drive.act == "seek_water" and needs is not None:
-            return self._seek_water(ent, pos, needs, occupied, ctx["shore"])
+            return self._seek_water(ent, pos, needs, occupied, ctx["shore"], ctx["region_id"])
         if drive.act == "eat_from_inventory" and needs is not None:
             return self._eat_from_inventory(ent, needs)
         if drive.act == "forage_berries" and needs is not None:
-            return self._forage_berries(ent, pos, needs, ctx["bushes"], occupied, ctx["clock"])
+            return self._forage_berries(
+                ent, pos, needs, ctx["bushes"], occupied, ctx["clock"], ctx["region_id"]
+            )
         if drive.act == "graze" and needs is not None:
-            return self._graze(ent, pos, needs, ctx["trees"], occupied)
+            return self._graze(ent, pos, needs, ctx["trees"], occupied, ctx["region_id"])
         if drive.act == "seek_food" and needs is not None:
             return self._seek_food(ent, pos, needs, ctx["prey"], ctx["corpses"], occupied)
         if drive.act == "feed_cook":
@@ -1469,6 +1694,7 @@ class NpcAiProcessor(esper.Processor):
         shore: list[tuple[int, int]],
         logical_turn: int,
         clock: "WorldClock | None",
+        region_id: RegionId | None = None,
     ) -> None:
         """Select and execute one declarative drive for an NPC.
 
@@ -1484,7 +1710,7 @@ class NpcAiProcessor(esper.Processor):
             "needs": needs, "diet_kind": diet_kind, "trees": trees, "prey": prey,
             "corpses": corpses, "stoves": stoves, "bushes": bushes,
             "sentients": sentients, "shore": shore, "player_xy": player_xy,
-            "logical_turn": logical_turn, "clock": clock,
+            "logical_turn": logical_turn, "clock": clock, "region_id": region_id,
         }
         for drive in self._rank_drives(ent, ctx):
             if self._execute_drive(drive, ent, pos, occupied, ctx):

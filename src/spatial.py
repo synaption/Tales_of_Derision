@@ -43,7 +43,7 @@ simply causes its map to be indexed on first use.
 """
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 import weakref
 
 import esper
@@ -123,6 +123,12 @@ class SpatialIndex:
         # region doesn't count. Systems cache per-region work against this, so a
         # cache rebuilds when its region actually changed rather than on a timer.
         self._version: dict[RegionId, int] = {}
+        # The same counter, but per (region, kind). A cache over one kind of thing
+        # -- the AI's tree/bush goal maps -- must not be thrown away every time a
+        # deer wanders across a seam, which is what the region-wide counter above
+        # would do. Trees change when a tree grows or is felled, and that is all
+        # this moves for.
+        self._kind_version: dict[tuple[RegionId, type], int] = {}
         # esper's population as of the last sync. Creation/deletion anywhere moves
         # this, which is how the index notices work it wasn't told about.
         self._population: tuple[int, int, int] = (-1, -1, -1)
@@ -204,15 +210,18 @@ class SpatialIndex:
             and not esper.has_component(ent, Player)
         )
 
-    def _bump(self, region: RegionId) -> None:
+    def _bump(self, region: RegionId, kinds: Iterable[type] = ()) -> None:
         self._version[region] = self._version.get(region, 0) + 1
+        for kind in kinds:
+            key = (region, kind)
+            self._kind_version[key] = self._kind_version.get(key, 0) + 1
 
     def _insert(self, ent: int, pos: Position) -> None:
         region = region_at(self.game_map, pos.x, pos.y)
-        self._bump(region)
+        kinds = self._kinds_for(ent)
+        self._bump(region, kinds)
         self._region_of[ent] = region
         self._by_region.setdefault(region, set()).add(ent)
-        kinds = self._kinds_for(ent)
         self._kinds_of[ent] = kinds
         for kind in kinds:
             self._by_kind.setdefault((region, kind), set()).add(ent)
@@ -225,9 +234,10 @@ class SpatialIndex:
         region = self._region_of.pop(ent, None)
         if region is None:
             return
-        self._bump(region)
+        kinds = self._kinds_of.pop(ent, ())
+        self._bump(region, kinds)
         self._by_region.get(region, set()).discard(ent)
-        for kind in self._kinds_of.pop(ent, ()):
+        for kind in kinds:
             self._by_kind.get((region, kind), set()).discard(ent)
         tile = self._blocker_tile.pop(ent, None)
         if tile is not None and self.blockers.get(tile) == ent:
@@ -247,11 +257,12 @@ class SpatialIndex:
             self._blocker_tile[ent] = new_xy
         if new_region == old_region:
             return
-        self._bump(old_region)
-        self._bump(new_region)
+        kinds = self._kinds_of.get(ent, ())
+        self._bump(old_region, kinds)
+        self._bump(new_region, kinds)
         self._by_region.get(old_region, set()).discard(ent)
         self._by_region.setdefault(new_region, set()).add(ent)
-        for kind in self._kinds_of.get(ent, ()):
+        for kind in kinds:
             self._by_kind.get((old_region, kind), set()).discard(ent)
             self._by_kind.setdefault((new_region, kind), set()).add(ent)
         self._region_of[ent] = new_region
@@ -262,14 +273,17 @@ class SpatialIndex:
         region = self._region_of.get(ent)
         if region is None:
             return
-        self._bump(region)
-        for kind in self._kinds_of.get(ent, ()):
+        was = self._kinds_of.get(ent, ())
+        self._bump(region, was)
+        for kind in was:
             self._by_kind.get((region, kind), set()).discard(ent)
         if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
             self._kinds_of.pop(ent, None)
             self._forget(ent)
             return
         kinds = self._kinds_for(ent)
+        # Only the kinds it gained; the ones it lost were bumped just above.
+        self._bump(region, (kind for kind in kinds if kind not in was))
         self._kinds_of[ent] = kinds
         for kind in kinds:
             self._by_kind.setdefault((region, kind), set()).add(ent)
@@ -306,6 +320,19 @@ class SpatialIndex:
         cx, cy = region_id
         return tuple(
             self._version.get((x, y), 0)
+            for y in range(cy - 1, cy + 2)
+            for x in range(cx - 1, cx + 2)
+        )
+
+    def kind_neighborhood_version(self, region_id: RegionId, kind: type) -> tuple[int, ...]:
+        """``neighborhood_version`` narrowed to one kind: changes exactly when one
+        of the nine regions gains, loses or reclassifies an entity **of that
+        kind**. What a cache over a single resource type wants, so a passing deer
+        doesn't invalidate the map of where the trees are."""
+        self.sync()
+        cx, cy = region_id
+        return tuple(
+            self._kind_version.get(((x, y), kind), 0)
             for y in range(cy - 1, cy + 2)
             for x in range(cx - 1, cx + 2)
         )

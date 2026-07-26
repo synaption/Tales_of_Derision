@@ -92,11 +92,62 @@ What has actually dominated, and the fixes already in place:
   Cost now concentrates only in cross-region catch-up. Reuse **flow fields**
   (`distance_field`) across travellers/turns instead of re-pathing.
 
-Remaining per-turn cost is spread thin (no single dominant): `distance_field` builds
-(now ~43% of a turn at 9 islands), per-island connectivity relabels
-(`_compute_island_regions`, `find_enclosed_rooms`) after a villager lays a wall, and
-region-geometry helpers (`region_bounds`/`region_grid_size`/`in_region_with_margin`).
-All of these are bounded by one island, so they no longer grow with the archipelago.
+Remaining per-turn cost is spread thin (no single dominant): `distance_field` builds,
+per-island connectivity relabels (`_compute_island_regions`, `find_enclosed_rooms`)
+after a villager lays a wall, and region-geometry helpers
+(`region_bounds`/`region_grid_size`/`in_region_with_margin`). All of these are bounded
+by one island, so they no longer grow with the archipelago.
+
+## Goal maps
+
+Flow-field reuse solved "many creatures, one goal". It did nothing for the commoner
+case — many creatures, *many* goals — because a per-goal field is a fresh island-wide
+BFS for every tile anybody picks. Measured, that was **one ~6 ms island flood per
+player turn, 60–70% of the whole turn, at every world size** (1.78 floods/turn at one
+island; 1.17 at a hundred). Creatures mint new goals constantly: 113 cached fields for
+15 deer, each choosing whichever tree looked nearest as it moved.
+
+A **goal map** inverts it: `GameMap.distance_field_from` seeds *every* tree (or shore
+tile, or ripe bush) at distance 0 in one flood, so stepping downhill from anywhere
+walks to the nearest one. `NpcAiProcessor._goal_map` caches one per
+`(kind, region, island)` and `_go_to_nearest` drives every resource-seeking drive off
+it — replacing both the flood *and* the `_reachable` scan (an O(sources) same-region
+filter each drive ran per creature per turn) with eight dict lookups.
+
+Three things make it pay, and each was needed:
+
+- **Per-kind invalidation.** `SpatialIndex.kind_neighborhood_version` narrows the
+  index's version counter to one component type. Keyed on the region-wide counter
+  instead, the map of where the trees are died every time a deer crossed a seam —
+  a 40% miss rate.
+- **Island scoping.** A region's widened source list can straddle several islands, and
+  seeding them all floods every one: measured at 27 382 tiles per flood (four islands)
+  where one island is 6 838. Seeds are filtered to the walking component the creature
+  is standing on — the same rule `_reachable` enforced, now paid once per flood rather
+  than per creature per turn.
+- **Watched creatures only.** In the player's region a flood is shared by everyone
+  standing there, every turn. In the lagging world a region gets one turn at a time
+  and its trees churn as its creatures eat them, so the same flood is bought over and
+  over for a handful of uses: 75 tree floods for ~205 uses (2 ms a use), and
+  whole-world catch-up rose 47%. Out there `_go_to_nearest_unwatched` keeps the cheap
+  scan-and-walk. (A demand-driven staleness policy was tried instead and measured
+  *worse* — 228 floods against 109 — because a periodic refresh fires more often than
+  real changes do.)
+
+Everything improved, and per-turn cost is now flat in island count *and* small:
+
+| islands | 1 | 9 | 25 | 100 |
+|---|---|---|---|---|
+| per player turn, before | 15.6 ms | 8.0 | 9.0 | 14.5 |
+| per player turn, after | **3.6 ms** | **3.2** | **0.63** | **2.3** |
+| enter a stale region, before | — | 153 ms | 156 | 165 |
+| enter a stale region, after | — | **85 ms** | **88** | **98** |
+| `catch_up_all`, before | — | 1.26 s | 3.28 | 16.03 |
+| `catch_up_all`, after | — | **1.10 s** | **2.85** | **13.76** |
+
+The floods that remain are single-source ones from `_step_toward` for the goals no
+goal map covers yet — home, blueprints, prey, conversation partners — at 0.07–0.25
+per turn. Those are the next candidates.
 
 ### Strict active/inactive partitioning
 
