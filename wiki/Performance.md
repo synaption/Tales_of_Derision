@@ -227,6 +227,98 @@ Sprouts are now dated to the region's own day, and the same run ends with ~90
 saplings and ~40 more trees. Over 1000 days the forest climbs steadily toward its
 soft cap and `SpatialIndex.audit()` stays clean throughout.
 
+## Populations instead of individuals
+
+With flora counted rather than scanned, a night's sleep profiled at 3.93 s and
+**74% of it was fish** — not because fish AI is expensive per fish (an NPC costs
+76 µs a creature-turn, a fish 3.2 µs) but because there are 1121 of them against
+16 NPCs, and sleep replayed every one for all 800 turns. ~900k fish-turns of
+random-walking that nobody observed.
+
+Two things were wrong with that. The cheap one: `FishAiProcessor` registered only
+a `step` with the region scheduler — no `bulk`, no `idle_turns` — so per
+[`jump_limit`](../src/regions.py) it was pinned to one turn at a time, the only
+system to opt out of the skipping machinery while holding 99% of the entities.
+The deep one: it was computing the wrong thing. The single durable output of all
+that simulation was a seaweed count.
+
+[wildlife.py](../src/wildlife.py) replaces it with per-region population stocks
+(see [Systems](Systems.md#wildlifeprocessor-priority-0--populations-not-individuals)).
+A region with no fish *entities* has nothing for the fish step to do, so
+`_idle_turns` reports an unbounded span and the scheduler clears the whole
+debt in one visit.
+
+| a 800-turn night, 1400×800 | before | after |
+|---|---|---|
+| fish AI | 2.90 s (74%) | **0.024 s (1.7%)** |
+| NPC AI | 0.97 s | 0.98 s |
+| flora | 0.06 s | 0.06 s |
+| wildlife day model | — | 0.38 s |
+| **total** | **3.93 s** | **1.43 s** |
+
+Fish catch-up is **120× faster**; a night is 2.7× faster overall, and NPC AI is
+now the bottleneck at 68%. Entity count drops 32 766 → 31 658, and the per-turn
+loop is unchanged (residency sync walks the couple of dozen *people*, not the 143
+regions, and does not appear in a turn profile).
+
+### What it costs, and the tuning it exposes
+
+The day model is ~22 ms per world-day for 143 regions — the same order as flora,
+and off the keypress path by the same route.
+
+It also made an existing imbalance visible, which is the point of putting a real
+number on `forage_efficiency`. Run for 448 days the sea overshoots and settles:
+fish 1121 → 3788 by day 112, seaweed grazed 31 000 → 3 800 by day 168, then fish
+fall back and both hold steady around **2400 fish / ~1800 seaweed** from day 224.
+Textbook logistic overshoot, stable, no extinction.
+
+### Spreading, and why the sea now recovers
+
+That first cut collapsed monotonically: seaweed fell to ~6% of its world-gen
+density and stayed there. The cause was structural — seaweed regrowth was a flat
+per-ocean-tile chance *independent of standing stock*, so it could not accelerate
+when grazed down, and the system settled wherever consumption met that constant.
+
+Plants now **spread from what already stands** (`_spread_factor`, logistic), so
+regrowth rises as a thinned reef recovers. That turns a one-way collapse into a
+damped predator–prey oscillation that converges. Ten in-game years, 1400×800:
+
+| day | fish | seaweed | trees |
+|---|---|---|---|
+| 1 | 1189 | 30 908 | 656 |
+| 112 | 4501 | 14 928 | 654 |
+| 224 | 837 | 4 086 | 693 |
+| 336 | 1800 | 20 584 | 739 |
+| 560 | 1724 | 9 939 | 849 |
+| 840 | 1902 | 11 814 | 989 |
+| 1120 | 1842 | 13 471 | 1112 |
+
+Fish boom, overgraze, crash, and the reef comes back; the swings damp out to
+roughly **1850 fish / 13 000 seaweed** while the forest grows steadily toward its
+own cap. `_DAILY_SEAWEED_SPROUT_CHANCE` was doubled to 0.0012 as part of this:
+spreading makes a *sparse* reef slower to recover, so the peak rate has to be
+high enough that a healthy reef outgrows the shoal eating it.
+
+Two things worth knowing:
+
+- **World-gen over-stocks the sea.** It lays down ~31 000 seaweed against an
+  equilibrium near 13 000, so the first ~6 in-game months always show a fish boom
+  and a crash before things settle. Dropping the world-gen seaweed density
+  (0.028 → ~0.013 of ocean tiles) would start the world at its own equilibrium
+  and skip the opening swing — a one-line change in `_spawn_ocean_life`, left
+  alone because the settling-in is arguably worth watching.
+- **A bug the separation caught.** Giving seaweed a seedling stage as a third
+  `Sapling.kind` silently stopped forests growing: `flora_total` counts saplings
+  against the *land* cap, and 4000 young fronds instantly exceeded it. Hence
+  `SeaSprout` as its own component — the two habitats have to be countable apart.
+  Pinned by `test_young_seaweed_is_not_counted_against_the_land_flora_cap`.
+- **And one in the audit.** `SpatialIndex.audit` was the only query that didn't
+  `sync()` first, so it compared unrepaired state against the world. Since the
+  index's contract is *repaired on read*, that measured a state no caller can
+  observe and reported false staleness for any deletion after the last read —
+  which is precisely what dissolving a shoal into a stock does. It read clean
+  before only because a read always happened to precede it.
+
 ### Strict active/inactive partitioning
 
 `esper.process(action)` simulates the region the player stands in and nothing else.

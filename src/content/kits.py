@@ -64,8 +64,24 @@ def grazer_kit(
 def fish_kit(*, hunger: float = 25.0) -> list:
     """A sea creature driven by ``FishAiProcessor`` (water-only, never the land
     pathfinder). Never thirsty; its only drive is hunger, which sends it grazing
-    seaweed."""
-    return [Fish(), Needs(hunger=hunger, thirst=0.0, thirst_rate=0.0, tiredness_rate=0.0)]
+    seaweed.
+
+    Its hunger rate is a fish's own (``systems._FISH_HUNGER_RATE``), not the
+    generic one: a fish must need exactly one bite of seaweed a day, which is
+    what ``wildlife.FISH`` assumes when it works out whether the sea can feed
+    the shoal. See that constant for the arithmetic.
+    """
+    from systems import _FISH_HUNGER_RATE  # late: systems imports content
+    return [
+        Fish(),
+        Needs(
+            hunger=hunger,
+            thirst=0.0,
+            hunger_rate=_FISH_HUNGER_RATE,
+            thirst_rate=0.0,
+            tiredness_rate=0.0,
+        ),
+    ]
 
 
 def person_kit(*, gender: str, traits: list[str], surname: str) -> list:

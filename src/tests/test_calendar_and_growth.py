@@ -1,5 +1,7 @@
 """Unrendered tests for the calendar (year/month/week/day + clock time) and the
-tree growth cycle (saplings sprouting near trees and maturing after a year)."""
+flora growth cycle: seedlings sprouting where their kind already grows, maturing
+after their season, bearing and rotting. Trees, bushes and seaweed all live the
+same life -- see ``TreeGrowthProcessor``."""
 from __future__ import annotations
 
 import esper
@@ -361,3 +363,115 @@ def test_growth_respects_the_soft_cap() -> None:
 
     _advance_a_day(processor, clock, from_turn=0)
     assert list(esper.get_components(Sapling)) == []
+
+
+# --- Spreading, and seaweed's life cycle ------------------------------------
+#
+# Plants spread from what already stands rather than appearing uniformly on open
+# ground, and seaweed now lives the same life a tree does: a seedling that takes
+# time to become food, and a grown frond that can rot rather than only ever being
+# eaten. These hold the two properties that follow from that.
+
+
+def test_a_bare_region_still_gets_colonised() -> None:
+    """Spreading must never be able to lock a region at zero. With nothing
+    standing there is nothing to spread from, so a floor rate (``_COLONISE_SHARE``)
+    carries seed in from elsewhere -- otherwise a logged or grazed-out region
+    could never come back, which is worse than the uniform model it replaced."""
+    from systems import _spread_factor, _COLONISE_SHARE
+
+    assert _spread_factor(0, 1000) == pytest.approx(_COLONISE_SHARE)
+    assert _spread_factor(0, 0) == pytest.approx(_COLONISE_SHARE)
+
+
+def test_spreading_is_fastest_at_half_capacity_and_tails_off_when_full() -> None:
+    from systems import _spread_factor, _COLONISE_SHARE
+
+    empty = _spread_factor(0, 1000)
+    half = _spread_factor(500, 1000)
+    full = _spread_factor(1000, 1000)
+
+    assert half == pytest.approx(1.0)      # the per-tile constants' own meaning
+    assert half > _spread_factor(200, 1000) > empty
+    assert half > _spread_factor(800, 1000) > full
+    # Both ends bottom out at the colonisation floor, never at zero.
+    assert empty == pytest.approx(_COLONISE_SHARE)
+    assert full == pytest.approx(_COLONISE_SHARE)
+
+
+def test_a_thriving_region_outgrows_a_sparse_one() -> None:
+    """The behavioural point of spreading: the same tile, the same odds, but a
+    wood that is already there fills in faster than bare ground does."""
+    from systems import _spread_factor
+
+    sparse = _spread_factor(10, 1000)
+    thriving = _spread_factor(400, 1000)
+    assert thriving > sparse * 5
+
+
+def test_seaweed_sprouts_as_a_seedling_and_matures_into_food() -> None:
+    """Seaweed lives a tree's life now: a sprout first, which feeds nobody until
+    it grows. That delay is what gives a grazed reef a recovery time."""
+    from components import SeaSprout, Seaweed
+    from systems import _SEAWEED_MATURE_DAYS
+
+    game_map = GameMap(24, 14)
+    game_map.has_ocean = True
+    clock = WorldClock(turn=0, day_length=_DAY_LEN)
+    esper.create_entity(clock)
+    sprout = esper.create_entity(
+        Position(8, 8), Renderable("'"), Name("Seaweed Sprout"), SeaSprout(planted_turn=0)
+    )
+    processor = TreeGrowthProcessor(game_map, rng=lambda: 1.0)  # nothing else happens
+
+    _advance_a_day(processor, clock, from_turn=0)
+    assert esper.has_component(sprout, SeaSprout), "still young the next day"
+    assert not esper.has_component(sprout, Seaweed)
+
+    clock.turn = _SEAWEED_MATURE_DAYS * _DAY_LEN
+    processor.process("wait")
+
+    assert not esper.has_component(sprout, SeaSprout)
+    assert esper.has_component(sprout, Seaweed)
+    # ...and unlike a tree it does not block the water it grows in: fish swim
+    # over seaweed, which is how they graze it.
+    assert not esper.has_component(sprout, BlocksMovement)
+    assert esper.component_for_entity(sprout, Name).value == "Seaweed"
+
+
+def test_grown_seaweed_can_rot() -> None:
+    """Before, a frond could only ever leave the world down a fish."""
+    from components import Seaweed
+
+    game_map = GameMap(24, 14)
+    game_map.has_ocean = True
+    clock = WorldClock(turn=0, day_length=_DAY_LEN)
+    esper.create_entity(clock)
+    fronds = [
+        esper.create_entity(Position(4 + i, 5), Renderable('"'), Name("Seaweed"), Seaweed())
+        for i in range(6)
+    ]
+    processor = TreeGrowthProcessor(game_map, rng=lambda: 0.0)  # every roll kills
+
+    _advance_a_day(processor, clock, from_turn=0)
+
+    assert all(not esper.entity_exists(e) for e in fronds)
+
+
+def test_young_seaweed_is_not_counted_against_the_land_flora_cap() -> None:
+    """``SeaSprout`` is a separate component precisely so a sea full of young
+    fronds cannot tell the *forests* they are full -- the bug that stopped trees
+    growing when seaweed first got a seedling stage."""
+    from components import SeaSprout
+
+    game_map = GameMap(24, 14)
+    clock = WorldClock(turn=0, day_length=_DAY_LEN)
+    esper.create_entity(clock)
+    for i in range(50):
+        esper.create_entity(Position(2 + i % 20, 2 + i // 20), SeaSprout(planted_turn=0))
+    processor = TreeGrowthProcessor(game_map, rng=lambda: 0.0)  # every roll sprouts
+    processor._cap = 40  # fewer than the 50 sea sprouts standing
+
+    _advance_a_day(processor, clock, from_turn=0)
+
+    assert list(esper.get_components(Sapling)), "land growth must ignore sea sprouts"

@@ -205,6 +205,22 @@ class Sapling:
 
 
 @dataclass
+class SeaSprout:
+    """A young frond rooted on an open-sea tile -- the ocean's ``Sapling``.
+
+    Kept as its own component rather than a third ``Sapling.kind`` so the two
+    habitats stay countable apart: the land's soft cap and the sea's are separate
+    numbers, and both are read as O(1) populations off the spatial index. A world
+    with 4000 young fronds must not be told its *forests* are full.
+
+    Matures into ``Seaweed`` after ``systems._SEAWEED_MATURE_DAYS``; like a
+    sapling it blocks nothing and feeds nobody until it is grown, which is what
+    gives a grazed reef a recovery time.
+    """
+    planted_turn: int = 0
+
+
+@dataclass
 class BerryBush:
     """A mature berry bush. When ripe (``has_berries``) its berries can be
     picked; once taken they regrow 7 days later. ``harvested_turn`` records when

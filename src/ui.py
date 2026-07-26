@@ -713,6 +713,8 @@ def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = 
     births = esper.get_processor(ReproductionProcessor)
     if births is not None:
         births.catch_up_all_births()
+    # Wild populations came with it: they ride the flora's day cursor, so
+    # catch_up_all_flora above already grazed, bred and starved the night out.
 
     esper.process(None)
 

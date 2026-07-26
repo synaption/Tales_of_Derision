@@ -167,3 +167,26 @@ def test_index_is_not_shared_between_worlds() -> None:
     assert spatial.index_for(game_map) is not None
     other_map = GameMap(60, 30)
     assert spatial.index_for(other_map) is None
+
+
+def test_audit_reflects_the_index_as_callers_see_it() -> None:
+    """``audit`` must sync before comparing, like every other query.
+
+    The index's contract is *repaired on read*, so an entity deleted since the
+    last read is legitimately still in the buckets until something asks again.
+    An audit that skipped the sync measured a state no caller can observe and
+    reported false staleness for any deletion after the last read -- which is
+    exactly what dissolving a shoal into a population count does.
+    """
+    game_map = _world()
+    index = spatial.index_for(game_map)
+    doomed = [ent for ent, (_t,) in list(esper.get_components(Tree))[:5]]
+    assert doomed
+    index.sync()
+
+    for ent in doomed:
+        esper.delete_entity(ent, immediate=True)
+    # No read in between: the buckets still hold them, by design.
+    assert index.audit() == [], "audit must fold in the deletions before judging"
+    for ent in doomed:
+        assert index.blocker_at(*(0, 0)) != ent

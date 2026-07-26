@@ -129,6 +129,39 @@ sprout and how many die and acts on that many (see
 the outcome instead of rolling for it, file a deadline instead of searching for it —
 apply to anything else shaped like a scan.
 
+**Wild animals go one level further**, and are the aggregate model this section
+kept pointing at. Rather than shortcut the simulation of 1121 individual fish,
+[wildlife.py](../src/wildlife.py) stops representing them as individuals at all:
+a region holds a *number*, and the number moves once a day against the region's
+food supply. Entities exist only where somebody can see them. That is the answer
+to "what does an unobserved creature cost" — nothing, because there is no
+creature, only a population. See
+[Systems](Systems.md#wildlifeprocessor-priority-0--populations-not-individuals).
+
+Its randomness is drawn from `rng.region_day_rng(seed, region, day)` rather than
+a running stream, which holds batch independence a little tighter than this
+section demands: a given region-day produces the same outcome regardless of the
+order regions were visited or how many the idle pump managed that frame.
+
+### Coupled day models need one cursor
+
+Batch independence is not enough when two day models **read each other's state**.
+Wild animals eat the flora, and the population model and the growth model were
+first given a day cursor each, caught up one after the other. Over a single day
+that is identical; over a long catch-up it is not — a region grew a month of
+seaweed with nothing grazing it, then grazed a month with nothing growing, and
+landed somewhere the interleaved simulation never would. It showed up as a sea
+that collapsed on some seeds and not others, purely as a function of how far the
+two cursors had drifted.
+
+So there is exactly **one region-day cursor**, owned by `TreeGrowthProcessor`, and
+`WildlifeProcessor.register_on` makes the population a step on it
+(`register_day_step`). A region's plants and its animals now advance together
+whatever pays the debt down — a keypress, the idle pump, or a night's sleep. The
+rule generalises: *a system whose day depends on another system's day must not
+keep its own cursor.* This is also the seam the shared world scheduler this
+document keeps asking for would slot into.
+
 The constraint is **not** "replay every turn". It is **batch independence**:
 
 > the result must not depend on how the turns were divided up.

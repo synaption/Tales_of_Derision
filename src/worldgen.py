@@ -22,6 +22,7 @@ from onymancer import make_onymancer
 from queries import first_player_entity
 from rng import world_rng
 import spatial
+import wildlife
 from systems import born_turn_for_age, furnish_house, set_bed_owner
 from content.items import default_equipment_slots
 from content.kits import person_kit
@@ -185,6 +186,14 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     # is allowed: after it, systems ask ``spatial`` for a region's entities instead
     # of walking the entity table every turn (see spatial.py).
     spatial.attach(game_map)
+
+    # Adopt the wild animals just scattered into per-region population stocks and
+    # stock down everywhere nobody is watching. World-gen deliberately scatters
+    # real fish so the shoals are placed by the same seeded pass as everything
+    # else; this is what turns them into numbers a moment later (see wildlife.py).
+    stocks = wildlife.ensure(game_map)
+    stocks.sync_residency()
+    stocks.seed_from_world()
 
     return 1
 

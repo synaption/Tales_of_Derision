@@ -70,6 +70,7 @@ from audio import CombatSfxPlayer, start_background_music, stop_background_music
 from content.effects import EffectsProcessor
 from renderer.base import Renderer
 from renderer.pygame_renderer import PygameRenderer
+from wildlife import WildlifeProcessor
 from systems import FishAiProcessor, HousingProcessor, MovementProcessor, NeedsProcessor, NpcAiProcessor, RenderProcessor, ReproductionProcessor, TimeProcessor, TreeGrowthProcessor, WAIT_ACTION, bubbles_active, player_is_animated, queue_message, world_clock
 
 _RELEASE_TO_DIRECTION = {
@@ -264,6 +265,9 @@ def _pump_background_regions(budget_seconds: float) -> None:
     births = esper.get_processor(ReproductionProcessor)
     if births is not None:
         births.pump_births(player_xy)
+    # Wild populations need no pump of their own: they ride the flora's
+    # per-region day cursor (WildlifeProcessor.register_on), so the shoal a
+    # region feeds is advanced by the same pass that grew its seaweed.
 
 
 @dataclass(frozen=True)
@@ -611,8 +615,15 @@ def _register_processors(game_map: GameMap, combat_sfx: CombatSfxPlayer) -> None
     # effect declares behaviour; the seam lives in content.effects.
     effects = EffectsProcessor(game_map)
     esper.add_processor(effects, priority=0)
-    esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
+    flora = TreeGrowthProcessor(game_map)
+    esper.add_processor(flora, priority=0)
     esper.add_processor(ReproductionProcessor(game_map), priority=0)
+    # Wild populations. The processor itself only keeps residency in step each
+    # turn; the population model rides the flora's day cursor, because animals
+    # eat plants and the two must advance together (see register_on).
+    animals = WildlifeProcessor(game_map)
+    animals.register_on(flora)
+    esper.add_processor(animals, priority=0)
 
     # Needs and status effects belong to a *region's* turn, not the world's: they
     # are registered as steps on the region scheduler, so they run wherever that

@@ -1877,7 +1877,15 @@ class FishAiProcessor(esper.Processor):
         self._rng = rng if rng is not None else world_rng().stream("ai").random
         self._wall_clock = clock if clock is not None else time.monotonic
         self.scheduler = RegionScheduler(game_map, _current_region_turn())
-        self.scheduler.register("fish", self._advance_region)
+        # ``idle_turns`` is what makes the stock model pay off. A region whose
+        # fish are a *number* rather than entities has nothing for this step to
+        # do -- no fish to swim, no seaweed to nibble tile by tile -- so it
+        # reports an unbounded idle span and the scheduler skips the whole debt
+        # in one visit instead of replaying it a turn at a time. Population
+        # change for those regions happens once a day in ``wildlife``.
+        self.scheduler.register(
+            "fish", self._advance_region, idle_turns=self._idle_turns
+        )
         # Which fish is on which tile, world-wide -- the one thing here that isn't
         # per-region, because a fish must not swim onto a neighbour resting in a
         # region nobody is simulating. Rebuilt only when the shoal gains or loses a
@@ -1928,6 +1936,19 @@ class FishAiProcessor(esper.Processor):
         ]
         self._seaweed_by_region[region_id] = (version, fronds)
         return fronds
+
+    def _idle_turns(self, region_id: RegionId) -> int:
+        """How many turns this region can prove hold nothing for the fish step.
+
+        A region with no fish *entities* -- which, under the stock model, is
+        every region nobody is looking at -- can never do anything here, so the
+        answer is "as far as you like". This is the discrete-event move the
+        scheduler is built around, and it is why a night's sleep no longer
+        replays 900k fish-turns to arrive back where it started.
+        """
+        if spatial.ensure(self.game_map).of_kind(region_id, Fish):
+            return 1
+        return _UNBOUNDED
 
     def _advance_region(self, region_id: RegionId) -> None:
         """One turn of fish for one region, reading only that region's fish and

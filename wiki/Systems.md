@@ -75,11 +75,28 @@ edit-revision) so a villager with nowhere to build doesn't re-run the site searc
 every turn (a former hot spot — see [Performance](Performance.md)).
 
 ### `TreeGrowthProcessor` (priority 0)
-Evaluated **once per in-game day**: sprouts saplings on open ground
-(`_DAILY_SPROUT_CHANCE` trees, `_DAILY_BUSH_SPROUT_CHANCE` bushes), matures
-year-old saplings, kills off some mature plants (`_DAILY_DEATH_CHANCE`), regrows
-harvested berry bushes after 7 days, and sprouts seaweed in the sea — a
-self-sustaining forest and reef.
+Evaluated **once per in-game day**. Every plant in the world — trees, berry
+bushes, seaweed — lives the same life:
+
+**seedling → (matures) → grown plant → (rots, or is eaten)**
+
+- `Sapling` on land (→ `Tree` after 112 days, or `BerryBush` per its `kind`);
+  `SeaSprout` at sea (→ `Seaweed` after `_SEAWEED_MATURE_DAYS`, 7). They are two
+  components rather than one so the land's soft cap and the sea's stay countable
+  apart — a sea full of young fronds must not tell the forests they are full.
+- Every grown plant can die at `_DAILY_DEATH_CHANCE`, seaweed included. Before,
+  a frond could only ever leave the world down a fish.
+- Berry bushes regrow their crop 7 days after being picked.
+
+**Plants spread from what already stands.** The per-tile sprout chance is scaled
+by `_spread_factor(standing, capacity)` — logistic, so growth is fastest at half
+capacity and tails off at both ends: nothing to spread from when a region is
+bare, nowhere to go when it is full. A floor (`_COLONISE_SHARE`, 5%) carries seed
+in from elsewhere so a logged or grazed-out region can always come back; without
+it, spreading could lock a region at zero forever.
+
+Standing stock and capacity are both O(1) index reads, so this costs nothing and
+sprouting stays a single binomial draw — see below.
 
 **It does none of that by scanning.** Written literally those are four sweeps per
 region per day — every tile, every plant, every sapling, every bush — so the
@@ -106,6 +123,54 @@ a tile map of plants, needed because saplings and seaweed occupy a tile without
 blocking it, and cheap because nothing in it ever moves. A candidate tile that is
 taken is simply given up on. See
 [Performance](Performance.md#counting-instead-of-scanning).
+
+### `WildlifeProcessor` (priority 0) — populations, not individuals
+
+Lives in [wildlife.py](../src/wildlife.py). Wild animals are **per-region counts**,
+not thousands of persistent individuals walking the world. A species is in one of
+two forms:
+
+- **Stocked** — the normal case. A region holds an integer: "310 fish". No
+  entities, no positions, no per-turn work. Population changes here, once a day.
+- **Resident** — a region someone can watch (the player's, or one holding an NPC
+  that might hunt) materialises its stock into real entities, which the per-turn
+  AI swims or walks exactly as before.
+
+At shipping size that is **1121 fish held as 13 entities** in two live regions.
+Individuals are therefore not persistent — the fish you swam past yesterday is
+not the same fish today. That is the trade: the *population* is what is being
+modelled, and the population is what persists.
+
+**Residency runs every turn** — the player crossing a seam must materialise the
+sea before it is drawn, so it cannot lag. It is cheap: a walk over the couple of
+dozen *people* in the world, not the hundred-odd regions.
+
+**Population runs every day, on the flora's cursor, not its own.** Animals eat
+plants, so the two day models must advance in lockstep; `register_on` makes the
+population a step on `TreeGrowthProcessor`'s per-region day cursor. Given each its
+own cursor — as they briefly had — a long catch-up could grow a month of seaweed
+with nothing grazing it and then graze a month with nothing growing. See
+[World Simulation](World-Simulation.md#coupled-day-models-need-one-cursor).
+
+A day, per region:
+
+```
+demand    = count * bites_per_day
+eaten     = min(demand, standing_food * forage_efficiency)
+deaths   ~= starve_chance * (1 - eaten/demand)  +  predation_chance * predators
+births   ~= breed_chance, if fed and under the region's density cap
+```
+
+Births and deaths are `rng.binomial` draws, so a day costs the animals that were
+actually born or died. A species is a `Species` dataclass — adding one is a
+declaration, not a code path. `predators` / `predation_chance` are the plug-in
+point for the predator layer; `DEER` is declared but left resident everywhere
+until deer scale with the land (see the note on it).
+
+`forage_efficiency` is worth understanding: before this existed, fish "balanced"
+against their food only because a wandering fish usually failed to *find* seaweed
+within its sight radius. The ecology was propped up by a bad search. It is now an
+explicit number.
 
 ### `ReproductionProcessor` (priority 0)
 Delivers due pregnancies: after `_GESTATION_DAYS` it spawns a newborn beside the

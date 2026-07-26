@@ -50,7 +50,7 @@ import esper
 
 from components import (
     Bed, BerryBush, BlocksMovement, Blueprint, Camp, Corpse, Deer, Fish, Needs, NPC,
-    Personality, Player, Position, Resident, Sapling, Seaweed, Stove, Tree,
+    Personality, Player, Position, Resident, Sapling, SeaSprout, Seaweed, Stove, Tree,
 )
 from game_map import GameMap
 from regions import RegionId, region_at
@@ -60,7 +60,7 @@ from regions import RegionId, region_at
 # recomputed for an entity only when it is added or reclassified -- never per turn.
 _KINDS: tuple[type, ...] = (
     NPC, Personality, Deer, Fish, Corpse, Tree, BerryBush, Stove, Seaweed, Needs,
-    Resident, Player, Bed, Sapling, Blueprint, Camp,
+    Resident, Player, Bed, Sapling, SeaSprout, Blueprint, Camp,
 )
 
 # Plants: the things that are *rooted* to the tile they occupy. They are worth
@@ -68,7 +68,7 @@ _KINDS: tuple[type, ...] = (
 # movement path nothing to maintain (unlike a general occupancy map, which every
 # creature step would have to update). ``rooted_at`` is what lets flora growth ask
 # "is this tile already taken?" in O(1) instead of collecting a region's tiles.
-_ROOTED: tuple[type, ...] = (Tree, BerryBush, Sapling, Seaweed)
+_ROOTED: tuple[type, ...] = (Tree, BerryBush, Sapling, SeaSprout, Seaweed)
 
 
 class _CreationCounter:
@@ -427,7 +427,17 @@ class SpatialIndex:
     def audit(self) -> list[str]:
         """Differences between the index and a fresh whole-world scan. Empty means
         the index is telling the truth; used by the tests to prove the incremental
-        maintenance stays correct across a long simulation."""
+        maintenance stays correct across a long simulation.
+
+        Syncs first, like every other query. That is not a formality: the index's
+        contract is that it is *repaired on read*, so unsynced state differing from
+        the world is normal and expected -- deletions since the last query have
+        simply not been folded in yet. Auditing without syncing measured a state
+        no caller can ever observe, and reported false staleness for any deletion
+        that happened after the last read (a shoal being dissolved into a stock,
+        for instance).
+        """
+        self.sync()
         problems: list[str] = []
         truth_region: dict[int, RegionId] = {}
         truth_blockers: dict[tuple[int, int], int] = {}

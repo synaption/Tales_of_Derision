@@ -38,6 +38,7 @@ from systems import (  # noqa: E402
     TreeGrowthProcessor,
 )
 from content.effects import EffectsProcessor  # noqa: E402
+from wildlife import WildlifeProcessor  # noqa: E402
 
 
 class _NullRenderer(Renderer):
@@ -68,8 +69,12 @@ def build(flood: bool, render: bool, active_cap: int | None = None) -> GameMap:
     )
     esper.add_processor(NeedsProcessor(game_map), priority=0)
     esper.add_processor(EffectsProcessor(), priority=0)
-    esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
+    flora = TreeGrowthProcessor(game_map)
+    esper.add_processor(flora, priority=0)
     esper.add_processor(ReproductionProcessor(), priority=0)
+    animals = WildlifeProcessor(game_map)
+    animals.register_on(flora)
+    esper.add_processor(animals, priority=0)
     if render:
         esper.add_processor(RenderProcessor(_NullRenderer(), game_map), priority=0)
     npcs = sum(1 for _e, _c in esper.get_components(Position))
