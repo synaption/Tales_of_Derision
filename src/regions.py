@@ -10,10 +10,25 @@ is the shared, generic version so other expensive systems (chiefly
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
 
 RegionId = tuple[int, int]
+
+# "As far as you like" for ``jump_limit`` -- a region with nothing in it can skip
+# straight to the target turn, so the only real bound is the debt itself.
+_UNBOUNDED = 1 << 30
+
+
+@dataclass(frozen=True)
+class _Step:
+    """One registered per-region simulation step and its optional fast paths.
+    See ``RegionScheduler.register``."""
+    name: str
+    step: Callable[[RegionId], None]
+    bulk: Callable[[RegionId, int], None] | None = None
+    idle_turns: Callable[[RegionId], int] | None = None
 
 REGION_W = LAND_WIDTH   # 120
 REGION_H = LAND_HEIGHT  # 60
@@ -127,7 +142,7 @@ class RegionScheduler:
 
     def __init__(self, game_map: GameMap, current_turn: int):
         self.game_map = game_map
-        self._steps: list[tuple[str, Callable[[RegionId], None]]] = []
+        self._steps: list[_Step] = []
         # A freshly built world has no history to be behind on: every region
         # starts "caught up" to the turn it was created at, not zero -- else
         # the first pump would replay turns nothing ever actually lived
@@ -137,18 +152,70 @@ class RegionScheduler:
             region_id: current_turn for region_id in all_region_ids(game_map)
         }
 
-    def register(self, name: str, step: Callable[[RegionId], None]) -> None:
-        """Add a per-region simulation step, run in registration order."""
-        self._steps.append((name, step))
+    def register(
+        self,
+        name: str,
+        step: Callable[[RegionId], None],
+        bulk: Callable[[RegionId, int], None] | None = None,
+        idle_turns: Callable[[RegionId], int] | None = None,
+    ) -> None:
+        """Add a per-region simulation step, run in registration order.
+
+        ``step`` runs one turn and is all a system needs to provide. The other two
+        are how a step opts in to being **skipped ahead** (see ``jump_limit``):
+
+        * ``bulk(region_id, turns)`` -- do those turns' worth of work in one call.
+          A step with a bulk never limits how far the region may jump.
+        * ``idle_turns(region_id)`` -- how many upcoming turns this step can prove
+          require nothing beyond what its bulk does. A step with neither hook
+          pins the region to one turn at a time, which is the old behaviour.
+        """
+        self._steps.append(_Step(name, step, bulk, idle_turns))
 
     def region_at(self, x: int, y: int) -> RegionId:
         return region_at(self.game_map, x, y)
 
     def advance_region(self, region_id: RegionId) -> None:
         """Run every registered step for ``region_id``'s next turn."""
-        for _name, step in self._steps:
-            step(region_id)
+        for entry in self._steps:
+            entry.step(region_id)
         self.region_turn[region_id] = self.region_turn.get(region_id, 0) + 1
+
+    def jump_limit(self, region_id: RegionId) -> int:
+        """How many turns ``region_id`` may be advanced in one go right now.
+
+        The smallest ``idle_turns`` any step reports, ignoring steps that can do a
+        span in bulk, and 1 for any step that offers neither -- so a region jumps
+        only as far as *every* step agrees nothing happens. This is the classic
+        discrete-event move: rather than tick a world where nothing can change,
+        skip to the next turn on which something can.
+
+        Nothing about the outcome depends on how far it happens to jump, which is
+        the batch-independence rule this class documents: a step is asked to skip
+        only turns it has proved are empty for it, and the arithmetic a bulk does
+        is a function of the span, not of how the span was chosen.
+        """
+        limit = _UNBOUNDED
+        for entry in self._steps:
+            if entry.idle_turns is not None:
+                limit = min(limit, max(0, entry.idle_turns(region_id)))
+            elif entry.bulk is None:
+                limit = min(limit, 1)
+            if limit <= 1:
+                return 1
+        return limit
+
+    def advance_region_by(self, region_id: RegionId, turns: int) -> None:
+        """Advance ``turns`` region-turns at once. Steps with a bulk hook do the
+        whole span in one call; steps without one have already promised (via
+        ``idle_turns``) that the span is empty for them, so they are simply not
+        run. Callers must not pass more than ``jump_limit`` allows."""
+        if turns <= 0:
+            return
+        for entry in self._steps:
+            if entry.bulk is not None:
+                entry.bulk(region_id, turns)
+        self.region_turn[region_id] = self.region_turn.get(region_id, 0) + turns
 
     def next_turn_for(self, region_id: RegionId, observed_turn: int) -> int:
         """The turn number *this* call represents for ``region_id``.
@@ -172,12 +239,22 @@ class RegionScheduler:
         live play prioritize the player's input frame: it performs a deterministic
         number of replayed region-turns, returns whether the region is current,
         and leaves the remaining debt for later frames.
+
+        Turns nothing can happen on are skipped rather than replayed (see
+        ``jump_limit``), and a skip counts as one advance against ``max_advances``
+        -- it is cheaper than a real turn, so paying for it as if it were one is
+        conservative in the direction that protects the input frame.
         """
         advances = 0
         while self.region_turn.get(region_id, target_turn) < target_turn:
             if max_advances is not None and advances >= max_advances:
                 return False
-            self.advance_region(region_id)
+            gap = target_turn - self.region_turn.get(region_id, target_turn)
+            jump = min(gap, self.jump_limit(region_id))
+            if jump > 1:
+                self.advance_region_by(region_id, jump)
+            else:
+                self.advance_region(region_id)
             advances += 1
         return True
 
@@ -194,8 +271,12 @@ class RegionScheduler:
         wall_clock: Callable[[], float],
     ) -> None:
         """Spend up to ``budget_seconds`` of real time advancing the *nearest*
-        lagging region to ``player_region`` by one turn at a time -- never the
-        stalest -- until either nothing lags or the budget runs out."""
+        lagging region to ``player_region`` -- never the stalest -- until either
+        nothing lags or the budget runs out.
+
+        A turn at a time, except where a region can prove nothing happens on the
+        next several (``jump_limit``), which the pump takes in one step: an empty
+        stretch of ocean is brought fully current for the price of one visit."""
         deadline = wall_clock() + budget_seconds
         while wall_clock() < deadline:
             lagging = [r for r, t in self.region_turn.items() if t < target_turn]
@@ -206,4 +287,9 @@ class RegionScheduler:
                 if player_region is None
                 else min(lagging, key=lambda r: _chebyshev(r, player_region))
             )
-            self.advance_region(nearest)
+            gap = target_turn - self.region_turn.get(nearest, target_turn)
+            jump = min(gap, self.jump_limit(nearest))
+            if jump > 1:
+                self.advance_region_by(nearest, jump)
+            else:
+                self.advance_region(nearest)

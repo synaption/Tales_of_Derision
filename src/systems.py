@@ -234,6 +234,56 @@ def is_night(clock: WorldClock | None) -> bool:
     return time_phase(clock) in _NIGHTFALL_PHASES
 
 
+def _night_start_fraction() -> float:
+    """Where in the day nightfall begins, read off ``_PHASE_BOUNDS`` rather than
+    hardcoded, so retuning the phases can't silently desync the closed form below
+    from ``is_night``. Assumes the nightfall phases run to the end of the day,
+    which is what "night" means; ``test_regions`` pins the two together."""
+    lower = 0.0
+    for upper, label in _PHASE_BOUNDS:
+        if label in _NIGHTFALL_PHASES:
+            return lower
+        lower = upper
+    return 1.0  # no night at all
+
+
+def night_turns_in(clock: WorldClock, first_turn: int, turns: int) -> int:
+    """How many of the ``turns`` baseline turns starting at TU ``first_turn`` fall
+    at night -- in closed form, without visiting one.
+
+    This is what lets a lagging region's tiredness be settled for a span of turns
+    at once: the only thing that varies across the span is the night multiplier,
+    and how many night turns a span contains is arithmetic on the day cycle.
+
+    Counting ``t`` in ``[a, b)`` with ``t mod D >= S`` is
+    ``(n // D) * (D - S) + max(0, n % D - S)`` evaluated at both ends.
+    """
+    day_length = clock.day_length
+    step = BASE_ACTION_COST
+    if day_length <= 0 or turns <= 0:
+        return 0
+    if day_length % step or first_turn % step:
+        # A day that isn't a whole number of baseline turns (or a span that
+        # doesn't start on one) has no clean closed form. Nothing in the game
+        # produces that today; count it out rather than get it subtly wrong.
+        return sum(
+            1
+            for i in range(turns)
+            if is_night(replace(clock, turn=first_turn + i * step))
+        )
+    day_turns = day_length // step
+    # The first turn of the day that counts as night.
+    night_from = -(-int(_night_start_fraction() * day_length) // step)  # ceil-divide
+    first = first_turn // step
+
+    def nights_before(turn_index: int) -> int:
+        """How many turn-of-day indices in ``[0, turn_index)`` are night."""
+        whole, rest = divmod(turn_index, day_turns)
+        return whole * (day_turns - night_from) + max(0, rest - night_from)
+
+    return nights_before(first + turns) - nights_before(first)
+
+
 # --- Calendar --------------------------------------------------------------
 # A year is 4 months, each 4 weeks of 7 days -> 4*4*7 = 112 days.
 _DAYS_PER_WEEK = 7
@@ -2506,7 +2556,7 @@ class NeedsProcessor(esper.Processor):
         a region is allowed to simulate: the live region each turn, and everywhere
         else in the background pump, on region entry, and during sleep.
         """
-        scheduler.register("needs", self.advance_region)
+        scheduler.register("needs", self.advance_region, bulk=self.advance_region_by)
         self._scheduler_driven = True
         # Kept so a replayed turn can be dated to the region's own history rather
         # than to the moment the replay happens -- see ``_as_of_clock``.
@@ -2544,25 +2594,67 @@ class NeedsProcessor(esper.Processor):
         The player is excluded: their needs follow the world clock in ``process``,
         because a slow action must make *them* proportionally hungrier -- an NPC has
         no such thing as a slow action, it has region-turns.
+
+        This is ``advance_region_by(region_id, 1)`` and nothing else. Keeping a
+        separate one-turn implementation would mean two ways to age a creature that
+        have to be proved equal forever; a span of one is a span.
         """
-        if self.game_map is None:
+        self.advance_region_by(region_id, 1)
+
+    def advance_region_by(self, region_id: RegionId, turns: int) -> None:
+        """``turns`` region-turns of needs for one region, in closed form.
+
+        Needs are the easy half of analytic catch-up: hunger and thirst are linear
+        in elapsed turns, sleep pays tiredness down linearly, and the only thing
+        that varies across the span is the night multiplier -- which
+        ``night_turns_in`` counts without visiting a turn. So a region that has
+        been asleep for a thousand turns gets a thousand turns of appetite for the
+        price of one pass over its creatures.
+
+        Identical to running ``advance_region`` ``turns`` times, and the suite
+        pins that (``test_regions``). The clamps don't spoil it: hunger and thirst
+        only rise and tiredness only falls here, so clamping the endpoint is the
+        same as clamping every step.
+        """
+        if self.game_map is None or turns <= 0:
             return
-        night = is_night(self._as_of_clock(region_id))
+        clock = self._as_of_clock(region_id)
+        nights = (
+            night_turns_in(clock, clock.turn, turns) if clock is not None else 0
+        )
         woke: list[int] = []
         for ent, (needs,) in spatial.ensure(self.game_map).components(region_id, Needs):
             if esper.has_component(ent, Player):
                 continue
             if esper.has_component(ent, Settled):
-                # A compacted activity already applied this turn's effects, back
-                # when it was settled in one go. Burn one turn off the receipt and
-                # leave the needs alone -- accruing here would live the turn twice.
-                if self._burn_settled_turn(ent):
+                if self._burn_settled_turns(ent, turns):
                     woke.append(ent)
                 continue
-            if self._accrue(ent, needs, scale=1.0, night=night):
-                woke.append(ent)
+            needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate * turns)
+            needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate * turns)
+            if esper.has_component(ent, Asleep):
+                needs.tiredness = max(0.0, needs.tiredness - _SLEEP_RECOVERY * turns)
+                if needs.tiredness <= 0.0:
+                    woke.append(ent)
+            else:
+                # Day turns at the plain rate, night turns at the night multiplier.
+                weighted = (turns - nights) + nights * _NIGHT_TIREDNESS_MULTIPLIER
+                needs.tiredness = min(
+                    needs.max_value, needs.tiredness + needs.tiredness_rate * weighted
+                )
         for ent in woke:
             wake_up(ent, self.game_map)
+
+    @staticmethod
+    def _burn_settled_turns(ent: int, turns: int) -> bool:
+        """Consume ``turns`` region-turns of a compacted activity at once. Returns
+        True when that used the receipt up and the entity was asleep."""
+        settled = esper.component_for_entity(ent, Settled)
+        settled.turns -= turns
+        if settled.turns > 0:
+            return False
+        esper.remove_component(ent, Settled)
+        return esper.has_component(ent, Asleep)
 
     @staticmethod
     def _burn_settled_turn(ent: int) -> bool:
@@ -2570,12 +2662,7 @@ class NeedsProcessor(esper.Processor):
         was the last one and the entity was asleep -- i.e. the sleep it settled has
         now really elapsed and it should wake, on exactly the turn it would have
         woken had every turn been simulated one at a time."""
-        settled = esper.component_for_entity(ent, Settled)
-        settled.turns -= 1
-        if settled.turns > 0:
-            return False
-        esper.remove_component(ent, Settled)
-        return esper.has_component(ent, Asleep)
+        return NeedsProcessor._burn_settled_turns(ent, 1)
 
     def _accrue(self, ent: int, needs: Needs, scale: float, night: bool) -> bool:
         """Age one creature's needs by ``scale`` baseline turns. Returns True if it

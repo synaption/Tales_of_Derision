@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import replace
+from math import ceil
 
 import esper
 
@@ -23,7 +24,9 @@ from components import (
 )
 from game_map import GameMap
 from content.drives import DriveDef, all_drives
-from regions import RegionId, RegionScheduler, all_region_ids, in_region_with_margin
+from regions import (
+    _UNBOUNDED, RegionId, RegionScheduler, all_region_ids, in_region_with_margin,
+)
 import spatial
 from action import BASE_ACTION_COST, action_cost
 from items import WOOD, cook_meat, hunger_restored, is_cooked_meat, is_raw_meat
@@ -154,7 +157,12 @@ class NpcAiProcessor(esper.Processor):
         ] = {}
         self._trip_cache_world: str | None = None
         self.scheduler = RegionScheduler(game_map, _current_region_turn())
-        self.scheduler.register("npc_ai", self._advance_region)
+        self.scheduler.register(
+            "npc_ai",
+            self._advance_region,
+            bulk=self._advance_region_by,
+            idle_turns=self._idle_turns,
+        )
         # Shore tiles bucketed by simulation region (like the resource snapshot), so
         # a thirsty NPC scans only nearby shores, not every shore in the world -- the
         # flat list is O(all shores) per drink and dominates at archipelago scale.
@@ -1424,9 +1432,20 @@ class NpcAiProcessor(esper.Processor):
     def _static_region_items(self, region_id: RegionId) -> tuple[list, list, list]:
         """``(trees, stoves, shore)`` around a region. None of these move, so this
         is rebuilt only when the index says one of the nine regions involved gained
-        or lost something -- not on a timer, and never from a world scan."""
+        or lost **one of these kinds** -- not on a timer, and never from a world
+        scan.
+
+        Keyed per kind rather than on the region-wide version, which counts every
+        entity that appears, dies or crosses a seam: with that key a wandering deer
+        rebuilt the list of where the *trees* are, a 40% miss rate that measured as
+        31.6% of whole-world catch-up. Trees and ovens change when trees and ovens
+        change, and shore is terrain that never changes at all.
+        """
         index = self._index()
-        key = index.neighborhood_version(region_id)
+        key = (
+            index.kind_neighborhood_version(region_id, Tree),
+            index.kind_neighborhood_version(region_id, Stove),
+        )
         cached = self._static_region_cache.get(region_id)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -1446,10 +1465,15 @@ class NpcAiProcessor(esper.Processor):
         advances of this region, exactly the staleness the old world-wide snapshot
         traded for, except the refresh now costs one region rather than one world.
         A membership change (a birth, a death, someone crossing the seam) refreshes
-        it immediately regardless.
+        it immediately regardless -- but only in one of *these* kinds, for the same
+        reason ``_static_region_items`` keys per kind: a felled tree has nothing to
+        say about where the deer are.
         """
         index = self._index()
-        key = index.neighborhood_version(region_id)
+        key = tuple(
+            index.kind_neighborhood_version(region_id, kind)
+            for kind in (Deer, Corpse, BerryBush, Personality)
+        )
         cached = self._dynamic_region_cache.get(region_id)
         if cached is not None and cached[0] == key and cached[1] > 0:
             self._dynamic_region_cache[region_id] = (key, cached[1] - 1, cached[2])
@@ -1481,6 +1505,67 @@ class NpcAiProcessor(esper.Processor):
                     if in_region_with_margin(game_map, region_id, x, y, margin):
                         items.append(item)
         return items
+
+    def _idle_turns(self, region_id: RegionId) -> int:
+        """How many upcoming region-turns provably contain no NPC action here.
+
+        The region scheduler skips that many rather than replaying them (see
+        ``RegionScheduler.jump_limit``). Every NPC is in one of three states and
+        each says exactly when it could next act:
+
+        * **asleep with a receipt** -- a compacted sleep runs for
+          ``Settled.turns`` more turns and it wakes at the end of them, so it
+          cannot act before that.
+        * **asleep without one** -- it wakes when tiredness reaches zero, which is
+          the needs step's business, not something this step can prove. Reported
+          as 0, so the region ticks normally.
+        * **awake** -- ``_advance_region`` grants ``BASE_ACTION_COST`` of energy a
+          turn and spends ``action_cost`` an action, so an NPC in arrears is idle
+          until the balance is paid off. That is what compacted travel and hauling
+          leave behind, and it is why they make whole stretches skippable.
+
+        An empty region reports ``_UNBOUNDED``: an unpeopled stretch of ocean can
+        be brought fully current in one visit rather than one visit per turn, and
+        that is the single biggest source of skippable turns (measured at 40% of
+        all region-turns of debt in a 9-island world).
+        """
+        index = self._index()
+        limit = _UNBOUNDED
+        for ent in index.of_kind(region_id, NPC):
+            if not esper.entity_exists(ent):
+                continue
+            if esper.has_component(ent, Asleep):
+                if not esper.has_component(ent, Settled):
+                    return 0
+                wait = esper.component_for_entity(ent, Settled).turns
+            else:
+                energy = (
+                    esper.component_for_entity(ent, Actor).energy
+                    if esper.has_component(ent, Actor)
+                    else 0.0
+                )
+                # It acts on the turn its granted energy first covers an action.
+                wait = ceil((action_cost(ent, None) - energy) / BASE_ACTION_COST) - 1
+            if wait <= 0:
+                return 0
+            limit = min(limit, wait)
+        return limit
+
+    def _advance_region_by(self, region_id: RegionId, turns: int) -> None:
+        """Skip ``turns`` region-turns for which ``_idle_turns`` has already proved
+        no NPC here can act.
+
+        Nothing happens except the passage of time, and for an NPC the passage of
+        time is energy: ``_advance_region`` grants a baseline action's worth per
+        turn, so the skip grants the whole span at once. Sleepers are excluded for
+        the same reason the per-turn path excludes them -- a sleeping creature
+        banks nothing, or it would wake with a windfall of stored turns and act
+        several times over.
+        """
+        for ent in self._index().of_kind(region_id, NPC):
+            if not esper.entity_exists(ent) or esper.has_component(ent, Asleep):
+                continue
+            self._actor_of(ent).energy += turns * BASE_ACTION_COST
 
     def _advance_region(self, region_id: RegionId) -> None:
         """Run one turn of NPC AI for the NPCs standing in ``region_id``.

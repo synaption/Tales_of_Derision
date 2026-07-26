@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import esper
 
 from components import Asleep, OnFire, Player, Position
+from regions import _UNBOUNDED
 import spatial
 
 RGB = tuple[int, int, int]
@@ -129,8 +130,24 @@ class EffectsProcessor(esper.Processor):
 
     def register_region_step(self, scheduler) -> None:
         """Make effects part of a region's turn."""
-        scheduler.register("effects", self.advance_region)
+        scheduler.register("effects", self.advance_region, idle_turns=self._idle_turns)
         self._scheduler_driven = True
+
+    @staticmethod
+    def _idle_turns(_region_id) -> int:
+        """How many upcoming turns this step provably has nothing to do for.
+
+        While no registered effect declares an ``on_tick`` there is nothing to run
+        on any turn, so a lagging region need not be visited on this step's
+        account at all. Once one does, its behaviour is per-turn by definition and
+        every turn has to be lived -- unless the effect itself grows a bulk form.
+
+        Without this the step would pin every region to one turn at a time, which
+        is what a step that offers neither hook means (see
+        ``RegionScheduler.register``) -- and a no-op would be the thing preventing
+        an empty ocean region from skipping a thousand turns of nothing.
+        """
+        return 0 if EffectsProcessor._tickable() else _UNBOUNDED
 
     @staticmethod
     def _tickable():

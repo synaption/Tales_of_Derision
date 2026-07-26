@@ -11,11 +11,16 @@ import itertools
 import esper
 import pytest
 
+from dataclasses import replace
+
 from action import BASE_ACTION_COST
-from components import Diet, NPC, Needs, Player, Position, Tree, WorldClock
+from components import Actor, Diet, NPC, Needs, Player, Position, Tree, WorldClock
 from game_map import GameMap
 from regions import RegionScheduler, all_region_ids, in_region_with_margin, region_at, region_grid_size
-from systems import FishAiProcessor, NeedsProcessor, NpcAiProcessor, world_clock
+from systems import (
+    FishAiProcessor, NeedsProcessor, NpcAiProcessor, is_night, night_turns_in,
+    world_clock,
+)
 import spatial
 
 pytestmark = pytest.mark.unrendered
@@ -329,3 +334,136 @@ def test_a_replayed_turn_is_dated_to_when_it_happened_not_when_it_is_replayed() 
 
     assert on_time == replayed_late, "the turn's own time of day decides, not the replay's"
     assert on_time > by_day, "and it really is the night rate, not a trivial pass"
+
+
+# --- analytic catch-up: skipping turns nothing can happen on -----------------
+
+
+def test_the_closed_form_night_count_matches_asking_turn_by_turn() -> None:
+    """``night_turns_in`` replaces a loop over ``is_night`` for a whole span, so
+    the two must never drift -- this is the licence for the arithmetic."""
+    clock = WorldClock(turn=0)
+    for start in (0, 3_000, 13_100, 13_200, 23_900, 47_000):
+        for span in (1, 7, 240, 601):
+            counted = sum(
+                1
+                for i in range(span)
+                if is_night(replace(clock, turn=start + i * BASE_ACTION_COST))
+            )
+            assert night_turns_in(clock, start, span) == counted, (start, span)
+
+
+def test_a_step_with_no_fast_path_pins_the_region_to_one_turn() -> None:
+    game_map = GameMap(30, 18)
+    scheduler = RegionScheduler(game_map, 0)
+    scheduler.register("plain", lambda region_id: None)
+
+    assert scheduler.jump_limit((0, 0)) == 1
+
+
+def test_a_region_where_nothing_can_act_jumps_the_whole_gap() -> None:
+    """The point of the whole mechanism: an empty region is brought current in one
+    visit instead of one visit per turn of debt."""
+    esper.clear_database()
+    spatial.detach()
+    game_map = GameMap(240, 60)
+    esper.create_entity(WorldClock(turn=0))
+    esper.create_entity(Position(2, 30), Player())
+    npc_ai = NpcAiProcessor(game_map, wall_clock=_no_background_pump())
+    empty = region_at(game_map, 200, 30)
+    assert not list(npc_ai._index().of_kind(empty, NPC))
+
+    advances = _count_advances(npc_ai.scheduler)
+    npc_ai.scheduler.catch_up_region(empty, 500)
+
+    assert npc_ai.scheduler.region_turn[empty] == 500
+    assert advances["single"] == 0, "no turn of an empty region needs replaying"
+    assert advances["jumps"] == 1
+
+
+def test_a_region_with_someone_able_to_act_does_not_jump() -> None:
+    esper.clear_database()
+    spatial.detach()
+    game_map = GameMap(240, 60)
+    esper.create_entity(WorldClock(turn=0))
+    esper.create_entity(Position(2, 30), Player())
+    esper.create_entity(Position(200, 30), NPC(), Needs(hunger=50.0, thirst=50.0))
+    npc_ai = NpcAiProcessor(game_map, wall_clock=_no_background_pump())
+
+    assert npc_ai.scheduler.jump_limit(region_at(game_map, 200, 30)) == 1
+
+
+def test_a_creature_in_arrears_makes_its_region_skippable() -> None:
+    """Compacted travel and hauling leave an NPC unable to act for N turns. That
+    is exactly the state the scheduler can skip over."""
+    esper.clear_database()
+    spatial.detach()
+    game_map = GameMap(240, 60)
+    esper.create_entity(WorldClock(turn=0))
+    esper.create_entity(Position(2, 30), Player())
+    npc = esper.create_entity(
+        Position(200, 30), NPC(), Needs(hunger=50.0, thirst=50.0),
+        Actor(energy=-7 * BASE_ACTION_COST),
+    )
+    npc_ai = NpcAiProcessor(game_map, wall_clock=_no_background_pump())
+    region = region_at(game_map, 200, 30)
+
+    assert npc_ai.scheduler.jump_limit(region) == 7
+
+    # And skipping those turns leaves it able to act on exactly the turn it would
+    # have: the jump credits the same energy the turns would have granted.
+    npc_ai.scheduler.advance_region_by(region, 7)
+    assert esper.component_for_entity(npc, Actor).energy == 0.0
+    assert npc_ai.scheduler.jump_limit(region) == 1
+
+
+def test_skipping_turns_ages_a_creature_exactly_as_living_them_would() -> None:
+    """Batch independence, measured: needs after one jump of N must match needs
+    after N single turns, or the world would change with the frame rate."""
+
+    def run(jump: bool, turns: int = 60) -> tuple[float, float, float]:
+        esper.clear_database()
+        spatial.detach()
+        game_map = GameMap(240, 60)
+        esper.create_entity(WorldClock(turn=0))
+        esper.create_entity(Position(2, 30), Player())
+        # A creature with no AI attached, so only its needs move.
+        esper.create_entity(
+            Position(200, 30),
+            Needs(hunger=0.0, thirst=0.0, tiredness=0.0,
+                  hunger_rate=0.3, thirst_rate=0.2, tiredness_rate=0.5),
+        )
+        scheduler = RegionScheduler(game_map, 0)
+        needs_processor = NeedsProcessor(game_map)
+        needs_processor.register_region_step(scheduler)
+        region = region_at(game_map, 200, 30)
+        if jump:
+            scheduler.advance_region_by(region, turns)
+        else:
+            for _ in range(turns):
+                scheduler.advance_region(region)
+        needs = next(n for _e, (n,) in esper.get_components(Needs))
+        return (needs.hunger, needs.thirst, needs.tiredness)
+
+    jumped = run(jump=True)
+    lived = run(jump=False)
+    assert jumped == pytest.approx(lived), "a skipped span must age like a lived one"
+    assert jumped[2] > 0, "and the span really did cover some tiredness"
+
+
+def _count_advances(scheduler: RegionScheduler) -> dict[str, int]:
+    """Tally single-turn advances against multi-turn jumps, in place."""
+    counts = {"single": 0, "jumps": 0}
+    single, bulk = scheduler.advance_region, scheduler.advance_region_by
+
+    def spy_single(region_id):
+        counts["single"] += 1
+        return single(region_id)
+
+    def spy_bulk(region_id, turns):
+        counts["jumps"] += 1
+        return bulk(region_id, turns)
+
+    scheduler.advance_region = spy_single
+    scheduler.advance_region_by = spy_bulk
+    return counts

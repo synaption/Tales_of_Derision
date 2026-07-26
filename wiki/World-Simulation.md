@@ -30,7 +30,8 @@ Owns each region's *"simulated up to turn N"* cursor and pays down debt.
   the same real moment; that's the whole point.
 - **`catch_up_region(region_id, target_turn)`** — block until one region reaches a
   turn. **Used when you enter a region**: bring that whole 120×60 area fully up to
-  date before it's shown/played.
+  date before it's shown/played. Turns nothing can happen on are skipped rather than
+  replayed — see *Analytic catch-up* below.
 - **`catch_up_all(target_turn)`** — bring the **entire world** up to date. **Used when
   you sleep** (the world fast-forwards through the night).
 - **`pump_background(budget_seconds, player_region, target_turn, wall_clock)`** — spend
@@ -70,6 +71,52 @@ sleep and hauling measured as no change, and the section says why).
 This is the counterpart to paying region debt down faster: the pump, region entry
 and sleep all get cheaper per region-turn because the far world thinks less often,
 not because it simulates less.
+
+## Analytic catch-up: skipping turns nothing happens on
+
+Replaying debt costs *turns × regions*. The scheduler no longer replays turns it can
+prove are empty — the classic discrete-event move of jumping to the next turn on
+which something can change. `RegionScheduler.register` takes two optional hooks
+beside the per-turn `step`:
+
+- **`bulk(region_id, turns)`** — do that span's work in one call. A step with a bulk
+  never limits how far a region may jump.
+- **`idle_turns(region_id)`** — how many upcoming turns this step can prove need
+  nothing beyond what its bulk does.
+
+`jump_limit` takes the smallest `idle_turns` any step reports (and 1 for any step
+offering neither, which is the old behaviour), and `advance_region_by` moves the
+cursor that far, calling only the bulks. `catch_up_region` and `pump_background` both
+use it.
+
+The three steps today:
+
+| step | `bulk` | `idle_turns` |
+|---|---|---|
+| `npc_ai` | credit the span's `Actor.energy` | until the first NPC could act — a sleeper's `Settled` receipt, or an NPC's energy arrears |
+| `needs` | closed-form accrual over the span | — (a bulk covers any span) |
+| `effects` | — | unbounded while no effect declares an `on_tick` |
+
+`NeedsProcessor.advance_region_by` is the analytic half: hunger and thirst are linear
+in elapsed turns, sleep pays tiredness down linearly, and the only thing that varies
+across a span is the night multiplier — which `night_turns_in` counts in closed form
+rather than by visiting turns. The per-turn `advance_region` *is* `advance_region_by(…,
+1)`, so there is only one implementation to keep honest.
+
+**What it's worth, measured.** At a long horizon (11 000 region-turns of debt) **47%
+of the debt is skipped** rather than replayed. The time saved is much smaller and
+varies by world — 21% at 9 islands, nothing measurable at 25 — because *the turns it
+skips were already the cheap ones*: when everybody in a region is asleep nothing
+moves, so the region's caches all hit and the turn was nearly free anyway. It is kept
+because it is exact, costs nothing when it doesn't fire, and is the seam every future
+closed-form system plugs into — tree growth being the obvious next one.
+
+The larger win this round came from what profiling for it turned up:
+`_static_region_items` was 31.6% of whole-world catch-up because it keyed on the
+index's region-wide version, so a wandering deer rebuilt the list of where the *trees*
+were. Switching it (and `_dynamic_region_items`) to the per-kind key introduced for
+[goal maps](Performance.md#goal-maps) took catch-up at 25 islands from 10.5 s to
+8.3 s.
 
 ## Analytic shortcuts and what actually has to hold
 

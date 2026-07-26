@@ -149,6 +149,25 @@ The floods that remain are single-source ones from `_step_toward` for the goals 
 goal map covers yet — home, blueprints, prey, conversation partners — at 0.07–0.25
 per turn. Those are the next candidates.
 
+## Per-kind cache invalidation
+
+`kind_neighborhood_version` turned out to matter well beyond goal maps.
+`_static_region_items` (the region's trees and ovens) and `_dynamic_region_items`
+(deer, corpses, bushes, people) both keyed on the index's **region-wide** version,
+which moves whenever any entity anywhere in the nine-region neighbourhood appears,
+dies or crosses a seam. A 40% miss rate, and `_static_region_items` alone was **31.6%
+of whole-world catch-up** — 198 µs a call, 16 814 calls.
+
+Keying each on the versions of the kinds it actually holds took catch-up at 25 islands
+from **10.5 s to 8.3 s** and dropped it out of the profile entirely. Trees and ovens
+change when trees and ovens change; a wandering deer has nothing to say about either.
+
+Where catch-up time goes now (25 islands, 29 000 region-turns): `_take_turn` 70%, of
+which `_step_toward`/`find_path` 25%, `_go_to_nearest` 22% and `_rank_drives` 17%.
+That is real decision-making rather than bookkeeping — the next win there is fewer
+decisions, not cheaper ones (see
+[World Simulation](World-Simulation.md#analytic-catch-up-skipping-turns-nothing-happens-on)).
+
 ### Strict active/inactive partitioning
 
 `esper.process(action)` simulates the region the player stands in and nothing else.
