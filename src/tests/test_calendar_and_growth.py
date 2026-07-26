@@ -229,19 +229,124 @@ def test_bush_regrows_berries_after_seven_days() -> None:
     assert esper.component_for_entity(bush, BerryBush).has_berries is True
 
 
+def test_bush_picked_midway_through_a_day_still_regrows_on_the_seventh_day() -> None:
+    """Deadlines are counted in whole days from the day they were set, so the
+    hour a bush was picked at doesn't push its crop into an eighth day. Picking
+    almost always happens mid-day in play, and the queue files by day, so this is
+    the case that would drift if the rounding were wrong."""
+    game_map = GameMap(24, 14)
+    clock = WorldClock(turn=0, day_length=_DAY_LEN)
+    esper.create_entity(clock)
+    bush = esper.create_entity(Position(8, 8), Renderable("%"), Name("Berry Bush"), BerryBush())
+    processor = TreeGrowthProcessor(game_map, rng=lambda: 1.0)
+    processor.process("wait")  # baseline day 0
+    clock.turn = _DAY_LEN // 2  # picked halfway through day 0
+    pick_berries(bush, clock)
+
+    for day in range(1, _BERRY_REGROW_DAYS):
+        clock.turn = day * _DAY_LEN
+        processor.process("wait")
+        assert esper.component_for_entity(bush, BerryBush).has_berries is False
+
+    clock.turn = _BERRY_REGROW_DAYS * _DAY_LEN
+    processor.process("wait")
+    assert esper.component_for_entity(bush, BerryBush).has_berries is True
+
+
 def test_bush_saplings_can_sprout() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
     esper.create_entity(clock)
-    # rng just under the combined tree+bush chance but not under the tree-only
-    # chance -> every eligible tile sprouts a *bush* seedling.
+    # Sprouting draws twice per sapling: first the gap to the next sprouting
+    # tile (0.0 -> the very next one), then what kind it is. A kind roll above
+    # the tree's share of the combined chance makes every sprout a bush.
     from systems import _DAILY_SPROUT_CHANCE, _DAILY_BUSH_SPROUT_CHANCE
-    roll = _DAILY_SPROUT_CHANCE + _DAILY_BUSH_SPROUT_CHANCE / 2
-    processor = TreeGrowthProcessor(game_map, rng=lambda: roll)
+    tree_share = _DAILY_SPROUT_CHANCE / (_DAILY_SPROUT_CHANCE + _DAILY_BUSH_SPROUT_CHANCE)
+    rolls = iter([0.0, tree_share + 0.01] * 10_000)
+    processor = TreeGrowthProcessor(game_map, rng=lambda: next(rolls))
 
     _advance_a_day(processor, clock, from_turn=0)
     kinds = {esper.component_for_entity(e, Sapling).kind for e, _c in esper.get_components(Sapling)}
     assert kinds == {"bush"}
+
+
+# --- Counting instead of scanning ------------------------------------------
+#
+# The daily pass must cost what actually grew, not what could have. These pin
+# that down directly, because it is the property the whole design rests on and
+# nothing else in the suite would notice it regressing.
+
+
+def test_a_quiet_day_costs_a_handful_of_rolls_not_one_per_tile() -> None:
+    game_map = GameMap(24, 14)  # ~250 outdoor ground tiles
+    clock = WorldClock(turn=0, day_length=_DAY_LEN)
+    esper.create_entity(clock)
+    for x in range(4, 12):
+        esper.create_entity(Position(x, 3), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
+    calls = 0
+
+    def counting_rng() -> float:
+        nonlocal calls
+        calls += 1
+        return 0.999999  # nothing sprouts, nothing dies
+
+    processor = TreeGrowthProcessor(game_map, rng=counting_rng)
+    _advance_a_day(processor, clock, from_turn=0)
+
+    # One draw for tree deaths, one for bush deaths, one for sprouting: the day
+    # asks each distribution "how many?" once and is told "none".
+    assert calls <= 4, f"a quiet day should not roll per tile or per plant (rolled {calls})"
+    assert list(esper.get_components(Sapling)) == []
+
+
+def test_sprouting_costs_two_rolls_per_sapling_regardless_of_map_size() -> None:
+    """The same forced-sprout run on a bigger map plants proportionally more but
+    still spends exactly two random numbers per sapling -- the gap draw and the
+    kind draw. A per-tile scan would scale with the tiles instead."""
+    counts = {}
+    for width, height in ((24, 14), (48, 28)):
+        esper.clear_database()
+        game_map = GameMap(width, height)
+        clock = WorldClock(turn=0, day_length=_DAY_LEN)
+        esper.create_entity(clock)
+        calls = 0
+
+        def counting_rng() -> float:
+            nonlocal calls
+            calls += 1
+            return 0.0  # every trial is a hit
+
+        processor = TreeGrowthProcessor(game_map, rng=counting_rng)
+        processor._cap = 10  # stop well short of the map, so tiles aren't the limit
+        _advance_a_day(processor, clock, from_turn=0)
+        counts[(width, height)] = (calls, len(list(esper.get_components(Sapling))))
+
+    for _size, (calls, saplings) in counts.items():
+        assert saplings == 10  # the cap, on both maps
+        assert calls <= 2 * saplings + 4
+    assert counts[(24, 14)][0] == counts[(48, 28)][0]
+
+
+def test_death_count_tracks_the_population_not_a_per_plant_roll() -> None:
+    game_map = GameMap(24, 14)
+    clock = WorldClock(turn=0, day_length=_DAY_LEN)
+    esper.create_entity(clock)
+    trees = [
+        esper.create_entity(Position(x, 3), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
+        for x in range(4, 12)
+    ]
+    # A gap roll worth exactly two failures, so the deaths land two trees apart:
+    # the pass never asks the other six trees anything.
+    from systems import _DAILY_DEATH_CHANCE
+    two_apart = 1.0 - (1.0 - _DAILY_DEATH_CHANCE) ** 2
+    rolls = iter([two_apart] * 100)
+    processor = TreeGrowthProcessor(game_map, rng=lambda: next(rolls))
+    processor._cap = 0  # no sprouting to interleave
+
+    _advance_a_day(processor, clock, from_turn=0)
+
+    dead = [i for i, e in enumerate(sorted(trees)) if not esper.entity_exists(e)]
+    assert dead == [2, 5]  # skip 2, hit; skip 2, hit; the next gap runs off the end
 
 
 def test_growth_respects_the_soft_cap() -> None:

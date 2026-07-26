@@ -10,7 +10,7 @@ from __future__ import annotations
 import esper
 import pytest
 
-from components import BlocksMovement, NPC, Position, Tree
+from components import BlocksMovement, NPC, Position, Sapling, Seaweed, Tree
 from game_map import GameMap, archipelago_size
 from regions import region_at
 from rng import set_world_rng
@@ -90,6 +90,50 @@ def test_static_blockers_are_indexed_by_tile_not_scanned() -> None:
     for ent, (pos, _npc) in esper.get_components(Position, NPC):
         assert index.blocker_at(pos.x, pos.y) != ent
         break
+
+
+def test_plants_are_indexed_by_tile_whether_or_not_they_block() -> None:
+    """``rooted`` exists because half the flora doesn't block: seaweed and
+    saplings occupy a tile invisibly to ``blockers``, and flora growth asks by
+    tile before it seeds one."""
+    game_map = _world()
+    index = spatial.index_for(game_map)
+
+    for ent, (_s,) in list(esper.get_components(Seaweed))[:20]:
+        pos = esper.component_for_entity(ent, Position)
+        assert index.rooted_at(pos.x, pos.y) == ent
+        assert index.blocker_at(pos.x, pos.y) is None  # a frond blocks nothing
+
+    for ent, (_t,) in list(esper.get_components(Tree))[:20]:
+        pos = esper.component_for_entity(ent, Position)
+        assert index.rooted_at(pos.x, pos.y) == ent  # trees are in both maps
+
+    for ent, (pos, _npc) in esper.get_components(Position, NPC):
+        assert index.rooted_at(pos.x, pos.y) != ent  # people are not plants
+        break
+
+
+def test_a_sapling_maturing_into_a_tree_stays_rooted_to_its_tile() -> None:
+    """The reclassify hook has to carry a plant across a kind change: a sapling
+    becoming a tree keeps its tile, and the map must not lose it in between."""
+    game_map = _world()
+    index = spatial.index_for(game_map)
+    x, y = 7, 7
+    ent = esper.create_entity(Position(x, y), Sapling(planted_turn=0))
+    assert index.rooted_at(x, y) == ent
+
+    esper.remove_component(ent, Sapling)
+    esper.add_component(ent, Tree())
+    esper.add_component(ent, BlocksMovement())
+    spatial.reclassify(ent)
+
+    assert index.rooted_at(x, y) == ent
+    assert index.blocker_at(x, y) == ent  # and now it blocks, too
+    assert index.audit() == []
+
+    esper.delete_entity(ent, immediate=True)
+    assert index.rooted_at(x, y) is None
+    assert index.audit() == []
 
 
 def test_entities_created_without_a_hook_are_picked_up() -> None:

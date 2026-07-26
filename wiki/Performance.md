@@ -168,6 +168,65 @@ That is real decision-making rather than bookkeeping — the next win there is f
 decisions, not cheaper ones (see
 [World Simulation](World-Simulation.md#analytic-catch-up-skipping-turns-nothing-happens-on)).
 
+## Counting instead of scanning
+
+The daily flora pass (`TreeGrowthProcessor`) was the last system whose cost was set
+by how much world there is rather than by how much of it changed. Per region per
+day it rolled once for every one of ~7200 outdoor ground tiles, once for every
+ocean tile, and once for every plant, and it rebuilt a whole-world snapshot (five
+`esper.get_components` sweeps over ~85 000 entities, plus a set of every occupied
+tile in the world) for each elapsed day. All of that to plant roughly one sapling.
+
+Nothing about the *rules* required any of it. A per-tile chance over N tiles is a
+binomial, and the gap between successes is geometric, so the day can ask the
+distribution which tiles sprout and get the answer in one draw per sprout —
+`_bernoulli_hits(n, p, rng)`. Deadlines (a sapling's year, a bush's seven days) are
+known when they start, so they are filed under the day they come due instead of
+being searched for. Populations and cap totals come from the spatial index in O(1).
+
+| 1400×800, 143 regions | before | after |
+|---|---|---|
+| one day, whole world | 166 ms | **19.1 ms** |
+| 200-day `catch_up_all_flora` | 15.0 s | **0.17 s** |
+
+The 88× on catch-up is larger than the 8.7× on a single day because the old
+whole-world snapshot was rebuilt per elapsed day; there is no snapshot now. What
+remains is the cost of creating the plants themselves — nothing in the pass scales
+with the size of the world any more.
+
+### The tile check: `rooted`
+
+Counting *which* tiles sprout still leaves the question the per-tile scan answered
+for free — is that tile already taken? The first cut collected the region's
+occupied tiles on demand, which left one term proportional to population and
+promptly became ~70% of the pass.
+
+The right answer is to ask per candidate and give up on a tile that's taken, which
+needs an O(1) tile → entity lookup. `blocker_at` almost does it, but saplings and
+seaweed occupy a tile *without blocking it*, so half the flora is invisible to it.
+Hence `SpatialIndex.rooted` — the same tile-map machinery as `blockers`, for
+plants. It is affordable for the reason `blockers` is: **nothing in it moves**, so
+keeping it true costs entity creation and destruction, never a step. Measured on
+`moved()` (the per-step hook): 615 ns → 655 ns, and it does not appear in a turn
+profile at all.
+
+Creatures are deliberately *not* consulted when sprouting. A sapling under a
+passing villager is harmless — it doesn't block, and `_mature_saplings` won't let
+it become a tree while anyone stands there — and checking for them is exactly what
+would drag a region's population back into the pass.
+
+The one bulk read left is `_region_blockers`, used when a sapling matures, which
+genuinely does care about creatures. It fires about once a day in the few regions
+that have land at all.
+
+**It also fixed a latent bug.** Sprouting stamped `planted_turn` from the world
+clock while the region replayed a day far behind it, so saplings planted during a
+catch-up were dated to the present and could never reach maturity — 200 days of
+simulation used to end with ~160 saplings and *fewer* trees than it started with.
+Sprouts are now dated to the region's own day, and the same run ends with ~90
+saplings and ~40 more trees. Over 1000 days the forest climbs steadily toward its
+soft cap and `SpatialIndex.audit()` stays clean throughout.
+
 ### Strict active/inactive partitioning
 
 `esper.process(action)` simulates the region the player stands in and nothing else.

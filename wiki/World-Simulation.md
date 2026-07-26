@@ -109,7 +109,7 @@ varies by world — 21% at 9 islands, nothing measurable at 25 — because *the 
 skips were already the cheap ones*: when everybody in a region is asleep nothing
 moves, so the region's caches all hit and the turn was nearly free anyway. It is kept
 because it is exact, costs nothing when it doesn't fire, and is the seam every future
-closed-form system plugs into — tree growth being the obvious next one.
+closed-form system plugs into.
 
 The larger win this round came from what profiling for it turned up:
 `_static_region_items` was 31.6% of whole-world catch-up because it keyed on the
@@ -121,8 +121,13 @@ were. Switching it (and `_dynamic_region_items`) to the per-kind key introduced 
 ## Analytic shortcuts and what actually has to hold
 
 A step may work out where N turns of something end up instead of living them one at
-a time. Compacted activities are the first users; tree growth and other scan-shaped
-systems are the obvious next ones.
+a time. Compacted activities were the first users; **tree growth is the second** —
+its daily pass no longer walks a region's tiles or plants at all, it draws how many
+sprout and how many die and acts on that many (see
+[Performance](Performance.md#counting-instead-of-scanning) and
+[Systems](Systems.md#treegrowthprocessor-priority-0)). The same two moves — count
+the outcome instead of rolling for it, file a deadline instead of searching for it —
+apply to anything else shaped like a scan.
 
 The constraint is **not** "replay every turn". It is **batch independence**:
 

@@ -6,7 +6,7 @@ process() receives whatever args are passed to esper.process().
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from math import ceil
+from math import ceil, log1p
 import textwrap
 import time
 
@@ -131,6 +131,9 @@ def pick_berries(bush_ent: int, clock: WorldClock | None) -> bool:
     bush.has_berries = False
     bush.harvested_turn = clock.turn if clock is not None else 0
     _set_bush_appearance(bush_ent, False)
+    # Tell the flora processor this bush now has a regrow deadline, so its daily
+    # pass never has to ask every bush in the region whether it is bare.
+    _PICKED_BUSHES.append(bush_ent)
     return True
 
 # A section must be at least this big for the section camera to engage; below it
@@ -1911,6 +1914,65 @@ _DAILY_SEAWEED_SPROUT_CHANCE = 0.0006
 _BERRY_REGROW_DAYS = 7
 
 
+def _bernoulli_hits(n: int, p: float, rng: Callable[[], float]):
+    """The indices of the successes among ``n`` independent Bernoulli(``p``)
+    trials, drawing one random number **per success** instead of one per trial.
+
+    This is the primitive that replaces "scanning like trees". The old daily
+    flora pass asked every one of a region's 7200 ground tiles "do you sprout?"
+    to get an answer that is almost always "no" -- 7200 RNG calls to plant about
+    one sapling. The number of successes is just a binomial draw, though, and
+    the *gap* between consecutive successes is geometric, so the index of the
+    next success can be sampled directly:
+
+        skip = floor( log(U) / log(1 - p) )   failures, then a hit
+
+    Same process and therefore the same distribution as rolling every trial --
+    it *is* the same Bernoulli process, only sampled by its waiting time -- but
+    the cost is the number of things that actually happen, not the number of
+    tiles or plants that might have. A region's daily growth goes from O(tiles)
+    to O(sprouts), and the caller stays free to look at each hit (checking the
+    tile is clear, respecting the soft cap) exactly as it did per roll before.
+
+    ``U`` is taken as ``1 - rng()`` so the injectable test RNG keeps its old
+    meaning at the extremes: ``rng() == 0.0`` (a roll below any chance) makes
+    every trial a hit, and ``rng() == 1.0`` (a roll above any chance) makes none.
+    """
+    if n <= 0 or p <= 0.0:
+        return
+    if p >= 1.0:
+        yield from range(n)
+        return
+    log_survive = log1p(-p)  # negative; the log-probability of one failure
+    i = 0
+    while i < n:
+        u = rng()
+        if u >= 1.0:
+            # log1p(-1) is -inf: the gap to the next hit is unbounded, so the
+            # remaining trials all fail. (Also keeps log1p out of its domain.)
+            return
+        i += int(log1p(-u) / log_survive)
+        if i >= n:
+            return
+        yield i
+        i += 1
+
+
+# Bushes picked since the flora processor last filed them, awaiting a regrow
+# deadline. Picking is the *only* thing that makes a bush bare, so it is also
+# the only place a regrow needs scheduling -- which is what lets the daily pass
+# look at the handful of bushes that are actually waiting instead of every bush
+# in the region. Ids are validated when drained, so a stale one is harmless.
+_PICKED_BUSHES: list[int] = []
+
+
+def reset_flora_queue() -> None:
+    """Forget bushes picked in a previous world. Entity ids restart with each
+    world, so a leftover id could alias an unrelated entity in the next one;
+    the test fixture clears this alongside esper's database."""
+    _PICKED_BUSHES.clear()
+
+
 class TreeGrowthProcessor(esper.Processor):
     """Ages the flora one **day** at a time (it acts on the turn a new day
     begins, matching the per-day odds below).
@@ -1921,6 +1983,31 @@ class TreeGrowthProcessor(esper.Processor):
     open outdoor ground tile has a small chance of sprouting a fresh sapling. A
     soft cap (scaled to the map) keeps the world from filling solid. The RNG is
     injectable so tests can force or suppress growth.
+
+    Nothing here scans
+    ------------------
+    Read literally, that description is four sweeps over a region every day:
+    every sapling, every plant, every bush, every ground tile. At archipelago
+    scale that is ~7200 tiles and a few hundred plants **per region per day**,
+    to produce roughly one sprout and one death a week. This processor states
+    the same rules without any of the sweeps, in two moves:
+
+    * **Chance is counted, not rolled.** A per-tile/per-plant chance over N
+      candidates is a binomial, so the day asks *how many* sprout or die and
+      then acts on that many -- see ``_bernoulli_hits``. Cost is what happened,
+      not what could have.
+    * **Deadlines are filed, not searched for.** A sapling's maturity day and a
+      picked bush's regrow day are both known the moment they are created, so
+      each is filed under the day it comes due (``_mature_due``,
+      ``_berry_due``). The daily pass pops the day's entries instead of asking
+      every plant whether its time has come yet.
+
+    What a region's flora costs per day is therefore the flora that actually
+    changed, plus O(1) bookkeeping -- which is what makes full-world simulation
+    affordable. Population counts come from the spatial index
+    (``spatial.of_kind``) and the world-wide soft-cap totals from
+    ``spatial.component_population``; both are O(1) reads, so not even the caps
+    require a scan.
     """
 
     def __init__(self, game_map: GameMap, rng: Callable[[], float] | None = None):
@@ -1951,9 +2038,25 @@ class TreeGrowthProcessor(esper.Processor):
         self._ocean_cache: dict = {}
         # The same two lists bucketed by simulation region, so a single region's
         # daily flora pass touches only its own tiles (the whole point of the
-        # region split -- one island's seaweed scan, not the whole sea's).
+        # region split -- one island's seaweed scan, not the whole sea's). They
+        # are *lists*, deliberately: sprouting indexes straight into them (see
+        # ``_bernoulli_hits``), so a candidate tile is picked in O(1) and the
+        # region's tiles are never walked.
         self._ground_by_region: dict = {}
         self._ocean_by_region: dict = {}
+        # Timed flora events, filed by the day they come due:
+        # ``{region: {due_day: [entity, ...]}}``. A day's pass pops its own key
+        # rather than asking every sapling/bush whether it is ready yet.
+        self._mature_due: dict[RegionId, dict[int, list[int]]] = {}
+        self._berry_due: dict[RegionId, dict[int, list[int]]] = {}
+        # The saplings currently filed in ``_mature_due``, per region -- kept so
+        # the queue can be checked against the world in O(1) (see
+        # ``_sync_sapling_queue``).
+        self._filed_saplings: dict[RegionId, set[int]] = {}
+        # Regions whose pre-existing flora has been filed into the queues above.
+        # A region is seeded once, on its first day pass, which is what picks up
+        # plants that world-gen (or a test) created directly.
+        self._seeded: set[RegionId] = set()
 
     def process(self, action: str | None = None) -> None:
         if action not in _TURN_ACTIONS:
@@ -1965,10 +2068,11 @@ class TreeGrowthProcessor(esper.Processor):
         if self._baseline_day is None:
             self._baseline_day = day  # establish a baseline; age the flora from here
             return
-        # During live play (a player exists) NO flora ages on the keypress: a
-        # daily growth pass is a whole-world scan, far too heavy to hang off a
-        # turn. It is deferred entirely to spare time (``pump_flora``, which walks
-        # the nearest-to-player region first, so the player's own island greens up
+        # During live play (a player exists) NO flora ages on the keypress: even
+        # a scan-free daily pass is a whole *world's* worth of regions, and the
+        # keypress owes the player a frame, not a growing season. It is deferred
+        # entirely to spare time (``pump_flora``, which walks the
+        # nearest-to-player region first, so the player's own island greens up
         # the instant they pause) and to sleep (``catch_up_all_flora``). With no
         # player at all (unit tests / headless) there is no idle loop to defer to,
         # so age everything inline, matching the old unpartitioned daily pass.
@@ -2011,18 +2115,15 @@ class TreeGrowthProcessor(esper.Processor):
                     abs(r[0] - player_region[0]), abs(r[1] - player_region[1])
                 )
             )
-        # One world scan feeds this whole pump; the time budget then governs how
-        # many nearby regions we advance a day from it (always at least one, so a
-        # scan is never wasted). Regions further behind than one day come back
-        # around on a later pump; the nearest-first order means the player's own
-        # island is always first in line.
+        # One day-context feeds this whole pump; the time budget then governs how
+        # many nearby regions we advance a day from it (always at least one).
+        # Regions further behind than one day come back around on a later pump;
+        # the nearest-first order means the player's own island is always first
+        # in line.
         ctx = self._build_day_context(clock)
         deadline = wall_clock() + budget_seconds
         for region_id in lagging:
-            self._run_region_day(region_id, ctx)
-            self._region_day[region_id] = (
-                self._region_day.get(region_id, self._baseline_day) + 1
-            )
+            self._advance_one_day(region_id, ctx)
             if wall_clock() >= deadline:
                 break
 
@@ -2046,10 +2147,9 @@ class TreeGrowthProcessor(esper.Processor):
         self, regions: list[RegionId], target_day: int, clock: WorldClock
     ) -> None:
         """Age each of ``regions`` one day at a time up to ``target_day``, in
-        strict order so state one day builds is consistent for the next. Flora is
-        bucketed once per day-step and shared across the regions advancing that
-        step, so a whole-world catch-up costs one entity scan per elapsed day, not
-        one per region."""
+        strict order so state one day builds is consistent for the next. The
+        day-context (chiefly the world-wide soft-cap totals) is built once per
+        day-step and shared by every region advancing that step."""
         while True:
             due = [
                 r for r in regions if self._region_day.get(r, self._baseline_day) < target_day
@@ -2058,70 +2158,201 @@ class TreeGrowthProcessor(esper.Processor):
                 return
             ctx = self._build_day_context(clock)
             for region_id in due:
-                self._run_region_day(region_id, ctx)
-                self._region_day[region_id] = (
-                    self._region_day.get(region_id, self._baseline_day) + 1
-                )
+                self._advance_one_day(region_id, ctx)
 
     def _build_day_context(self, clock: WorldClock) -> dict:
-        """One snapshot of the world the day's flora pass reads from: flora bucketed
-        by region (so each region touches only its own), the occupied/blocker tile
-        sets sprouting and maturation consult, and the running global counts the
-        soft caps compare against."""
-        game_map = self.game_map
-        trees: dict[RegionId, list[int]] = {}
-        bushes: dict[RegionId, list[tuple[int, object]]] = {}
-        saplings: dict[RegionId, list[tuple[int, Position, object]]] = {}
-        occupied: set[tuple[int, int]] = set()
-        blockers: set[tuple[int, int]] = set()
-        for _e, (pos,) in esper.get_components(Position):
-            occupied.add((pos.x, pos.y))
-        for _e, (pos, _b) in esper.get_components(Position, BlocksMovement):
-            blockers.add((pos.x, pos.y))
-        flora_total = 0
-        for ent, (pos, _t) in esper.get_components(Position, Tree):
-            trees.setdefault(region_at(game_map, pos.x, pos.y), []).append(ent)
-            flora_total += 1
-        for ent, (pos, bush) in esper.get_components(Position, BerryBush):
-            bushes.setdefault(region_at(game_map, pos.x, pos.y), []).append((ent, bush))
-            flora_total += 1
-        for ent, (pos, sapling) in esper.get_components(Position, Sapling):
-            saplings.setdefault(region_at(game_map, pos.x, pos.y), []).append(
-                (ent, pos, sapling)
-            )
-            flora_total += 1
-        seaweed_total = sum(1 for _e, _c in esper.get_components(Seaweed))
-        return {
-            "clock": clock,
-            "trees": trees,
-            "bushes": bushes,
-            "saplings": saplings,
-            "occupied": occupied,
-            "blockers": blockers,
-            "flora_total": flora_total,
-            "seaweed_total": seaweed_total,
-        }
+        """What a day's flora pass needs that isn't per-region: the clock, the
+        spatial index it asks for regional populations, and the running
+        world-wide totals the soft caps compare against.
 
-    def _run_region_day(self, region_id: RegionId, ctx: dict) -> None:
-        """One region's worth of a single day's growth, reading ``ctx``."""
-        self._mature_saplings(region_id, ctx)
+        All three are O(1) to obtain -- the totals come from
+        ``spatial.component_population``, which reads a length rather than
+        counting the world's plants. The regional detail this used to precompute
+        (trees, bushes, saplings and every occupied tile, bucketed by region, off
+        five whole-world entity scans) is gone: each pass now asks the index for
+        just its own region, and only when it has something to do.
+        """
+        ctx = {
+            "clock": clock,
+            "index": spatial.ensure(self.game_map),
+            "flora_total": (
+                spatial.component_population(Tree)
+                + spatial.component_population(BerryBush)
+                + spatial.component_population(Sapling)
+            ),
+            "seaweed_total": spatial.component_population(Seaweed),
+        }
+        self._drain_picked_bushes(ctx)
+        return ctx
+
+    def _advance_one_day(self, region_id: RegionId, ctx: dict) -> None:
+        """Run ``region_id``'s next day of growth and move its cursor onto it."""
+        day = self._region_day.get(region_id, self._baseline_day) + 1
+        self._run_region_day(region_id, day, ctx)
+        self._region_day[region_id] = day
+
+    def _run_region_day(self, region_id: RegionId, day: int, ctx: dict) -> None:
+        """One region's worth of a single day's growth.
+
+        ``day`` is the region's *own* day -- the one it is being advanced onto,
+        which for a lagging region is behind the world clock. Deadlines are
+        judged against it, so a region that has not been simulated for a season
+        still ripens its berries on the day they were due, not all at once when
+        someone finally looks.
+        """
+        self._seed_region(region_id, ctx)
+        self._sync_sapling_queue(region_id, ctx)
+        self._mature_saplings(region_id, day, ctx)
         self._kill_flora(region_id, ctx)
-        self._regrow_berries(region_id, ctx)
-        self._sprout_saplings(region_id, ctx)
+        self._regrow_berries(region_id, day, ctx)
+        self._sprout_saplings(region_id, day, ctx)
         if getattr(self.game_map, "has_ocean", False):
             self._sprout_seaweed(region_id, ctx)
 
-    def _mature_saplings(self, region_id: RegionId, ctx: dict) -> None:
+    # --- deadline queues ---------------------------------------------------
+
+    @staticmethod
+    def _due_day(turn: int, delay_days: int, day_length: int) -> int:
+        """The day ``delay_days`` after the one ``turn`` fell in.
+
+        Growth is quantized to days, so a deadline is counted in days from the
+        day it was set -- "berries regrow seven days after they were picked",
+        whichever hour of that day they were taken. This is the timing the old
+        per-plant test (``turn - stamped >= delay``) produced whenever the pass
+        ran on schedule; unlike that test it does not also depend on how far
+        behind the world clock the region happens to be.
+        """
+        return turn // max(1, day_length) + delay_days
+
+    @staticmethod
+    def _file(queue: dict[int, list[int]], due_day: int, ent: int) -> None:
+        queue.setdefault(due_day, []).append(ent)
+
+    @staticmethod
+    def _pop_due(queue: dict[int, list[int]], day: int) -> list[int]:
+        """Everything filed for ``day`` or any earlier day, removed from the
+        queue. Earlier days are swept up too so a region that jumped forward
+        (or was seeded with something already overdue) never strands an entry."""
+        overdue = [d for d in queue if d <= day]
+        if not overdue:
+            return []
+        ready: list[int] = []
+        for d in sorted(overdue):
+            ready.extend(queue.pop(d))
+        return ready
+
+    def _seed_region(self, region_id: RegionId, ctx: dict) -> None:
+        """File the deadlines of flora this processor never saw created.
+
+        World-gen spawns mature trees and ripe bushes, so in a fresh world this
+        finds nothing; it exists for saplings and picked bushes placed directly
+        (tests, tools, future content), which would otherwise sit in the world
+        with no deadline on file and never mature or ripen. Runs once per region.
+        """
+        if region_id in self._seeded:
+            return
+        self._seeded.add(region_id)
+        clock, index = ctx["clock"], ctx["index"]
+        mature_queue = self._mature_due.setdefault(region_id, {})
+        filed = self._filed_saplings.setdefault(region_id, set())
+        for ent in sorted(index.of_kind(region_id, Sapling)):
+            sapling = esper.component_for_entity(ent, Sapling)
+            self._file(
+                mature_queue,
+                self._due_day(sapling.planted_turn, _DAYS_PER_YEAR, clock.day_length),
+                ent,
+            )
+            filed.add(ent)
+        berry_queue = self._berry_due.setdefault(region_id, {})
+        # ``_drain_picked_bushes`` has already run for this day-step, so anything
+        # picked through ``pick_berries`` is on the queue -- which is every bush
+        # in normal play. Skipping those is what keeps a bush from being filed
+        # twice; what is left for this scan is a bush made bare some other way.
+        already = {ent for ents in berry_queue.values() for ent in ents}
+        for ent in sorted(index.of_kind(region_id, BerryBush) - already):
+            bush = esper.component_for_entity(ent, BerryBush)
+            if not bush.has_berries and bush.harvested_turn is not None:
+                self._file(
+                    berry_queue,
+                    self._due_day(bush.harvested_turn, _BERRY_REGROW_DAYS, clock.day_length),
+                    ent,
+                )
+
+    def _drain_picked_bushes(self, ctx: dict) -> None:
+        """Move bushes picked since the last pass onto their regrow deadline.
+
+        ``pick_berries`` is the only way a bush goes bare, so this is the whole
+        of "which bushes are waiting to regrow" -- no bush is ever asked.
+        """
+        if not _PICKED_BUSHES:
+            return
+        clock, index = ctx["clock"], ctx["index"]
+        picked, _PICKED_BUSHES[:] = list(_PICKED_BUSHES), []
+        for ent in picked:
+            if not esper.entity_exists(ent) or not esper.has_component(ent, BerryBush):
+                continue
+            bush = esper.component_for_entity(ent, BerryBush)
+            if bush.has_berries or bush.harvested_turn is None:
+                continue  # already regrown (or never really picked)
+            region_id = index.region_of(ent)
+            if region_id is None:
+                continue
+            self._file(
+                self._berry_due.setdefault(region_id, {}),
+                self._due_day(bush.harvested_turn, _BERRY_REGROW_DAYS, clock.day_length),
+                ent,
+            )
+
+    def _sync_sapling_queue(self, region_id: RegionId, ctx: dict) -> None:
+        """Repair the maturity queue if it has drifted from the world.
+
+        Sprouting files a sapling and maturing unfiles it, so in normal play the
+        queue and the region's sapling population move together and this costs
+        one length comparison. A mismatch means something created or destroyed a
+        sapling behind our back, and the queue is rebuilt from the index -- the
+        same "check a cheap length, repair by rebuilding" discipline the spatial
+        index itself uses, and for the same reason: a missed hook then costs one
+        rebuild instead of a sapling that never grows up.
+        """
+        index = ctx["index"]
+        bucket = index.of_kind(region_id, Sapling)
+        filed = self._filed_saplings.setdefault(region_id, set())
+        if len(filed) == len(bucket):
+            return
         clock = ctx["clock"]
-        mature_age = _DAYS_PER_YEAR * max(1, clock.day_length)
-        blockers = ctx["blockers"]
-        for ent, pos, sapling in ctx["saplings"].get(region_id, []):
-            if not esper.entity_exists(ent):
+        queue = self._mature_due.setdefault(region_id, {})
+        queue.clear()
+        filed.clear()
+        for ent in sorted(bucket):
+            sapling = esper.component_for_entity(ent, Sapling)
+            self._file(
+                queue,
+                self._due_day(sapling.planted_turn, _DAYS_PER_YEAR, clock.day_length),
+                ent,
+            )
+            filed.add(ent)
+
+    def _mature_saplings(self, region_id: RegionId, day: int, ctx: dict) -> None:
+        """Grow up the saplings whose year is up today -- the ones filed under
+        this day, not every sapling in the region asked how old it is."""
+        queue = self._mature_due.setdefault(region_id, {})
+        due = self._pop_due(queue, day)
+        if not due:
+            return
+        blockers = self._region_blockers(region_id, ctx)
+        filed = self._filed_saplings.setdefault(region_id, set())
+        for ent in due:
+            filed.discard(ent)
+            if not esper.entity_exists(ent) or not esper.has_component(ent, Sapling):
                 continue
-            if clock.turn - sapling.planted_turn < mature_age:
-                continue
+            sapling = esper.component_for_entity(ent, Sapling)
+            pos = esper.component_for_entity(ent, Position)
             if (pos.x, pos.y) in blockers:
-                continue  # occupied -- let it mature once the tile clears
+                # Something stands on it -- try again tomorrow rather than turn
+                # into a wall of wood under whoever is there.
+                self._file(queue, day + 1, ent)
+                filed.add(ent)
+                continue
             esper.remove_component(ent, Sapling)
             esper.add_component(ent, BlocksMovement())
             if sapling.kind == "bush":
@@ -2142,25 +2373,39 @@ class TreeGrowthProcessor(esper.Processor):
             spatial.reclassify(ent)
 
     def _kill_flora(self, region_id: RegionId, ctx: dict) -> None:
-        for ent in ctx["trees"].get(region_id, []):
-            if esper.entity_exists(ent) and self._rng() < _DAILY_DEATH_CHANCE:
-                esper.delete_entity(ent, immediate=True)
-        for ent, _bush in ctx["bushes"].get(region_id, []):
-            if esper.entity_exists(ent) and self._rng() < _DAILY_DEATH_CHANCE:
-                esper.delete_entity(ent, immediate=True)
+        """Rot and fell the day's share of the region's mature flora.
 
-    def _regrow_berries(self, region_id: RegionId, ctx: dict) -> None:
-        clock = ctx["clock"]
-        ready_after = _BERRY_REGROW_DAYS * max(1, clock.day_length)
-        for ent, bush in ctx["bushes"].get(region_id, []):
-            if not esper.entity_exists(ent):
+        How many die is a binomial draw over the region's plant count (an O(1)
+        read off the spatial index), so the usual answer -- none -- costs one
+        random number and the region's plants are never touched at all. Only
+        once a death is drawn is the population materialised, in entity order,
+        so which plant dies is reproducible from the seed.
+        """
+        index = ctx["index"]
+        for kind in (Tree, BerryBush):
+            population = index.of_kind(region_id, kind)
+            doomed = list(_bernoulli_hits(len(population), _DAILY_DEATH_CHANCE, self._rng))
+            if not doomed:
                 continue
-            if bush.has_berries or bush.harvested_turn is None:
+            ordered = sorted(population)  # snapshot: we are about to delete from it
+            for i in doomed:
+                ent = ordered[i]
+                if esper.entity_exists(ent):
+                    esper.delete_entity(ent, immediate=True)
+
+    def _regrow_berries(self, region_id: RegionId, day: int, ctx: dict) -> None:
+        """Ripen the bushes whose seven days are up today. Only bushes that were
+        actually picked are ever on the queue, so a region full of ripe bushes
+        costs nothing."""
+        for ent in self._pop_due(self._berry_due.setdefault(region_id, {}), day):
+            if not esper.entity_exists(ent) or not esper.has_component(ent, BerryBush):
                 continue
-            if clock.turn - bush.harvested_turn >= ready_after:
-                bush.has_berries = True
-                bush.harvested_turn = None
-                _set_bush_appearance(ent, True)
+            bush = esper.component_for_entity(ent, BerryBush)
+            if bush.has_berries:
+                continue  # picked, regrown and picked again? the later filing wins
+            bush.has_berries = True
+            bush.harvested_turn = None
+            _set_bush_appearance(ent, True)
 
     def _outdoor_ground(self) -> list[tuple[int, int]]:
         """Every regular ground tile that is outdoors (floor, and not inside an
@@ -2191,31 +2436,81 @@ class TreeGrowthProcessor(esper.Processor):
             self._ground_by_region = {"revision": revision, "buckets": buckets}
         return self._ground_by_region["buckets"]
 
-    def _sprout_saplings(self, region_id: RegionId, ctx: dict) -> None:
+    def _sprout_saplings(self, region_id: RegionId, day: int, ctx: dict) -> None:
+        """Seed the region's day of new growth.
+
+        The old shape of this was "for every outdoor ground tile, roll" -- 7200
+        rolls a day per region to plant about one sapling. Here the day asks the
+        distribution how many tiles sprout and gets the tiles back with them
+        (``_bernoulli_hits``), so the work is the saplings, not the ground. Each
+        one is still checked against the soft cap and against what is already on
+        its tile, and the ratio of trees to bushes is the same ratio the two
+        per-tile chances gave.
+
+        The tile check is two O(1) index reads and a shrug: a candidate that is
+        already grown over or built on is simply given up on, the way the
+        per-tile version skipped an occupied tile. Creatures are deliberately not
+        consulted -- a sapling under a passing villager is harmless (it doesn't
+        block, and ``_mature_saplings`` won't let it become a tree while anyone
+        is standing there), and checking for them is what would drag a
+        region's whole population back into a pass that no longer needs it.
+        """
         if ctx["flora_total"] >= self._cap:
             return
-        clock = ctx["clock"]
-        occupied = ctx["occupied"]
-        for x, y in self._ground_buckets().get(region_id, []):
+        tiles = self._ground_buckets().get(region_id, ())
+        clock, index = ctx["clock"], ctx["index"]
+        # Dated to the region's own day, not the world clock: growth is a
+        # day-quantized simulation, and a region that is a season behind must
+        # plant its saplings on the day it is living, or they would mature a
+        # season late (see ``_run_region_day``).
+        planted_turn = day * max(1, clock.day_length)
+        sprout_chance = _DAILY_SPROUT_CHANCE + _DAILY_BUSH_SPROUT_CHANCE
+        tree_share = _DAILY_SPROUT_CHANCE / sprout_chance
+        for i in _bernoulli_hits(len(tiles), sprout_chance, self._rng):
             if ctx["flora_total"] >= self._cap:
                 break
-            if (x, y) in occupied:
-                continue
-            roll = self._rng()
-            if roll < _DAILY_SPROUT_CHANCE:
+            x, y = tiles[i]
+            if index.rooted_at(x, y) is not None or index.blocker_at(x, y) is not None:
+                continue  # already grown over, or somebody built on it
+            if self._rng() < tree_share:
                 kind, glyph, name = "tree", "t", "Sapling"
-            elif roll < _DAILY_SPROUT_CHANCE + _DAILY_BUSH_SPROUT_CHANCE:
-                kind, glyph, name = "bush", ",", "Bush Seedling"
             else:
-                continue
-            esper.create_entity(
+                kind, glyph, name = "bush", ",", "Bush Seedling"
+            ent = esper.create_entity(
                 Position(x, y),
                 Renderable(glyph, fg=_SAPLING_GREEN),
                 Name(name),
-                Sapling(planted_turn=clock.turn, kind=kind),
+                Sapling(planted_turn=planted_turn, kind=kind),
             )
-            occupied.add((x, y))
+            # Its maturity is a known date, so file it now; the day it comes due
+            # is the only day this sapling is ever looked at again.
+            self._file(
+                self._mature_due.setdefault(region_id, {}), day + _DAYS_PER_YEAR, ent
+            )
+            self._filed_saplings.setdefault(region_id, set()).add(ent)
             ctx["flora_total"] += 1
+
+    def _region_blockers(self, region_id: RegionId, ctx: dict) -> set[tuple[int, int]]:
+        """The region's tiles that something blocking is standing on -- what a
+        maturing sapling must not turn into a tree underneath.
+
+        The one place a region's population is still read in bulk, and the only
+        one that has to be: unlike sprouting, this genuinely cares about
+        *creatures*, which move and so cannot be kept in a tile map cheaply. It
+        is built only when a sapling actually comes due (about once a day in the
+        few regions that have land at all) and cached for the day-step.
+        """
+        cache = ctx.setdefault("blockers", {})
+        tiles = cache.get(region_id)
+        if tiles is None:
+            tiles = {
+                (pos.x, pos.y)
+                for _e, (pos, _b) in ctx["index"].components(
+                    region_id, Position, BlocksMovement
+                )
+            }
+            cache[region_id] = tiles
+        return tiles
 
     def _ocean_buckets(self) -> dict[RegionId, list[tuple[int, int]]]:
         """``_ocean_tiles`` split by simulation region. Static like its source, so
@@ -2251,24 +2546,27 @@ class TreeGrowthProcessor(esper.Processor):
 
     def _sprout_seaweed(self, region_id: RegionId, ctx: dict) -> None:
         """Grow fresh seaweed on one region's open water so grazing fish keep the
-        sea fed."""
+        sea fed. Counted, not rolled, exactly like ``_sprout_saplings`` -- and the
+        saving is biggest here, since a sea region is nothing but candidate
+        tiles."""
         if ctx["seaweed_total"] >= self._seaweed_cap:
             return
-        occupied = ctx["occupied"]
-        for x, y in self._ocean_buckets().get(region_id, []):
+        tiles = self._ocean_buckets().get(region_id, ())
+        index = ctx["index"]
+        for i in _bernoulli_hits(len(tiles), _DAILY_SEAWEED_SPROUT_CHANCE, self._rng):
             if ctx["seaweed_total"] >= self._seaweed_cap:
                 break
-            if (x, y) in occupied:
-                continue
-            if self._rng() < _DAILY_SEAWEED_SPROUT_CHANCE:
-                esper.create_entity(
-                    Position(x, y),
-                    Renderable('"', fg=_SEAWEED_GREEN, bg=_WATER_BLUE),
-                    Name("Seaweed"),
-                    Seaweed(),
-                )
-                occupied.add((x, y))
-                ctx["seaweed_total"] += 1
+            x, y = tiles[i]
+            if index.rooted_at(x, y) is not None:
+                continue  # a frond already grows there; fish swim over, so that
+                          # is the only thing an open-sea tile can be taken by
+            esper.create_entity(
+                Position(x, y),
+                Renderable('"', fg=_SEAWEED_GREEN, bg=_WATER_BLUE),
+                Name("Seaweed"),
+                Seaweed(),
+            )
+            ctx["seaweed_total"] += 1
 
 
 # The glyph/colour a newborn villager shares with the adult cast.

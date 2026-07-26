@@ -63,6 +63,13 @@ _KINDS: tuple[type, ...] = (
     Resident, Player, Bed, Sapling, Blueprint, Camp,
 )
 
+# Plants: the things that are *rooted* to the tile they occupy. They are worth
+# singling out because they never move, so a tile -> entity map of them costs the
+# movement path nothing to maintain (unlike a general occupancy map, which every
+# creature step would have to update). ``rooted_at`` is what lets flora growth ask
+# "is this tile already taken?" in O(1) instead of collecting a region's tiles.
+_ROOTED: tuple[type, ...] = (Tree, BerryBush, Sapling, Seaweed)
+
 
 class _CreationCounter:
     """Remembers the last entity id esper handed out.
@@ -106,6 +113,12 @@ class SpatialIndex:
     in place instead of rescanned: the AI treats it as a map overlay and reads it
     by tile, so a dict is exactly the right shape -- it just must never be
     rebuilt from a world scan again.
+
+    ``rooted`` is the same idea for plants (``_ROOTED``), which need their own map
+    because half of them -- saplings and seaweed -- occupy a tile without blocking
+    it, so ``blockers`` cannot answer "is there already something growing here?".
+    Both maps are affordable for the same reason: nothing in either of them moves,
+    so keeping them true costs creation and destruction, never a step.
     """
 
     def __init__(self, game_map: GameMap) -> None:
@@ -118,6 +131,11 @@ class SpatialIndex:
         # The same blocker map read the other way (entity -> its tile), so removing
         # one costs a lookup rather than a walk over every blocker in the world.
         self._blocker_tile: dict[int, tuple[int, int]] = {}
+        # Tile -> the plant rooted on it, and the reverse, maintained exactly like
+        # the two above. Trees and bushes appear in both maps (they block as well
+        # as grow); saplings and seaweed appear only here.
+        self.rooted: dict[tuple[int, int], int] = {}
+        self._rooted_tile: dict[int, tuple[int, int]] = {}
         # Bumped whenever a region's *membership* changes -- something appears,
         # disappears, changes kind, or crosses in or out. Walking about inside one
         # region doesn't count. Systems cache per-region work against this, so a
@@ -190,6 +208,8 @@ class SpatialIndex:
         self._kinds_of = {}
         self.blockers = {}
         self._blocker_tile = {}
+        self.rooted = {}
+        self._rooted_tile = {}
         for ent, (pos,) in esper.get_components(Position):
             self._insert(ent, pos)
         self._population = self._population_now()
@@ -210,6 +230,12 @@ class SpatialIndex:
             and not esper.has_component(ent, Player)
         )
 
+    @staticmethod
+    def _is_rooted(kinds: tuple[type, ...]) -> bool:
+        """Whether an entity's kinds make it a plant. Read off the kinds tuple the
+        caller already computed, so this costs no component lookups."""
+        return any(kind in _ROOTED for kind in kinds)
+
     def _bump(self, region: RegionId, kinds: Iterable[type] = ()) -> None:
         self._version[region] = self._version.get(region, 0) + 1
         for kind in kinds:
@@ -228,6 +254,9 @@ class SpatialIndex:
         if self._is_static_blocker(ent):
             self.blockers[(pos.x, pos.y)] = ent
             self._blocker_tile[ent] = (pos.x, pos.y)
+        if self._is_rooted(kinds):
+            self.rooted[(pos.x, pos.y)] = ent
+            self._rooted_tile[ent] = (pos.x, pos.y)
 
     def _forget(self, ent: int) -> None:
         """Drop a destroyed entity from every bucket it was in."""
@@ -242,6 +271,9 @@ class SpatialIndex:
         tile = self._blocker_tile.pop(ent, None)
         if tile is not None and self.blockers.get(tile) == ent:
             del self.blockers[tile]
+        tile = self._rooted_tile.pop(ent, None)
+        if tile is not None and self.rooted.get(tile) == ent:
+            del self.rooted[tile]
 
     def moved(self, ent: int, old_xy: tuple[int, int], new_xy: tuple[int, int]) -> None:
         """Record a step. Called by the three places that move an entity."""
@@ -255,6 +287,12 @@ class SpatialIndex:
             del self.blockers[old_xy]
             self.blockers[new_xy] = ent
             self._blocker_tile[ent] = new_xy
+        if self.rooted.get(old_xy) == ent:
+            # Defensive: nothing uproots a plant today, and if that ever changes
+            # this is the line that keeps the map true rather than a stale tile.
+            del self.rooted[old_xy]
+            self.rooted[new_xy] = ent
+            self._rooted_tile[ent] = new_xy
         if new_region == old_region:
             return
         kinds = self._kinds_of.get(ent, ())
@@ -294,6 +332,15 @@ class SpatialIndex:
         elif self.blockers.get((pos.x, pos.y)) == ent:
             del self.blockers[(pos.x, pos.y)]
             self._blocker_tile.pop(ent, None)
+        # A sapling maturing into a tree stays rooted on the same tile, so this
+        # normally re-files what is already there; it is the losing case (a plant
+        # that stopped being one) that needs saying.
+        if self._is_rooted(kinds):
+            self.rooted[(pos.x, pos.y)] = ent
+            self._rooted_tile[ent] = (pos.x, pos.y)
+        elif self.rooted.get((pos.x, pos.y)) == ent:
+            del self.rooted[(pos.x, pos.y)]
+            self._rooted_tile.pop(ent, None)
 
     # --- queries ----------------------------------------------------------
 
@@ -343,6 +390,13 @@ class SpatialIndex:
         self.sync()
         return self.blockers.get((x, y))
 
+    def rooted_at(self, x: int, y: int) -> int | None:
+        """The plant growing on a tile, in O(1). ``blocker_at`` answers this for
+        trees and bushes but not for saplings and seaweed, which occupy a tile
+        without blocking it -- so growth asks here before it seeds a tile."""
+        self.sync()
+        return self.rooted.get((x, y))
+
     def components(self, region_id: RegionId, *kinds: type) -> Iterator[tuple[int, tuple]]:
         """``esper.get_components``, scoped to one region.
 
@@ -377,10 +431,13 @@ class SpatialIndex:
         problems: list[str] = []
         truth_region: dict[int, RegionId] = {}
         truth_blockers: dict[tuple[int, int], int] = {}
+        truth_rooted: dict[tuple[int, int], int] = {}
         for ent, (pos,) in esper.get_components(Position):
             truth_region[ent] = region_at(self.game_map, pos.x, pos.y)
             if self._is_static_blocker(ent):
                 truth_blockers[(pos.x, pos.y)] = ent
+            if self._is_rooted(self._kinds_for(ent)):
+                truth_rooted[(pos.x, pos.y)] = ent
         if truth_region != self._region_of:
             missing = set(truth_region) - set(self._region_of)
             extra = set(self._region_of) - set(truth_region)
@@ -395,6 +452,10 @@ class SpatialIndex:
         if truth_blockers != self.blockers:
             problems.append(
                 f"blockers differ: index {len(self.blockers)} vs world {len(truth_blockers)}"
+            )
+        if truth_rooted != self.rooted:
+            problems.append(
+                f"rooted differ: index {len(self.rooted)} vs world {len(truth_rooted)}"
             )
         for (region, kind), bucket in self._by_kind.items():
             for ent in bucket:

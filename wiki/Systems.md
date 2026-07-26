@@ -81,6 +81,32 @@ year-old saplings, kills off some mature plants (`_DAILY_DEATH_CHANCE`), regrows
 harvested berry bushes after 7 days, and sprouts seaweed in the sea — a
 self-sustaining forest and reef.
 
+**It does none of that by scanning.** Written literally those are four sweeps per
+region per day — every tile, every plant, every sapling, every bush — so the
+processor states the same rules two other ways:
+
+- **Chance is counted, not rolled.** A per-tile or per-plant chance over N
+  candidates is a binomial, and the gaps between successes are geometric, so
+  `_bernoulli_hits(n, p, rng)` samples *which* trials succeed directly — one
+  random number per success instead of one per trial. A region's 7200 ground
+  tiles cost the ~1 sapling that sprouts on them, not 7200 rolls. It is the same
+  Bernoulli process, so the distribution is unchanged (and the injected test RNG
+  keeps its meaning: `0.0` makes every trial a hit, `1.0` none).
+- **Deadlines are filed, not searched for.** A sapling's maturity day and a
+  picked bush's regrow day are known the moment each is created, so they are
+  filed under the day they come due (`_mature_due`, `_berry_due`). The daily pass
+  pops that day's entries; no plant is ever asked whether its time has come.
+  `pick_berries` is the only thing that makes a bush bare, so it is also the only
+  place a regrow gets scheduled.
+
+Populations come from the spatial index (`of_kind`, O(1)) and the world-wide
+soft-cap totals from `spatial.component_population` (also O(1)), so not even the
+caps need a scan. "Is this tile already taken?" is `SpatialIndex.rooted_at` —
+a tile map of plants, needed because saplings and seaweed occupy a tile without
+blocking it, and cheap because nothing in it ever moves. A candidate tile that is
+taken is simply given up on. See
+[Performance](Performance.md#counting-instead-of-scanning).
+
 ### `ReproductionProcessor` (priority 0)
 Delivers due pregnancies: after `_GESTATION_DAYS` it spawns a newborn beside the
 mother, wires the family links reciprocally, names it via the onymancer, and removes
