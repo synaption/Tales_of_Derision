@@ -9,7 +9,7 @@ runtime uses pygame.
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 import os
 from pathlib import Path
 import sys
@@ -25,6 +25,7 @@ from config import (
     WORLD_LAYOUT, WORLD_SETTLE_TURNS,
 )
 from queries import entity_name, first_player_entity
+from regions import all_region_ids
 from worldgen import _setup_world
 # Used by the turn loop below. Tests import these helpers from ``interactions`` directly.
 from interactions import (
@@ -64,6 +65,7 @@ from ui import (
     _place_from_inventory,
     _run_startup_flow,
     _sleep_player,
+    draw_settling_frame,
     run_world_generation,
 )
 from audio import CombatSfxPlayer, start_background_music, stop_background_music
@@ -231,6 +233,50 @@ def _catch_up_entered_region_cooperatively(renderer: Renderer, region_id: tuple[
             esper.process(None)
 
 
+# Slices for spending a turn's leftover beat on background simulation. The slice
+# is small so the loop notices the deadline; the epsilon detects "the pump found
+# nothing to do", which is the signal to stop asking and just wait out the beat.
+_SLACK_SLICE_SECONDS = 0.02
+_SLACK_IDLE_SECONDS = 0.001
+
+
+def catch_up_whole_world(on_progress: Callable[[float], None] | None = None) -> None:
+    """Bring every region -- not just the player's -- current with the clock.
+
+    Used at the end of world generation. The settle turns run through
+    ``esper.process``, which by design simulates only the region the player
+    stands in, so a hundred-island world walks out of the loading screen with
+    every other region a hundred and fifty turns in arrears. That debt is not
+    free: it is paid later, all at once, the first time something demands a
+    current world -- which is a night's rest. Paying it here costs nothing the
+    player can see, because the loading screen is already up.
+
+    ``on_progress`` is called with a 0..1 fraction as regions are brought
+    current, so the screen can keep showing progress rather than appear hung.
+    """
+    target_turn = _current_target_region_turn()
+    if target_turn is None:
+        return
+    schedulers = [
+        processor.scheduler
+        for processor in (
+            esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor)
+        )
+        if processor is not None
+    ]
+    for index, scheduler in enumerate(schedulers):
+        regions = all_region_ids(scheduler.game_map)
+        for done, region_id in enumerate(regions, start=1):
+            scheduler.catch_up_region(region_id, target_turn)
+            if on_progress is not None and done % 8 == 0:
+                on_progress((index + done / max(1, len(regions))) / (len(schedulers) + 1))
+    flora = esper.get_processor(TreeGrowthProcessor)
+    if flora is not None:
+        flora.catch_up_all_flora()
+    if on_progress is not None:
+        on_progress(1.0)
+
+
 def _pump_background_regions(budget_seconds: float) -> None:
     """Spend up to ``budget_seconds`` advancing the nearest lagging region for
     each region-aware processor, closest to the player first. Safe to call
@@ -364,6 +410,34 @@ class GameSession:
         return action
 
     # --- 2. idle ----------------------------------------------------------
+
+    def use_slack(self, seconds: float) -> None:
+        """Spend the unused remainder of this turn's beat simulating the world.
+
+        Every turn is held to the same wall-clock length so movement looks even,
+        and a turn's own work is a few milliseconds of that -- which left ~95ms
+        per turn being slept away. Meanwhile each of the hundred-odd regions the
+        player isn't standing in falls one turn further behind *per turn*, and
+        the whole arrears comes due the moment something needs a current world.
+
+        So the wait becomes the catch-up. This costs the player nothing: the turn
+        takes exactly as long as it already did, and the pump works nearest-region
+        first, so what gets simulated is what the player is about to walk into.
+        Idle ticks still do the same thing for longer pauses (``simulate_idle``);
+        this is what keeps a *held key* from starving the background entirely.
+        """
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= _SLACK_IDLE_SECONDS:
+                break
+            started = time.monotonic()
+            _pump_background_regions(min(remaining, _SLACK_SLICE_SECONDS))
+            if time.monotonic() - started < _SLACK_IDLE_SECONDS:
+                break  # nothing lagging: stop asking and wait out the beat
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
 
     def simulate_idle(self) -> None:
         """Spend an idle tick paying down off-screen simulation debt, ramping up
@@ -698,6 +772,10 @@ def game_session(args: argparse.Namespace) -> Iterator[GameSession | None]:
                 if not run_world_generation(renderer, WORLD_SETTLE_TURNS):
                     yield None
                     return
+                # Those settle turns only advanced the player's own region, so
+                # every other one is now WORLD_SETTLE_TURNS in arrears. Clear it
+                # here, while the loading screen is still up and it is free.
+                catch_up_whole_world(on_progress=lambda done: draw_settling_frame(renderer, done))
 
             esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
 

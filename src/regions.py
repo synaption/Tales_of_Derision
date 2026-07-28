@@ -151,6 +151,11 @@ class RegionScheduler:
         self.region_turn: dict[RegionId, int] = {
             region_id: current_turn for region_id in all_region_ids(game_map)
         }
+        # Diagnostics: region-turns actually replayed vs jumped over. The ratio is
+        # what says whether a slow catch-up is a lot of cheap turns or a few
+        # expensive ones, which are different problems with different fixes.
+        self.simulated = 0
+        self.skipped = 0
 
     def register(
         self,
@@ -177,6 +182,7 @@ class RegionScheduler:
 
     def advance_region(self, region_id: RegionId) -> None:
         """Run every registered step for ``region_id``'s next turn."""
+        self.simulated += 1
         for entry in self._steps:
             entry.step(region_id)
         self.region_turn[region_id] = self.region_turn.get(region_id, 0) + 1
@@ -212,6 +218,7 @@ class RegionScheduler:
         run. Callers must not pass more than ``jump_limit`` allows."""
         if turns <= 0:
             return
+        self.skipped += turns
         for entry in self._steps:
             if entry.bulk is not None:
                 entry.bulk(region_id, turns)

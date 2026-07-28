@@ -18,8 +18,8 @@ import esper
 
 from action import BASE_ACTION_COST
 from components import (
-    Asleep, Corpse, Dialogue, Equipment, Inventory, Needs, Personality, Player,
-    Position,
+    Asleep, Corpse, Dialogue, Equipment, Inventory, NPC, Needs, Personality,
+    Player, Position,
 )
 from config import (
     DEFAULT_WORLD_GRID, MAP_HEIGHT, MAP_WIDTH, WORLD_GRID_CHOICES, WORLD_LAYOUT,
@@ -36,6 +36,8 @@ from systems import (
     bed_owner, go_to_sleep, queue_message, settle_sleep, sleep_turns_needed,
     wake_up, world_clock,
 )
+from wildlife import WildlifeProcessor
+import spatial
 from interactions import (
     _CARDINAL_ACTION_DELTAS, _CRAFT_MENU, _apply_consumable, _chebyshev_from_player,
     _craft_item, _creature_at_xy, _creature_status_lines, _direction_target_xy,
@@ -578,17 +580,26 @@ def _draw_generation_frame(renderer: Renderer, fraction: float) -> None:
     renderer.present()
 
 
+def draw_settling_frame(renderer: Renderer, fraction: float) -> None:
+    """Progress for the whole-world catch-up that follows the settle turns, so a
+    hundred islands being brought current reads as progress, not as a hang."""
+    _draw_generation_frame(renderer, fraction)
+
+
 def run_world_generation(renderer: Renderer, settle_turns: int) -> bool:
     """Pre-simulate ``settle_turns`` turns behind a progress screen before play, so
     the startup 'building boom' (villagers all raising their first homes at once)
     happens here instead of as lag on the opening turns. Call it after the sim
     processors are registered but BEFORE the RenderProcessor, so these turns advance
     the world without drawing the game. Returns False if the player quit."""
-    # Build the flora processor's static per-region caches now, behind this
-    # screen, so their one-off cost never lands on a gameplay idle tick.
+    # Build the static per-region caches now, behind this screen, so their one-off
+    # cost never lands on a gameplay idle tick or the session's first rest.
     flora = esper.get_processor(TreeGrowthProcessor)
     if flora is not None:
         flora.warm_region_caches()
+    animals = esper.get_processor(WildlifeProcessor)
+    if animals is not None:
+        animals.stocks.warm_region_caches()
     if settle_turns <= 0:
         return True
     poll = getattr(renderer, "poll_action_nonblocking", None)
@@ -609,6 +620,9 @@ _MIN_SLEEP_TIREDNESS = 1.0
 
 
 _SLEEP_MAX_TURNS = 400
+
+# A rest slower than this prints where its time went (see ``_sleep_player``).
+_SLOW_REST_SECONDS = 0.25
 
 
 def _confirm_if_owned_by_other(renderer: Renderer, ent: int, noun: str, verb: str) -> bool:
@@ -718,25 +732,62 @@ def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = 
     # sits in -- region-aware processors otherwise only keep the player's
     # immediate region fully live turn by turn, leaving everywhere else to
     # catch up gradually in the background.
+    #
+    # Each phase is timed, and the lot is reported if the rest was slow enough to
+    # feel. A rest is the one action that can legitimately take a while, so when
+    # it does it should say which part took it -- the alternative is guessing
+    # from the outside, where a blocking confirmation prompt and a slow world
+    # catch-up look exactly the same.
+    spans: list[tuple[str, float]] = []
+    work: list[str] = []
+    started = time.monotonic()
+    mark = started
     if clock is not None:
         target_region_turn = clock.turn // BASE_ACTION_COST
-        for processor in (esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor)):
+        for name, processor in (
+            ("npc", esper.get_processor(NpcAiProcessor)),
+            ("fish", esper.get_processor(FishAiProcessor)),
+        ):
             if processor is not None:
-                processor.scheduler.catch_up_all(target_region_turn)
+                scheduler = processor.scheduler
+                before = (scheduler.simulated, scheduler.skipped)
+                scheduler.catch_up_all(target_region_turn)
+                work.append(
+                    f"{name} replayed {scheduler.simulated - before[0]} region-turns, "
+                    f"jumped {scheduler.skipped - before[1]}"
+                )
+            spans.append((name, time.monotonic() - mark))
+            mark = time.monotonic()
     # Flora ages per day rather than per turn, and lags the same way; a sleep
     # brings every region's growth fully current too.
     flora = esper.get_processor(TreeGrowthProcessor)
     if flora is not None:
         flora.catch_up_all_flora()
+    spans.append(("flora", time.monotonic() - mark))
+    mark = time.monotonic()
     # Births lag per region the same way -- the world's babies due while you slept
     # are all delivered here rather than on some later keypress.
     births = esper.get_processor(ReproductionProcessor)
     if births is not None:
         births.catch_up_all_births()
+    spans.append(("births", time.monotonic() - mark))
+    mark = time.monotonic()
     # Wild populations came with it: they ride the flora's day cursor, so
     # catch_up_all_flora above already grazed, bred and starved the night out.
 
     esper.process(None)
+    spans.append(("draw", time.monotonic() - mark))
+
+    total = time.monotonic() - started
+    if total >= _SLOW_REST_SECONDS:
+        detail = "  ".join(f"{name} {span * 1000:.0f}ms" for name, span in spans)
+        npcs = sum(1 for _e, _c in esper.get_components(NPC))
+        index = spatial.index_for(game_map) if game_map is not None else None
+        held = len(index._region_of) if index is not None else 0
+        rebuilds = index.rebuilds if index is not None else 0
+        print(f"rest: {turns} turns of sleep, {total * 1000:.0f} ms   {detail}")
+        print(f"      {npcs} NPCs in the world; " + "; ".join(work))
+        print(f"      index holds {held} entities, {rebuilds} rebuilds so far")
 
 
 def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name: str) -> None:

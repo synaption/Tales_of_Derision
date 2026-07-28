@@ -232,6 +232,17 @@ class WildlifeStocks:
     def capacity(self, species: Species, region_id: RegionId) -> int:
         return int(len(self.habitat(species, region_id)) * species.density_cap)
 
+    def warm_region_caches(self) -> None:
+        """Build every (species, region) habitat list up front.
+
+        Each one is a scan of a region's tiles, so the first whole-world day pass
+        -- which is a night's rest -- otherwise pays for all of them at once
+        (measured ~0.3s on the first rest of a session, and only the first).
+        Doing it behind the world-gen screen keeps it out of gameplay entirely."""
+        for species in self.species:
+            for region_id in all_region_ids(self.game_map):
+                self.habitat(species, region_id)
+
     # --- seeding ----------------------------------------------------------
 
     def seed_from_world(self) -> None:

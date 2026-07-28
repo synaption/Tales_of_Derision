@@ -105,6 +105,48 @@ def _last_entity_id() -> int:
     return counter.last_id
 
 
+# Ids passed to ``esper.delete_entity`` since the log was last trimmed, in order.
+# The deletion half of the ``_CreationCounter`` trick, and for the same reason:
+# esper has no "something died" signal, so without this the only way to find out
+# what an index still holds that the world no longer has is to compare the whole
+# index against the world. That comparison is O(everything alive) and it fires
+# whenever *anything* dies -- which during a world catch-up is every region,
+# every day. (Measured: 1,441 of those scans walked 51.7M entity slots in a
+# single ten-day rest.) Recording the ids instead makes the repair proportional
+# to what actually died.
+_deleted_log: list[int] = []
+
+
+def _install_deletion_log() -> None:
+    """Wrap ``esper.delete_entity`` once so deletions are recorded. Idempotent,
+    and like the creation counter it needs no call-site changes anywhere."""
+    original = esper.delete_entity
+    if getattr(original, "_records_deletions", False):
+        return
+
+    def delete_entity(entity: int, immediate: bool = False):
+        _deleted_log.append(entity)
+        return original(entity, immediate=immediate)
+
+    delete_entity._records_deletions = True  # type: ignore[attr-defined]
+    esper.delete_entity = delete_entity
+
+
+def _trim_deletion_log() -> None:
+    """Drop the prefix of the log every live index has already consumed, so a
+    long game doesn't accumulate one entry per entity that ever died."""
+    if len(_deleted_log) < 4096:
+        return
+    consumed = min(
+        (index._deleted_cursor for index in _INDEXES.values()), default=len(_deleted_log)
+    )
+    if consumed <= 0:
+        return
+    del _deleted_log[:consumed]
+    for index in _INDEXES.values():
+        index._deleted_cursor -= consumed
+
+
 class SpatialIndex:
     """Every positioned entity, bucketed by region and by kind.
 
@@ -150,6 +192,11 @@ class SpatialIndex:
         # esper's population as of the last sync. Creation/deletion anywhere moves
         # this, which is how the index notices work it wasn't told about.
         self._population: tuple[int, int, int] = (-1, -1, -1)
+        # How far this index has read the shared deletion log, and the ids it has
+        # seen there but not yet been able to drop (a deferred delete is still
+        # alive until the next ``esper.process``).
+        self._deleted_cursor = 0
+        self._pending_deletes: set[int] = set()
         self.rebuilds = 0  # diagnostics; a healthy live game leaves this alone
         self.rebuild()
 
@@ -192,10 +239,19 @@ class SpatialIndex:
             if ent in positioned:
                 self._insert(ent, esper.component_for_entity(ent, Position))
         if (alive - prev_alive) != (last_id - prev_last_id) or dead != prev_dead:
-            # Something died. Which is only answerable by comparing what we hold
-            # against what still lives -- but only on the turns a death happened.
-            for ent in [e for e in self._region_of if e not in positioned]:
-                self._forget(ent)
+            # Something died. The deletion log says exactly what, so the repair
+            # costs what died rather than what lives. A deferred delete is still
+            # in ``positioned`` until the next ``esper.process``, so ids that
+            # haven't actually gone yet stay pending and are re-checked next time
+            # -- that set only ever holds the handful in flight.
+            self._pending_deletes.update(_deleted_log[self._deleted_cursor:])
+            self._deleted_cursor = len(_deleted_log)
+            if self._pending_deletes:
+                for ent in [e for e in self._pending_deletes if e not in positioned]:
+                    self._pending_deletes.discard(ent)
+                    if ent in self._region_of:
+                        self._forget(ent)
+            _trim_deletion_log()
         self._population = signature
 
     def rebuild(self) -> None:
@@ -210,8 +266,13 @@ class SpatialIndex:
         self._blocker_tile = {}
         self.rooted = {}
         self._rooted_tile = {}
+        _install_deletion_log()
         for ent, (pos,) in esper.get_components(Position):
             self._insert(ent, pos)
+        # A rebuild has just read the world directly, so nothing already in the
+        # log can still be owed -- start from its end.
+        self._deleted_cursor = len(_deleted_log)
+        self._pending_deletes.clear()
         self._population = self._population_now()
 
     # --- maintenance ------------------------------------------------------

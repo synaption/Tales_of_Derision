@@ -190,3 +190,92 @@ def test_audit_reflects_the_index_as_callers_see_it() -> None:
     assert index.audit() == [], "audit must fold in the deletions before judging"
     for ent in doomed:
         assert index.blocker_at(*(0, 0)) != ent
+
+
+def test_a_death_does_not_cost_a_pass_over_the_whole_index() -> None:
+    """Repairing a death used to mean comparing everything the index holds against
+    everything alive -- an O(world) walk triggered by *any* death.
+
+    During a world catch-up that fires for every region, every day: a ten-day rest
+    measured 1,441 of those scans walking 51.7M entity slots between them. Deaths
+    are recorded as they happen instead, so the repair costs what died. This holds
+    the property that made it slow: a single death must not read the world.
+    """
+    game_map = _world()
+    index = spatial.index_for(game_map)
+    for x in range(20, 40):
+        esper.create_entity(Position(x, 5), Tree(), BlocksMovement())
+    index.sync()
+    held = len(index._region_of)
+    doomed = esper.create_entity(Position(11, 11), Tree(), BlocksMovement())
+    index.sync()
+
+    reads = 0
+    original = spatial.SpatialIndex._forget
+
+    def counting_forget(self, ent):
+        nonlocal reads
+        reads += 1
+        return original(self, ent)
+
+    spatial.SpatialIndex._forget = counting_forget
+    try:
+        esper.delete_entity(doomed, immediate=True)
+        index.sync()
+    finally:
+        spatial.SpatialIndex._forget = original
+
+    assert reads == 1, "only the entity that died should be touched"
+    assert index.blocker_at(11, 11) is None
+    assert len(index._region_of) == held
+    assert index.audit() == []
+
+
+def test_many_deaths_and_births_leave_the_index_exact() -> None:
+    """The deletion log is consumed incrementally and trimmed, so this pins that
+    a long run of churn -- the shape of a world catch-up -- never drifts."""
+    game_map = _world()
+    index = spatial.index_for(game_map)
+    living: list[int] = []
+    # Free ground only: the ``rooted`` map is one plant per tile by design, so
+    # planting a second on an occupied tile is not a thing the world can do.
+    tiles = iter([
+        (x, y)
+        for y in range(5, 55)
+        for x in range(5, 115)
+        if index.rooted_at(x, y) is None and index.blocker_at(x, y) is None
+    ])
+    for round_ in range(30):
+        for _ in range(20):
+            x, y = next(tiles)
+            living.append(esper.create_entity(Position(x, y), Tree()))
+        index.sync()
+        for ent in living[: len(living) // 2]:
+            esper.delete_entity(ent, immediate=True)
+        living = living[len(living) // 2:]
+        assert index.audit() == [], f"drifted after round {round_}"
+    assert index.rebuilds == 1, "churn must never force a full rebuild"
+
+
+def test_a_deferred_delete_is_folded_in_once_it_really_goes() -> None:
+    """``delete_entity`` without ``immediate`` only queues the entity; esper keeps
+    it in the component tables until the next ``process``.
+
+    The deletion is logged at the call, which is *before* the entity actually
+    goes, so the index has to hold it pending and re-check -- consuming the log
+    entry and forgetting about it would strand the entity in the buckets forever.
+    """
+    game_map = _world()
+    index = spatial.index_for(game_map)
+    ent = esper.create_entity(Position(13, 13), Tree(), BlocksMovement())
+    assert index.blocker_at(13, 13) == ent
+
+    esper.delete_entity(ent)  # deferred
+    index.sync()              # logged, but the entity is still in the world
+    assert index._pending_deletes, "held pending, not consumed and dropped"
+
+    esper.process()
+
+    assert index.blocker_at(13, 13) is None
+    assert index.audit() == []
+    assert not index._pending_deletes, "and the pending set drains"
