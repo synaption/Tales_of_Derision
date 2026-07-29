@@ -5,6 +5,7 @@ import random
 import sys
 from array import array
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     import pygame
@@ -19,6 +20,12 @@ except ImportError as exc:
 
 WINDOW_SIZE = (1000, 700)
 PAPER_TEXTURE_WIDTH = 512
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SPRITE_SHEET_PATH = (
+    REPO_ROOT / "gfx" / "tilesets" / "Hexany" / "monochrome_32x32_transparent.png"
+)
+SPRITE_TILE_SIZE = 32
 
 
 VERTEX_SHADER = """
@@ -180,6 +187,16 @@ class DemoSettings:
     light_height: float = 0.24
     exposure: float = 1.00
     debug_mode: int = 0
+    brush_radius: int = 5
+
+
+@dataclass
+class Stroke:
+    """One hand-drawn polyline, kept as vectors so undo can recomposite."""
+
+    points: list[tuple[int, int]]
+    radius: int
+    erase: bool
 
 
 @dataclass
@@ -324,7 +341,100 @@ def generate_paper_maps(
     )
 
 
-def make_demo_ink(size: tuple[int, int]) -> pygame.Surface:
+class SpriteSheet:
+    """A grid of equally sized tiles cut out of one image.
+
+    The Hexany monochrome sheet is pure white on transparency, so a tile's
+    alpha channel drops straight into the ink mask and the sprite is lit as
+    though it had been stamped onto the parchment in the same ink as the
+    hand-drawn strokes.
+    """
+
+    def __init__(self, path: Path, tile_size: int = SPRITE_TILE_SIZE) -> None:
+        source = pygame.image.load(str(path))
+
+        # Blitting onto an SRCALPHA surface resolves the palette + colour key
+        # of an indexed PNG into real per-pixel alpha, and unlike
+        # convert_alpha() it does not need a display surface.
+        self.surface = pygame.Surface(source.get_size(), pygame.SRCALPHA)
+        self.surface.fill((0, 0, 0, 0))
+        self.surface.blit(source, (0, 0))
+
+        self.tile_size = tile_size
+        sheet_width, sheet_height = self.surface.get_size()
+        self.columns = sheet_width // tile_size
+        self.rows = sheet_height // tile_size
+        self._scaled_cache: dict[tuple[int, int], pygame.Surface] = {}
+
+    @property
+    def count(self) -> int:
+        return self.columns * self.rows
+
+    def tile_rect(self, index: int) -> pygame.Rect:
+        index %= self.count
+        column = index % self.columns
+        row = index // self.columns
+        return pygame.Rect(
+            column * self.tile_size,
+            row * self.tile_size,
+            self.tile_size,
+            self.tile_size,
+        )
+
+    def tile(self, index: int, scale: int = 1) -> pygame.Surface:
+        """Return one tile, optionally point-scaled to keep pixels crisp."""
+        index %= self.count
+        key = (index, scale)
+        cached = self._scaled_cache.get(key)
+        if cached is not None:
+            return cached
+
+        tile = pygame.Surface(
+            (self.tile_size, self.tile_size), pygame.SRCALPHA
+        )
+        tile.fill((0, 0, 0, 0))
+        tile.blit(self.surface, (0, 0), self.tile_rect(index))
+
+        if scale != 1:
+            size = (self.tile_size * scale, self.tile_size * scale)
+            tile = pygame.transform.scale(tile, size)
+
+        self._scaled_cache[key] = tile
+        return tile
+
+    def draw(
+        self,
+        target: pygame.Surface,
+        index: int,
+        position: tuple[int, int],
+        scale: int = 1,
+        opacity: int = 255,
+    ) -> pygame.Rect:
+        """Stamp one tile onto `target`, treating it as ink of a given density."""
+        tile = self.tile(index, scale)
+        if opacity != 255:
+            tile = tile.copy()
+            tile.fill(
+                (255, 255, 255, opacity),
+                special_flags=pygame.BLEND_RGBA_MULT,
+            )
+        return target.blit(tile, position)
+
+
+def load_sprite_sheet(path: Path = SPRITE_SHEET_PATH) -> SpriteSheet | None:
+    """Load the sprite sheet, or return None so the demo still runs without it."""
+    try:
+        return SpriteSheet(path)
+    except (pygame.error, FileNotFoundError) as exc:
+        print(f"Could not load sprite sheet {path}: {exc}", file=sys.stderr)
+        return None
+
+
+def make_demo_ink(
+    size: tuple[int, int],
+    sprites: SpriteSheet | None = None,
+    sprite_page: int = 0,
+) -> pygame.Surface:
     """Create anti-aliased ink artwork; its alpha channel becomes the ink mask."""
     width, height = size
     ink_mask = pygame.Surface(size, pygame.SRCALPHA)
@@ -375,7 +485,7 @@ def make_demo_ink(size: tuple[int, int]) -> pygame.Surface:
     pygame.draw.circle(ink_mask, white, center, 12)
 
     # Thick pools produce broad dark shapes and very visible coat highlights.
-    for position, radius in [((165, 555), 30), ((245, 520), 18), ((325, 565), 24)]:
+    for position, radius in [((430, 520), 30), ((512, 496), 18), ((594, 528), 24)]:
         pygame.draw.circle(ink_mask, white, position, radius)
 
     # A few pressure-varying pen strokes.
@@ -385,6 +495,29 @@ def make_demo_ink(size: tuple[int, int]) -> pygame.Surface:
         end = (340 + index * 34, y + random.Random(index).randint(-5, 5))
         pygame.draw.aaline(ink_mask, white, start, end)
         pygame.draw.line(ink_mask, white, start, end, 2 + index // 2)
+
+    if sprites is not None:
+        per_page = sprites.columns
+        pages = max(1, sprites.count // per_page)
+        page = sprite_page % pages
+        first_tile = page * per_page
+
+        draw_text(
+            f"Hexany 32x32 - tiles {first_tile}-{first_tile + per_page - 1}"
+            f" of {sprites.count}",
+            small_font,
+            (100, 538),
+        )
+
+        scale = 2
+        spacing = sprites.tile_size * scale + 12
+        for column in range(per_page):
+            sprites.draw(
+                ink_mask,
+                first_tile + column,
+                (100 + column * spacing, 566),
+                scale=scale,
+            )
 
     return ink_mask
 
@@ -400,6 +533,137 @@ def surface_to_texture(
     texture.repeat_x = False
     texture.repeat_y = False
     return texture
+
+
+def make_brush(radius: int, softness: float = 1.5) -> pygame.Surface:
+    """A round brush whose alpha fades over the outer pixel or two.
+
+    Stamping a soft brush along a segment gives anti-aliased strokes with round
+    caps and joins, which `pygame.draw.line` cannot do; the ink mask is sampled
+    one-to-one with the screen, so hard edges would read as staircase aliasing.
+    """
+    diameter = max(2, radius * 2)
+    brush = pygame.Surface((diameter, diameter), pygame.SRCALPHA)
+    center = (diameter - 1) * 0.5
+
+    for y in range(diameter):
+        delta_y = y - center
+        for x in range(diameter):
+            delta_x = x - center
+            distance = math.hypot(delta_x, delta_y)
+            coverage = (radius - distance) / softness
+            alpha = clamp_byte(max(0.0, min(1.0, coverage)) * 255.0)
+            if alpha:
+                brush.set_at((x, y), (255, 255, 255, alpha))
+
+    return brush
+
+
+class InkCanvas:
+    """The ink mask as editable artwork: generated demo art plus user strokes."""
+
+    def __init__(self, size: tuple[int, int]) -> None:
+        self.size = size
+        self.base = pygame.Surface(size, pygame.SRCALPHA)
+        self.base.fill((0, 0, 0, 0))
+        self.surface = self.base.copy()
+        self.strokes: list[Stroke] = []
+        self.active_stroke: Stroke | None = None
+        self._brushes: dict[int, pygame.Surface] = {}
+
+    def _brush(self, radius: int) -> pygame.Surface:
+        brush = self._brushes.get(radius)
+        if brush is None:
+            brush = make_brush(radius)
+            self._brushes[radius] = brush
+        return brush
+
+    def _stamp_segment(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        radius: int,
+        erase: bool,
+    ) -> pygame.Rect:
+        """Stamp the brush along one segment; returns the touched rectangle."""
+        brush = self._brush(radius)
+        offset = brush.get_width() * 0.5
+        blend = pygame.BLEND_RGBA_SUB if erase else pygame.BLEND_RGBA_MAX
+
+        delta_x = end[0] - start[0]
+        delta_y = end[1] - start[1]
+        distance = math.hypot(delta_x, delta_y)
+        step = max(1.0, radius * 0.35)
+        stamps = max(1, int(distance / step) + 1)
+
+        for index in range(stamps + 1):
+            travel = index / stamps
+            x = start[0] + delta_x * travel - offset
+            y = start[1] + delta_y * travel - offset
+            self.surface.blit(brush, (round(x), round(y)), special_flags=blend)
+
+        pad = radius + 2
+        dirty = pygame.Rect(
+            min(start[0], end[0]) - pad,
+            min(start[1], end[1]) - pad,
+            abs(delta_x) + pad * 2,
+            abs(delta_y) + pad * 2,
+        )
+        return dirty.clip(self.surface.get_rect())
+
+    def begin_stroke(
+        self,
+        position: tuple[int, int],
+        radius: int,
+        erase: bool,
+    ) -> pygame.Rect:
+        self.active_stroke = Stroke([position], radius, erase)
+        self.strokes.append(self.active_stroke)
+        return self._stamp_segment(position, position, radius, erase)
+
+    def extend_stroke(self, position: tuple[int, int]) -> pygame.Rect | None:
+        stroke = self.active_stroke
+        if stroke is None:
+            return None
+
+        previous = stroke.points[-1]
+        if previous == position:
+            return None
+
+        stroke.points.append(position)
+        return self._stamp_segment(previous, position, stroke.radius, stroke.erase)
+
+    def end_stroke(self) -> None:
+        self.active_stroke = None
+
+    def undo(self) -> bool:
+        if not self.strokes:
+            return False
+        self.strokes.pop()
+        self.active_stroke = None
+        self.recomposite()
+        return True
+
+    def clear_strokes(self) -> bool:
+        if not self.strokes:
+            return False
+        self.strokes.clear()
+        self.active_stroke = None
+        self.recomposite()
+        return True
+
+    def set_base(self, base: pygame.Surface) -> None:
+        self.base = base
+        self.recomposite()
+
+    def recomposite(self) -> None:
+        """Redraw everything from the base art. Only needed for undo and clear."""
+        self.surface = self.base.copy()
+        for stroke in self.strokes:
+            points = stroke.points
+            self._stamp_segment(points[0], points[0], stroke.radius, stroke.erase)
+            for start, end in zip(points, points[1:]):
+                self._stamp_segment(start, end, stroke.radius, stroke.erase)
 
 
 class ParchmentInkRenderer:
@@ -430,10 +694,18 @@ class ParchmentInkRenderer:
             [(self.vertex_buffer, "2f 2f", "in_position", "in_uv")],
         )
 
+        self.sprites = load_sprite_sheet()
+        self.sprite_page = 0
+        self.canvas = InkCanvas(size)
+
         self.paper_albedo: moderngl.Texture
         self.paper_normal: moderngl.Texture
         self.paper_roughness: moderngl.Texture
-        self.ink_mask = surface_to_texture(self.context, make_demo_ink(size))
+        self.ink_mask = self.context.texture(size, 4)
+        self.ink_mask.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.ink_mask.repeat_x = False
+        self.ink_mask.repeat_y = False
+        self._rebuild_base_ink()
         self._replace_paper_textures(seed)
 
         self.program["u_paper_albedo"].value = 0
@@ -441,6 +713,43 @@ class ParchmentInkRenderer:
         self.program["u_paper_roughness"].value = 2
         self.program["u_ink_mask"].value = 3
         self.program["u_resolution"].value = tuple(float(value) for value in size)
+
+    def _rebuild_base_ink(self) -> None:
+        """Regenerate the demo artwork underneath the user's strokes."""
+        self.canvas.set_base(make_demo_ink(self.size, self.sprites, self.sprite_page))
+        self.upload_ink()
+
+    def upload_ink(self, region: pygame.Rect | None = None) -> None:
+        """Push the canvas to the GPU, by default only the rectangle that changed.
+
+        Texture V runs bottom-up while Pygame Y runs top-down, so the region is
+        flipped and its origin mirrored to match `surface_to_texture`.
+        """
+        surface = self.canvas.surface
+        if region is None:
+            region = surface.get_rect()
+        else:
+            region = region.clip(surface.get_rect())
+            if not region.width or not region.height:
+                return
+
+        patch = pygame.transform.flip(surface.subsurface(region), False, True)
+        self.ink_mask.write(
+            pygame.image.tobytes(patch, "RGBA"),
+            viewport=(
+                region.left,
+                self.size[1] - region.bottom,
+                region.width,
+                region.height,
+            ),
+        )
+
+    def change_sprite_page(self, delta: int) -> None:
+        if self.sprites is None:
+            return
+        pages = max(1, self.sprites.count // self.sprites.columns)
+        self.sprite_page = (self.sprite_page + delta) % pages
+        self._rebuild_base_ink()
 
     def _replace_paper_textures(self, seed: int) -> None:
         maps = generate_paper_maps(self.size, seed)
@@ -505,8 +814,11 @@ def update_caption(settings: DemoSettings) -> None:
         "ModernGL Parchment + Fresh Ink  |  "
         f"wetness {settings.wetness:.2f}  "
         f"light height {settings.light_height:.2f}  "
+        f"brush {settings.brush_radius}px  "
         f"view {modes[settings.debug_mode]}  |  "
-        "Mouse light, [ ] wetness, - = height, 1-4 views, R regenerate, Esc quit"
+        "Drag draws, right-drag erases, wheel brush size, U undo, C clear, "
+        "move mouse for light, [ ] wetness, - = height, 1-4 views, "
+        "arrows sprite page, R regenerate, Esc quit"
     )
 
 
@@ -539,12 +851,40 @@ def main() -> None:
     settings = DemoSettings()
     update_caption(settings)
 
+    light_position = (WINDOW_SIZE[0] // 2, WINDOW_SIZE[1] // 2)
+    drawing = False
+
     running = True
     while running:
         caption_changed = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+                drawing = True
+                dirty = renderer.canvas.begin_stroke(
+                    event.pos,
+                    settings.brush_radius,
+                    erase=event.button == 3,
+                )
+                renderer.upload_ink(dirty)
+            elif event.type == pygame.MOUSEBUTTONUP and event.button in (1, 3):
+                drawing = False
+                renderer.canvas.end_stroke()
+            elif event.type == pygame.MOUSEMOTION:
+                if drawing:
+                    dirty = renderer.canvas.extend_stroke(event.pos)
+                    if dirty is not None:
+                        renderer.upload_ink(dirty)
+                else:
+                    # The light stays put while drawing so a fresh stroke can be
+                    # judged under steady lighting instead of a moving highlight.
+                    light_position = event.pos
+            elif event.type == pygame.MOUSEWHEEL:
+                settings.brush_radius = max(
+                    1, min(48, settings.brush_radius + event.y)
+                )
+                caption_changed = True
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
@@ -574,11 +914,23 @@ def main() -> None:
                 elif event.key in (pygame.K_4, pygame.K_KP4):
                     settings.debug_mode = 3
                     caption_changed = True
+                elif event.key == pygame.K_LEFT:
+                    renderer.change_sprite_page(-1)
+                elif event.key == pygame.K_RIGHT:
+                    renderer.change_sprite_page(1)
+                elif event.key == pygame.K_u or (
+                    event.key == pygame.K_z and event.mod & pygame.KMOD_CTRL
+                ):
+                    if renderer.canvas.undo():
+                        renderer.upload_ink()
+                elif event.key == pygame.K_c:
+                    if renderer.canvas.clear_strokes():
+                        renderer.upload_ink()
 
         if caption_changed:
             update_caption(settings)
 
-        renderer.render(pygame.mouse.get_pos(), settings)
+        renderer.render(light_position, settings)
         pygame.display.flip()
         clock.tick(60)
 
