@@ -1,25 +1,34 @@
-"""Metallic sprite demo using Pygame + ModernGL.
+"""PBR sprite demo using Pygame and ModernGL.
+
+This version loads four independent material textures:
+    gear_albedo.png
+    gear_normal.png
+    gear_metallic.png
+    gear_roughness.png
 
 Install:
     python -m pip install pygame moderngl
 
-Run this file from the same directory as:
-    metallic_sprite.glsl
-    metal_sprite.png
+Run:
+    python metallic_sprite_demo.py
 
 Controls:
-    Mouse          Move the point light
-    W/A/S/D        Move the sprite
-    Q / E          Rotate the sprite
-    Up / Down      Decrease / increase roughness
-    M              Toggle metallic / non-metallic
-    R              Reset the material and transform
-    Escape         Quit
+    Mouse              Move the point light
+    W / A / S / D      Move the sprite
+    Q / E              Rotate the sprite
+    Up / Down          Change roughness-map strength
+    Left / Right       Change metallic-map strength
+    1                  Final shaded material
+    2                  Albedo map
+    3                  Normal map
+    4                  Metallic map
+    5                  Roughness map
+    R                  Reset
+    Escape             Quit
 """
 
 from __future__ import annotations
 
-import math
 import struct
 from pathlib import Path
 
@@ -29,9 +38,24 @@ import pygame
 WINDOW_SIZE = (1000, 700)
 BACKGROUND = (0.012, 0.017, 0.030, 1.0)
 
+MAP_FILES = {
+    "albedo": "gear_albedo.png",
+    "normal": "gear_normal.png",
+    "metallic": "gear_metallic.png",
+    "roughness": "gear_roughness.png",
+}
+
+DEBUG_NAMES = {
+    0: "final PBR",
+    1: "albedo",
+    2: "normal",
+    3: "metallic",
+    4: "roughness",
+}
+
 
 def split_shader_file(path: Path) -> tuple[str, str]:
-    """Load the two shader stages stored in one GLSL text file."""
+    """Read the vertex and fragment stages stored in one GLSL file."""
     source = path.read_text(encoding="utf-8")
     vertex_marker = "// === VERTEX SHADER ==="
     fragment_marker = "// === FRAGMENT SHADER ==="
@@ -46,12 +70,12 @@ def split_shader_file(path: Path) -> tuple[str, str]:
     return vertex_source.strip(), fragment_source.strip()
 
 
-def load_texture(ctx: moderngl.Context, path: Path) -> moderngl.Texture:
-    """Load a Pygame RGBA image as a filtered ModernGL texture."""
+def load_rgba_texture(ctx: moderngl.Context, path: Path) -> moderngl.Texture:
+    """Load any source image as RGBA so all material maps share one loader."""
     surface = pygame.image.load(path).convert_alpha()
-    image_bytes = pygame.image.tobytes(surface, "RGBA", True)
+    pixels = pygame.image.tobytes(surface, "RGBA", True)
 
-    texture = ctx.texture(surface.get_size(), components=4, data=image_bytes)
+    texture = ctx.texture(surface.get_size(), components=4, data=pixels)
     texture.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
     texture.repeat_x = False
     texture.repeat_y = False
@@ -63,21 +87,21 @@ def create_sprite_vao(
     ctx: moderngl.Context,
     program: moderngl.Program,
 ) -> tuple[moderngl.Buffer, moderngl.VertexArray]:
-    """Create one reusable unit quad for all sprite instances."""
-    # x, y, u, v. Local Y points downward. The image data is vertically
-    # flipped during upload, so the top vertices use v=1.
+    """Create a centered unit quad with UV coordinates."""
+    # Local positions use positive Y downward. The image upload is flipped,
+    # so the top vertices sample v=1 and the bottom vertices sample v=0.
     vertices = (
         -0.5, -0.5, 0.0, 1.0,
          0.5, -0.5, 1.0, 1.0,
         -0.5,  0.5, 0.0, 0.0,
          0.5,  0.5, 1.0, 0.0,
     )
-    vertex_buffer = ctx.buffer(struct.pack(f"{len(vertices)}f", *vertices))
+    buffer = ctx.buffer(struct.pack(f"{len(vertices)}f", *vertices))
     vao = ctx.vertex_array(
         program,
-        [(vertex_buffer, "2f 2f", "in_position", "in_uv")],
+        [(buffer, "2f 2f", "in_position", "in_uv")],
     )
-    return vertex_buffer, vao
+    return buffer, vao
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -87,11 +111,12 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 def main() -> None:
     asset_dir = Path(__file__).resolve().parent
     shader_path = asset_dir / "metallic_sprite.glsl"
-    sprite_path = asset_dir / "metal_sprite.png"
+    map_paths = {name: asset_dir / filename for name, filename in MAP_FILES.items()}
 
-    for required_file in (shader_path, sprite_path):
-        if not required_file.exists():
-            raise FileNotFoundError(f"Missing required file: {required_file}")
+    required_files = [shader_path, *map_paths.values()]
+    missing = [path.name for path in required_files if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Missing required files: " + ", ".join(missing))
 
     pygame.init()
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
@@ -102,7 +127,7 @@ def main() -> None:
     )
     pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
     pygame.display.set_mode(WINDOW_SIZE, pygame.OPENGL | pygame.DOUBLEBUF, vsync=1)
-    pygame.display.set_caption("ModernGL Metallic Sprite")
+    pygame.display.set_caption("ModernGL PBR Sprite")
 
     ctx = moderngl.create_context(require=330)
     ctx.enable(moderngl.BLEND)
@@ -115,25 +140,34 @@ def main() -> None:
     )
 
     vertex_buffer, vao = create_sprite_vao(ctx, program)
-    sprite_texture = load_texture(ctx, sprite_path)
-    sprite_texture.use(location=0)
-    program["u_sprite"].value = 0
-    program["u_texel_size"].value = (
-        1.0 / sprite_texture.width,
-        1.0 / sprite_texture.height,
-    )
+    textures = {
+        name: load_rgba_texture(ctx, path)
+        for name, path in map_paths.items()
+    }
+
+    texture_bindings = {
+        "albedo": (0, "u_albedo_map"),
+        "normal": (1, "u_normal_map"),
+        "metallic": (2, "u_metallic_map"),
+        "roughness": (3, "u_roughness_map"),
+    }
+    for name, (unit, uniform_name) in texture_bindings.items():
+        textures[name].use(location=unit)
+        program[uniform_name].value = unit
+
     program["u_alpha_cutoff"].value = 0.015
-    program["u_normal_strength"].value = 9.0
+    program["u_normal_strength"].value = 1.0
+
+    position = pygame.Vector2(WINDOW_SIZE[0] * 0.5, WINDOW_SIZE[1] * 0.51)
+    sprite_size = pygame.Vector2(460.0, 460.0)
+    rotation = 0.0
+    metallic_scale = 1.0
+    roughness_scale = 1.0
+    debug_view = 0
 
     clock = pygame.time.Clock()
     running = True
     elapsed = 0.0
-
-    position = pygame.Vector2(WINDOW_SIZE[0] * 0.5, WINDOW_SIZE[1] * 0.51)
-    sprite_size = pygame.Vector2(380.0, 380.0)
-    rotation = 0.0
-    metallic = 1.0
-    roughness = 0.22
 
     try:
         while running:
@@ -146,62 +180,72 @@ def main() -> None:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
-                    elif event.key == pygame.K_m:
-                        metallic = 0.0 if metallic > 0.5 else 1.0
+                    elif pygame.K_1 <= event.key <= pygame.K_5:
+                        debug_view = event.key - pygame.K_1
                     elif event.key == pygame.K_r:
                         position.update(WINDOW_SIZE[0] * 0.5, WINDOW_SIZE[1] * 0.51)
                         rotation = 0.0
-                        metallic = 1.0
-                        roughness = 0.22
+                        metallic_scale = 1.0
+                        roughness_scale = 1.0
+                        debug_view = 0
 
             keys = pygame.key.get_pressed()
+
             movement = pygame.Vector2(
                 float(keys[pygame.K_d]) - float(keys[pygame.K_a]),
                 float(keys[pygame.K_s]) - float(keys[pygame.K_w]),
             )
             if movement.length_squared() > 0.0:
-                movement = movement.normalize()
-                position += movement * 290.0 * delta_time
+                position += movement.normalize() * 290.0 * delta_time
 
             rotation += (
                 float(keys[pygame.K_e]) - float(keys[pygame.K_q])
             ) * 1.8 * delta_time
 
-            roughness += (
+            roughness_scale += (
                 float(keys[pygame.K_DOWN]) - float(keys[pygame.K_UP])
-            ) * 0.55 * delta_time
-            roughness = clamp(roughness, 0.045, 1.0)
+            ) * 0.65 * delta_time
+            roughness_scale = clamp(roughness_scale, 0.05, 2.0)
 
-            half_size = sprite_size * 0.34
+            metallic_scale += (
+                float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT])
+            ) * 0.65 * delta_time
+            metallic_scale = clamp(metallic_scale, 0.0, 1.0)
+
+            half_size = sprite_size * 0.35
             position.x = clamp(position.x, half_size.x, WINDOW_SIZE[0] - half_size.x)
             position.y = clamp(position.y, half_size.y, WINDOW_SIZE[1] - half_size.y)
 
-            mouse_position = pygame.mouse.get_pos()
+            mouse_x, mouse_y = pygame.mouse.get_pos()
 
             ctx.clear(*BACKGROUND)
             program["u_resolution"].value = tuple(map(float, WINDOW_SIZE))
             program["u_position"].value = (position.x, position.y)
             program["u_size"].value = (sprite_size.x, sprite_size.y)
             program["u_rotation"].value = rotation
-            program["u_light_position"].value = tuple(map(float, mouse_position))
+            program["u_light_position"].value = (float(mouse_x), float(mouse_y))
             program["u_time"].value = elapsed
-            program["u_metallic"].value = metallic
-            program["u_roughness"].value = roughness
+            program["u_metallic_scale"].value = metallic_scale
+            program["u_roughness_scale"].value = roughness_scale
+            program["u_debug_view"].value = debug_view
 
-            sprite_texture.use(location=0)
+            for name, (unit, _) in texture_bindings.items():
+                textures[name].use(location=unit)
+
             vao.render(mode=moderngl.TRIANGLE_STRIP)
             pygame.display.flip()
 
-            material_name = "metal" if metallic > 0.5 else "painted plastic"
             pygame.display.set_caption(
-                "ModernGL Metallic Sprite | "
-                f"material: {material_name} | roughness: {roughness:.2f} | "
-                "mouse=light, WASD=move, Q/E=rotate, M=toggle"
+                "ModernGL PBR Sprite | "
+                f"view: {DEBUG_NAMES[debug_view]} | "
+                f"metallic x{metallic_scale:.2f} | roughness x{roughness_scale:.2f} | "
+                "1-5=maps"
             )
     finally:
         vao.release()
         vertex_buffer.release()
-        sprite_texture.release()
+        for texture in textures.values():
+            texture.release()
         program.release()
         ctx.release()
         pygame.quit()
