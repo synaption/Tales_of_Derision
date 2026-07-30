@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
 import math
 import random
 import sys
 from array import array
 from dataclasses import dataclass, replace
 from pathlib import Path
+
+try:
+    # Recovering the strokes inside a finished drawing. Optional: it needs
+    # numpy, and everything except the "draw the creature" key works without it.
+    import numpy
+    import pentrace
+except ImportError:
+    numpy = pentrace = None
 
 try:
     import pygame
@@ -30,6 +39,27 @@ PAPER_TEXTURE_WIDTH = 512
 # time, and costs nothing per frame. At rest the extra samples are not wasted
 # either: the bilinear fetch lands exactly between texels and box-filters them.
 INK_SUPERSAMPLE = 2
+
+# Recorded pen strokes, ready to be played back as if drawn now. They are kept
+# in design-space units so a script captured in a small window replays at the
+# same place and the same weight in a large one.
+STROKE_SCRIPT_PATH = Path(__file__).resolve().parent / "strokes.json"
+
+# How fast the played-back pen travels, in design-space units per second, and
+# how long it stays off the page between one stroke and the next.
+PEN_SPEED = 420.0
+PEN_LIFT_SECONDS = 0.18
+
+# The same pause, for a traced drawing. Much shorter, because a hand-recorded
+# script is a few long strokes while a traced figure is dozens of short ones,
+# and a traced pen is charged for crossing to the next stroke on top of this.
+PEN_TOUCHDOWN_SECONDS = 0.05
+
+# How far past its traced width the nib reaches when uncovering a sprite, in
+# page pixels. Reaching too far costs nothing at all -- there is no artwork
+# outside the figure for it to uncover -- while reaching too short leaves a
+# pixel waiting on its neighbours, so the setting is deliberately generous.
+NIB_SLACK = 1.5
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SPRITE_SHEET_PATH = (
@@ -429,6 +459,7 @@ class DemoSettings:
     slick_swirl: float = 0.35
     slick_zoom: float = 2.20
     swirl_dryness: float = 1.00
+    pen_speed: float = PEN_SPEED
 
     @property
     def swirl_span(self) -> float:
@@ -596,6 +627,50 @@ class Stroke:
     points: list[tuple[int, int]]
     radius: int
     erase: bool
+    # A radius per point, for a pen whose width changes as it travels -- what a
+    # traced drawing needs, since the shape of a figure is carried as much by
+    # how the line swells and tapers as by where it goes. `None` means the whole
+    # stroke is `radius` wide, which is what a hand at a fixed brush size draws,
+    # and it costs that far commoner case nothing.
+    widths: list[int] | None = None
+
+    def width_at(self, index: int) -> int:
+        return self.radius if self.widths is None else self.widths[index]
+
+
+@dataclass
+class PenStroke:
+    """One stroke of a script the pen can replay, in design-space units.
+
+    The difference from `Stroke` is only what the numbers are measured in.
+    `Stroke` is what is on the page right now, in page pixels; this is what a
+    hand did, at whatever size the page happened to be when it did it, so the
+    same script draws the same picture in an 800-wide window and a 4K one.
+    """
+
+    points: list[tuple[float, float]]
+    radius: float
+    erase: bool = False
+    widths: list[float] | None = None
+
+    def to_page(self, unit: float) -> Stroke:
+        return Stroke(
+            [(round(x * unit), round(y * unit)) for x, y in self.points],
+            max(1, round(self.radius * unit)),
+            self.erase,
+            None
+            if self.widths is None
+            else [max(1, round(w * unit)) for w in self.widths],
+        )
+
+    @classmethod
+    def from_page(cls, stroke: Stroke, unit: float) -> "PenStroke":
+        return cls(
+            [(x / unit, y / unit) for x, y in stroke.points],
+            stroke.radius / unit,
+            stroke.erase,
+            None if stroke.widths is None else [w / unit for w in stroke.widths],
+        )
 
 
 @dataclass
@@ -976,11 +1051,59 @@ def load_oil_slick(
     return grey, 1.0 / max(mean_linear_luminance(grey), 1e-3)
 
 
+def design_unit(size: tuple[int, int]) -> float:
+    """Page pixels per design-space unit for a page of this size.
+
+    The smaller of the two ratios, so a composition laid out against
+    `DESIGN_SIZE` is letterboxed into an oddly shaped window rather than
+    cropped by it.
+    """
+    return min(size[0] / DESIGN_SIZE[0], size[1] / DESIGN_SIZE[1])
+
+
+def feature_placement(size: tuple[int, int]) -> tuple[tuple[float, float], float]:
+    """Where the featured creature sits on the page, in design-space units.
+
+    One source of truth for two callers who must agree exactly: the artwork
+    that draws it, and the tracer that has to put the pen in the same place.
+    The page's own size in design units comes out of `design_unit`, so the
+    creature stays the same distance from the corner in any window shape.
+    """
+    unit = design_unit(size)
+    return (
+        (size[0] / unit - 178.0, size[1] / unit - 150.0),
+        float(FEATURE_IMAGE_HEIGHT),
+    )
+
+
+def feature_rect(size: tuple[int, int], scale: int) -> pygame.Rect | None:
+    """Where the featured creature goes on the mask, aligned to the page grid.
+
+    One source of truth for two things that have to agree to the pixel: the
+    printed artwork, and the animation that uncovers the same sprite in its
+    place. Snapped so a whole number of mask texels falls inside every page
+    pixel, because the animation keeps a page-resolution copy of its timings
+    beside the mask-resolution one and the two can only line up on a boundary.
+    """
+    unit = scale * design_unit(size)
+    centre, height = feature_placement(size)
+    image = load_ink_image(FEATURE_IMAGE_PATH, max(1, round(height * unit)))
+    if image is None:
+        return None
+
+    rect = image.get_rect()
+    rect.center = (round(centre[0] * unit), round(centre[1] * unit))
+    rect.left -= rect.left % scale
+    rect.top -= rect.top % scale
+    return rect
+
+
 def make_demo_ink(
     size: tuple[int, int],
     sprites: SpriteSheet | None = None,
     sprite_page: int = 0,
     scale: int = 1,
+    include_feature: bool = True,
 ) -> pygame.Surface:
     """Create anti-aliased ink artwork; its alpha channel becomes the ink mask.
 
@@ -997,9 +1120,8 @@ def make_demo_ink(
     ink_mask = pygame.Surface((width, height), pygame.SRCALPHA)
     ink_mask.fill((0, 0, 0, 0))
 
-    design_width, design_height = DESIGN_SIZE
-    # The smaller of the two ratios, so the composition is never cropped.
-    unit = scale * min(page_width / design_width, page_height / design_height)
+    design_width = DESIGN_SIZE[0]
+    unit = scale * design_unit(size)
 
     def at(x: float, y: float) -> tuple[int, int]:
         return (round(x * unit), round(y * unit))
@@ -1073,11 +1195,13 @@ def make_demo_ink(
         pygame.draw.aaline(ink_mask, white, start, end)
         pygame.draw.line(ink_mask, white, start, end, span(2 + index // 2))
 
-    feature = load_ink_image(FEATURE_IMAGE_PATH, span(FEATURE_IMAGE_HEIGHT))
-    if feature is not None:
-        feature_rect = feature.get_rect()
-        feature_rect.center = (width - span(178), height - span(150))
-        ink_mask.blit(feature, feature_rect, special_flags=pygame.BLEND_RGBA_MAX)
+    # Left out when the creature is about to be drawn by the pen instead: it
+    # cannot be animated on to a page that already has it.
+    if include_feature:
+        placed = feature_rect(size, scale)
+        if placed is not None:
+            feature = load_ink_image(FEATURE_IMAGE_PATH, placed.height)
+            ink_mask.blit(feature, placed, special_flags=pygame.BLEND_RGBA_MAX)
 
     if sprites is not None:
         per_page = sprites.columns
@@ -1218,28 +1342,40 @@ class InkCanvas:
         end: tuple[int, int],
         radius: int,
         erase: bool,
+        end_radius: int | None = None,
     ) -> pygame.Rect:
-        """Stamp the brush along one segment; returns the touched rectangle."""
+        """Stamp the brush along one segment; returns the touched rectangle.
+
+        `end_radius` lets the nib swell or taper across the segment. The brush
+        is picked per stamp rather than once per segment, which costs a cached
+        lookup and keeps the width continuous instead of stepping at every
+        vertex.
+        """
         scale = self.scale
-        brush = self._brush(radius)
-        offset = brush.get_width() * 0.5
+        if end_radius is None:
+            end_radius = radius
         blend = pygame.BLEND_RGBA_SUB if erase else pygame.BLEND_RGBA_MAX
 
         delta_x = end[0] - start[0]
         delta_y = end[1] - start[1]
         # Spacing and travel are both in mask texels, so the stamp count is
-        # unchanged by supersampling and only their placement gets finer.
+        # unchanged by supersampling and only their placement gets finer. The
+        # spacing follows the narrower end, so a taper does not go dotted.
         distance = math.hypot(delta_x, delta_y) * scale
-        step = max(1.0, radius * scale * 0.35)
+        step = max(1.0, min(radius, end_radius) * scale * 0.35)
         stamps = max(1, int(distance / step) + 1)
 
         for index in range(stamps + 1):
             travel = index / stamps
+            brush = self._brush(
+                max(1, round(radius + (end_radius - radius) * travel))
+            )
+            offset = brush.get_width() * 0.5
             x = (start[0] + delta_x * travel) * scale - offset
             y = (start[1] + delta_y * travel) * scale - offset
             self.surface.blit(brush, (round(x), round(y)), special_flags=blend)
 
-        pad = radius + 2
+        pad = max(radius, end_radius) + 2
         dirty = pygame.Rect(
             min(start[0], end[0]) - pad,
             min(start[1], end[1]) - pad,
@@ -1253,6 +1389,7 @@ class InkCanvas:
         start: tuple[int, int],
         end: tuple[int, int],
         radius: int,
+        end_radius: int | None = None,
     ) -> pygame.Rect:
         """Flood a segment with fresh ink in the wetness field.
 
@@ -1261,20 +1398,32 @@ class InkCanvas:
         spilling a pixel past the stroke edge is invisible.
         """
         fresh = (255, 255, 255)
-        reach = radius + 1
+        # The wider end of a tapering segment, since spilling wetness past the
+        # coverage costs nothing: it is only ever seen through the mask.
+        reach = max(radius, radius if end_radius is None else end_radius) + 1
         if start != end:
             pygame.draw.line(self.wetness, fresh, start, end, reach * 2)
         pygame.draw.circle(self.wetness, fresh, start, reach)
         pygame.draw.circle(self.wetness, fresh, end, reach)
 
         pad = reach + 2
-        dirty = pygame.Rect(
-            min(start[0], end[0]) - pad,
-            min(start[1], end[1]) - pad,
-            abs(end[0] - start[0]) + pad * 2,
-            abs(end[1] - start[1]) + pad * 2,
-        ).clip(self.wetness.get_rect())
+        return self.mark_wet(
+            pygame.Rect(
+                min(start[0], end[0]) - pad,
+                min(start[1], end[1]) - pad,
+                abs(end[0] - start[0]) + pad * 2,
+                abs(end[1] - start[1]) + pad * 2,
+            )
+        )
 
+    def mark_wet(self, region: pygame.Rect) -> pygame.Rect:
+        """Note that fresh ink was put into the wetness field inside `region`.
+
+        Whatever wrote the field -- a brush segment, or a sprite uncovering
+        itself -- the drying clock is restarted and the region the decay has to
+        sweep is widened to include it.
+        """
+        dirty = region.clip(self.wetness.get_rect())
         self.wet_bounds = (
             dirty if self.wet_bounds is None else self.wet_bounds.union(dirty)
         )
@@ -1287,13 +1436,14 @@ class InkCanvas:
         end: tuple[int, int],
         radius: int,
         erase: bool,
+        end_radius: int | None = None,
     ) -> pygame.Rect:
         """Lay down one segment of live ink: coverage plus its drying clock."""
-        dirty = self._stamp_segment(start, end, radius, erase)
+        dirty = self._stamp_segment(start, end, radius, erase, end_radius)
         if erase:
             # Lifting ink off the page leaves nothing behind to dry.
             return dirty
-        return dirty.union(self._wet_segment(start, end, radius))
+        return dirty.union(self._wet_segment(start, end, radius, end_radius))
 
     def wet_gain(self, rate: float = 1.0) -> float:
         """How much further the field has faded since its last step.
@@ -1347,6 +1497,22 @@ class InkCanvas:
         )
         return region
 
+    def dry_now(self) -> pygame.Rect | None:
+        """Take every trace of wetness off the page at once.
+
+        Playback uses it so a replay begins on a dry sheet whatever was drawn a
+        moment earlier; without it the fresh nib would be laying wet ink onto a
+        page that was already wet, and there would be nothing to see.
+        """
+        if self.wet_bounds is None:
+            return None
+        region = self.wet_bounds
+        self.wetness.fill((0, 0, 0))
+        self.wet_bounds = None
+        self.wet_seconds_left = 0.0
+        self._wet_elapsed = 0.0
+        return region
+
     def begin_stroke(
         self,
         position: tuple[int, int],
@@ -1357,7 +1523,14 @@ class InkCanvas:
         self.strokes.append(self.active_stroke)
         return self._draw_segment(position, position, radius, erase)
 
-    def extend_stroke(self, position: tuple[int, int]) -> pygame.Rect | None:
+    def extend_stroke(
+        self, position: tuple[int, int], radius: int | None = None
+    ) -> pygame.Rect | None:
+        """Carry the stroke on to `position`, optionally changing width there.
+
+        A stroke only starts carrying a radius per point once one is given, so
+        the hand-drawn case -- a fixed brush size -- never pays for the list.
+        """
         stroke = self.active_stroke
         if stroke is None:
             return None
@@ -1366,8 +1539,17 @@ class InkCanvas:
         if previous == position:
             return None
 
+        start_radius = stroke.width_at(-1)
+        end_radius = start_radius if radius is None else max(1, int(radius))
+        if stroke.widths is None and radius is not None:
+            stroke.widths = [stroke.radius] * len(stroke.points)
+        if stroke.widths is not None:
+            stroke.widths.append(end_radius)
+
         stroke.points.append(position)
-        return self._draw_segment(previous, position, stroke.radius, stroke.erase)
+        return self._draw_segment(
+            previous, position, start_radius, stroke.erase, end_radius
+        )
 
     def end_stroke(self) -> None:
         self.active_stroke = None
@@ -1397,9 +1579,16 @@ class InkCanvas:
         self.surface = self.base.copy()
         for stroke in self.strokes:
             points = stroke.points
-            self._stamp_segment(points[0], points[0], stroke.radius, stroke.erase)
-            for start, end in zip(points, points[1:]):
-                self._stamp_segment(start, end, stroke.radius, stroke.erase)
+            first = stroke.width_at(0)
+            self._stamp_segment(points[0], points[0], first, stroke.erase)
+            for index, (start, end) in enumerate(zip(points, points[1:])):
+                self._stamp_segment(
+                    start,
+                    end,
+                    stroke.width_at(index),
+                    stroke.erase,
+                    stroke.width_at(index + 1),
+                )
 
 
 PANEL_FILL = (24, 19, 14, 234)
@@ -1407,6 +1596,366 @@ PANEL_EDGE = (150, 124, 86, 255)
 PANEL_TITLE = (240, 218, 170)
 PANEL_KEY = (248, 220, 148)
 PANEL_TEXT = (224, 213, 194)
+
+
+def arc_lengths(points: list[tuple[int, int]]) -> list[float]:
+    """Cumulative distance along a polyline, one entry per point."""
+    lengths = [0.0]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        lengths.append(lengths[-1] + math.hypot(x1 - x0, y1 - y0))
+    return lengths
+
+
+def union_rect(
+    first: pygame.Rect | None, second: pygame.Rect | None
+) -> pygame.Rect | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return first.union(second)
+
+
+class StrokePlayer:
+    """Draws a recorded script back onto the page as if a hand were doing it.
+
+    The pen walks each polyline at a constant speed rather than emitting one
+    recorded point per frame. That decouples playback from how the script was
+    captured -- a mouse that hesitated halfway through a curve, or sampled it
+    twice as densely on a faster machine, replays as an even hand -- and it
+    makes the drawing take the same time at every window size, because the
+    speed is in design-space units and so is the script.
+
+    The point of drawing rather than revealing is that the ink goes through
+    exactly the path a live stroke does, so the nib carries its own wetness and
+    the tail dries behind it with no extra machinery. Set the pen slower than
+    the dry-down and the stroke is dry before it is finished; faster, and the
+    whole figure stays glossy until the end.
+    """
+
+    def __init__(
+        self,
+        script: list[PenStroke],
+        size: tuple[int, int],
+        speed: float = PEN_SPEED,
+    ) -> None:
+        unit = design_unit(size)
+        self.strokes = [pen.to_page(unit) for pen in script]
+        # Speed arrives in design units, and everything below is page pixels.
+        self.unit = unit
+        self.speed = speed
+        self.index = 0
+        self.drawing = False
+        self.lift = 0.0
+        self.travelled = 0.0
+        self.vertex = 0
+        self.lengths: list[float] = [0.0]
+
+    @property
+    def finished(self) -> bool:
+        return self.index >= len(self.strokes)
+
+    @property
+    def progress(self) -> float:
+        """How far through the script the pen is, by stroke count."""
+        if not self.strokes:
+            return 1.0
+        return self.index / len(self.strokes)
+
+    def _nib_at(self, stroke: Stroke) -> tuple[tuple[int, int], int]:
+        """Where the nib is between the vertex it passed and the next one, and
+        how wide it is there."""
+        start = self.lengths[self.vertex]
+        span = self.lengths[self.vertex + 1] - start
+        travel = 0.0 if span <= 0.0 else (self.travelled - start) / span
+        (x0, y0), (x1, y1) = stroke.points[self.vertex : self.vertex + 2]
+        w0, w1 = stroke.width_at(self.vertex), stroke.width_at(self.vertex + 1)
+        return (
+            (round(x0 + (x1 - x0) * travel), round(y0 + (y1 - y0) * travel)),
+            max(1, round(w0 + (w1 - w0) * travel)),
+        )
+
+    def update(self, elapsed: float, canvas: InkCanvas) -> pygame.Rect | None:
+        """Advance the pen by one frame; returns the region it touched.
+
+        At most one stroke is finished per call. Any travel left over when a
+        stroke ends is dropped rather than carried into the next one, which
+        costs nothing worth having -- the pen has to lift and come down again
+        anyway, and that pause is far longer than the fragment being discarded.
+        """
+        if self.finished:
+            return None
+
+        if self.lift > 0.0:
+            self.lift -= elapsed
+            if self.lift > 0.0:
+                return None
+            # Whatever was left of the frame after the nib touched down.
+            elapsed, self.lift = -self.lift, 0.0
+
+        stroke = self.strokes[self.index]
+        dirty = None
+
+        if not self.drawing:
+            self.lengths = arc_lengths(stroke.points)
+            self.travelled = 0.0
+            self.vertex = 0
+            self.drawing = True
+            dirty = canvas.begin_stroke(
+                stroke.points[0], stroke.width_at(0), stroke.erase
+            )
+
+        total = self.lengths[-1]
+        self.travelled = min(total, self.travelled + self.speed * self.unit * elapsed)
+
+        # Pass through every vertex the nib has reached, so the polyline keeps
+        # its corners however fast the pen is moving.
+        while (
+            self.vertex + 1 < len(stroke.points)
+            and self.lengths[self.vertex + 1] <= self.travelled
+        ):
+            self.vertex += 1
+            dirty = union_rect(
+                dirty,
+                canvas.extend_stroke(
+                    stroke.points[self.vertex], stroke.width_at(self.vertex)
+                ),
+            )
+
+        if self.travelled < total:
+            position, width = self._nib_at(stroke)
+            dirty = union_rect(dirty, canvas.extend_stroke(position, width))
+            return dirty
+
+        canvas.end_stroke()
+        self.drawing = False
+        self.index += 1
+        self.lift = PEN_LIFT_SECONDS
+        return dirty
+
+
+class SpriteReveal:
+    """Draws a sprite on to the page by uncovering it along a pen's path.
+
+    Interchangeable with `StrokePlayer` -- the loop only asks either of them to
+    `update` and whether it has `finished` -- but it works the other way round.
+    `StrokePlayer` knows where the pen went and lets the brush decide what
+    appears; this knows what has to appear and lets the pen decide only when.
+
+    That is what makes a traced drawing exact. Redrawing a figure by stamping a
+    round brush along its medial axis lands within a few percent of it and no
+    closer, because the brush is not the tool the figure was made with. Here
+    the pixels put down are the sprite's own, in an order the traced pen path
+    supplies, so the drawing ends up identical to the artwork rather than a
+    good likeness of it.
+
+    Coverage is uncovered on the mask's fine grid and wetness on the page's
+    coarse one, which is the same split the rest of the canvas uses; the two
+    travel maps are built together so a pixel wets exactly as it appears.
+    """
+
+    def __init__(
+        self,
+        sprite: pygame.Surface,
+        mask_rect: pygame.Rect,
+        page_rect: pygame.Rect,
+        travel,
+        page_travel,
+        speed: float = PEN_SPEED,
+        unit: float = 1.0,
+    ) -> None:
+        self.sprite = sprite
+        self.mask_rect = mask_rect
+        self.page = page_rect
+        self.travel = travel
+        self.page_travel = page_travel
+        self.speed = speed
+        # Mask texels per design-space unit, so the pen's speed means the same
+        # thing here as it does when it is drawing with the brush.
+        self.unit = unit
+        self.opaque = pygame.surfarray.array_alpha(sprite)
+        self.reached = 0.0
+        reachable = travel[numpy.isfinite(travel)]
+        self.total = float(reachable.max()) if reachable.size else 0.0
+        # Reused rather than rebuilt every frame; only its alpha changes.
+        self.piece = sprite.copy()
+
+    @property
+    def finished(self) -> bool:
+        return self.reached >= self.total
+
+    @property
+    def progress(self) -> float:
+        return 1.0 if self.total <= 0.0 else min(1.0, self.reached / self.total)
+
+    def update(self, elapsed: float, canvas: InkCanvas) -> pygame.Rect | None:
+        """Uncover as much of the sprite as the pen reaches this frame."""
+        if self.finished:
+            return None
+
+        previous = self.reached
+        self.reached = min(
+            self.total, self.reached + self.speed * self.unit * elapsed
+        )
+
+        # Everything reached so far, not just this frame's sliver: coverage is
+        # accumulated with a max blend, so re-laying what is already down costs
+        # one blit of a small tile and cannot drift out of step with the clock.
+        shown = self.travel <= self.reached
+        alpha = pygame.surfarray.pixels_alpha(self.piece)
+        numpy.multiply(self.opaque, shown.T, out=alpha, casting="unsafe")
+        del alpha
+        canvas.surface.blit(
+            self.piece, self.mask_rect, special_flags=pygame.BLEND_RGBA_MAX
+        )
+
+        # Wetness, on the other hand, is written only where the pen has just
+        # been: what is behind it has to be left alone to dry.
+        fresh = (self.page_travel > previous) & (self.page_travel <= self.reached)
+        if fresh.any():
+            field = pygame.surfarray.pixels3d(canvas.wetness)
+            window = field[
+                self.page.left : self.page.right,
+                self.page.top : self.page.bottom,
+            ]
+            window[fresh.T] = 255
+            del window, field
+            canvas.mark_wet(self.page)
+
+        return self.page
+
+
+_travel_cache: dict[tuple, tuple] = {}
+
+
+def _page_travel(travel, scale: int):
+    """Reduce a mask-resolution travel map to one value per page pixel.
+
+    A page pixel is reached as soon as any of the mask texels inside it is, so
+    the reduction is a minimum. Padded out to a whole number of page pixels
+    first; the padding is unreachable and so never fires.
+    """
+    if scale == 1:
+        return travel
+    height, width = travel.shape
+    tall, wide = -(-height // scale), -(-width // scale)
+    padded = numpy.full((tall * scale, wide * scale), numpy.inf, numpy.float32)
+    padded[:height, :width] = travel
+    return padded.reshape(tall, scale, wide, scale).min(axis=(1, 3))
+
+
+def sprite_reveal(
+    path: Path,
+    placed: pygame.Rect,
+    scale: int,
+    unit: float,
+    speed: float = PEN_SPEED,
+) -> SpriteReveal | None:
+    """Work out the order a pen would draw a sprite in, and stand ready to.
+
+    The sprite is traced at exactly the size it will appear -- no rescaling
+    anywhere -- so the timings and the pixels they belong to are the same grid,
+    and what ends up on the page is the artwork rather than a redrawing of it.
+
+    Tracing costs a handful of passes over the image, so the answer is kept:
+    pressing the key again asks the same question of the same sprite.
+    """
+    if pentrace is None:
+        print("Drawing a sprite needs numpy: python -m pip install numpy",
+              file=sys.stderr)
+        return None
+
+    sprite = load_ink_image(path, placed.height)
+    if sprite is None:
+        return None
+
+    key = (str(path), placed.height, scale)
+    cached = _travel_cache.get(key)
+    if cached is None:
+        # Coverage lives in alpha, and pygame hands out arrays column-first
+        # while the tracer works in rows, hence the transpose. The path is
+        # traced through the solid body, but every pixel that will ever show --
+        # the soft edge included -- has to be given a time.
+        alpha = pygame.surfarray.array_alpha(sprite).T
+        strokes = pentrace.trace_drawing(alpha > 127)
+        travel = pentrace.reveal_travel(
+            alpha > 0,
+            strokes,
+            lift=PEN_TOUCHDOWN_SECONDS * PEN_SPEED * unit,
+            slack=NIB_SLACK * scale,
+        )
+        cached = (travel, _page_travel(travel, scale))
+        _travel_cache[key] = cached
+
+    travel, page_travel = cached
+    page = pygame.Rect(
+        placed.left // scale,
+        placed.top // scale,
+        page_travel.shape[1],
+        page_travel.shape[0],
+    )
+    return SpriteReveal(sprite, placed, page, travel, page_travel, speed, unit)
+
+
+def to_script(strokes: list[Stroke], size: tuple[int, int]) -> list[PenStroke]:
+    """The strokes on a page of this size, as a resolution-free script."""
+    unit = design_unit(size)
+    return [PenStroke.from_page(stroke, unit) for stroke in strokes]
+
+
+def save_script(
+    script: list[PenStroke], path: Path = STROKE_SCRIPT_PATH
+) -> int:
+    """Write a script out; returns how many strokes were saved."""
+    payload = {
+        "design_size": list(DESIGN_SIZE),
+        "strokes": [
+            {
+                "radius": round(pen.radius, 3),
+                "erase": pen.erase,
+                "points": [[round(x, 2), round(y, 2)] for x, y in pen.points],
+                **(
+                    {}
+                    if pen.widths is None
+                    else {"widths": [round(w, 3) for w in pen.widths]}
+                ),
+            }
+            for pen in script
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    return len(script)
+
+
+def load_script(path: Path = STROKE_SCRIPT_PATH) -> list[PenStroke]:
+    """Read a script back, or return nothing if there is none to read.
+
+    A script that was recorded against a different design size is rescaled to
+    the current one, so changing `DESIGN_SIZE` does not silently move every
+    saved drawing off the page.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+
+    saved = payload.get("design_size") or list(DESIGN_SIZE)
+    gain = min(DESIGN_SIZE[0] / saved[0], DESIGN_SIZE[1] / saved[1])
+
+    script = []
+    for entry in payload.get("strokes", ()):
+        points = [(x * gain, y * gain) for x, y in entry.get("points", ())]
+        widths = entry.get("widths")
+        if points:
+            script.append(
+                PenStroke(
+                    points,
+                    entry.get("radius", 5) * gain,
+                    entry.get("erase", False),
+                    None if widths is None else [w * gain for w in widths],
+                )
+            )
+    return script
 
 
 def make_panel_surface(size: tuple[int, int]) -> pygame.Surface:
@@ -1518,6 +2067,12 @@ class HelpOverlay(Panel):
         None,
         ("U / Ctrl+Z", "undo a stroke"),
         ("C", "clear every stroke"),
+        None,
+        ("T", "draw the creature, traced from its sprite"),
+        ("P", "redraw your strokes, pen and all"),
+        ("S", "save them to strokes.json"),
+        ("L", "load that file and draw it"),
+        None,
         ("Arrows", "sprite sheet page"),
         ("R", "regenerate the parchment"),
         None,
@@ -1615,6 +2170,8 @@ class Slider:
             return f"{value:.2f}x"
         if self.style == "pixels":
             return f"{value:.1f} px"
+        if self.style == "speed":
+            return f"{value:.0f} px/s"
         if self.style == "rate":
             # Enough decimals to still read as a number four decades down.
             if value < 0.001:
@@ -1666,6 +2223,11 @@ class SliderPanel(Panel):
         # Log-scaled so that 1.0, the straight line, sits in the middle of the
         # track with an equal factor of slow and fast either side of it.
         Slider("weave_soak", "Weave soaks in", 0.1, 10.0, logarithmic=True),
+        # What makes a replay read as a hand rather than a wipe is how the pen
+        # races the dry-down, so this belongs beside "Ink dries in": slow enough
+        # and the tail is dry before the figure is finished, fast enough and the
+        # whole drawing is still glossy when the nib lifts.
+        Slider("pen_speed", "Pen speed", 40.0, 4000.0, "speed", logarithmic=True),
     )
 
     TITLE = "Wet ink"
@@ -2105,6 +2667,9 @@ class ParchmentInkRenderer:
 
         self.sprites = load_sprite_sheet()
         self.sprite_page = 0
+        # The featured creature is printed on the page until the pen is asked
+        # to draw it, at which point it has to come off first.
+        self.show_feature = True
         self.canvas = InkCanvas(size, scale=supersample)
 
         self.paper_albedo: moderngl.Texture
@@ -2156,10 +2721,38 @@ class ParchmentInkRenderer:
         """Regenerate the demo artwork underneath the user's strokes."""
         self.canvas.set_base(
             make_demo_ink(
-                self.size, self.sprites, self.sprite_page, scale=self.canvas.scale
+                self.size,
+                self.sprites,
+                self.sprite_page,
+                scale=self.canvas.scale,
+                include_feature=self.show_feature,
             )
         )
         self.upload_ink()
+
+    def show_creature(self, visible: bool) -> None:
+        """Put the featured creature into the printed artwork, or take it out.
+
+        It has to come out before the pen can draw it, and go back in when the
+        page is cleared, so that clearing does not quietly lose it for good.
+        """
+        if self.show_feature != visible:
+            self.show_feature = visible
+            self._rebuild_base_ink()
+
+    def draw_feature(self, speed: float) -> SpriteReveal | None:
+        """Set the pen to draw the featured creature where it is printed."""
+        scale = self.canvas.scale
+        placed = feature_rect(self.size, scale)
+        if placed is None:
+            return None
+        return sprite_reveal(
+            FEATURE_IMAGE_PATH,
+            placed,
+            scale,
+            scale * design_unit(self.size),
+            speed,
+        )
 
     def _write_region(
         self,
@@ -2399,6 +2992,7 @@ def rebuild_renderer(
     """
     strokes = old.canvas.strokes
     sprite_page = old.sprite_page
+    show_feature = old.show_feature
     seed = old.seed
     panels = (old.help.visible, old.sliders.visible, old.menu.visible, old.menu.page)
     old.release()
@@ -2406,9 +3000,14 @@ def rebuild_renderer(
     display.size = open_window(display.size, display.fullscreen)
     fresh = ParchmentInkRenderer(display.size, seed, display.supersample)
 
+    # Both of these reprint the base art; setting the flag first means it is
+    # only reprinted once however many of them changed.
+    fresh.show_feature = show_feature
     # `change_sprite_page` counts from the page a new renderer starts on, zero.
     if sprite_page:
         fresh.change_sprite_page(sprite_page)
+    elif not show_feature:
+        fresh._rebuild_base_ink()
     if strokes:
         fresh.canvas.strokes = strokes
         fresh.canvas.recomposite()
@@ -2468,6 +3067,29 @@ def main() -> None:
     panning = False
     elapsed = 0.0
     shown_wetness = settings.wetness
+    player: StrokePlayer | None = None
+
+    def clear_for_playback() -> None:
+        """Take the ink off the page and dry it, ready for the pen to start.
+
+        The drying matters as much as the clearing: a replay begun a moment
+        after drawing would otherwise start on a soaking sheet, and the nib's
+        own wetness -- the whole point of drawing it rather than fading it in --
+        would be lost in it.
+        """
+        renderer.canvas.clear_strokes()
+        renderer.canvas.dry_now()
+        renderer.upload_ink()
+        renderer.upload_wetness()
+        settings.wetness = PAGE_WET_FLOOR
+        settings.drying = True
+
+    def start_playback(script: list[PenStroke]) -> StrokePlayer | None:
+        """Clear the page and set the pen to lay a recorded script down again."""
+        if not script:
+            return None
+        clear_for_playback()
+        return StrokePlayer(script, renderer.canvas.size, settings.pen_speed)
 
     running = True
     while running:
@@ -2512,6 +3134,9 @@ def main() -> None:
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 2:
                 panning = False
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+                # Taking the pen back interrupts the replay rather than fighting
+                # it for the page.
+                player = None
                 drawing = True
                 dirty = renderer.canvas.begin_stroke(
                     view.screen_to_canvas(event.pos),
@@ -2547,6 +3172,9 @@ def main() -> None:
                     renderer.menu.open()
                     renderer.menu.refresh(display, active)
                     drawing = panning = False
+                    if player is not None:
+                        renderer.canvas.end_stroke()
+                        player = None
                 elif getattr(event, "unicode", "") == "?" or event.key in (
                     pygame.K_QUESTION,
                     pygame.K_SLASH,
@@ -2604,8 +3232,39 @@ def main() -> None:
                     if renderer.canvas.undo():
                         renderer.upload_ink()
                 elif event.key == pygame.K_c:
-                    if renderer.canvas.clear_strokes():
-                        renderer.upload_ink()
+                    player = None
+                    cleared = renderer.canvas.clear_strokes()
+                    # Putting the creature back reprints the base art, which
+                    # uploads the mask itself; only a bare clear has to.
+                    if renderer.show_feature:
+                        if cleared:
+                            renderer.upload_ink()
+                    else:
+                        renderer.show_creature(True)
+                elif event.key == pygame.K_t:
+                    # Take the printed creature off the page and let the pen
+                    # put it back, stroke by stroke.
+                    drawing_feature = renderer.draw_feature(settings.pen_speed)
+                    if drawing_feature is not None:
+                        renderer.show_creature(False)
+                        clear_for_playback()
+                        player = drawing_feature
+                elif event.key == pygame.K_p:
+                    # Replay what is on the page, or the saved script if the
+                    # page is bare, so `P` always draws something.
+                    script = to_script(
+                        renderer.canvas.strokes, renderer.canvas.size
+                    ) or load_script()
+                    player = start_playback(script)
+                elif event.key == pygame.K_s:
+                    saved = save_script(
+                        to_script(renderer.canvas.strokes, renderer.canvas.size)
+                    )
+                    print(f"saved {saved} strokes to {STROKE_SCRIPT_PATH}")
+                elif event.key == pygame.K_l:
+                    script = load_script()
+                    print(f"loaded {len(script)} strokes from {STROKE_SCRIPT_PATH}")
+                    player = start_playback(script)
                 elif event.key in (pygame.K_0, pygame.K_KP0, pygame.K_HOME):
                     view.reset()
                     caption_changed = True
@@ -2613,6 +3272,19 @@ def main() -> None:
         # The menu pauses the page, so ink is not quietly drying out behind it.
         if renderer.menu.visible:
             elapsed = 0.0
+
+        # The pen moves before the page dries, so the ink it laid down this
+        # frame is at its freshest when the light hits it.
+        if player is not None and not renderer.menu.visible:
+            player.speed = settings.pen_speed
+            renderer.upload_stroke(player.update(elapsed, renderer.canvas))
+            if player.finished:
+                if isinstance(player, SpriteReveal):
+                    # A finished drawing is simply the printed artwork again,
+                    # so hand it back to the base and it survives an undo like
+                    # everything else on the page.
+                    renderer.show_creature(True)
+                player = None
 
         # The page-wide ink and each individual stroke dry on the same clock.
         if settings.advance(elapsed) and abs(settings.wetness - shown_wetness) >= 0.01:
