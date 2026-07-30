@@ -35,6 +35,13 @@ FEATURE_IMAGE_PATH = (
 )
 FEATURE_IMAGE_HEIGHT = 160
 
+# The iridescent film reflected in wet ink. Whichever of these exists is used.
+OIL_SLICK_PATHS = (
+    Path(__file__).resolve().parent / "oil_slick.png",
+    Path(__file__).resolve().parent / "oil_slick.jpg",
+)
+OIL_SLICK_SIZE = 512
+
 # Ink drying. The shine and the raised meniscus fade exponentially, which is the
 # usual model for a solvent leaving a film: `exp(-age / tau)`. Half the gloss is
 # gone within a second and a stroke reads as dry after two or three.
@@ -75,6 +82,9 @@ uniform sampler2D u_paper_normal;
 uniform sampler2D u_paper_roughness;
 uniform sampler2D u_ink_mask;
 uniform sampler2D u_ink_wet;
+uniform sampler2D u_oil_slick;
+uniform float u_slick_gain;
+uniform float u_time;
 
 uniform vec2 u_resolution;
 uniform vec2 u_light_uv;
@@ -104,6 +114,12 @@ vec3 to_srgb(vec3 linear_color) {
 
 vec3 fresnel_schlick(float cos_theta, vec3 f0) {
     return f0 + (1.0 - f0) * pow(1.0 - saturate(cos_theta), 5.0);
+}
+
+// Tile a photograph that was never made to tile: folding the coordinate back on
+// itself is seamless everywhere, and a mirrored swirl still reads as a swirl.
+vec2 mirror_uv(vec2 uv) {
+    return 1.0 - abs(fract(uv * 0.5) * 2.0 - 1.0);
 }
 
 void main() {
@@ -198,8 +214,42 @@ void main() {
     float ink_specular_strength = mix(0.10, 1.05, wetness);
     float specular_strength = mix(paper_specular_strength, ink_specular_strength, ink);
 
+    // Wet ink is a thin film: it mirrors the room, and interference paints that
+    // reflection with the shifting colours of an oil slick. The lookup is warped
+    // by the surface normal so the film reads as curved, and it keeps swirling
+    // while the ink is liquid, settling into place as the shine goes.
+    float coat = ink * wetness;
+    vec3 reflection = reflect(-view_direction, normal);
+    // The warp from the normal has to stay gentle: the ink normal carries the
+    // paper's own grain, and a strong warp turns that into rainbow speckle
+    // instead of the broad bands a film actually shows.
+    vec2 slick_uv = vec2(page_uv.x * aspect, page_uv.y) * 1.35
+        + reflection.xy * 0.28
+        + vec2(0.045, -0.07) * u_time;
+    // Every phase advances at a fixed rate; only the amplitude follows the
+    // wetness, otherwise drying ink would jerk the swirl backwards.
+    slick_uv += vec2(
+        sin(slick_uv.y * 5.7 + u_time * 1.7),
+        cos(slick_uv.x * 4.9 - u_time * 1.3)
+    ) * 0.075 * wetness;
+
+    vec3 slick = to_linear(texture(u_oil_slick, mirror_uv(slick_uv)).rgb);
+    float slick_luminance = max(dot(slick, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    // Chroma alone colours the lamp's hotspot without changing how bright it is.
+    vec3 highlight_tint = mix(vec3(1.0), slick / slick_luminance, coat * 0.9);
+
     vec3 diffuse = albedo * (ambient_light + warm_light * n_dot_l * attenuation * 0.68);
-    vec3 specular = warm_light * fresnel * specular_lobe * specular_strength * attenuation;
+    vec3 specular = warm_light * highlight_tint
+        * fresnel * specular_lobe * specular_strength * attenuation;
+
+    // The film mirrors more of the room than just the lamp, and most strongly
+    // where it curves away from the viewer. u_slick_gain normalises the photo to
+    // a mean luminance of one, so this adds the pattern, not a brightness bias.
+    // Squaring the wetness keeps it a liquid effect: iridescence is gone well
+    // before the last of the shine is, and dry ink never shimmers.
+    float grazing = pow(1.0 - n_dot_v, 2.0);
+    specular += slick * u_slick_gain * coat * wetness
+        * (0.016 + 0.055 * grazing) * attenuation * 0.85;
 
     // A small extra meniscus glint along the stroke boundary sells fresh ink.
     float edge_glint = edge * ink * wetness * pow(n_dot_h, 34.0) * attenuation;
@@ -240,6 +290,7 @@ class DemoSettings:
     debug_mode: int = 0
     brush_radius: int = 5
     drying: bool = True
+    moment: float = 0.0
 
     def advance(self, elapsed: float) -> bool:
         """Dry the page-wide ink. Returns True if the wetness changed.
@@ -248,6 +299,9 @@ class DemoSettings:
         multiply to `exp(-total / tau)` -- so this is frame-rate independent and
         needs no absolute clock, which also lets `[`/`]` nudge the value.
         """
+        # The clock the slick swirls on keeps running even when drying is held.
+        self.moment += elapsed
+
         if not self.drying or self.wetness <= PAGE_WET_FLOOR + 1e-4:
             return False
 
@@ -594,6 +648,76 @@ def load_ink_image(
 
     _ink_image_cache[key] = image
     return image
+
+
+def mean_linear_luminance(surface: pygame.Surface) -> float:
+    """Average luminance of a surface in linear light, judged from a thumbnail."""
+    thumbnail = pygame.transform.smoothscale(surface, (64, 64))
+    to_linear = [(value / 255.0) ** 2.2 for value in range(256)]
+    data = pygame.image.tobytes(thumbnail, "RGB")
+
+    total = 0.0
+    for index in range(0, len(data), 3):
+        total += (
+            0.2126 * to_linear[data[index]]
+            + 0.7152 * to_linear[data[index + 1]]
+            + 0.0722 * to_linear[data[index + 2]]
+        )
+    return total / (len(data) // 3)
+
+
+def load_oil_slick(
+    paths: tuple[Path, ...] = OIL_SLICK_PATHS,
+    size: int = OIL_SLICK_SIZE,
+) -> tuple[pygame.Surface, float]:
+    """Load the iridescent film that wet ink reflects.
+
+    Returns the square, downscaled image together with the gain that lifts its
+    mean linear luminance to 1.0, so using it to tint a highlight adds the
+    pattern without also making the highlight brighter or darker on average.
+    A plain grey stands in if the photograph is missing, which switches the
+    iridescence off and leaves a colourless coat.
+    """
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            source = pygame.image.load(str(path))
+        except pygame.error as exc:
+            print(f"Could not load oil slick {path}: {exc}", file=sys.stderr)
+            continue
+
+        # Centre square, so the swirls keep their shape instead of being squashed.
+        side = min(source.get_size())
+        image = pygame.Surface((side, side))
+        image.blit(
+            source,
+            (0, 0),
+            pygame.Rect(
+                (source.get_width() - side) // 2,
+                (source.get_height() - side) // 2,
+                side,
+                side,
+            ),
+        )
+
+        # Halve repeatedly before the final resize: one big step of smoothscale
+        # samples too few source pixels and aliases the fine filaments away.
+        while image.get_width() >= size * 2:
+            half = image.get_width() // 2
+            image = pygame.transform.smoothscale(image, (half, half))
+        if image.get_width() != size:
+            image = pygame.transform.smoothscale(image, (size, size))
+
+        return image, 1.0 / max(mean_linear_luminance(image), 1e-3)
+
+    print(
+        f"No oil slick image found at {paths[0]}; wet ink will not be iridescent.",
+        file=sys.stderr,
+    )
+    grey = pygame.Surface((size, size))
+    grey.fill((128, 128, 128))
+    return grey, 1.0 / max(mean_linear_luminance(grey), 1e-3)
 
 
 def make_demo_ink(
@@ -978,6 +1102,11 @@ class ParchmentInkRenderer:
         self.ink_wet.repeat_x = False
         self.ink_wet.repeat_y = False
 
+        slick, slick_gain = load_oil_slick()
+        # The shader folds the coordinate to tile it, so clamping is what we want.
+        self.oil_slick = surface_to_texture(self.context, slick)
+        self.slick_gain = slick_gain
+
         self._rebuild_base_ink()
         self.upload_wetness()
         self._replace_paper_textures(seed)
@@ -987,6 +1116,8 @@ class ParchmentInkRenderer:
         self.program["u_paper_roughness"].value = 2
         self.program["u_ink_mask"].value = 3
         self.program["u_ink_wet"].value = 4
+        self.program["u_oil_slick"].value = 5
+        self.program["u_slick_gain"].value = self.slick_gain
         self.program["u_resolution"].value = tuple(float(value) for value in size)
 
     def _rebuild_base_ink(self) -> None:
@@ -1091,10 +1222,12 @@ class ParchmentInkRenderer:
         self.paper_roughness.use(location=2)
         self.ink_mask.use(location=3)
         self.ink_wet.use(location=4)
+        self.oil_slick.use(location=5)
 
         self.program["u_light_uv"].value = light_uv
         self.program["u_light_height"].value = settings.light_height
         self.program["u_page_wetness"].value = settings.wetness
+        self.program["u_time"].value = settings.moment
         self.program["u_exposure"].value = settings.exposure
         self.program["u_debug_mode"].value = settings.debug_mode
         self.program["u_zoom"].value = 1.0 if view is None else view.zoom
@@ -1110,6 +1243,7 @@ class ParchmentInkRenderer:
         self.paper_roughness.release()
         self.ink_mask.release()
         self.ink_wet.release()
+        self.oil_slick.release()
         self.vertex_array.release()
         self.vertex_buffer.release()
         self.program.release()
