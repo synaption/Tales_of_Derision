@@ -100,6 +100,7 @@ uniform vec2 u_resolution;
 uniform vec2 u_light_uv;
 uniform float u_light_height;
 uniform float u_page_wetness;
+uniform float u_wet_gain;
 uniform float u_exposure;
 uniform int u_debug_mode;
 uniform float u_zoom;
@@ -171,7 +172,11 @@ void main() {
 
     // Wetness has two sources: the page-wide dry-down of the printed artwork,
     // and a per-pixel field that gives every fresh stroke its own drying clock.
-    float wetness = max(u_page_wetness, texture(u_ink_wet, page_uv).r);
+    // The field only fades in steps, so u_wet_gain carries it the rest of the way
+    // to the present moment and the steps stop being visible as steps.
+    float wetness = max(
+        u_page_wetness, texture(u_ink_wet, page_uv).r * u_wet_gain
+    );
 
     // The alpha gradient makes wet strokes look microscopically raised. Drying
     // ink sinks into the fibres, so the relief nearly vanishes with the shine.
@@ -1017,6 +1022,19 @@ class InkCanvas:
             return dirty
         return dirty.union(self._wet_segment(start, end, radius))
 
+    def wet_gain(self, rate: float = 1.0) -> float:
+        """How much further the field has faded since its last step.
+
+        The field itself only moves in steps, which have to be far enough apart
+        to keep the multiply blend's floor under dry ink. Handing the shader the
+        fade for the part-step since then makes the result continuous, so a
+        sixty-second dry-down still looks smooth on a field stepping once a
+        second.
+        """
+        if self.wet_bounds is None:
+            return 1.0
+        return math.exp(-self._wet_elapsed * rate / INK_DRY_TAU)
+
     def dry(self, elapsed: float, rate: float = 1.0) -> pygame.Rect | None:
         """Fade the stroke wetness field; returns the region needing re-upload.
 
@@ -1322,6 +1340,12 @@ class Slider:
             return f"{value * 100:.0f}%"
         if self.style == "times":
             return f"{value:.2f}x"
+        if self.style == "rate":
+            # Enough decimals to still read as a number four decades down.
+            if value < 0.001:
+                return f"{value:.4f}"
+            if value < 0.1:
+                return f"{value:.3f}"
         return f"{value:.2f}"
 
     def widest_text(self) -> str:
@@ -1341,10 +1365,20 @@ class SliderPanel(Panel):
     lamp stops following the cursor.
     """
 
+    # The three multiplicative controls span two to four decades, so all of them
+    # are logarithmic: a linear track would spend most of its length on values
+    # nobody wants and leave the slow end unreachable.
     SLIDERS = (
-        Slider("dry_rate", "Ink dries in", 0.25, 4.0, "seconds", logarithmic=True),
-        Slider("slick_swirl", "Swirl speed", 0.0, 1.5),
-        Slider("slick_zoom", "Slick size", 0.5, 8.0, "times", logarithmic=True),
+        Slider(
+            "dry_rate",
+            "Ink dries in",
+            INK_DRY_SECONDS / 60.0,
+            INK_DRY_SECONDS / 1.0,
+            "seconds",
+            logarithmic=True,
+        ),
+        Slider("slick_swirl", "Swirl speed", 0.0001, 1.5, "rate", logarithmic=True),
+        Slider("slick_zoom", "Slick size", 0.5, 30.0, "times", logarithmic=True),
         Slider("slick_opacity", "Iridescence", 0.0, 1.5, "percent"),
     )
 
@@ -1662,6 +1696,7 @@ class ParchmentInkRenderer:
         self.program["u_light_uv"].value = light_uv
         self.program["u_light_height"].value = settings.light_height
         self.program["u_page_wetness"].value = settings.wetness
+        self.program["u_wet_gain"].value = self.canvas.wet_gain(settings.dry_rate)
         self.program["u_time"].value = settings.moment
         self.program["u_slick_opacity"].value = settings.slick_opacity
         self.program["u_slick_swirl"].value = settings.slick_swirl
