@@ -35,6 +35,22 @@ FEATURE_IMAGE_PATH = (
 )
 FEATURE_IMAGE_HEIGHT = 160
 
+# Ink drying. The shine and the raised meniscus fade exponentially, which is the
+# usual model for a solvent leaving a film: `exp(-age / tau)`. Half the gloss is
+# gone within a second and a stroke reads as dry after two or three.
+INK_DRY_TAU = 1.0
+# How long a stroke's pixels stay in the wetness field. By then the fade has
+# bottomed out below PAGE_WET_FLOOR, so emptying the field changes nothing.
+INK_DRY_SECONDS = 4.0
+# Fully dry ink keeps a trace of sheen; parchment is not perfectly matte either.
+PAGE_WET_FLOOR = 0.06
+# The stroke wetness field fades on this interval rather than every frame: it is
+# a slow, low-contrast change, and each step costs a fill plus an upload over the
+# whole wet region. Pygame's multiply blend is `(dest * src + 255) >> 8`, whose
+# +1 of rounding stalls the fade once a byte reaches about `1 / (1 - factor)`;
+# stepping this slowly puts that floor at 15/255, below the sheen of dry ink.
+WET_UPDATE_INTERVAL = 1.0 / 15.0
+
 
 VERTEX_SHADER = """
 #version 330
@@ -58,11 +74,12 @@ uniform sampler2D u_paper_albedo;
 uniform sampler2D u_paper_normal;
 uniform sampler2D u_paper_roughness;
 uniform sampler2D u_ink_mask;
+uniform sampler2D u_ink_wet;
 
 uniform vec2 u_resolution;
 uniform vec2 u_light_uv;
 uniform float u_light_height;
-uniform float u_wetness;
+uniform float u_page_wetness;
 uniform float u_exposure;
 uniform int u_debug_mode;
 uniform float u_zoom;
@@ -126,22 +143,27 @@ void main() {
     float ink_down = texture(u_ink_mask, page_uv - vec2(0.0, texel.y)).a;
     float ink_up = texture(u_ink_mask, page_uv + vec2(0.0, texel.y)).a;
 
-    // The alpha gradient makes wet strokes look microscopically raised.
+    // Wetness has two sources: the page-wide dry-down of the printed artwork,
+    // and a per-pixel field that gives every fresh stroke its own drying clock.
+    float wetness = max(u_page_wetness, texture(u_ink_wet, page_uv).r);
+
+    // The alpha gradient makes wet strokes look microscopically raised. Drying
+    // ink sinks into the fibres, so the relief nearly vanishes with the shine.
     vec2 ink_gradient = vec2(ink_right - ink_left, ink_up - ink_down);
     float edge = saturate(length(ink_gradient) * 3.2);
 
     vec3 ink_normal = normalize(vec3(
-        paper_normal.xy * 0.22 - ink_gradient * (1.4 + 1.2 * u_wetness),
+        paper_normal.xy * 0.22 - ink_gradient * (0.30 + 2.30 * wetness),
         max(0.30, paper_normal.z)
     ));
     vec3 normal = normalize(mix(paper_normal, ink_normal, ink));
 
     vec3 dry_ink = to_linear(vec3(0.085, 0.047, 0.026));
     vec3 wet_ink = to_linear(vec3(0.030, 0.016, 0.010));
-    vec3 ink_albedo = mix(dry_ink, wet_ink, u_wetness);
+    vec3 ink_albedo = mix(dry_ink, wet_ink, wetness);
     vec3 albedo = mix(paper_albedo, ink_albedo, ink);
 
-    float ink_roughness = mix(0.62, 0.10, u_wetness);
+    float ink_roughness = mix(0.68, 0.10, wetness);
     float roughness = mix(paper_roughness, ink_roughness, ink);
 
     vec3 surface_position = vec3(v_uv.x * aspect, v_uv.y, 0.0);
@@ -168,19 +190,19 @@ void main() {
     float specular_lobe = pow(n_dot_h, shininess) * normalized_specular;
 
     vec3 paper_f0 = vec3(0.025);
-    vec3 ink_f0 = mix(vec3(0.035), vec3(0.115), u_wetness);
+    vec3 ink_f0 = mix(vec3(0.030), vec3(0.115), wetness);
     vec3 f0 = mix(paper_f0, ink_f0, ink);
     vec3 fresnel = fresnel_schlick(n_dot_v, f0);
 
     float paper_specular_strength = mix(0.055, 0.025, paper_roughness);
-    float ink_specular_strength = mix(0.16, 1.05, u_wetness);
+    float ink_specular_strength = mix(0.10, 1.05, wetness);
     float specular_strength = mix(paper_specular_strength, ink_specular_strength, ink);
 
     vec3 diffuse = albedo * (ambient_light + warm_light * n_dot_l * attenuation * 0.68);
     vec3 specular = warm_light * fresnel * specular_lobe * specular_strength * attenuation;
 
     // A small extra meniscus glint along the stroke boundary sells fresh ink.
-    float edge_glint = edge * ink * u_wetness * pow(n_dot_h, 34.0) * attenuation;
+    float edge_glint = edge * ink * wetness * pow(n_dot_h, 34.0) * attenuation;
     specular += warm_light * edge_glint * 0.16;
 
     // Darken the sheet perimeter without baking it into the generated texture.
@@ -196,6 +218,8 @@ void main() {
         color = vec3(roughness);
     } else if (u_debug_mode == 3) {
         color = vec3(ink);
+    } else if (u_debug_mode == 4) {
+        color = vec3(wetness);
     }
 
     // Draw a tiny unobtrusive ring at the movable light position.
@@ -210,11 +234,31 @@ void main() {
 
 @dataclass
 class DemoSettings:
-    wetness: float = 0.82
+    wetness: float = 1.00
     light_height: float = 0.24
     exposure: float = 1.00
     debug_mode: int = 0
     brush_radius: int = 5
+    drying: bool = True
+
+    def advance(self, elapsed: float) -> bool:
+        """Dry the page-wide ink. Returns True if the wetness changed.
+
+        Decaying incrementally is exact for an exponential -- successive factors
+        multiply to `exp(-total / tau)` -- so this is frame-rate independent and
+        needs no absolute clock, which also lets `[`/`]` nudge the value.
+        """
+        if not self.drying or self.wetness <= PAGE_WET_FLOOR + 1e-4:
+            return False
+
+        decay = math.exp(-elapsed / INK_DRY_TAU)
+        self.wetness = PAGE_WET_FLOOR + (self.wetness - PAGE_WET_FLOOR) * decay
+        return True
+
+    def rewet(self) -> None:
+        """Flood the page with fresh ink again and restart the dry-down."""
+        self.wetness = 1.0
+        self.drying = True
 
 
 class View:
@@ -690,13 +734,26 @@ def make_brush(radius: int, softness: float = 1.5) -> pygame.Surface:
 
 
 class InkCanvas:
-    """The ink mask as editable artwork: generated demo art plus user strokes."""
+    """The ink mask as editable artwork: generated demo art plus user strokes.
+
+    Alongside the coverage mask the canvas keeps a `wetness` field holding how
+    fresh the ink at each pixel is. Keeping it in its own surface means a drying
+    stroke re-uploads one small greyscale region and never touches the coverage
+    mask, and it leaves the mask's own colour channels alone.
+    """
 
     def __init__(self, size: tuple[int, int]) -> None:
         self.size = size
         self.base = pygame.Surface(size, pygame.SRCALPHA)
         self.base.fill((0, 0, 0, 0))
         self.surface = self.base.copy()
+        self.wetness = pygame.Surface(size)
+        self.wetness.fill((0, 0, 0))
+        # Every non-zero wetness pixel lies inside `wet_bounds`, so both the
+        # decay and its upload can be confined to that rectangle.
+        self.wet_bounds: pygame.Rect | None = None
+        self.wet_seconds_left = 0.0
+        self._wet_elapsed = 0.0
         self.strokes: list[Stroke] = []
         self.active_stroke: Stroke | None = None
         self._brushes: dict[int, pygame.Surface] = {}
@@ -741,6 +798,85 @@ class InkCanvas:
         )
         return dirty.clip(self.surface.get_rect())
 
+    def _wet_segment(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        radius: int,
+    ) -> pygame.Rect:
+        """Flood a segment with fresh ink in the wetness field.
+
+        Hard-edged primitives are enough here: wetness is a slowly varying
+        material property, and it only ever shows through the coverage mask, so
+        spilling a pixel past the stroke edge is invisible.
+        """
+        fresh = (255, 255, 255)
+        reach = radius + 1
+        if start != end:
+            pygame.draw.line(self.wetness, fresh, start, end, reach * 2)
+        pygame.draw.circle(self.wetness, fresh, start, reach)
+        pygame.draw.circle(self.wetness, fresh, end, reach)
+
+        pad = reach + 2
+        dirty = pygame.Rect(
+            min(start[0], end[0]) - pad,
+            min(start[1], end[1]) - pad,
+            abs(end[0] - start[0]) + pad * 2,
+            abs(end[1] - start[1]) + pad * 2,
+        ).clip(self.wetness.get_rect())
+
+        self.wet_bounds = (
+            dirty if self.wet_bounds is None else self.wet_bounds.union(dirty)
+        )
+        self.wet_seconds_left = INK_DRY_SECONDS
+        return dirty
+
+    def _draw_segment(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        radius: int,
+        erase: bool,
+    ) -> pygame.Rect:
+        """Lay down one segment of live ink: coverage plus its drying clock."""
+        dirty = self._stamp_segment(start, end, radius, erase)
+        if erase:
+            # Lifting ink off the page leaves nothing behind to dry.
+            return dirty
+        return dirty.union(self._wet_segment(start, end, radius))
+
+    def dry(self, elapsed: float) -> pygame.Rect | None:
+        """Fade the stroke wetness field; returns the region needing re-upload.
+
+        Every pixel fades by the same factor each step, so a pixel stamped
+        `age` seconds ago is left holding roughly `exp(-age / tau)` -- no
+        per-stroke bookkeeping is needed to give each stroke its own clock.
+        """
+        if self.wet_bounds is None:
+            return None
+
+        self._wet_elapsed += elapsed
+        if self._wet_elapsed < WET_UPDATE_INTERVAL:
+            return None
+
+        step = self._wet_elapsed
+        self._wet_elapsed = 0.0
+        self.wet_seconds_left -= step
+        region = self.wet_bounds
+
+        if self.wet_seconds_left <= 0.0:
+            # Land exactly on dry, so nothing keeps a stale trace of wetness.
+            self.wetness.fill((0, 0, 0))
+            self.wet_bounds = None
+            return region
+
+        # The blend divides by 256, not 255, so that is what the factor scales.
+        scale = clamp_byte(math.exp(-step / INK_DRY_TAU) * 256.0)
+        self.wetness.subsurface(region).fill(
+            (scale, scale, scale), special_flags=pygame.BLEND_RGB_MULT
+        )
+        return region
+
     def begin_stroke(
         self,
         position: tuple[int, int],
@@ -749,7 +885,7 @@ class InkCanvas:
     ) -> pygame.Rect:
         self.active_stroke = Stroke([position], radius, erase)
         self.strokes.append(self.active_stroke)
-        return self._stamp_segment(position, position, radius, erase)
+        return self._draw_segment(position, position, radius, erase)
 
     def extend_stroke(self, position: tuple[int, int]) -> pygame.Rect | None:
         stroke = self.active_stroke
@@ -761,7 +897,7 @@ class InkCanvas:
             return None
 
         stroke.points.append(position)
-        return self._stamp_segment(previous, position, stroke.radius, stroke.erase)
+        return self._draw_segment(previous, position, stroke.radius, stroke.erase)
 
     def end_stroke(self) -> None:
         self.active_stroke = None
@@ -835,13 +971,22 @@ class ParchmentInkRenderer:
         self.ink_mask.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.ink_mask.repeat_x = False
         self.ink_mask.repeat_y = False
+
+        # One byte per pixel: how fresh the ink there is.
+        self.ink_wet = self.context.texture(size, 1)
+        self.ink_wet.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.ink_wet.repeat_x = False
+        self.ink_wet.repeat_y = False
+
         self._rebuild_base_ink()
+        self.upload_wetness()
         self._replace_paper_textures(seed)
 
         self.program["u_paper_albedo"].value = 0
         self.program["u_paper_normal"].value = 1
         self.program["u_paper_roughness"].value = 2
         self.program["u_ink_mask"].value = 3
+        self.program["u_ink_wet"].value = 4
         self.program["u_resolution"].value = tuple(float(value) for value in size)
 
     def _rebuild_base_ink(self) -> None:
@@ -849,13 +994,18 @@ class ParchmentInkRenderer:
         self.canvas.set_base(make_demo_ink(self.size, self.sprites, self.sprite_page))
         self.upload_ink()
 
-    def upload_ink(self, region: pygame.Rect | None = None) -> None:
-        """Push the canvas to the GPU, by default only the rectangle that changed.
+    def _write_region(
+        self,
+        texture: moderngl.Texture,
+        surface: pygame.Surface,
+        region: pygame.Rect | None,
+        red_only: bool = False,
+    ) -> None:
+        """Upload part of a surface into a texture, by default the whole thing.
 
         Texture V runs bottom-up while Pygame Y runs top-down, so the region is
         flipped and its origin mirrored to match `surface_to_texture`.
         """
-        surface = self.canvas.surface
         if region is None:
             region = surface.get_rect()
         else:
@@ -864,8 +1014,13 @@ class ParchmentInkRenderer:
                 return
 
         patch = pygame.transform.flip(surface.subsurface(region), False, True)
-        self.ink_mask.write(
-            pygame.image.tobytes(patch, "RGBA"),
+        if red_only:
+            data = pygame.image.tobytes(patch, "RGB")[0::3]
+        else:
+            data = pygame.image.tobytes(patch, "RGBA")
+
+        texture.write(
+            data,
             viewport=(
                 region.left,
                 self.size[1] - region.bottom,
@@ -873,6 +1028,21 @@ class ParchmentInkRenderer:
                 region.height,
             ),
         )
+
+    def upload_ink(self, region: pygame.Rect | None = None) -> None:
+        """Push the ink coverage to the GPU, only the changed rectangle."""
+        self._write_region(self.ink_mask, self.canvas.surface, region)
+
+    def upload_wetness(self, region: pygame.Rect | None = None) -> None:
+        """Push the stroke wetness field to its single-channel texture."""
+        self._write_region(self.ink_wet, self.canvas.wetness, region, red_only=True)
+
+    def upload_stroke(self, region: pygame.Rect | None) -> None:
+        """Push both halves of freshly drawn ink: what it covers and how wet."""
+        if region is None:
+            return
+        self.upload_ink(region)
+        self.upload_wetness(region)
 
     def change_sprite_page(self, delta: int) -> None:
         if self.sprites is None:
@@ -920,10 +1090,11 @@ class ParchmentInkRenderer:
         self.paper_normal.use(location=1)
         self.paper_roughness.use(location=2)
         self.ink_mask.use(location=3)
+        self.ink_wet.use(location=4)
 
         self.program["u_light_uv"].value = light_uv
         self.program["u_light_height"].value = settings.light_height
-        self.program["u_wetness"].value = settings.wetness
+        self.program["u_page_wetness"].value = settings.wetness
         self.program["u_exposure"].value = settings.exposure
         self.program["u_debug_mode"].value = settings.debug_mode
         self.program["u_zoom"].value = 1.0 if view is None else view.zoom
@@ -938,24 +1109,26 @@ class ParchmentInkRenderer:
         self.paper_normal.release()
         self.paper_roughness.release()
         self.ink_mask.release()
+        self.ink_wet.release()
         self.vertex_array.release()
         self.vertex_buffer.release()
         self.program.release()
 
 
 def update_caption(settings: DemoSettings, view: View) -> None:
-    modes = ("final", "normals", "roughness", "ink mask")
+    modes = ("final", "normals", "roughness", "ink mask", "wetness")
     pygame.display.set_caption(
         "ModernGL Parchment + Fresh Ink  |  "
-        f"wetness {settings.wetness:.2f}  "
+        f"wetness {settings.wetness:.2f} "
+        f"({'drying' if settings.drying else 'held'})  "
         f"light height {settings.light_height:.2f}  "
         f"brush {settings.brush_radius}px  "
         f"zoom {view.zoom * 100:.0f}%  "
         f"view {modes[settings.debug_mode]}  |  "
-        "Drag draws, right-drag erases, middle-drag pans, wheel zooms, "
+        "Drag draws wet ink, right-drag erases, middle-drag pans, wheel zooms, "
         "shift-wheel brush size, 0 resets view, U undo, C clear, "
-        "move mouse for light, [ ] wetness, - = height, 1-4 views, "
-        "arrows sprite page, R regenerate, Esc quit"
+        "move mouse for light, W re-wets the page, [ ] hold wetness, "
+        "- = height, 1-5 views, arrows sprite page, R regenerate, Esc quit"
     )
 
 
@@ -992,6 +1165,8 @@ def main() -> None:
     light_position = (WINDOW_SIZE[0] // 2, WINDOW_SIZE[1] // 2)
     drawing = False
     panning = False
+    elapsed = 0.0
+    shown_wetness = settings.wetness
 
     running = True
     while running:
@@ -1010,7 +1185,7 @@ def main() -> None:
                     settings.brush_radius,
                     erase=event.button == 3,
                 )
-                renderer.upload_ink(dirty)
+                renderer.upload_stroke(dirty)
             elif event.type == pygame.MOUSEBUTTONUP and event.button in (1, 3):
                 drawing = False
                 renderer.canvas.end_stroke()
@@ -1018,11 +1193,9 @@ def main() -> None:
                 if panning:
                     view.pan_by(event.rel)
                 elif drawing:
-                    dirty = renderer.canvas.extend_stroke(
-                        view.screen_to_canvas(event.pos)
+                    renderer.upload_stroke(
+                        renderer.canvas.extend_stroke(view.screen_to_canvas(event.pos))
                     )
-                    if dirty is not None:
-                        renderer.upload_ink(dirty)
                 else:
                     # The light stays put while drawing so a fresh stroke can be
                     # judged under steady lighting instead of a moving highlight.
@@ -1041,10 +1214,17 @@ def main() -> None:
                 elif event.key == pygame.K_r:
                     renderer.regenerate_paper()
                 elif event.key in (pygame.K_LEFTBRACKET, pygame.K_COMMA):
+                    # Taking manual control pauses the dry-down, otherwise the
+                    # decay would pull the value straight back down again.
+                    settings.drying = False
                     settings.wetness = max(0.0, settings.wetness - 0.06)
                     caption_changed = True
                 elif event.key in (pygame.K_RIGHTBRACKET, pygame.K_PERIOD):
+                    settings.drying = False
                     settings.wetness = min(1.0, settings.wetness + 0.06)
+                    caption_changed = True
+                elif event.key == pygame.K_w:
+                    settings.rewet()
                     caption_changed = True
                 elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                     settings.light_height = max(0.06, settings.light_height - 0.025)
@@ -1064,6 +1244,9 @@ def main() -> None:
                 elif event.key in (pygame.K_4, pygame.K_KP4):
                     settings.debug_mode = 3
                     caption_changed = True
+                elif event.key in (pygame.K_5, pygame.K_KP5):
+                    settings.debug_mode = 4
+                    caption_changed = True
                 elif event.key == pygame.K_LEFT:
                     renderer.change_sprite_page(-1)
                 elif event.key == pygame.K_RIGHT:
@@ -1080,12 +1263,21 @@ def main() -> None:
                     view.reset()
                     caption_changed = True
 
+        # The page-wide ink and each individual stroke dry on the same clock.
+        if settings.advance(elapsed) and abs(settings.wetness - shown_wetness) >= 0.01:
+            caption_changed = True
+
+        drying_region = renderer.canvas.dry(elapsed)
+        if drying_region is not None:
+            renderer.upload_wetness(drying_region)
+
         if caption_changed:
+            shown_wetness = settings.wetness
             update_caption(settings, view)
 
         renderer.render(light_position, settings, view)
         pygame.display.flip()
-        clock.tick(60)
+        elapsed = clock.tick(60) / 1000.0
 
     renderer.release()
     pygame.quit()
