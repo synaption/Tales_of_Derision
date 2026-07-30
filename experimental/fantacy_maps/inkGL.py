@@ -40,7 +40,9 @@ OIL_SLICK_PATHS = (
     Path(__file__).resolve().parent / "oil_slick.png",
     Path(__file__).resolve().parent / "oil_slick.jpg",
 )
-OIL_SLICK_SIZE = 512
+# Magnified by the slick zoom, only a fraction of the film is on screen at once,
+# so it needs the resolution to survive being spread over the sheet.
+OIL_SLICK_SIZE = 1024
 
 # Ink drying. The shine and the raised meniscus fade exponentially, which is the
 # usual model for a solvent leaving a film: `exp(-age / tau)`. Half the gloss is
@@ -85,6 +87,14 @@ uniform sampler2D u_ink_wet;
 uniform sampler2D u_oil_slick;
 uniform float u_slick_gain;
 uniform float u_time;
+
+// How much of the oil film shows over the ink, how fast it swirls while the ink
+// is still liquid, and how much of the sheet one copy of the photograph covers.
+// All three are taste rather than physics. Everything feeding the lookup is kept
+// in page units and scaled once at the end, so size cannot disturb speed.
+uniform float u_slick_opacity;
+uniform float u_slick_swirl;
+uniform float u_slick_zoom;
 
 uniform vec2 u_resolution;
 uniform vec2 u_light_uv;
@@ -220,23 +230,26 @@ void main() {
     // while the ink is liquid, settling into place as the shine goes.
     float coat = ink * wetness;
     vec3 reflection = reflect(-view_direction, normal);
+    // Every phase advances at a fixed rate; only the amplitude follows the
+    // wetness, otherwise drying ink would jerk the swirl backwards.
+    vec2 flow = vec2(page_uv.x * aspect, page_uv.y)
+        + vec2(0.033, -0.052) * u_time * u_slick_swirl;
+    flow += vec2(
+        sin(flow.y * 7.7 + u_time * 1.7 * u_slick_swirl),
+        cos(flow.x * 6.6 - u_time * 1.3 * u_slick_swirl)
+    ) * 0.055 * wetness;
+
     // The warp from the normal has to stay gentle: the ink normal carries the
     // paper's own grain, and a strong warp turns that into rainbow speckle
     // instead of the broad bands a film actually shows.
-    vec2 slick_uv = vec2(page_uv.x * aspect, page_uv.y) * 1.35
-        + reflection.xy * 0.28
-        + vec2(0.045, -0.07) * u_time;
-    // Every phase advances at a fixed rate; only the amplitude follows the
-    // wetness, otherwise drying ink would jerk the swirl backwards.
-    slick_uv += vec2(
-        sin(slick_uv.y * 5.7 + u_time * 1.7),
-        cos(slick_uv.x * 4.9 - u_time * 1.3)
-    ) * 0.075 * wetness;
+    vec2 slick_uv = (flow + reflection.xy * 0.21) / u_slick_zoom;
 
     vec3 slick = to_linear(texture(u_oil_slick, mirror_uv(slick_uv)).rgb);
     float slick_luminance = max(dot(slick, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
     // Chroma alone colours the lamp's hotspot without changing how bright it is.
-    vec3 highlight_tint = mix(vec3(1.0), slick / slick_luminance, coat * 0.9);
+    vec3 highlight_tint = mix(
+        vec3(1.0), slick / slick_luminance, coat * 0.9 * u_slick_opacity
+    );
 
     vec3 diffuse = albedo * (ambient_light + warm_light * n_dot_l * attenuation * 0.68);
     vec3 specular = warm_light * highlight_tint
@@ -249,7 +262,7 @@ void main() {
     // before the last of the shine is, and dry ink never shimmers.
     float grazing = pow(1.0 - n_dot_v, 2.0);
     specular += slick * u_slick_gain * coat * wetness
-        * (0.016 + 0.055 * grazing) * attenuation * 0.85;
+        * (0.016 + 0.055 * grazing) * attenuation * 0.85 * u_slick_opacity;
 
     // A small extra meniscus glint along the stroke boundary sells fresh ink.
     float edge_glint = edge * ink * wetness * pow(n_dot_h, 34.0) * attenuation;
@@ -282,6 +295,35 @@ void main() {
 """
 
 
+OVERLAY_VERTEX_SHADER = """
+#version 330
+
+in vec2 in_position;
+in vec2 in_uv;
+
+out vec2 v_uv;
+
+void main() {
+    gl_Position = vec4(in_position, 0.0, 1.0);
+    v_uv = in_uv;
+}
+"""
+
+
+OVERLAY_FRAGMENT_SHADER = """
+#version 330
+
+uniform sampler2D u_panel;
+
+in vec2 v_uv;
+out vec4 frag_color;
+
+void main() {
+    frag_color = texture(u_panel, v_uv);
+}
+"""
+
+
 @dataclass
 class DemoSettings:
     wetness: float = 1.00
@@ -291,6 +333,12 @@ class DemoSettings:
     brush_radius: int = 5
     drying: bool = True
     moment: float = 0.0
+
+    # Live-tunable material controls, all exposed as sliders.
+    dry_rate: float = 1.00
+    slick_opacity: float = 0.50
+    slick_swirl: float = 0.35
+    slick_zoom: float = 2.20
 
     def advance(self, elapsed: float) -> bool:
         """Dry the page-wide ink. Returns True if the wetness changed.
@@ -305,7 +353,7 @@ class DemoSettings:
         if not self.drying or self.wetness <= PAGE_WET_FLOOR + 1e-4:
             return False
 
-        decay = math.exp(-elapsed / INK_DRY_TAU)
+        decay = math.exp(-elapsed * self.dry_rate / INK_DRY_TAU)
         self.wetness = PAGE_WET_FLOOR + (self.wetness - PAGE_WET_FLOOR) * decay
         return True
 
@@ -969,23 +1017,30 @@ class InkCanvas:
             return dirty
         return dirty.union(self._wet_segment(start, end, radius))
 
-    def dry(self, elapsed: float) -> pygame.Rect | None:
+    def dry(self, elapsed: float, rate: float = 1.0) -> pygame.Rect | None:
         """Fade the stroke wetness field; returns the region needing re-upload.
 
         Every pixel fades by the same factor each step, so a pixel stamped
         `age` seconds ago is left holding roughly `exp(-age / tau)` -- no
         per-stroke bookkeeping is needed to give each stroke its own clock.
+
+        `rate` scales how fast ink dries. The interval between steps scales with
+        it so that each step is always the same fraction of a time constant:
+        that keeps the multiply blend's stall floor pinned under the sheen of dry
+        ink, where a slow dry-down with frequent steps would leave it stranded at
+        a visible wetness.
         """
         if self.wet_bounds is None:
             return None
 
+        interval = max(1.0 / 60.0, WET_UPDATE_INTERVAL / rate)
         self._wet_elapsed += elapsed
-        if self._wet_elapsed < WET_UPDATE_INTERVAL:
+        if self._wet_elapsed < interval:
             return None
 
         step = self._wet_elapsed
         self._wet_elapsed = 0.0
-        self.wet_seconds_left -= step
+        self.wet_seconds_left -= step * rate
         region = self.wet_bounds
 
         if self.wet_seconds_left <= 0.0:
@@ -995,7 +1050,7 @@ class InkCanvas:
             return region
 
         # The blend divides by 256, not 255, so that is what the factor scales.
-        scale = clamp_byte(math.exp(-step / INK_DRY_TAU) * 256.0)
+        scale = clamp_byte(math.exp(-step * rate / INK_DRY_TAU) * 256.0)
         self.wetness.subsurface(region).fill(
             (scale, scale, scale), special_flags=pygame.BLEND_RGB_MULT
         )
@@ -1056,6 +1111,383 @@ class InkCanvas:
                 self._stamp_segment(start, end, stroke.radius, stroke.erase)
 
 
+PANEL_FILL = (24, 19, 14, 234)
+PANEL_EDGE = (150, 124, 86, 255)
+PANEL_TITLE = (240, 218, 170)
+PANEL_KEY = (248, 220, 148)
+PANEL_TEXT = (224, 213, 194)
+
+
+def make_panel_surface(size: tuple[int, int]) -> pygame.Surface:
+    """A bordered, mostly opaque card for the interface overlays to draw on."""
+    panel = pygame.Surface(size, pygame.SRCALPHA)
+    panel.fill(PANEL_FILL)
+    pygame.draw.rect(panel, PANEL_EDGE, panel.get_rect(), 2)
+    return panel
+
+
+class Panel:
+    """A pixel-positioned, alpha-blended quad: how the overlays reach the screen.
+
+    The window is an OpenGL surface, so there is nothing to blit text onto. Each
+    overlay lays itself out with Pygame's font renderer and hands the surface
+    here to be drawn over the finished page, at a fixed size in window pixels so
+    zooming and panning the page leave it alone.
+    """
+
+    def __init__(
+        self,
+        context: moderngl.Context,
+        window_size: tuple[int, int],
+        surface: pygame.Surface,
+        position: tuple[int, int] | None = None,
+    ) -> None:
+        self.context = context
+        self.visible = False
+
+        window_width, window_height = window_size
+        panel_width, panel_height = surface.get_size()
+        if position is None:
+            # Centre it, on whole pixels so the text stays crisp.
+            position = (
+                (window_width - panel_width) // 2,
+                (window_height - panel_height) // 2,
+            )
+        self.rect = pygame.Rect(position, surface.get_size())
+
+        self.texture = surface_to_texture(context, surface)
+        self.program = context.program(
+            vertex_shader=OVERLAY_VERTEX_SHADER,
+            fragment_shader=OVERLAY_FRAGMENT_SHADER,
+        )
+        self.program["u_panel"].value = 0
+
+        x0 = 2.0 * self.rect.left / window_width - 1.0
+        x1 = 2.0 * self.rect.right / window_width - 1.0
+        y0 = 1.0 - 2.0 * self.rect.bottom / window_height
+        y1 = 1.0 - 2.0 * self.rect.top / window_height
+
+        vertices = array(
+            "f",
+            (
+                x0, y0, 0.0, 0.0,
+                x1, y0, 1.0, 0.0,
+                x0, y1, 0.0, 1.0,
+                x1, y1, 1.0, 1.0,
+            ),
+        )
+        self.vertex_buffer = context.buffer(vertices.tobytes())
+        self.vertex_array = context.vertex_array(
+            self.program,
+            [(self.vertex_buffer, "2f 2f", "in_position", "in_uv")],
+        )
+
+    def update(self, surface: pygame.Surface) -> None:
+        """Replace the artwork. The size is fixed by the quad, so it must match."""
+        self.texture.write(pygame.image.tobytes(surface, "RGBA", True))
+
+    def toggle(self) -> None:
+        self.visible = not self.visible
+
+    def draw(self) -> None:
+        """Composite the card over whatever has already been rendered."""
+        self.context.enable(moderngl.BLEND)
+        self.context.blend_func = (
+            moderngl.SRC_ALPHA,
+            moderngl.ONE_MINUS_SRC_ALPHA,
+        )
+        self.texture.use(location=0)
+        self.vertex_array.render(mode=moderngl.TRIANGLE_STRIP)
+        self.context.disable(moderngl.BLEND)
+
+    def release(self) -> None:
+        self.texture.release()
+        self.vertex_array.release()
+        self.vertex_buffer.release()
+        self.program.release()
+
+
+class HelpOverlay(Panel):
+    """A card of controls, shown over the page when the user presses `?`."""
+
+    # None starts a new group of related keys.
+    ROWS: tuple[tuple[str, str] | None, ...] = (
+        ("Drag", "draw wet ink"),
+        ("Right-drag", "erase"),
+        ("Shift+Wheel", "brush size"),
+        None,
+        ("Middle-drag", "pan the page"),
+        ("Wheel", "zoom about the cursor"),
+        ("0 / Home", "reset the view"),
+        None,
+        ("Move mouse", "move the lamp"),
+        ("- / =", "lamp height"),
+        ("W", "re-wet the whole page"),
+        ("[ / ]", "hold the wetness, pausing the dry-down"),
+        None,
+        ("U / Ctrl+Z", "undo a stroke"),
+        ("C", "clear every stroke"),
+        ("Arrows", "sprite sheet page"),
+        ("R", "regenerate the parchment"),
+        None,
+        ("Tab", "sliders for drying and the oil slick"),
+        ("1 - 5", "final, normals, roughness, ink, wetness"),
+        ("?", "hide this card"),
+        ("Esc", "quit"),
+    )
+
+    TITLE = "Controls"
+    PADDING = 24
+    LINE_HEIGHT = 24
+    GROUP_GAP = 12
+
+    def __init__(self, context: moderngl.Context, window_size: tuple[int, int]) -> None:
+        super().__init__(context, window_size, self._render_panel())
+
+    def _render_panel(self) -> pygame.Surface:
+        title_font = pygame.font.SysFont("serif", 22, bold=True)
+        key_font = pygame.font.SysFont("monospace", 14, bold=True)
+        text_font = pygame.font.SysFont("serif", 17)
+
+        rows = [row for row in self.ROWS if row is not None]
+        key_column = max(key_font.size(keys)[0] for keys, _ in rows) + 20
+        body_width = max(text_font.size(text)[0] for _, text in rows)
+        title = title_font.render(self.TITLE, True, PANEL_TITLE)
+
+        width = self.PADDING * 2 + max(key_column + body_width, title.get_width())
+        height = (
+            self.PADDING * 2
+            + title.get_height()
+            + 14
+            + len(rows) * self.LINE_HEIGHT
+            + sum(self.GROUP_GAP for row in self.ROWS if row is None)
+        )
+
+        panel = make_panel_surface((width, height))
+        panel.blit(title, (self.PADDING, self.PADDING))
+        y = self.PADDING + title.get_height() + 14
+
+        for row in self.ROWS:
+            if row is None:
+                y += self.GROUP_GAP
+                continue
+            keys, text = row
+            panel.blit(key_font.render(keys, True, PANEL_KEY), (self.PADDING, y + 2))
+            panel.blit(
+                text_font.render(text, True, PANEL_TEXT),
+                (self.PADDING + key_column, y),
+            )
+            y += self.LINE_HEIGHT
+
+        return panel
+
+
+@dataclass(frozen=True)
+class Slider:
+    """One tunable value on the slider panel.
+
+    `logarithmic` is for the controls whose useful range is multiplicative -- the
+    drying rate and the slick zoom -- so that the middle of the track is the
+    default and each half is an equal factor either side of it.
+    """
+
+    field: str
+    label: str
+    minimum: float
+    maximum: float
+    style: str = "plain"
+    logarithmic: bool = False
+
+    def position(self, value: float) -> float:
+        """Where a value sits along the track, 0 to 1."""
+        value = max(self.minimum, min(self.maximum, value))
+        if self.logarithmic:
+            return math.log(value / self.minimum) / math.log(
+                self.maximum / self.minimum
+            )
+        return (value - self.minimum) / (self.maximum - self.minimum)
+
+    def value(self, position: float) -> float:
+        """The value at a point along the track, 0 to 1."""
+        position = max(0.0, min(1.0, position))
+        if self.logarithmic:
+            return self.minimum * (self.maximum / self.minimum) ** position
+        return self.minimum + (self.maximum - self.minimum) * position
+
+    def text(self, value: float) -> str:
+        if self.style == "seconds":
+            # Read out the time ink takes to dry rather than the bare multiplier.
+            return f"{INK_DRY_SECONDS / value:.1f} s"
+        if self.style == "percent":
+            return f"{value * 100:.0f}%"
+        if self.style == "times":
+            return f"{value:.2f}x"
+        return f"{value:.2f}"
+
+    def widest_text(self) -> str:
+        candidates = (
+            self.text(self.minimum),
+            self.text(self.maximum),
+            self.text(self.value(0.5)),
+        )
+        return max(candidates, key=len)
+
+
+class SliderPanel(Panel):
+    """Draggable controls for the material parameters, shown on Tab.
+
+    The panel owns its own hit testing: while it is visible it takes any mouse
+    event over itself, so tuning a slider never leaves ink on the page and the
+    lamp stops following the cursor.
+    """
+
+    SLIDERS = (
+        Slider("dry_rate", "Ink dries in", 0.25, 4.0, "seconds", logarithmic=True),
+        Slider("slick_swirl", "Swirl speed", 0.0, 1.5),
+        Slider("slick_zoom", "Slick size", 0.5, 8.0, "times", logarithmic=True),
+        Slider("slick_opacity", "Iridescence", 0.0, 1.5, "percent"),
+    )
+
+    TITLE = "Wet ink"
+    PADDING = 18
+    ROW_HEIGHT = 42
+    TRACK_HEIGHT = 6
+    KNOB_RADIUS = 7
+    MARGIN = 20
+
+    def __init__(
+        self,
+        context: moderngl.Context,
+        window_size: tuple[int, int],
+        settings: DemoSettings,
+    ) -> None:
+        self.title_font = pygame.font.SysFont("serif", 19, bold=True)
+        self.label_font = pygame.font.SysFont("serif", 16)
+        self.value_font = pygame.font.SysFont("monospace", 14, bold=True)
+
+        label_width = max(
+            self.label_font.size(slider.label)[0] for slider in self.SLIDERS
+        )
+        value_width = max(
+            self.value_font.size(slider.widest_text())[0] for slider in self.SLIDERS
+        )
+        title = self.title_font.render(self.TITLE, True, PANEL_TITLE)
+
+        self._label_width = label_width
+        self._value_width = value_width
+        self._header = title.get_height() + 12
+        # A track long enough to be worth dragging, whatever the labels measure.
+        self._track_width = 190
+        size = (
+            self.PADDING * 2 + label_width + 14 + self._track_width + 14 + value_width,
+            self.PADDING * 2 + self._header + len(self.SLIDERS) * self.ROW_HEIGHT,
+        )
+
+        # Tucked into the top left, clear of the page's title and the lamp.
+        super().__init__(context, window_size, make_panel_surface(size),
+                         (self.MARGIN, self.MARGIN))
+        self.dragging: Slider | None = None
+        self.refresh(settings)
+
+    def _track_rect(self, index: int) -> pygame.Rect:
+        """Where a slider's track sits, in window pixels."""
+        return pygame.Rect(
+            self.rect.left + self.PADDING + self._label_width + 14,
+            self.rect.top
+            + self.PADDING
+            + self._header
+            + index * self.ROW_HEIGHT
+            + self.ROW_HEIGHT // 2
+            - self.TRACK_HEIGHT // 2,
+            self._track_width,
+            self.TRACK_HEIGHT,
+        )
+
+    def refresh(self, settings: DemoSettings) -> None:
+        """Redraw the panel for the current values and push it to the GPU."""
+        panel = make_panel_surface(self.rect.size)
+        panel.blit(
+            self.title_font.render(self.TITLE, True, PANEL_TITLE),
+            (self.PADDING, self.PADDING),
+        )
+
+        for index, slider in enumerate(self.SLIDERS):
+            value = getattr(settings, slider.field)
+            # The track rect is in window pixels; shift it into panel space.
+            track = self._track_rect(index).move(-self.rect.left, -self.rect.top)
+            row_middle = track.centery
+
+            label = self.label_font.render(slider.label, True, PANEL_TEXT)
+            panel.blit(
+                label, (self.PADDING, row_middle - label.get_height() // 2)
+            )
+
+            filled = round(track.width * slider.position(value))
+            pygame.draw.rect(panel, (58, 47, 36, 255), track, border_radius=3)
+            if filled:
+                pygame.draw.rect(
+                    panel,
+                    (150, 112, 58, 255),
+                    pygame.Rect(track.left, track.top, filled, track.height),
+                    border_radius=3,
+                )
+            pygame.draw.circle(
+                panel, PANEL_KEY, (track.left + filled, row_middle), self.KNOB_RADIUS
+            )
+
+            reading = self.value_font.render(slider.text(value), True, PANEL_KEY)
+            panel.blit(
+                reading,
+                (
+                    self.rect.width - self.PADDING - reading.get_width(),
+                    row_middle - reading.get_height() // 2,
+                ),
+            )
+
+        self.update(panel)
+
+    def _set_from_mouse(self, slider: Slider, index: int, x: int,
+                        settings: DemoSettings) -> None:
+        track = self._track_rect(index)
+        position = (x - track.left) / max(1, track.width)
+        setattr(settings, slider.field, slider.value(position))
+        self.refresh(settings)
+
+    def handle(self, event: pygame.event.Event, settings: DemoSettings) -> bool:
+        """Consume a mouse event aimed at the panel. Returns True if it was ours."""
+        if not self.visible:
+            return False
+
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if not self.rect.collidepoint(event.pos):
+                return False
+            if event.button == 1:
+                for index, slider in enumerate(self.SLIDERS):
+                    # A generous grab area: the whole row, not just the track.
+                    row = self._track_rect(index).inflate(
+                        self.KNOB_RADIUS * 2, self.ROW_HEIGHT
+                    )
+                    if row.collidepoint(event.pos):
+                        self.dragging = slider
+                        self._set_from_mouse(slider, index, event.pos[0], settings)
+                        break
+            return True
+
+        if event.type == pygame.MOUSEMOTION:
+            if self.dragging is not None:
+                index = self.SLIDERS.index(self.dragging)
+                self._set_from_mouse(self.dragging, index, event.pos[0], settings)
+                return True
+            return self.rect.collidepoint(event.pos)
+
+        if event.type == pygame.MOUSEBUTTONUP:
+            was_dragging = self.dragging is not None
+            self.dragging = None
+            return was_dragging or self.rect.collidepoint(event.pos)
+
+        return False
+
+
 class ParchmentInkRenderer:
     def __init__(self, size: tuple[int, int], seed: int = 7) -> None:
         self.size = size
@@ -1101,6 +1533,9 @@ class ParchmentInkRenderer:
         self.ink_wet.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.ink_wet.repeat_x = False
         self.ink_wet.repeat_y = False
+
+        self.help = HelpOverlay(self.context, size)
+        self.sliders = SliderPanel(self.context, size, DemoSettings())
 
         slick, slick_gain = load_oil_slick()
         # The shader folds the coordinate to tile it, so clamping is what we want.
@@ -1228,6 +1663,9 @@ class ParchmentInkRenderer:
         self.program["u_light_height"].value = settings.light_height
         self.program["u_page_wetness"].value = settings.wetness
         self.program["u_time"].value = settings.moment
+        self.program["u_slick_opacity"].value = settings.slick_opacity
+        self.program["u_slick_swirl"].value = settings.slick_swirl
+        self.program["u_slick_zoom"].value = max(settings.slick_zoom, 1e-3)
         self.program["u_exposure"].value = settings.exposure
         self.program["u_debug_mode"].value = settings.debug_mode
         self.program["u_zoom"].value = 1.0 if view is None else view.zoom
@@ -1237,7 +1675,14 @@ class ParchmentInkRenderer:
 
         self.vertex_array.render(mode=moderngl.TRIANGLE_STRIP)
 
+        if self.sliders.visible:
+            self.sliders.draw()
+        if self.help.visible:
+            self.help.draw()
+
     def release(self) -> None:
+        self.help.release()
+        self.sliders.release()
         self.paper_albedo.release()
         self.paper_normal.release()
         self.paper_roughness.release()
@@ -1258,11 +1703,7 @@ def update_caption(settings: DemoSettings, view: View) -> None:
         f"light height {settings.light_height:.2f}  "
         f"brush {settings.brush_radius}px  "
         f"zoom {view.zoom * 100:.0f}%  "
-        f"view {modes[settings.debug_mode]}  |  "
-        "Drag draws wet ink, right-drag erases, middle-drag pans, wheel zooms, "
-        "shift-wheel brush size, 0 resets view, U undo, C clear, "
-        "move mouse for light, W re-wets the page, [ ] hold wetness, "
-        "- = height, 1-5 views, arrows sprite page, R regenerate, Esc quit"
+        f"view {modes[settings.debug_mode]}  |  press ? for controls"
     )
 
 
@@ -1306,6 +1747,11 @@ def main() -> None:
     while running:
         caption_changed = False
         for event in pygame.event.get():
+            # The slider panel gets first refusal on the mouse, so dragging a
+            # control neither draws ink nor drags the lamp along with it.
+            if renderer.sliders.handle(event, settings):
+                continue
+
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 2:
@@ -1345,6 +1791,17 @@ def main() -> None:
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
+                elif getattr(event, "unicode", "") == "?" or event.key in (
+                    pygame.K_QUESTION,
+                    pygame.K_SLASH,
+                    pygame.K_F1,
+                ):
+                    # The key that produces `?` moves around between layouts, so
+                    # trust the character the event carries where there is one.
+                    renderer.help.toggle()
+                elif event.key == pygame.K_TAB:
+                    renderer.sliders.toggle()
+                    renderer.sliders.refresh(settings)
                 elif event.key == pygame.K_r:
                     renderer.regenerate_paper()
                 elif event.key in (pygame.K_LEFTBRACKET, pygame.K_COMMA):
@@ -1401,7 +1858,7 @@ def main() -> None:
         if settings.advance(elapsed) and abs(settings.wetness - shown_wetness) >= 0.01:
             caption_changed = True
 
-        drying_region = renderer.canvas.dry(elapsed)
+        drying_region = renderer.canvas.dry(elapsed, settings.dry_rate)
         if drying_region is not None:
             renderer.upload_wetness(drying_region)
 
