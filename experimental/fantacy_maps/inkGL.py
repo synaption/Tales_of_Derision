@@ -45,6 +45,16 @@ FEATURE_IMAGE_PATH = (
 )
 FEATURE_IMAGE_HEIGHT = 160
 
+# The relief of the sheet itself, as a tangent-space normal map. Without it the
+# parchment falls back to the normal generated alongside its albedo.
+CANVAS_NORMAL_PATH = Path(__file__).resolve().parent / "canvas_normal.png"
+# The weave photograph repeats across the page rather than being stretched to
+# fit it, which keeps the threads square whatever shape the window is; it very
+# nearly tiles already. Its threads lie every sixteen texels, measured by
+# autocorrelating the map, and that is what turns the "weave size" the user asks
+# for, in page pixels between threads, into a number of repeats.
+CANVAS_WEAVE_PERIOD = 16.0
+
 # The iridescent film reflected in wet ink. Whichever of these exists is used.
 OIL_SLICK_PATHS = (
     Path(__file__).resolve().parent / "oil_slick.png",
@@ -91,6 +101,11 @@ FRAGMENT_SHADER = """
 
 uniform sampler2D u_paper_albedo;
 uniform sampler2D u_paper_normal;
+uniform sampler2D u_ink_grain;
+uniform vec2 u_paper_normal_tiles;
+uniform float u_paper_relief;
+uniform float u_weave_soak;
+uniform float u_wet_floor;
 uniform sampler2D u_paper_roughness;
 uniform sampler2D u_ink_mask;
 uniform sampler2D u_ink_wet;
@@ -177,8 +192,21 @@ void main() {
     vec2 texel = 1.0 / u_resolution;
 
     vec3 paper_albedo = to_linear(texture(u_paper_albedo, page_uv).rgb);
-    vec3 paper_normal = normalize(texture(u_paper_normal, page_uv).rgb * 2.0 - 1.0);
     float paper_roughness = texture(u_paper_roughness, page_uv).r;
+
+    // The bare sheet's relief. It tiles across the page rather than stretching
+    // to fit, so the weave stays square whatever shape the window is, and its
+    // slopes are scaled to the depth the rest of the lighting was tuned for.
+    vec3 sheet_normal = texture(
+        u_paper_normal, page_uv * u_paper_normal_tiles
+    ).rgb * 2.0 - 1.0;
+    sheet_normal = normalize(
+        vec3(sheet_normal.xy * u_paper_relief, max(sheet_normal.z, 1e-3))
+    );
+
+    // The sheet's fine grain, which is what wet ink lies on. Which of the two
+    // shows through a stroke depends on how wet it is; see `under_ink` below.
+    vec3 grain_normal = normalize(texture(u_ink_grain, page_uv).rgb * 2.0 - 1.0);
 
     float ink = texture(u_ink_mask, page_uv).a;
     float ink_left = texture(u_ink_mask, page_uv - vec2(texel.x, 0.0)).a;
@@ -199,11 +227,29 @@ void main() {
     vec2 ink_gradient = vec2(ink_right - ink_left, ink_up - ink_down);
     float edge = saturate(length(ink_gradient) * 3.2);
 
+    // Wet ink is a film lying over the sheet: it pools into the hollows of the
+    // weave and skins over them, so the coat picks up only the fibre underneath.
+    // As it dries it sinks in and takes up the shape of the fabric, and by then
+    // the weave is showing through the stroke as strongly as it does beside it.
+    //
+    // The changeover is `span^soak`, where span is the dry-down remapped to run
+    // the whole way from 1 to 0 -- wetness itself stops at the floor, so raising
+    // that to a power would leave the weave short of full no matter how dry the
+    // ink got. A soak above 1 brings the fabric through early, below 1 holds it
+    // off until the stroke has nearly finished drying, and exactly 1 is a
+    // straight line.
+    float wet_span = saturate(
+        (wetness - u_wet_floor) / max(1.0 - u_wet_floor, 1e-4)
+    );
+    vec3 under_ink = normalize(
+        mix(sheet_normal, grain_normal, pow(wet_span, u_weave_soak))
+    );
+
     vec3 ink_normal = normalize(vec3(
-        paper_normal.xy * 0.22 - ink_gradient * (0.30 + 2.30 * wetness),
-        max(0.30, paper_normal.z)
+        under_ink.xy * 0.22 - ink_gradient * (0.30 + 2.30 * wetness),
+        max(0.30, under_ink.z)
     ));
-    vec3 normal = normalize(mix(paper_normal, ink_normal, ink));
+    vec3 normal = normalize(mix(sheet_normal, ink_normal, ink));
 
     vec3 dry_ink = to_linear(vec3(0.085, 0.047, 0.026));
     vec3 wet_ink = to_linear(vec3(0.030, 0.016, 0.010));
@@ -375,6 +421,9 @@ class DemoSettings:
     drying: bool = True
 
     # Live-tunable material controls, all exposed as sliders.
+    paper_relief: float = 1.00
+    weave_soak: float = 1.00
+    weave_size: float = 4.00
     dry_rate: float = 1.00
     slick_opacity: float = 0.50
     slick_swirl: float = 0.35
@@ -820,6 +869,43 @@ def load_ink_image(
     return image
 
 
+def load_canvas_normal(
+    path: Path = CANVAS_NORMAL_PATH,
+) -> pygame.Surface | None:
+    """The woven relief of the sheet, as a tangent-space normal map.
+
+    Returns None when the file is missing, in which case the parchment keeps the
+    normal generated alongside its albedo and roughness.
+    """
+    try:
+        image = pygame.image.load(str(path))
+    except (pygame.error, FileNotFoundError) as exc:
+        print(f"Could not load canvas normal {path}: {exc}", file=sys.stderr)
+        return None
+
+    surface = pygame.Surface(image.get_size(), pygame.SRCALPHA)
+    surface.blit(image, (0, 0))
+    return surface
+
+
+def mean_tangent_deviation(surface: pygame.Surface, stride: int = 17) -> float:
+    """How steep a normal map's slopes are on average: the mean of |xy|.
+
+    Comparing two maps by this puts them on the same footing, which is what
+    lets a photographed weave stand in for a procedural one without the whole
+    surface suddenly reading as flat or as corrugated metal.
+    """
+    data = pygame.image.tobytes(surface, "RGB")
+    total = 0.0
+    count = 0
+    for index in range(0, len(data) - 2, 3 * stride):
+        x = data[index] / 127.5 - 1.0
+        y = data[index + 1] / 127.5 - 1.0
+        total += math.hypot(x, y)
+        count += 1
+    return total / max(1, count)
+
+
 def mean_linear_luminance(surface: pygame.Surface) -> float:
     """Average luminance of a surface in linear light, judged from a thumbnail."""
     thumbnail = pygame.transform.smoothscale(surface, (64, 64))
@@ -1024,13 +1110,23 @@ def make_demo_ink(
 def surface_to_texture(
     context: moderngl.Context,
     surface: pygame.Surface,
+    repeat: bool = False,
+    mipmap: bool = False,
 ) -> moderngl.Texture:
-    """Upload a Pygame surface with top-left artwork correctly oriented in GL."""
+    """Upload a Pygame surface with top-left artwork correctly oriented in GL.
+
+    `mipmap` is only for textures that are uploaded once and never patched: the
+    chain would have to be rebuilt on every partial write otherwise.
+    """
     data = pygame.image.tobytes(surface, "RGBA", True)
     texture = context.texture(surface.get_size(), 4, data)
-    texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
-    texture.repeat_x = False
-    texture.repeat_y = False
+    texture.repeat_x = repeat
+    texture.repeat_y = repeat
+    if mipmap:
+        texture.build_mipmaps()
+        texture.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+    else:
+        texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
     return texture
 
 
@@ -1517,6 +1613,8 @@ class Slider:
             return f"{value * 100:.0f}%"
         if self.style == "times":
             return f"{value:.2f}x"
+        if self.style == "pixels":
+            return f"{value:.1f} px"
         if self.style == "rate":
             # Enough decimals to still read as a number four decades down.
             if value < 0.001:
@@ -1560,6 +1658,14 @@ class SliderPanel(Panel):
         ),
         Slider("slick_zoom", "Slick size", 0.5, 30.0, "times", logarithmic=True),
         Slider("slick_opacity", "Iridescence", 0.0, 1.5, "percent"),
+        Slider("paper_relief", "Weave depth", 0.0, 3.0, "percent"),
+        # Below about two and a half pixels a thread the mip chain averages
+        # the weave away and only the photograph's broad blotches survive, so
+        # the track stops before it gets there.
+        Slider("weave_size", "Weave size", 2.5, 40.0, "pixels", logarithmic=True),
+        # Log-scaled so that 1.0, the straight line, sits in the middle of the
+        # track with an equal factor of slow and fast either side of it.
+        Slider("weave_soak", "Weave soaks in", 0.1, 10.0, logarithmic=True),
     )
 
     TITLE = "Wet ink"
@@ -2003,6 +2109,7 @@ class ParchmentInkRenderer:
 
         self.paper_albedo: moderngl.Texture
         self.paper_normal: moderngl.Texture
+        self.ink_grain: moderngl.Texture
         self.paper_roughness: moderngl.Texture
         self.ink_mask = self.context.texture(self.canvas.mask_size, 4)
         self.ink_mask.filter = (moderngl.LINEAR, moderngl.LINEAR)
@@ -2028,6 +2135,8 @@ class ParchmentInkRenderer:
 
         self._rebuild_base_ink()
         self.upload_wetness()
+        self.canvas_normal = load_canvas_normal()
+        self.normal_gain = 1.0
         self._replace_paper_textures(seed)
 
         self.program["u_paper_albedo"].value = 0
@@ -2036,8 +2145,12 @@ class ParchmentInkRenderer:
         self.program["u_ink_mask"].value = 3
         self.program["u_ink_wet"].value = 4
         self.program["u_oil_slick"].value = 5
+        self.program["u_ink_grain"].value = 6
         self.program["u_slick_gain"].value = self.slick_gain
         self.program["u_resolution"].value = tuple(float(value) for value in size)
+        # The dry-down stops here rather than at zero, which is what the weave's
+        # changeover has to be measured against.
+        self.program["u_wet_floor"].value = PAGE_WET_FLOOR
 
     def _rebuild_base_ink(self) -> None:
         """Regenerate the demo artwork underneath the user's strokes."""
@@ -2111,20 +2224,62 @@ class ParchmentInkRenderer:
         self.sprite_page = (self.sprite_page + delta) % pages
         self._rebuild_base_ink()
 
-    def _replace_paper_textures(self, seed: int) -> None:
-        maps = generate_paper_maps(self.size, seed)
-        new_textures = (
-            surface_to_texture(self.context, maps.albedo),
-            surface_to_texture(self.context, maps.normal),
-            surface_to_texture(self.context, maps.roughness),
-        )
+    def _weave_tiles(self, weave_size: float) -> tuple[float, float]:
+        """How often the weave repeats, for a wanted spacing between threads.
 
-        for name in ("paper_albedo", "paper_normal", "paper_roughness"):
+        `weave_size` is in page pixels, so asking for finer marks means more
+        repeats. The generated parchment is made at the window's aspect and
+        covers the page exactly once, so it stays at one repeat; a photograph
+        has an aspect of its own, and stretching it would shear the weave.
+        """
+        if self.canvas_normal is None:
+            return (1.0, 1.0)
+
+        weave_width, weave_height = self.canvas_normal.get_size()
+        page_width, page_height = self.size
+        across = (
+            CANVAS_WEAVE_PERIOD * page_width / (max(weave_size, 0.1) * weave_width)
+        )
+        down = across * (page_height / page_width) * (weave_width / weave_height)
+        return (across, down)
+
+    def _replace_paper_textures(self, seed: int) -> None:
+        """Regenerate the parchment for a new seed.
+
+        The weave, when there is one, is a photograph rather than something the
+        seed produces, so it is uploaded once and left alone; the albedo, the
+        roughness and the grain under the ink are rebuilt each time.
+        """
+        maps = generate_paper_maps(self.size, seed)
+        new_textures = {
+            "paper_albedo": surface_to_texture(self.context, maps.albedo),
+            "paper_roughness": surface_to_texture(self.context, maps.roughness),
+            # The ink is lit by the generated grain whether or not a weave was
+            # loaded, so a coat of ink looks the same as it always did.
+            "ink_grain": surface_to_texture(self.context, maps.normal),
+        }
+
+        if self.canvas_normal is None:
+            new_textures["paper_normal"] = surface_to_texture(
+                self.context, maps.normal
+            )
+            self.normal_gain = 1.0
+        elif getattr(self, "paper_normal", None) is None:
+            new_textures["paper_normal"] = surface_to_texture(
+                self.context, self.canvas_normal, repeat=True, mipmap=True
+            )
+            # The photographed weave has far gentler slopes than the procedural
+            # parchment. Matching their average puts it at the depth the rest of
+            # the lighting was tuned against, so `paper_relief` reads as 100%.
+            self.normal_gain = mean_tangent_deviation(maps.normal) / max(
+                mean_tangent_deviation(self.canvas_normal), 1e-4
+            )
+
+        for name, texture in new_textures.items():
             old_texture = getattr(self, name, None)
             if old_texture is not None:
                 old_texture.release()
-
-        self.paper_albedo, self.paper_normal, self.paper_roughness = new_textures
+            setattr(self, name, texture)
 
     def regenerate_paper(self) -> None:
         self.seed += 1
@@ -2152,9 +2307,15 @@ class ParchmentInkRenderer:
         self.ink_mask.use(location=3)
         self.ink_wet.use(location=4)
         self.oil_slick.use(location=5)
+        self.ink_grain.use(location=6)
 
         self.program["u_light_uv"].value = light_uv
         self.program["u_light_height"].value = settings.light_height
+        self.program["u_paper_relief"].value = settings.paper_relief * self.normal_gain
+        self.program["u_weave_soak"].value = max(settings.weave_soak, 1e-3)
+        self.program["u_paper_normal_tiles"].value = self._weave_tiles(
+            settings.weave_size
+        )
         self.program["u_page_wetness"].value = settings.wetness
         self.program["u_wet_gain"].value = self.canvas.wet_gain(settings.dry_rate)
         self.program["u_slick_opacity"].value = settings.slick_opacity
@@ -2185,6 +2346,7 @@ class ParchmentInkRenderer:
         self.menu.release()
         self.paper_albedo.release()
         self.paper_normal.release()
+        self.ink_grain.release()
         self.paper_roughness.release()
         self.ink_mask.release()
         self.ink_wet.release()
