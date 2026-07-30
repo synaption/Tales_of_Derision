@@ -86,7 +86,6 @@ uniform sampler2D u_ink_mask;
 uniform sampler2D u_ink_wet;
 uniform sampler2D u_oil_slick;
 uniform float u_slick_gain;
-uniform float u_time;
 
 // How much of the oil film shows over the ink, how fast it swirls while the ink
 // is still liquid, and how much of the sheet one copy of the photograph covers.
@@ -95,6 +94,11 @@ uniform float u_time;
 uniform float u_slick_opacity;
 uniform float u_slick_swirl;
 uniform float u_slick_zoom;
+
+// How sharply drying slows the swirl, and the factor that keeps the total travel
+// the same however sharply it does. See the derivation where they are used.
+uniform float u_swirl_dryness;
+uniform float u_swirl_span;
 
 uniform vec2 u_resolution;
 uniform vec2 u_light_uv;
@@ -235,13 +239,33 @@ void main() {
     // while the ink is liquid, settling into place as the shine goes.
     float coat = ink * wetness;
     vec3 reflection = reflect(-view_direction, normal);
-    // Every phase advances at a fixed rate; only the amplitude follows the
-    // wetness, otherwise drying ink would jerk the swirl backwards.
-    vec2 flow = vec2(page_uv.x * aspect, page_uv.y)
-        + vec2(0.033, -0.052) * u_time * u_slick_swirl;
+    // The swirl is driven by drying rather than by the clock, so each patch of
+    // ink churns at its own speed: fast while it is liquid, creeping as it sets,
+    // frozen once dry. A pixel's phase is the integral of its own rate, and for
+    // a rate following a power of the wetness that integral closes in the
+    // wetness itself, with K = u_swirl_dryness setting how sharply drying slows
+    // the film down:
+    //     rate(age)  = R / tau * exp(-K * age / tau)
+    //     phase(age) = R / K * (1 - exp(-K * age / tau)) = R / K * (1 - wetness^K)
+    // which needs no history and cannot jump, however the wetness got there.
+    // u_swirl_span carries the 1/K and normalises the total travel to R, so that
+    // K only redistributes the churn over the dry-down instead of adding more:
+    // near zero the film creeps evenly the whole way, high up it does nearly all
+    // of its moving in the first instant of being wet.
+    //
+    // Leaving tau out of the phase fixes the total travel and lets the drying
+    // slider stretch it over more time. Keeping it in would instead fix the
+    // speed, but then ink laid down one fade step apart would sit a large phase
+    // apart, and a slowly drawn stroke would show stripes where the steps fell
+    // -- a whole second of churn between one band of ink and the next.
+    float swirl = u_slick_swirl * (1.0 - pow(wetness, u_swirl_dryness))
+        * u_swirl_span;
+
+    vec2 flow = vec2(page_uv.x * aspect, page_uv.y) + vec2(0.13, -0.21) * swirl;
+    // Wet ink is also warped more strongly, not just faster.
     flow += vec2(
-        sin(flow.y * 7.7 + u_time * 1.7 * u_slick_swirl),
-        cos(flow.x * 6.6 - u_time * 1.3 * u_slick_swirl)
+        sin(flow.y * 7.7 + swirl * 6.8),
+        cos(flow.x * 6.6 - swirl * 5.2)
     ) * 0.055 * wetness;
 
     // The warp from the normal has to stay gentle: the ink normal carries the
@@ -337,13 +361,23 @@ class DemoSettings:
     debug_mode: int = 0
     brush_radius: int = 5
     drying: bool = True
-    moment: float = 0.0
 
     # Live-tunable material controls, all exposed as sliders.
     dry_rate: float = 1.00
     slick_opacity: float = 0.50
     slick_swirl: float = 0.35
     slick_zoom: float = 2.20
+    swirl_dryness: float = 1.00
+
+    @property
+    def swirl_span(self) -> float:
+        """Normalises the swirl's total travel against `swirl_dryness`.
+
+        The film's phase runs from 0 at fresh to `slick_swirl` by the time the ink
+        has dried to the floor, whatever shape the slowdown takes, so the two
+        sliders stay independent of each other.
+        """
+        return 1.0 / (1.0 - PAGE_WET_FLOOR**self.swirl_dryness)
 
     def advance(self, elapsed: float) -> bool:
         """Dry the page-wide ink. Returns True if the wetness changed.
@@ -352,9 +386,6 @@ class DemoSettings:
         multiply to `exp(-total / tau)` -- so this is frame-rate independent and
         needs no absolute clock, which also lets `[`/`]` nudge the value.
         """
-        # The clock the slick swirls on keeps running even when drying is held.
-        self.moment += elapsed
-
         if not self.drying or self.wetness <= PAGE_WET_FLOOR + 1e-4:
             return False
 
@@ -1378,6 +1409,9 @@ class SliderPanel(Panel):
             logarithmic=True,
         ),
         Slider("slick_swirl", "Swirl speed", 0.0001, 1.5, "rate", logarithmic=True),
+        Slider(
+            "swirl_dryness", "Slows as it dries", 0.1, 10.0, logarithmic=True
+        ),
         Slider("slick_zoom", "Slick size", 0.5, 30.0, "times", logarithmic=True),
         Slider("slick_opacity", "Iridescence", 0.0, 1.5, "percent"),
     )
@@ -1697,10 +1731,11 @@ class ParchmentInkRenderer:
         self.program["u_light_height"].value = settings.light_height
         self.program["u_page_wetness"].value = settings.wetness
         self.program["u_wet_gain"].value = self.canvas.wet_gain(settings.dry_rate)
-        self.program["u_time"].value = settings.moment
         self.program["u_slick_opacity"].value = settings.slick_opacity
         self.program["u_slick_swirl"].value = settings.slick_swirl
         self.program["u_slick_zoom"].value = max(settings.slick_zoom, 1e-3)
+        self.program["u_swirl_dryness"].value = settings.swirl_dryness
+        self.program["u_swirl_span"].value = settings.swirl_span
         self.program["u_exposure"].value = settings.exposure
         self.program["u_debug_mode"].value = settings.debug_mode
         self.program["u_zoom"].value = 1.0 if view is None else view.zoom
