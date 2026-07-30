@@ -552,10 +552,10 @@ def reveal_travel(
                 )
             clock += span
 
-    return _fill_unreached(travel, mask, clock)
+    return fill_unreached(travel, mask, clock)
 
 
-def _fill_unreached(
+def fill_unreached(
     travel: np.ndarray, mask: np.ndarray, clock: float
 ) -> np.ndarray:
     """Give a time to pixels the nib never covered, from their neighbours.
