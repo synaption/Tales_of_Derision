@@ -4,7 +4,7 @@ import math
 import random
 import sys
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 try:
@@ -19,7 +19,17 @@ except ImportError as exc:
 
 
 WINDOW_SIZE = (1000, 700)
+# The demo artwork is composed against this page and scaled to whatever window
+# the menu is set to, so every resolution shows the same layout.
+DESIGN_SIZE = (1000, 700)
 PAPER_TEXTURE_WIDTH = 512
+
+# The ink mask is drawn at this multiple of the window resolution. Zooming in
+# magnifies the mask, so a stroke's edge is only ever as smooth as the grid it
+# was drawn on; supersampling buys back that headroom for memory and stamping
+# time, and costs nothing per frame. At rest the extra samples are not wasted
+# either: the bilinear fetch lands exactly between texels and box-filters them.
+INK_SUPERSAMPLE = 2
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SPRITE_SHEET_PATH = (
@@ -162,7 +172,9 @@ void main() {
         return;
     }
 
-    vec2 texel = 1.0 / vec2(textureSize(u_ink_mask, 0));
+    // A page pixel, not a mask texel: the relief below is tuned to the width of
+    // the ramp the brush leaves, so supersampling the mask must not narrow it.
+    vec2 texel = 1.0 / u_resolution;
 
     vec3 paper_albedo = to_linear(texture(u_paper_albedo, page_uv).rgb);
     vec3 paper_normal = normalize(texture(u_paper_normal, page_uv).rgb * 2.0 - 1.0);
@@ -397,6 +409,80 @@ class DemoSettings:
         """Flood the page with fresh ink again and restart the dry-down."""
         self.wetness = 1.0
         self.drying = True
+
+
+@dataclass
+class DisplayOptions:
+    """What the menu can change but a running renderer cannot.
+
+    Both of these decide how much texture gets allocated, so changing either
+    means tearing the renderer down and building it again. They are kept apart
+    from `DemoSettings` for that reason: everything there is live, everything
+    here costs a rebuild, which is why the options page has an Apply row.
+    """
+
+    size: tuple[int, int] = WINDOW_SIZE
+    supersample: int = INK_SUPERSAMPLE
+    fullscreen: bool = False
+
+    SIZES = (
+        (800, 560),
+        (1000, 700),
+        (1280, 720),
+        (1600, 900),
+        (1920, 1080),
+        (2560, 1440),
+        (3840, 2160),
+    )
+    SUPERSAMPLES = (1, 2, 3, 4)
+    MODES = (False, True)
+
+    # The list is deliberately not filtered against the desktop. What a window
+    # manager will grant is not reliably knowable in advance -- fullscreen tends
+    # to land on the desktop resolution whatever it was asked for -- so the size
+    # actually granted is read back afterwards instead of guessed at here.
+    def choices(self, field: str) -> tuple:
+        """The values `field` can take, in the order the menu steps through."""
+        if field == "size":
+            return self.SIZES
+        if field == "fullscreen":
+            return self.MODES
+        return self.SUPERSAMPLES
+
+    def cycle(self, field: str, step: int) -> None:
+        choices = self.choices(field)
+        current = getattr(self, field)
+        if current in choices:
+            index = choices.index(current)
+        elif field == "size":
+            # The granted size need not be one that was offered, so step off
+            # the nearest entry by area rather than back to the top of the list.
+            index = min(
+                range(len(choices)),
+                key=lambda i: abs(
+                    choices[i][0] * choices[i][1] - current[0] * current[1]
+                ),
+            )
+        else:
+            index = 0
+        setattr(self, field, choices[(index + step) % len(choices)])
+
+    @staticmethod
+    def _format(field: str, value) -> str:
+        if field == "size":
+            return f"{value[0]} x {value[1]}"
+        if field == "fullscreen":
+            return "Fullscreen" if value else "Windowed"
+        return "off" if value == 1 else f"{value}x"
+
+    def text(self, field: str) -> str:
+        return self._format(field, getattr(self, field))
+
+    def widest_text(self, field: str) -> str:
+        """The longest reading a field can show, for sizing its column."""
+        return max(
+            (self._format(field, value) for value in self.choices(field)), key=len
+        )
 
 
 class View:
@@ -808,15 +894,36 @@ def make_demo_ink(
     size: tuple[int, int],
     sprites: SpriteSheet | None = None,
     sprite_page: int = 0,
+    scale: int = 1,
 ) -> pygame.Surface:
-    """Create anti-aliased ink artwork; its alpha channel becomes the ink mask."""
-    width, height = size
-    ink_mask = pygame.Surface(size, pygame.SRCALPHA)
+    """Create anti-aliased ink artwork; its alpha channel becomes the ink mask.
+
+    Everything below is measured in the design space named by `DESIGN_SIZE` and
+    converted on its way to the drawing call, by `at` for a position and `span`
+    for a length. That absorbs two things at once: the window can be any of the
+    sizes the menu offers, and the mask is drawn at `scale` times the page. Type
+    and line weights go through the same conversion, so the artwork is laid out
+    at the final resolution rather than enlarged afterwards and gains real
+    detail instead of a smoother version of the same staircase.
+    """
+    page_width, page_height = size
+    width, height = page_width * scale, page_height * scale
+    ink_mask = pygame.Surface((width, height), pygame.SRCALPHA)
     ink_mask.fill((0, 0, 0, 0))
 
-    title_font = pygame.font.SysFont("serif", 58, bold=True)
-    body_font = pygame.font.SysFont("serif", 28)
-    small_font = pygame.font.SysFont("serif", 20, italic=True)
+    design_width, design_height = DESIGN_SIZE
+    # The smaller of the two ratios, so the composition is never cropped.
+    unit = scale * min(page_width / design_width, page_height / design_height)
+
+    def at(x: float, y: float) -> tuple[int, int]:
+        return (round(x * unit), round(y * unit))
+
+    def span(value: float) -> int:
+        return max(1, round(value * unit))
+
+    title_font = pygame.font.SysFont("serif", span(58), bold=True)
+    body_font = pygame.font.SysFont("serif", span(28))
+    small_font = pygame.font.SysFont("serif", span(20), italic=True)
 
     def draw_text(
         text: str,
@@ -826,7 +933,7 @@ def make_demo_ink(
     ) -> None:
         rendered = font.render(text, True, (255, 255, 255))
         rendered.set_alpha(opacity)
-        ink_mask.blit(rendered, position)
+        ink_mask.blit(rendered, at(*position))
 
     draw_text("The Cartographer's Ledger", title_font, (90, 72))
     draw_text(
@@ -841,41 +948,49 @@ def make_demo_ink(
     )
 
     white = (255, 255, 255, 255)
-    pygame.draw.line(ink_mask, white, (95, 245), (width - 95, 245), 5)
-    pygame.draw.circle(ink_mask, white, (width // 2, 245), 13, 3)
+    rule_y = at(0, 245)[1]
+    pygame.draw.line(
+        ink_mask, white, (span(95), rule_y), (width - span(95), rule_y), span(5)
+    )
+    pygame.draw.circle(ink_mask, white, (width // 2, rule_y), span(13), span(3))
 
     points: list[tuple[int, int]] = []
-    for x in range(120, width - 120, 8):
+    for x in range(120, design_width - 120, 8):
         y = 390 + int(52 * math.sin(x * 0.018)) + int(16 * math.sin(x * 0.053))
-        points.append((x, y))
-    pygame.draw.lines(ink_mask, white, False, points, 12)
+        points.append(at(x, y))
+    # Stretch the wave across whatever width the page turned out to be.
+    stretch = (width - 2 * span(120)) / max(1, points[-1][0] - points[0][0])
+    points = [
+        (round(span(120) + (x - points[0][0]) * stretch), y) for x, y in points
+    ]
+    pygame.draw.lines(ink_mask, white, False, points, span(12))
 
     # The rose sits up beside the title so the lower right stays free for the
     # featured creature and the sprite strip.
-    center = (width - 145, 320)
-    pygame.draw.circle(ink_mask, white, center, 62, 5)
+    center = (width - span(145), at(0, 320)[1])
+    pygame.draw.circle(ink_mask, white, center, span(62), span(5))
     for angle in range(0, 360, 45):
-        vector = pygame.Vector2(0, -54).rotate(angle)
+        vector = pygame.Vector2(0, -span(54)).rotate(angle)
         endpoint = (round(center[0] + vector.x), round(center[1] + vector.y))
-        pygame.draw.line(ink_mask, white, center, endpoint, 5)
-    pygame.draw.circle(ink_mask, white, center, 10)
+        pygame.draw.line(ink_mask, white, center, endpoint, span(5))
+    pygame.draw.circle(ink_mask, white, center, span(10))
 
     # Thick pools produce broad dark shapes and very visible coat highlights.
     for position, radius in [((430, 520), 30), ((512, 496), 18), ((594, 528), 24)]:
-        pygame.draw.circle(ink_mask, white, position, radius)
+        pygame.draw.circle(ink_mask, white, at(*position), span(radius))
 
     # A few pressure-varying pen strokes.
     for index in range(5):
         y = 292 + index * 18
-        start = (112, y)
-        end = (340 + index * 34, y + random.Random(index).randint(-5, 5))
+        start = at(112, y)
+        end = at(340 + index * 34, y + random.Random(index).randint(-5, 5))
         pygame.draw.aaline(ink_mask, white, start, end)
-        pygame.draw.line(ink_mask, white, start, end, 2 + index // 2)
+        pygame.draw.line(ink_mask, white, start, end, span(2 + index // 2))
 
-    feature = load_ink_image(FEATURE_IMAGE_PATH, FEATURE_IMAGE_HEIGHT)
+    feature = load_ink_image(FEATURE_IMAGE_PATH, span(FEATURE_IMAGE_HEIGHT))
     if feature is not None:
         feature_rect = feature.get_rect()
-        feature_rect.center = (width - 178, height - 150)
+        feature_rect.center = (width - span(178), height - span(150))
         ink_mask.blit(feature, feature_rect, special_flags=pygame.BLEND_RGBA_MAX)
 
     if sprites is not None:
@@ -891,14 +1006,16 @@ def make_demo_ink(
             (100, 538),
         )
 
-        scale = 2
-        spacing = sprites.tile_size * scale + 12
+        # Point-scaled pixel art, so the tiles keep their hard edges and simply
+        # resolve them on more texels. The factor stays whole for that reason.
+        tile_scale = max(1, round(2 * unit))
+        spacing = sprites.tile_size * tile_scale + span(12)
         for column in range(per_page):
             sprites.draw(
                 ink_mask,
                 first_tile + column,
-                (100 + column * spacing, 566),
-                scale=scale,
+                (span(100) + column * spacing, at(0, 566)[1]),
+                scale=tile_scale,
             )
 
     return ink_mask
@@ -948,11 +1065,19 @@ class InkCanvas:
     fresh the ink at each pixel is. Keeping it in its own surface means a drying
     stroke re-uploads one small greyscale region and never touches the coverage
     mask, and it leaves the mask's own colour channels alone.
+
+    Coverage is held at `scale` times the page resolution because its edges are
+    magnified when the view zooms in. Wetness is not: it varies slowly and is
+    only ever seen through the coverage mask, so it stays at page resolution and
+    the cost of drying is unchanged. Every coordinate crossing this class's
+    boundary -- arguments and returned rectangles alike -- is in page pixels.
     """
 
-    def __init__(self, size: tuple[int, int]) -> None:
+    def __init__(self, size: tuple[int, int], scale: int = INK_SUPERSAMPLE) -> None:
         self.size = size
-        self.base = pygame.Surface(size, pygame.SRCALPHA)
+        self.scale = max(1, int(scale))
+        self.mask_size = (size[0] * self.scale, size[1] * self.scale)
+        self.base = pygame.Surface(self.mask_size, pygame.SRCALPHA)
         self.base.fill((0, 0, 0, 0))
         self.surface = self.base.copy()
         self.wetness = pygame.Surface(size)
@@ -966,10 +1091,28 @@ class InkCanvas:
         self.active_stroke: Stroke | None = None
         self._brushes: dict[int, pygame.Surface] = {}
 
+    def mask_rect(self, region: pygame.Rect | None) -> pygame.Rect | None:
+        """Convert a page-pixel rectangle to the coverage mask's finer grid."""
+        if region is None:
+            return None
+        scale = self.scale
+        return pygame.Rect(
+            region.left * scale,
+            region.top * scale,
+            region.width * scale,
+            region.height * scale,
+        ).clip(pygame.Rect((0, 0), self.mask_size))
+
     def _brush(self, radius: int) -> pygame.Surface:
+        """The brush for a page-pixel radius, built on the mask's finer grid.
+
+        Softness is scaled along with the radius so the ramp stays the same
+        fraction of a page pixel: supersampling is meant to resolve the existing
+        edge better, not to sharpen it into a different-looking stroke.
+        """
         brush = self._brushes.get(radius)
         if brush is None:
-            brush = make_brush(radius)
+            brush = make_brush(radius * self.scale, softness=1.5 * self.scale)
             self._brushes[radius] = brush
         return brush
 
@@ -981,20 +1124,23 @@ class InkCanvas:
         erase: bool,
     ) -> pygame.Rect:
         """Stamp the brush along one segment; returns the touched rectangle."""
+        scale = self.scale
         brush = self._brush(radius)
         offset = brush.get_width() * 0.5
         blend = pygame.BLEND_RGBA_SUB if erase else pygame.BLEND_RGBA_MAX
 
         delta_x = end[0] - start[0]
         delta_y = end[1] - start[1]
-        distance = math.hypot(delta_x, delta_y)
-        step = max(1.0, radius * 0.35)
+        # Spacing and travel are both in mask texels, so the stamp count is
+        # unchanged by supersampling and only their placement gets finer.
+        distance = math.hypot(delta_x, delta_y) * scale
+        step = max(1.0, radius * scale * 0.35)
         stamps = max(1, int(distance / step) + 1)
 
         for index in range(stamps + 1):
             travel = index / stamps
-            x = start[0] + delta_x * travel - offset
-            y = start[1] + delta_y * travel - offset
+            x = (start[0] + delta_x * travel) * scale - offset
+            y = (start[1] + delta_y * travel) * scale - offset
             self.surface.blit(brush, (round(x), round(y)), special_flags=blend)
 
         pad = radius + 2
@@ -1004,7 +1150,7 @@ class InkCanvas:
             abs(delta_x) + pad * 2,
             abs(delta_y) + pad * 2,
         )
-        return dirty.clip(self.surface.get_rect())
+        return dirty.clip(pygame.Rect((0, 0), self.size))
 
     def _wet_segment(
         self,
@@ -1282,7 +1428,7 @@ class HelpOverlay(Panel):
         ("Tab", "sliders for drying and the oil slick"),
         ("1 - 5", "final, normals, roughness, ink, wetness"),
         ("?", "hide this card"),
-        ("Esc", "quit"),
+        ("Esc", "menu: display options and quit"),
     )
 
     TITLE = "Controls"
@@ -1556,11 +1702,278 @@ class SliderPanel(Panel):
         return False
 
 
+@dataclass(frozen=True)
+class MenuItem:
+    """One row of the menu: a command to run, or an option to step through."""
+
+    label: str
+    action: str
+    field: str = ""
+
+
+class MenuPanel(Panel):
+    """The Escape menu: resume, display options, quit.
+
+    While it is up it swallows every event, so backing out of it never leaves a
+    stray stroke or a moved lamp behind. Keyboard and mouse both drive it, and
+    it does its own navigating; the only things it hands back to the caller are
+    the two it cannot do itself, quitting and rebuilding the renderer.
+    """
+
+    PAGES: dict[str, tuple[MenuItem, ...]] = {
+        "main": (
+            MenuItem("Resume", "close"),
+            MenuItem("Options", "page:options"),
+            MenuItem("Quit", "quit"),
+        ),
+        "options": (
+            MenuItem("Display", "cycle", "fullscreen"),
+            MenuItem("Resolution", "cycle", "size"),
+            MenuItem("Anti-aliasing", "cycle", "supersample"),
+            MenuItem("Apply", "apply"),
+            MenuItem("Back", "page:main"),
+        ),
+    }
+    TITLES = {"main": "Paused", "options": "Display options"}
+    FOOTERS = {
+        "main": "Arrows and Enter, or the mouse",
+        "options": "Left / Right changes a setting",
+    }
+
+    PADDING = 26
+    ROW_HEIGHT = 36
+    GAP = 40
+    HIGHLIGHT = (58, 47, 36, 255)
+    DIMMED = (132, 122, 104)
+
+    def __init__(
+        self,
+        context: moderngl.Context,
+        window_size: tuple[int, int],
+        display: DisplayOptions,
+    ) -> None:
+        self.title_font = pygame.font.SysFont("serif", 26, bold=True)
+        self.row_font = pygame.font.SysFont("serif", 19)
+        self.value_font = pygame.font.SysFont("monospace", 16, bold=True)
+        self.footer_font = pygame.font.SysFont("serif", 14, italic=True)
+
+        self.page = "main"
+        self.index = 0
+        # Set by the caller when a rebuild did not land on what was asked for,
+        # so the resolution row snapping back to something else is explained
+        # rather than just puzzling.
+        self.note = ""
+
+        label_width = max(
+            self.row_font.size(item.label)[0]
+            for items in self.PAGES.values()
+            for item in items
+        )
+        value_width = max(
+            self.value_font.size(display.widest_text(item.field))[0]
+            for items in self.PAGES.values()
+            for item in items
+            if item.field
+        )
+        title_height = max(
+            self.title_font.size(title)[1] for title in self.TITLES.values()
+        )
+        footer_height = max(
+            self.footer_font.size(footer)[1] for footer in self.FOOTERS.values()
+        )
+
+        self._header = title_height + 18
+        self._footer = footer_height + 16
+        # One size fits both pages: the quad behind the card is fixed, and a
+        # menu that resized itself as you stepped through it would be worse.
+        self._rows = max(len(items) for items in self.PAGES.values())
+        size = (
+            self.PADDING * 2 + label_width + self.GAP + value_width,
+            self.PADDING * 2
+            + self._header
+            + self._rows * self.ROW_HEIGHT
+            + self._footer,
+        )
+        super().__init__(context, window_size, make_panel_surface(size))
+        self.refresh(display, display)
+
+    @property
+    def items(self) -> tuple[MenuItem, ...]:
+        return self.PAGES[self.page]
+
+    def _row_rect(self, index: int) -> pygame.Rect:
+        """Where a row sits, in window pixels."""
+        return pygame.Rect(
+            self.rect.left + self.PADDING // 2,
+            self.rect.top + self.PADDING + self._header + index * self.ROW_HEIGHT,
+            self.rect.width - self.PADDING,
+            self.ROW_HEIGHT,
+        )
+
+    def refresh(self, display: DisplayOptions, active: DisplayOptions) -> None:
+        """Redraw for the current page and push it to the GPU.
+
+        `display` is what the menu is editing and `active` is what the renderer
+        was actually built with, so Apply can say whether there is anything
+        waiting rather than looking like a button that does nothing.
+        """
+        panel = make_panel_surface(self.rect.size)
+        title = self.title_font.render(self.TITLES[self.page], True, PANEL_TITLE)
+        panel.blit(title, ((self.rect.width - title.get_width()) // 2, self.PADDING))
+
+        pending = display != active
+        for index, item in enumerate(self.items):
+            row = self._row_rect(index).move(-self.rect.left, -self.rect.top)
+            selected = index == self.index
+            waiting = item.action != "apply" or pending
+
+            if selected:
+                pygame.draw.rect(panel, self.HIGHLIGHT, row, border_radius=4)
+
+            # Apply is lit while there is something to apply and greyed once
+            # there is not, so the row says whether pressing it would do work.
+            colour = PANEL_TEXT
+            if selected or (item.action == "apply" and pending):
+                colour = PANEL_KEY
+            if not waiting:
+                colour = self.DIMMED
+            label = self.row_font.render(item.label, True, colour)
+            panel.blit(
+                label,
+                (row.left + self.PADDING // 2, row.centery - label.get_height() // 2),
+            )
+
+            if item.field:
+                reading = self.value_font.render(
+                    f"< {display.text(item.field)} >", True, colour
+                )
+                panel.blit(
+                    reading,
+                    (
+                        row.right - self.PADDING // 2 - reading.get_width(),
+                        row.centery - reading.get_height() // 2,
+                    ),
+                )
+
+        if self.note:
+            message, colour = self.note, PANEL_KEY
+        elif self.page == "options" and pending:
+            message, colour = "restart pending", PANEL_KEY
+        else:
+            message, colour = self.FOOTERS[self.page], self.DIMMED
+        footer = self.footer_font.render(message, True, colour)
+        panel.blit(
+            footer,
+            (
+                (self.rect.width - footer.get_width()) // 2,
+                self.rect.height - self.PADDING - footer.get_height(),
+            ),
+        )
+
+        self.update(panel)
+
+    def open(self) -> None:
+        self.page = "main"
+        self.index = 0
+        self.note = ""
+        self.visible = True
+
+    def _cycle(self, display: DisplayOptions, field: str, step: int) -> None:
+        # Whatever the last rebuild had to say about itself is stale the moment
+        # the user asks for something different.
+        self.note = ""
+        display.cycle(field, step)
+
+    def _move(self, step: int) -> None:
+        self.index = (self.index + step) % len(self.items)
+
+    def _go(self, page: str) -> None:
+        self.page = page
+        self.index = 0
+
+    def activate(self, display: DisplayOptions) -> str:
+        """Run the selected row. Returns the part the caller has to do."""
+        item = self.items[self.index]
+        if item.action == "close":
+            self.visible = False
+        elif item.action.startswith("page:"):
+            self._go(item.action.split(":", 1)[1])
+        elif item.action == "cycle":
+            self._cycle(display, item.field, 1)
+        else:
+            return item.action
+        return ""
+
+    def handle(
+        self,
+        event: pygame.event.Event,
+        display: DisplayOptions,
+        active: DisplayOptions,
+    ) -> str:
+        """Consume one event. Returns "quit", "apply", or nothing."""
+        action = ""
+
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                if self.page == "main":
+                    self.visible = False
+                else:
+                    self._go("main")
+            elif event.key in (pygame.K_UP, pygame.K_w, pygame.K_KP8):
+                self._move(-1)
+            elif event.key in (pygame.K_DOWN, pygame.K_s, pygame.K_KP2):
+                self._move(1)
+            elif event.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                item = self.items[self.index]
+                if item.action == "cycle":
+                    self._cycle(
+                        display, item.field, 1 if event.key == pygame.K_RIGHT else -1
+                    )
+            elif event.key in (
+                pygame.K_RETURN,
+                pygame.K_KP_ENTER,
+                pygame.K_SPACE,
+            ):
+                action = self.activate(display)
+
+        elif event.type == pygame.MOUSEMOTION:
+            for index in range(len(self.items)):
+                if self._row_rect(index).collidepoint(event.pos):
+                    self.index = index
+                    break
+
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for index in range(len(self.items)):
+                if self._row_rect(index).collidepoint(event.pos):
+                    self.index = index
+                    action = self.activate(display)
+                    break
+
+        elif event.type == pygame.MOUSEWHEEL:
+            item = self.items[self.index]
+            if item.action == "cycle":
+                self._cycle(display, item.field, 1 if event.y > 0 else -1)
+            else:
+                self._move(-1 if event.y > 0 else 1)
+
+        self.refresh(display, active)
+        return action
+
+
 class ParchmentInkRenderer:
-    def __init__(self, size: tuple[int, int], seed: int = 7) -> None:
+    def __init__(
+        self,
+        size: tuple[int, int],
+        seed: int = 7,
+        supersample: int = INK_SUPERSAMPLE,
+    ) -> None:
         self.size = size
         self.seed = seed
         self.context = moderngl.create_context(require=330)
+        # Re-opening the window for a new resolution leaves ModernGL's idea of
+        # the default framebuffer at the old size, so say what it is. Drawing
+        # sets the viewport itself; this is for anything that reads the screen.
+        self.context.screen.viewport = (0, 0, *size)
         self.context.disable(moderngl.DEPTH_TEST)
         self.context.disable(moderngl.CULL_FACE)
 
@@ -1586,12 +1999,12 @@ class ParchmentInkRenderer:
 
         self.sprites = load_sprite_sheet()
         self.sprite_page = 0
-        self.canvas = InkCanvas(size)
+        self.canvas = InkCanvas(size, scale=supersample)
 
         self.paper_albedo: moderngl.Texture
         self.paper_normal: moderngl.Texture
         self.paper_roughness: moderngl.Texture
-        self.ink_mask = self.context.texture(size, 4)
+        self.ink_mask = self.context.texture(self.canvas.mask_size, 4)
         self.ink_mask.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.ink_mask.repeat_x = False
         self.ink_mask.repeat_y = False
@@ -1604,6 +2017,9 @@ class ParchmentInkRenderer:
 
         self.help = HelpOverlay(self.context, size)
         self.sliders = SliderPanel(self.context, size, DemoSettings())
+        self.menu = MenuPanel(
+            self.context, size, DisplayOptions(size, self.canvas.scale)
+        )
 
         slick, slick_gain = load_oil_slick()
         # The shader folds the coordinate to tile it, so clamping is what we want.
@@ -1625,7 +2041,11 @@ class ParchmentInkRenderer:
 
     def _rebuild_base_ink(self) -> None:
         """Regenerate the demo artwork underneath the user's strokes."""
-        self.canvas.set_base(make_demo_ink(self.size, self.sprites, self.sprite_page))
+        self.canvas.set_base(
+            make_demo_ink(
+                self.size, self.sprites, self.sprite_page, scale=self.canvas.scale
+            )
+        )
         self.upload_ink()
 
     def _write_region(
@@ -1657,15 +2077,21 @@ class ParchmentInkRenderer:
             data,
             viewport=(
                 region.left,
-                self.size[1] - region.bottom,
+                surface.get_height() - region.bottom,
                 region.width,
                 region.height,
             ),
         )
 
     def upload_ink(self, region: pygame.Rect | None = None) -> None:
-        """Push the ink coverage to the GPU, only the changed rectangle."""
-        self._write_region(self.ink_mask, self.canvas.surface, region)
+        """Push the ink coverage to the GPU, only the changed rectangle.
+
+        The region arrives in page pixels, like every rectangle the canvas
+        hands out, and is converted here to the mask's own grid.
+        """
+        self._write_region(
+            self.ink_mask, self.canvas.surface, self.canvas.mask_rect(region)
+        )
 
     def upload_wetness(self, region: pygame.Rect | None = None) -> None:
         """Push the stroke wetness field to its single-channel texture."""
@@ -1749,10 +2175,14 @@ class ParchmentInkRenderer:
             self.sliders.draw()
         if self.help.visible:
             self.help.draw()
+        # The menu is modal, so it goes over everything else.
+        if self.menu.visible:
+            self.menu.draw()
 
     def release(self) -> None:
         self.help.release()
         self.sliders.release()
+        self.menu.release()
         self.paper_albedo.release()
         self.paper_normal.release()
         self.paper_roughness.release()
@@ -1762,6 +2192,75 @@ class ParchmentInkRenderer:
         self.vertex_array.release()
         self.vertex_buffer.release()
         self.program.release()
+
+
+def open_window(size: tuple[int, int], fullscreen: bool = False) -> tuple[int, int]:
+    """Open the window with a core OpenGL context; return the size granted.
+
+    A window manager is free to refuse what it is asked for. Fullscreen usually
+    lands on the desktop resolution whatever mode was requested, and growing an
+    existing window past the desktop may simply not happen. Everything from the
+    page outwards is sized from this, so the size that came back is the one to
+    believe rather than the one that was asked for.
+    """
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    pygame.display.gl_set_attribute(
+        pygame.GL_CONTEXT_PROFILE_MASK,
+        pygame.GL_CONTEXT_PROFILE_CORE,
+    )
+    pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
+    pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 0)
+
+    flags = pygame.OPENGL | pygame.DOUBLEBUF
+    if fullscreen:
+        flags |= pygame.FULLSCREEN
+    pygame.display.set_mode(size, flags)
+    return pygame.display.get_window_size()
+
+
+def rebuild_renderer(
+    old: ParchmentInkRenderer,
+    display: DisplayOptions,
+    settings: DemoSettings,
+    view: View,
+) -> tuple[ParchmentInkRenderer, View]:
+    """Reopen the window for new display options, carrying the page across.
+
+    Every option changes how much texture is allocated, so there is nothing to
+    do but build everything again. What survives is what the user made: the
+    strokes, which are kept as points and can simply be laid down onto the new
+    mask, along with the view, the material settings and which panels were up.
+
+    `display.size` is updated to the size the window manager actually granted,
+    so the menu reports where you ended up rather than where you aimed.
+    """
+    strokes = old.canvas.strokes
+    sprite_page = old.sprite_page
+    seed = old.seed
+    panels = (old.help.visible, old.sliders.visible, old.menu.visible, old.menu.page)
+    old.release()
+
+    display.size = open_window(display.size, display.fullscreen)
+    fresh = ParchmentInkRenderer(display.size, seed, display.supersample)
+
+    # `change_sprite_page` counts from the page a new renderer starts on, zero.
+    if sprite_page:
+        fresh.change_sprite_page(sprite_page)
+    if strokes:
+        fresh.canvas.strokes = strokes
+        fresh.canvas.recomposite()
+    fresh.upload_ink()
+
+    fresh.help.visible, fresh.sliders.visible = panels[0], panels[1]
+    fresh.menu.visible, fresh.menu.page = panels[2], panels[3]
+    fresh.sliders.refresh(settings)
+    fresh.menu.refresh(display, display)
+
+    fresh_view = View(display.size)
+    fresh_view.zoom = view.zoom
+    fresh_view.center_x, fresh_view.center_y = view.center_x, view.center_y
+    return fresh, fresh_view
 
 
 def update_caption(settings: DemoSettings, view: View) -> None:
@@ -1781,19 +2280,10 @@ def main() -> None:
     pygame.init()
     pygame.font.init()
 
-    # Ask Pygame for a modern core OpenGL context before creating the window.
-    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
-    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
-    pygame.display.gl_set_attribute(
-        pygame.GL_CONTEXT_PROFILE_MASK,
-        pygame.GL_CONTEXT_PROFILE_CORE,
-    )
-    pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
-    pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 0)
-
+    display = DisplayOptions()
     try:
-        pygame.display.set_mode(WINDOW_SIZE, pygame.OPENGL | pygame.DOUBLEBUF)
-        renderer = ParchmentInkRenderer(WINDOW_SIZE)
+        display.size = open_window(display.size, display.fullscreen)
+        renderer = ParchmentInkRenderer(display.size, supersample=display.supersample)
     except Exception as exc:
         pygame.quit()
         raise SystemExit(
@@ -1802,12 +2292,16 @@ def main() -> None:
             f"Original error: {exc}"
         ) from exc
 
+    # What the renderer standing in front of us was actually built with, so the
+    # menu can tell a pending change from an applied one.
+    active = replace(display)
+
     clock = pygame.time.Clock()
     settings = DemoSettings()
-    view = View(WINDOW_SIZE)
+    view = View(display.size)
     update_caption(settings, view)
 
-    light_position = (WINDOW_SIZE[0] // 2, WINDOW_SIZE[1] // 2)
+    light_position = (renderer.size[0] // 2, renderer.size[1] // 2)
     drawing = False
     panning = False
     elapsed = 0.0
@@ -1817,14 +2311,41 @@ def main() -> None:
     while running:
         caption_changed = False
         for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+                continue
+
+            # The menu is modal: while it is up nothing else sees an event, so
+            # arrowing through it cannot also nudge the lamp or the page.
+            if renderer.menu.visible:
+                action = renderer.menu.handle(event, display, active)
+                if action == "quit":
+                    running = False
+                elif action == "apply" and display != active:
+                    wanted = display.size
+                    renderer, view = rebuild_renderer(
+                        renderer, display, settings, view
+                    )
+                    active = replace(display)
+                    if display.size != wanted:
+                        renderer.menu.note = (
+                            f"window manager kept {display.text('size')}"
+                        )
+                    renderer.menu.refresh(display, active)
+                    light_position = (renderer.size[0] // 2, renderer.size[1] // 2)
+                    caption_changed = True
+                    # The rebuild took about a second; do not hand that to the
+                    # dry-down as if it were one very long frame.
+                    elapsed = 0.0
+                    clock.tick()
+                continue
+
             # The slider panel gets first refusal on the mouse, so dragging a
             # control neither draws ink nor drags the lamp along with it.
             if renderer.sliders.handle(event, settings):
                 continue
 
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 2:
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 2:
                 panning = True
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 2:
                 panning = False
@@ -1860,7 +2381,10 @@ def main() -> None:
                 caption_changed = True
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    running = False
+                    # Escape no longer quits on the spot; it asks.
+                    renderer.menu.open()
+                    renderer.menu.refresh(display, active)
+                    drawing = panning = False
                 elif getattr(event, "unicode", "") == "?" or event.key in (
                     pygame.K_QUESTION,
                     pygame.K_SLASH,
@@ -1923,6 +2447,10 @@ def main() -> None:
                 elif event.key in (pygame.K_0, pygame.K_KP0, pygame.K_HOME):
                     view.reset()
                     caption_changed = True
+
+        # The menu pauses the page, so ink is not quietly drying out behind it.
+        if renderer.menu.visible:
+            elapsed = 0.0
 
         # The page-wide ink and each individual stroke dry on the same clock.
         if settings.advance(elapsed) and abs(settings.wetness - shown_wetness) >= 0.01:
