@@ -27,6 +27,14 @@ SPRITE_SHEET_PATH = (
 )
 SPRITE_TILE_SIZE = 32
 
+FEATURE_IMAGE_PATH = (
+    Path(__file__).resolve().parent
+    / "outputs"
+    / "inv"
+    / "creature_059_smoothed_512.png"
+)
+FEATURE_IMAGE_HEIGHT = 160
+
 
 VERTEX_SHADER = """
 #version 330
@@ -57,6 +65,8 @@ uniform float u_light_height;
 uniform float u_wetness;
 uniform float u_exposure;
 uniform int u_debug_mode;
+uniform float u_zoom;
+uniform vec2 u_center_uv;
 
 in vec2 v_uv;
 out vec4 frag_color;
@@ -80,17 +90,41 @@ vec3 fresnel_schlick(float cos_theta, vec3 f0) {
 }
 
 void main() {
+    float aspect = u_resolution.x / u_resolution.y;
+
+    // Screen space stays put while the page zooms and pans underneath it, so
+    // the lamp keeps behaving like a fixed desk light above the viewer.
+    vec2 page_uv = (v_uv - 0.5) / u_zoom + u_center_uv;
+
+    vec2 marker_delta = (v_uv - u_light_uv) * vec2(aspect, 1.0);
+    float marker_distance = length(marker_delta);
+    float marker = 1.0 - smoothstep(0.010, 0.012, abs(marker_distance - 0.013));
+
+    vec3 warm_light = to_linear(vec3(1.00, 0.84, 0.61));
+    vec3 ambient_light = to_linear(vec3(0.34, 0.29, 0.22));
+
+    // Anything off the sheet is the desk it is lying on.
+    if (any(lessThan(page_uv, vec2(0.0))) || any(greaterThan(page_uv, vec2(1.0)))) {
+        vec3 desk = to_linear(vec3(0.078, 0.062, 0.049));
+        desk *= 1.0 / (1.0 + 4.5 * marker_distance * marker_distance);
+        if (u_debug_mode == 0) {
+            desk += warm_light * marker * 0.22;
+        }
+        frag_color = vec4(to_srgb(desk * u_exposure), 1.0);
+        return;
+    }
+
     vec2 texel = 1.0 / vec2(textureSize(u_ink_mask, 0));
 
-    vec3 paper_albedo = to_linear(texture(u_paper_albedo, v_uv).rgb);
-    vec3 paper_normal = normalize(texture(u_paper_normal, v_uv).rgb * 2.0 - 1.0);
-    float paper_roughness = texture(u_paper_roughness, v_uv).r;
+    vec3 paper_albedo = to_linear(texture(u_paper_albedo, page_uv).rgb);
+    vec3 paper_normal = normalize(texture(u_paper_normal, page_uv).rgb * 2.0 - 1.0);
+    float paper_roughness = texture(u_paper_roughness, page_uv).r;
 
-    float ink = texture(u_ink_mask, v_uv).a;
-    float ink_left = texture(u_ink_mask, v_uv - vec2(texel.x, 0.0)).a;
-    float ink_right = texture(u_ink_mask, v_uv + vec2(texel.x, 0.0)).a;
-    float ink_down = texture(u_ink_mask, v_uv - vec2(0.0, texel.y)).a;
-    float ink_up = texture(u_ink_mask, v_uv + vec2(0.0, texel.y)).a;
+    float ink = texture(u_ink_mask, page_uv).a;
+    float ink_left = texture(u_ink_mask, page_uv - vec2(texel.x, 0.0)).a;
+    float ink_right = texture(u_ink_mask, page_uv + vec2(texel.x, 0.0)).a;
+    float ink_down = texture(u_ink_mask, page_uv - vec2(0.0, texel.y)).a;
+    float ink_up = texture(u_ink_mask, page_uv + vec2(0.0, texel.y)).a;
 
     // The alpha gradient makes wet strokes look microscopically raised.
     vec2 ink_gradient = vec2(ink_right - ink_left, ink_up - ink_down);
@@ -110,7 +144,6 @@ void main() {
     float ink_roughness = mix(0.62, 0.10, u_wetness);
     float roughness = mix(paper_roughness, ink_roughness, ink);
 
-    float aspect = u_resolution.x / u_resolution.y;
     vec3 surface_position = vec3(v_uv.x * aspect, v_uv.y, 0.0);
     vec3 light_position = vec3(u_light_uv.x * aspect, u_light_uv.y, u_light_height);
     vec3 light_vector = light_position - surface_position;
@@ -143,9 +176,6 @@ void main() {
     float ink_specular_strength = mix(0.16, 1.05, u_wetness);
     float specular_strength = mix(paper_specular_strength, ink_specular_strength, ink);
 
-    vec3 warm_light = to_linear(vec3(1.00, 0.84, 0.61));
-    vec3 ambient_light = to_linear(vec3(0.34, 0.29, 0.22));
-
     vec3 diffuse = albedo * (ambient_light + warm_light * n_dot_l * attenuation * 0.68);
     vec3 specular = warm_light * fresnel * specular_lobe * specular_strength * attenuation;
 
@@ -154,7 +184,7 @@ void main() {
     specular += warm_light * edge_glint * 0.16;
 
     // Darken the sheet perimeter without baking it into the generated texture.
-    vec2 border_distance = min(v_uv, 1.0 - v_uv);
+    vec2 border_distance = min(page_uv, 1.0 - page_uv);
     float border = smoothstep(0.0, 0.095, min(border_distance.x, border_distance.y));
     diffuse *= mix(0.72, 1.0, border);
 
@@ -169,9 +199,6 @@ void main() {
     }
 
     // Draw a tiny unobtrusive ring at the movable light position.
-    vec2 marker_delta = (v_uv - u_light_uv) * vec2(aspect, 1.0);
-    float marker_distance = length(marker_delta);
-    float marker = 1.0 - smoothstep(0.010, 0.012, abs(marker_distance - 0.013));
     if (u_debug_mode == 0) {
         color += warm_light * marker * 0.22;
     }
@@ -188,6 +215,61 @@ class DemoSettings:
     exposure: float = 1.00
     debug_mode: int = 0
     brush_radius: int = 5
+
+
+class View:
+    """Zoom and pan over the page.
+
+    `center` is the canvas pixel shown at the middle of the window, so the
+    mapping both ways is just `canvas = (screen - middle) / zoom + center`.
+    """
+
+    MIN_ZOOM = 0.25
+    MAX_ZOOM = 16.0
+
+    def __init__(self, size: tuple[int, int]) -> None:
+        self.size = size
+        self.reset()
+
+    def reset(self) -> None:
+        self.zoom = 1.0
+        self.center_x = self.size[0] * 0.5
+        self.center_y = self.size[1] * 0.5
+
+    @property
+    def center_uv(self) -> tuple[float, float]:
+        return (self.center_x / self.size[0], 1.0 - self.center_y / self.size[1])
+
+    def screen_to_canvas_f(self, position: tuple[int, int]) -> tuple[float, float]:
+        return (
+            (position[0] - self.size[0] * 0.5) / self.zoom + self.center_x,
+            (position[1] - self.size[1] * 0.5) / self.zoom + self.center_y,
+        )
+
+    def screen_to_canvas(self, position: tuple[int, int]) -> tuple[int, int]:
+        x, y = self.screen_to_canvas_f(position)
+        return (round(x), round(y))
+
+    def pan_by(self, screen_delta: tuple[int, int]) -> None:
+        """Drag the page with the cursor rather than moving the camera."""
+        self.center_x -= screen_delta[0] / self.zoom
+        self.center_y -= screen_delta[1] / self.zoom
+
+    def zoom_by(self, steps: int, anchor: tuple[int, int]) -> bool:
+        """Zoom about `anchor`, keeping the canvas point under it stationary."""
+        previous_zoom = self.zoom
+        before = self.screen_to_canvas_f(anchor)
+
+        self.zoom = max(
+            self.MIN_ZOOM, min(self.MAX_ZOOM, self.zoom * (1.15**steps))
+        )
+        if self.zoom == previous_zoom:
+            return False
+
+        after = self.screen_to_canvas_f(anchor)
+        self.center_x += before[0] - after[0]
+        self.center_y += before[1] - after[1]
+        return True
 
 
 @dataclass
@@ -430,6 +512,46 @@ def load_sprite_sheet(path: Path = SPRITE_SHEET_PATH) -> SpriteSheet | None:
         return None
 
 
+_ink_image_cache: dict[tuple[str, int | None], pygame.Surface] = {}
+
+
+def load_ink_image(
+    path: Path,
+    height: int | None = None,
+) -> pygame.Surface | None:
+    """Load a standalone PNG as ink: alpha is kept, colour is forced to white.
+
+    Only the alpha channel reaches the shader, so a black-on-transparent
+    silhouette and a white-on-transparent one must behave identically. Unlike
+    the pixel-art tiles this is smoothed artwork, so it is resized with
+    `smoothscale` rather than point sampling.
+    """
+    key = (str(path), height)
+    cached = _ink_image_cache.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        source = pygame.image.load(str(path))
+    except (pygame.error, FileNotFoundError) as exc:
+        print(f"Could not load ink image {path}: {exc}", file=sys.stderr)
+        return None
+
+    image = pygame.Surface(source.get_size(), pygame.SRCALPHA)
+    image.fill((0, 0, 0, 0))
+    image.blit(source, (0, 0))
+
+    if height is not None and image.get_height() != height:
+        width = max(1, round(image.get_width() * height / image.get_height()))
+        image = pygame.transform.smoothscale(image, (width, height))
+
+    # Max against opaque white lifts RGB to white while leaving alpha alone.
+    image.fill((255, 255, 255, 0), special_flags=pygame.BLEND_RGBA_MAX)
+
+    _ink_image_cache[key] = image
+    return image
+
+
 def make_demo_ink(
     size: tuple[int, int],
     sprites: SpriteSheet | None = None,
@@ -476,13 +598,15 @@ def make_demo_ink(
         points.append((x, y))
     pygame.draw.lines(ink_mask, white, False, points, 12)
 
-    center = (width - 190, height - 155)
-    pygame.draw.circle(ink_mask, white, center, 72, 5)
+    # The rose sits up beside the title so the lower right stays free for the
+    # featured creature and the sprite strip.
+    center = (width - 145, 320)
+    pygame.draw.circle(ink_mask, white, center, 62, 5)
     for angle in range(0, 360, 45):
-        vector = pygame.Vector2(0, -62).rotate(angle)
+        vector = pygame.Vector2(0, -54).rotate(angle)
         endpoint = (round(center[0] + vector.x), round(center[1] + vector.y))
         pygame.draw.line(ink_mask, white, center, endpoint, 5)
-    pygame.draw.circle(ink_mask, white, center, 12)
+    pygame.draw.circle(ink_mask, white, center, 10)
 
     # Thick pools produce broad dark shapes and very visible coat highlights.
     for position, radius in [((430, 520), 30), ((512, 496), 18), ((594, 528), 24)]:
@@ -495,6 +619,12 @@ def make_demo_ink(
         end = (340 + index * 34, y + random.Random(index).randint(-5, 5))
         pygame.draw.aaline(ink_mask, white, start, end)
         pygame.draw.line(ink_mask, white, start, end, 2 + index // 2)
+
+    feature = load_ink_image(FEATURE_IMAGE_PATH, FEATURE_IMAGE_HEIGHT)
+    if feature is not None:
+        feature_rect = feature.get_rect()
+        feature_rect.center = (width - 178, height - 150)
+        ink_mask.blit(feature, feature_rect, special_flags=pygame.BLEND_RGBA_MAX)
 
     if sprites is not None:
         per_page = sprites.columns
@@ -774,6 +904,7 @@ class ParchmentInkRenderer:
         self,
         light_position: tuple[int, int],
         settings: DemoSettings,
+        view: View | None = None,
     ) -> None:
         width, height = self.size
         light_uv = (
@@ -795,6 +926,10 @@ class ParchmentInkRenderer:
         self.program["u_wetness"].value = settings.wetness
         self.program["u_exposure"].value = settings.exposure
         self.program["u_debug_mode"].value = settings.debug_mode
+        self.program["u_zoom"].value = 1.0 if view is None else view.zoom
+        self.program["u_center_uv"].value = (
+            (0.5, 0.5) if view is None else view.center_uv
+        )
 
         self.vertex_array.render(mode=moderngl.TRIANGLE_STRIP)
 
@@ -808,15 +943,17 @@ class ParchmentInkRenderer:
         self.program.release()
 
 
-def update_caption(settings: DemoSettings) -> None:
+def update_caption(settings: DemoSettings, view: View) -> None:
     modes = ("final", "normals", "roughness", "ink mask")
     pygame.display.set_caption(
         "ModernGL Parchment + Fresh Ink  |  "
         f"wetness {settings.wetness:.2f}  "
         f"light height {settings.light_height:.2f}  "
         f"brush {settings.brush_radius}px  "
+        f"zoom {view.zoom * 100:.0f}%  "
         f"view {modes[settings.debug_mode]}  |  "
-        "Drag draws, right-drag erases, wheel brush size, U undo, C clear, "
+        "Drag draws, right-drag erases, middle-drag pans, wheel zooms, "
+        "shift-wheel brush size, 0 resets view, U undo, C clear, "
         "move mouse for light, [ ] wetness, - = height, 1-4 views, "
         "arrows sprite page, R regenerate, Esc quit"
     )
@@ -849,10 +986,12 @@ def main() -> None:
 
     clock = pygame.time.Clock()
     settings = DemoSettings()
-    update_caption(settings)
+    view = View(WINDOW_SIZE)
+    update_caption(settings, view)
 
     light_position = (WINDOW_SIZE[0] // 2, WINDOW_SIZE[1] // 2)
     drawing = False
+    panning = False
 
     running = True
     while running:
@@ -860,10 +999,14 @@ def main() -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 2:
+                panning = True
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 2:
+                panning = False
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
                 drawing = True
                 dirty = renderer.canvas.begin_stroke(
-                    event.pos,
+                    view.screen_to_canvas(event.pos),
                     settings.brush_radius,
                     erase=event.button == 3,
                 )
@@ -872,8 +1015,12 @@ def main() -> None:
                 drawing = False
                 renderer.canvas.end_stroke()
             elif event.type == pygame.MOUSEMOTION:
-                if drawing:
-                    dirty = renderer.canvas.extend_stroke(event.pos)
+                if panning:
+                    view.pan_by(event.rel)
+                elif drawing:
+                    dirty = renderer.canvas.extend_stroke(
+                        view.screen_to_canvas(event.pos)
+                    )
                     if dirty is not None:
                         renderer.upload_ink(dirty)
                 else:
@@ -881,9 +1028,12 @@ def main() -> None:
                     # judged under steady lighting instead of a moving highlight.
                     light_position = event.pos
             elif event.type == pygame.MOUSEWHEEL:
-                settings.brush_radius = max(
-                    1, min(48, settings.brush_radius + event.y)
-                )
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    settings.brush_radius = max(
+                        1, min(48, settings.brush_radius + event.y)
+                    )
+                else:
+                    view.zoom_by(event.y, pygame.mouse.get_pos())
                 caption_changed = True
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
@@ -926,11 +1076,14 @@ def main() -> None:
                 elif event.key == pygame.K_c:
                     if renderer.canvas.clear_strokes():
                         renderer.upload_ink()
+                elif event.key in (pygame.K_0, pygame.K_KP0, pygame.K_HOME):
+                    view.reset()
+                    caption_changed = True
 
         if caption_changed:
-            update_caption(settings)
+            update_caption(settings, view)
 
-        renderer.render(light_position, settings)
+        renderer.render(light_position, settings, view)
         pygame.display.flip()
         clock.tick(60)
 
