@@ -395,17 +395,18 @@ class Hop(_Timed):
         body.shift(0.0, -self.height * math.sin(math.pi * p))
 
         if self.squash:
-            # +1 at the apex (stretched), -1 at take-off and landing (squashed).
-            s = -math.cos(2.0 * math.pi * p)
-            k = self.squash * s
-            horizontal = abs(self.dx) > abs(self.dy)
-            if horizontal:
-                body.scale(1.0 + k, 1.0 - k * 0.6)
-            else:
-                body.scale(1.0 - k * 0.6, 1.0 + k)
-            # Squashing about the centre would make a landing look like it
-            # sank into the floor; nudge down so the feet stay put instead.
-            body.shift(0.0, (1.0 - (1.0 + k)) * 0.5 if not horizontal else 0.0)
+            # +squash at take-off and landing, -squash at the apex. The sign
+            # is the whole effect and it is easy to get backwards: a body is
+            # *flattened* when it pushes off and when it lands, and *drawn out*
+            # while it is in the air. Inverted, the two phases cancel out to
+            # something that reads as a faint jitter rather than a bounce.
+            k = self.squash * math.cos(2.0 * math.pi * p)
+            sx, sy = 1.0 + k * 0.6, 1.0 - k
+            body.scale(sx, sy)
+            # Scaling happens about the centre, so a squashed body would sink
+            # into the floor and a stretched one would hover. Push it back down
+            # by half of what it lost, which pins the feet instead.
+            body.shift(0.0, (1.0 - sy) * 0.45)
         return done
 
 
@@ -592,6 +593,103 @@ class DeathSpin(_Timed):
         body.shift(0.0, self.drop * ease_in_quad(p))
         body.fade(1.0 - ease_in_quad(p))
         return done
+
+
+@dataclass
+class DeathTopple(_Timed):
+    """Falls over like a cut tree, then fades where it landed.
+
+    Reads as weight in a way a spin does not -- the body is not dissolving, it
+    is being *dropped*. Pairs best with heavy, grounded enemies.
+    """
+
+    duration: float = 0.7
+    facing: float = 1.0        # +1 topples right, -1 left
+    fall_frac: float = 0.55    # share of the duration spent falling
+
+    def update(self, body: Body, dt: float) -> bool:
+        p, done = self.tick(dt)
+        fall = clamp(p / self.fall_frac)
+        body.rotate(-90.0 * self.facing * ease_in_quad(fall))
+        # A body pivoting about its centre would leave the ground; drop it as
+        # it goes over so it stays in contact.
+        body.shift(0.0, 0.3 * ease_in_quad(fall))
+        body.fade(1.0 - clamp((p - self.fall_frac) / (1.0 - self.fall_frac)))
+        return done
+
+
+@dataclass
+class DeathBurst(_Timed):
+    """Swells, then bursts to nothing. For the things that should pop."""
+
+    duration: float = 0.4
+    swell: float = 0.45
+    swell_frac: float = 0.35
+
+    def update(self, body: Body, dt: float) -> bool:
+        p, done = self.tick(dt)
+        if p < self.swell_frac:
+            s = 1.0 + self.swell * ease_out_quad(p / self.swell_frac)
+        else:
+            q = (p - self.swell_frac) / (1.0 - self.swell_frac)
+            s = (1.0 + self.swell) * (1.0 - ease_in_quad(q))
+            body.fade(1.0 - q)
+        body.scale(max(s, 0.01), max(s, 0.01))
+        return done
+
+
+@dataclass
+class DeathMelt(_Timed):
+    """Collapses into a puddle on the floor. Slow, and reads as deflating."""
+
+    duration: float = 0.65
+    spread: float = 0.6
+
+    def update(self, body: Body, dt: float) -> bool:
+        p, done = self.tick(dt)
+        sy = max(0.02, 1.0 - ease_in_quad(p))
+        sx = 1.0 + self.spread * ease_out_quad(p)
+        body.scale(sx, sy)
+        body.shift(0.0, (1.0 - sy) * 0.45)      # keep the puddle on the ground
+        body.fade(1.0 - clamp((p - 0.55) / 0.45))
+        return done
+
+
+@dataclass
+class DeathLaunch(_Timed):
+    """Punted off the board on a ballistic arc, spinning.
+
+    The only death here that leaves the tile it started on, which is what makes
+    it worth having in the mix -- it reads as the blow having thrown something.
+    """
+
+    duration: float = 0.7
+    facing: float = 1.0
+    speed: float = 2.4         # tiles per second, horizontally
+    launch: float = 5.0        # tiles per second, upwards
+    gravity: float = 11.0      # tiles per second squared
+    spin: float = 700.0
+
+    def update(self, body: Body, dt: float) -> bool:
+        p, done = self.tick(dt)
+        t = self.elapsed
+        body.shift(self.facing * self.speed * t,
+                   -(self.launch * t - 0.5 * self.gravity * t * t))
+        body.rotate(self.spin * self.facing * p)
+        body.fade(1.0 - clamp((p - 0.6) / 0.4))
+        return done
+
+
+#: Every death animation, by name. The workbench cycles them so a fight does
+#: not play the same exit five times -- variety in the *rarest* animation is
+#: what stops a game looking canned, because it is the one you watch closely.
+DEATHS: dict[str, Callable[[float], Motion]] = {
+    "spin": lambda facing: DeathSpin(duration=0.55, spin=430.0, drop=0.45),
+    "topple": lambda facing: DeathTopple(duration=0.7, facing=facing),
+    "burst": lambda facing: DeathBurst(duration=0.4),
+    "melt": lambda facing: DeathMelt(duration=0.65),
+    "launch": lambda facing: DeathLaunch(duration=0.7, facing=facing),
+}
 
 
 class Animator:
@@ -988,6 +1086,49 @@ class SlashArc:
 
 
 @dataclass
+class SlashCut:
+    """A straight cut wiping through the target, as opposed to a swept arc.
+
+    `SlashArc` is the weapon travelling *around* the victim; this is the edge
+    going *through* it. Having both is worth it because they read differently:
+    the arc says a swing happened, the cut says it connected. It wipes on fast
+    and holds, rather than expanding, so the eye catches a line and not a
+    growing shape.
+    """
+
+    x: float
+    y: float
+    angle: float             # degrees, the direction the edge travels
+    length: float = 64.0
+    thickness: float = 7.0
+    life: float = 0.15
+    max_life: float = 0.15
+    color: Tuple[int, int, int] = (255, 255, 255)
+
+    @property
+    def t(self) -> float:
+        return 1.0 - clamp(self.life / self.max_life) if self.max_life else 1.0
+
+    @property
+    def progress(self) -> float:
+        """How much of the cut has been drawn. Front-loaded, so it snaps."""
+        return ease_out_quint(clamp(self.t / 0.45))
+
+    @property
+    def alpha(self) -> float:
+        return (1.0 - self.t) ** 1.2
+
+    def endpoints(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """Tail and head of the cut in world pixels."""
+        a = math.radians(self.angle)
+        dx, dy = math.cos(a), -math.sin(a)
+        tail = (self.x - dx * self.length * 0.5, self.y - dy * self.length * 0.5)
+        head = (tail[0] + dx * self.length * self.progress,
+                tail[1] + dy * self.length * self.progress)
+        return tail, head
+
+
+@dataclass
 class TileImpact:
     """A dent in the floor that spreads outward and dies.
 
@@ -1034,6 +1175,7 @@ class EffectField:
         self.floaters = FloaterField()
         self.shockwaves: List[Shockwave] = []
         self.slashes: List[SlashArc] = []
+        self.cuts: List[SlashCut] = []
         self.impacts: List[TileImpact] = []
 
     def shockwave(self, x: float, y: float, **kw) -> None:
@@ -1041,6 +1183,9 @@ class EffectField:
 
     def slash(self, x: float, y: float, angle: float, **kw) -> None:
         self.slashes.append(SlashArc(x=x, y=y, angle=angle, **kw))
+
+    def cut(self, x: float, y: float, angle: float, **kw) -> None:
+        self.cuts.append(SlashCut(x=x, y=y, angle=angle, **kw))
 
     def impact(self, x: float, y: float, **kw) -> None:
         self.impacts.append(TileImpact(x=x, y=y, **kw))
@@ -1057,11 +1202,12 @@ class EffectField:
     def update(self, dt: float) -> None:
         self.particles.update(dt)
         self.floaters.update(dt)
-        for pool in (self.shockwaves, self.slashes, self.impacts):
+        for pool in (self.shockwaves, self.slashes, self.cuts, self.impacts):
             for item in pool:
                 item.life -= dt
         self.shockwaves = [s for s in self.shockwaves if s.life > 0.0]
         self.slashes = [s for s in self.slashes if s.life > 0.0]
+        self.cuts = [c for c in self.cuts if c.life > 0.0]
         self.impacts = [i for i in self.impacts if i.life > 0.0]
 
     def clear(self) -> None:
@@ -1069,11 +1215,12 @@ class EffectField:
         self.floaters.clear()
         self.shockwaves.clear()
         self.slashes.clear()
+        self.cuts.clear()
         self.impacts.clear()
 
     def __len__(self) -> int:
         return (len(self.particles) + len(self.floaters) + len(self.shockwaves)
-                + len(self.slashes) + len(self.impacts))
+                + len(self.slashes) + len(self.cuts) + len(self.impacts))
 
 
 # ---------------------------------------------------------------------------

@@ -190,6 +190,34 @@ def test_hop_lifts_off_the_floor():
     assert peak < -0.3, f"hop only reached {peak:.3f} tiles"
 
 
+def test_hop_squash_is_the_right_way_round():
+    """The bug that made squash-and-stretch look like it did nothing.
+
+    Flat and wide at take-off and landing, tall and narrow at the apex. With
+    the sign inverted the two halves cancel to a shimmer you cannot see, and
+    the effect appears broken rather than wrong.
+    """
+    _, _, samples = run_motion(jf.Hop(duration=0.3, dx=1, dy=0, squash=0.3))
+    start_sx, start_sy = samples[0][2], samples[0][3]
+    assert start_sx > 1.05 and start_sy < 0.95, "take-off is not squashed"
+
+    mid = samples[len(samples) // 2]
+    assert mid[2] < 0.95 and mid[3] > 1.05, "the apex is not stretched"
+
+    end_sx, end_sy = samples[-2][2], samples[-2][3]
+    assert end_sx > 1.05 and end_sy < 0.95, "the landing is not squashed"
+
+
+def test_squash_keeps_the_feet_on_the_floor():
+    """A body scaled about its centre sinks when squashed. The compensating
+    shift is what stops a hop looking like it lands inside the tile."""
+    _, _, samples = run_motion(jf.Hop(duration=0.3, dx=1, dy=0, squash=0.3,
+                                      height=0.0))
+    for _, oy, _, sy, _, _ in samples:
+        bottom = oy + sy * 0.5          # where the feet are, in tiles
+        assert abs(bottom - 0.5) < 0.06, f"feet drifted to {bottom:.3f}"
+
+
 def test_hop_squash_roughly_conserves_volume():
     """Stretched thin has to also mean taller. Break it and the sprite reads as
     a bug rather than as weight."""
@@ -210,6 +238,64 @@ def test_anticipate_leans_the_wrong_way():
     _, _, samples = run_motion(jf.Anticipate(duration=0.12, dx=1, dy=0, amount=0.2))
     assert min(s[0] for s in samples) < -0.15, "no backswing"
     assert max(s[0] for s in samples) <= 0.0, "anticipation moved forwards"
+
+
+def test_every_death_animation_ends_invisible():
+    """Whatever route it takes, a corpse must finish gone. One that fades to
+    0.3 leaves a ghost sitting on the tile until the entity is culled."""
+    for name, make in jf.DEATHS.items():
+        body, _, samples = run_motion(make(1.0))
+        last = samples[-1]
+        assert last[5] < 0.12, f"{name} finished at alpha {last[5]:.2f}"
+
+
+def test_the_death_animations_are_actually_different():
+    """Five names are worth nothing if they all look the same. Compare each
+    pair's full trace and insist they diverge somewhere."""
+    traces = {}
+    for name, make in jf.DEATHS.items():
+        _, _, samples = run_motion(make(1.0), dt=1 / 120)
+        traces[name] = samples
+
+    names = sorted(traces)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            n = min(len(traces[a]), len(traces[b]))
+            spread = max(
+                max(abs(x - y) for x, y in zip(traces[a][k], traces[b][k]))
+                for k in range(n))
+            assert spread > 0.2, f"{a} and {b} animate almost identically"
+
+
+def test_death_launch_leaves_the_tile_and_topple_does_not():
+    """The two extremes of the set: one is thrown clear, one falls on the spot.
+    If launch stops moving sideways it stops being the odd one out."""
+    _, _, launched = run_motion(jf.DeathLaunch(duration=0.7, facing=1.0))
+    assert max(s[0] for s in launched) > 1.0, "launch never left the tile"
+    assert min(s[1] for s in launched) < -0.5, "launch never went up"
+
+    _, _, toppled = run_motion(jf.DeathTopple(duration=0.7, facing=1.0))
+    assert max(abs(s[0]) for s in toppled) < 0.05, "topple slid sideways"
+    assert max(abs(s[4]) for s in toppled) > 80.0, "topple never fell over"
+
+
+def test_death_melt_flattens_to_the_floor():
+    _, _, samples = run_motion(jf.DeathMelt(duration=0.6))
+    assert samples[-1][3] < 0.1, "melt never flattened"
+    assert samples[-1][2] > 1.3, "melt never spread out"
+
+
+def test_slash_cut_wipes_on_and_holds():
+    """The cut is a wipe, not a growth: nearly its whole length in the first
+    couple of frames, then it just fades."""
+    cut = jf.SlashCut(x=0.0, y=0.0, angle=0.0, length=100.0,
+                      life=0.15, max_life=0.15)
+    cut.life = 0.15 * 0.75            # a quarter of the way through
+    assert cut.progress > 0.85, f"only {cut.progress:.2f} drawn at t=0.25"
+    tail, head = cut.endpoints()
+    assert math.hypot(head[0] - tail[0], head[1] - tail[1]) > 85.0
+    cut.life = 0.15 * 0.05
+    assert cut.alpha < 0.1, "the cut never faded"
 
 
 def test_death_spin_fades_and_shrinks():
@@ -518,7 +604,7 @@ def test_logical_move_is_instant_regardless_of_the_animation():
 
 def test_a_kill_removes_the_entity_after_its_animation():
     rj, world = _world()
-    dummy = world.nearest_dummy()
+    dummy = world.nearest_enemy(killable=True)
     assert dummy in world.entities
     dummy.hp = 1
     world.land_blow(world.player, dummy, 1, 0)
@@ -530,7 +616,7 @@ def test_a_kill_removes_the_entity_after_its_animation():
 def test_unjuiced_kill_removes_immediately():
     rj, world = _world()
     world.juice.master = False
-    dummy = world.nearest_dummy()
+    dummy = world.nearest_enemy(killable=True)
     dummy.hp = 1
     world.land_blow(world.player, dummy, 1, 0)
     _step(world, 1)
@@ -564,7 +650,7 @@ def test_nothing_moves_at_all_with_the_juice_off():
                                  world.try_move(p, -1, 0))),
         ("a whiffed swing", world.swing),
         ("taking a hit", world.strike_player),
-        ("a kill", lambda: world.kill(world.nearest_dummy())),
+        ("a kill", lambda: world.kill(world.nearest_enemy(killable=True))),
     ):
         action()
         for _ in range(45):
@@ -610,7 +696,7 @@ def test_master_switch_spawns_no_effects_at_all():
     produce a damage number and nothing else."""
     rj, world = _world()
     world.juice.master = False
-    dummy = world.nearest_dummy()
+    dummy = world.nearest_enemy(killable=True)
     world.land_blow(world.player, dummy, 1, 0)
     assert len(world.fx) == 0, "effects leaked past the master switch"
     assert world.trauma.amount == 0.0
@@ -619,7 +705,7 @@ def test_master_switch_spawns_no_effects_at_all():
 
 def test_a_juiced_blow_lights_up_every_channel():
     rj, world = _world()
-    dummy = world.nearest_dummy()
+    dummy = world.nearest_enemy(killable=True)
     world.land_blow(world.player, dummy, 1, 0)
     assert world.trauma.amount > 0.0, "no shake"
     assert world.hitstop.frozen, "no hit-stop"
@@ -633,7 +719,7 @@ def test_a_juiced_blow_lights_up_every_channel():
 
 def test_hitstop_freezes_the_world_but_not_the_shake():
     rj, world = _world()
-    dummy = world.nearest_dummy()
+    dummy = world.nearest_enemy(killable=True)
     world.land_blow(world.player, dummy, 1, 0)
     before = [(p.x, p.y) for p in world.fx.particles.particles]
     trauma_before = world.trauma.amount
@@ -658,12 +744,12 @@ def test_every_toggle_can_be_turned_off_without_crashing():
         _step(world, 12)
         world.try_move(world.player, 0, -1)
         _step(world, 12)
-        d = world.nearest_dummy()
+        d = world.nearest_enemy(killable=True)
         for _ in range(6):
             world.land_blow(world.player, d, 1, 0)
             _step(world, 20)
             if d.dying:
-                d = world.nearest_dummy() or d
+                d = world.nearest_enemy(killable=True) or d
         _step(world, 60)
 
 
@@ -788,6 +874,135 @@ def test_the_map_is_larger_than_the_viewport():
     assert rj.GRID_H * rj.TILE > rj.VIEW_H
 
 
+def test_enemies_path_around_cover_to_reach_the_player():
+    """The goal map has to route around a wall, not stall against it.
+
+    Every enemy is placed behind cover relative to the middle of the arena, so
+    a straight-line chase would leave several of them stuck. Success is simply
+    that all of them close the distance.
+    """
+    rj, world = _world()
+    enemies = [e for e in world.entities
+               if e is not world.player and not e.stationary]
+    before = {e.name + str(id(e)): _dist(e, world.player) for e in enemies}
+    for _ in range(60):
+        world.end_player_turn()
+        _step(world, 2)
+    for e in enemies:
+        key = e.name + str(id(e))
+        assert _dist(e, world.player) < before[key], f"{e.name} never closed in"
+
+
+def _dist(a, b):
+    return abs(a.tile[0] - b.tile[0]) + abs(a.tile[1] - b.tile[1])
+
+
+def test_the_goal_map_reaches_every_open_tile():
+    """A `None` in a walkable cell is an enemy that will stand still forever."""
+    rj, world = _world()
+    unreached = [(x, y)
+                 for y in range(rj.GRID_H) for x in range(rj.GRID_W)
+                 if not world.blocked(x, y) and world.goal_map[y][x] is None]
+    assert not unreached, f"{len(unreached)} walkable tiles are unreachable"
+
+
+def test_enemies_attack_once_they_are_adjacent():
+    rj, world = _world()
+    e = world.nearest_enemy(killable=True, mobile=True)
+    px, py = world.player.tile
+    e.body.tx, e.body.ty = float(px + 1), float(py)      # park it next door
+    world.end_player_turn()
+    assert e.anim.busy, "an adjacent enemy did nothing"
+    for _ in range(45):
+        world.update(1 / 60)
+    assert any("shrug" in entry[0] for entry in world.log), "the blow never landed"
+
+
+def test_the_player_is_invincible_but_still_gets_the_whole_reaction():
+    """Invincible must mean unkillable, not unhittable -- the point of being
+    hit on a juice bench is to feel it."""
+    rj, world = _world()
+    p = world.player
+    hp = p.hp
+    for _ in range(30):
+        world.land_blow(world.nearest_enemy(mobile=True), p, 1, 0)
+    assert p.hp == hp, "the player took damage"
+    assert not p.dying and p in world.entities
+    world.update(1 / 60)
+    assert p.body.flash > 0.0, "no hit flash on the player"
+    assert world.trauma.amount > 0.0, "no screen shake when the player is hit"
+
+
+def test_the_training_dummy_never_moves_and_never_dies():
+    rj, world = _world()
+    dummy = next(e for e in world.entities if e.stationary)
+    where = dummy.tile
+    for _ in range(40):
+        world.land_blow(world.player, dummy, 1, 0)
+        world.end_player_turn()
+        _step(world, 4)
+    assert dummy.tile == where, "the training dummy wandered off"
+    assert not dummy.dying and dummy in world.entities, "the dummy died"
+    assert any("takes" in entry[0] for entry in world.log), "no damage reported"
+
+
+def test_the_dummy_does_not_hit_back():
+    """`x` picks the nearest attacker; a punching bag must not be a candidate."""
+    rj, world = _world()
+    dummy = next(e for e in world.entities if e.stationary)
+    world.player.body.tx = float(dummy.tile[0] + 1)
+    world.player.body.ty = float(dummy.tile[1])
+    assert world.nearest_enemy(mobile=True) is not dummy
+
+
+def test_reset_leaves_the_player_where_they_stand():
+    """Explicitly asked for: you line up a view of an effect, hit reset for
+    fresh targets, and you are still looking at the same thing."""
+    rj, world = _world()
+    for _ in range(6):
+        world.try_move(world.player, 1, 0)
+        _step(world, 12)
+    moved_to = world.player.tile
+    assert moved_to != (rj.GRID_W // 2, rj.GRID_H // 2), "the walk went nowhere"
+
+    before_cam = (world.camera.x, world.camera.y)
+    world.reset()
+    assert world.player.tile == moved_to, "reset teleported the player"
+    assert world.camera.x == before_cam[0] and world.camera.y == before_cam[1]
+    assert len([e for e in world.entities if e is not world.player]) > 1
+
+
+def test_reset_restores_a_full_roster():
+    rj, world = _world()
+    for e in list(world.entities):
+        if e is not world.player:
+            world.entities.remove(e)
+    world.reset()
+    assert len(world.entities) == len(rj.MONSTERS) + 2, "roster came back short"
+    styles = {e.death for e in world.entities if not e.invincible}
+    assert len(styles) >= 4, f"only {len(styles)} death animations in the roster"
+
+
+def test_the_sprite_sheet_loads_from_the_repo():
+    """The bench uses art the project already ships. If the path rots, the
+    fallback keeps it running -- but the test says so out loud."""
+    import pygame
+
+    import rogue_juice as rj
+    import tiles
+    pygame.init()
+    pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
+    sheet = tiles.SpriteSheet(rj.TILE)
+    assert sheet.available, f"tileset missing at {sheet.path}"
+    assert sheet.scale == 2, "16px art at a 32px tile should be an exact 2x"
+    for name, (col, row) in tiles.SPRITES.items():
+        surf = sheet.sprite(col, row, (200, 150, 100))
+        assert surf.get_size() == (rj.TILE, rj.TILE), f"{name} is the wrong size"
+        assert surf.get_bounding_rect().width > 2, f"{name} is a blank tile"
+    assert sheet.sprite(0, 0, None) is sheet.sprite(0, 0, None), "not cached"
+    pygame.quit()
+
+
 def test_headless_render_produces_a_frame():
     """Drives the real draw path under the dummy driver: floor, ripples,
     squashed glyphs, particles, panel and all."""
@@ -811,7 +1026,7 @@ def test_compositing_survives_every_whole_frame_effect_at_once():
     world = rj.World(rj.Juice())
     renderer = rj.Renderer()
     world.juice.intensity = 2.0
-    d = world.nearest_dummy()
+    d = world.nearest_enemy(killable=True)
     d.hp = 1
     world.land_blow(world.player, d, 1, 0)
     for _ in range(30):

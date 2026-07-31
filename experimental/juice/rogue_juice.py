@@ -44,6 +44,7 @@ import math
 import os
 import sys
 import time
+from collections import deque
 
 # The video driver has to be chosen before pygame brings the display up, so
 # the headless flag is read here rather than in main(). Without this a
@@ -56,10 +57,11 @@ import pygame
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import tiles  # noqa: E402
 from juicefx import (  # noqa: E402
-    ATTACK_TIME, ATTACK_WINDUP, EASINGS, FLASH_TIME, HITSTOP_HEAVY,
+    ATTACK_TIME, ATTACK_WINDUP, DEATHS, EASINGS, FLASH_TIME, HITSTOP_HEAVY,
     HITSTOP_LIGHT, MOVE_TIME, TRAUMA_HEAVY, TRAUMA_LIGHT,
-    Animator, Anticipate, Body, Breathe, Callback, Camera, DeathSpin,
+    Animator, Anticipate, Body, Breathe, Callback, Camera,
     EffectField, Flash, GhostTrail, HitStop, Hop, Knockback, Lunge, Parallel,
     Sequence, Shiver, Slide, Spring, Trauma, Wait, clamp, lerp,
 )
@@ -68,11 +70,13 @@ from juicefx import (  # noqa: E402
 # Layout and palette
 # ---------------------------------------------------------------------------
 
-TILE = 34
-# The map is deliberately a little larger than the viewport in both axes, so
-# the camera has somewhere to move -- a camera that cannot pan cannot lag, and
-# camera lag is one of the effects on the list.
-GRID_W, GRID_H = 24, 18
+# 32 is exactly twice the 16px source art, so a resting sprite is drawn with no
+# resampling at all and the squash effect deforms something already clean.
+TILE = 32
+# A 40x20 arena, which is far larger than the viewport in both axes -- the
+# camera has to pan, which is what makes the lag and the shake worth looking
+# at, and there is room for the enemies to actually path around cover.
+GRID_W, GRID_H = 40, 20
 VIEW_W, VIEW_H = 800, 600
 # The toggles run in two columns, which is what keeps the window short enough
 # to fit under a taskbar -- a single column of 28 rows needs 640px of panel on
@@ -82,7 +86,7 @@ WIN_W, WIN_H = VIEW_W + PANEL_W, VIEW_H     # 1180x600
 # Panel space reserved for the hover blurb / control list. Sized to swallow
 # the slack under the easing gallery rather than leave it as a dead band, so
 # the blurb gets room to wrap and the controls get room to be spelled out.
-FOOTER_H = 164
+FOOTER_H = 156
 
 #: The control list, shown whenever the mouse is not over a toggle.
 HELP_LINES = [
@@ -105,11 +109,14 @@ FPS = 60
 #: a multiple of this, so the bench feels identical whatever TILE is set to.
 PX = TILE / 40.0
 
-BG = (14, 15, 20)
-FLOOR = (38, 42, 55)
-FLOOR_ALT = (30, 33, 44)
-WALL = (58, 62, 80)
-WALL_TOP = (78, 84, 108)
+BG = (10, 11, 15)
+# The floor is deliberately dim and low-contrast. It was competing with the
+# sprites, and the floor's job here is to be a surface you can see the ripple
+# travel through -- not to be looked at.
+FLOOR = (28, 31, 41)
+FLOOR_ALT = (24, 27, 36)
+WALL = (62, 68, 88)
+WALL_TOP = (96, 104, 132)
 PANEL_BG = (20, 21, 28)
 PANEL_LINE = (44, 47, 60)
 INK = (208, 214, 230)
@@ -119,7 +126,32 @@ WARN = (240, 130, 110)
 GOLD = (250, 205, 120)
 
 PLAYER_COLOR = (225, 235, 250)
-DUMMY_COLORS = [(210, 130, 120), (150, 190, 130), (170, 150, 220), (220, 190, 120)]
+
+#: The roster: (sprite key, name, tint, hp, spawn x, spawn y).
+#: Health is deliberately generous -- at four points a monster died to the
+#: first or second blow, which meant you spent the whole session watching death
+#: animations and almost never saw a hit *land* on something still standing.
+MONSTERS = [
+    ("goblin", "goblin", (150, 200, 130), 14, 13, 5),
+    ("goblin", "goblin", (150, 200, 130), 14, 27, 15),
+    ("lizard", "lizard", (120, 200, 190), 16, 24, 4),
+    ("skeleton", "skeleton", (225, 225, 210), 12, 9, 14),
+    ("wolf", "wolf", (200, 160, 130), 12, 33, 9),
+    ("wolf", "wolf", (200, 160, 130), 12, 6, 9),
+    ("raven", "raven", (170, 150, 220), 10, 22, 16),
+    ("slime", "slime", (140, 220, 160), 18, 35, 13),
+    ("ogre", "ogre", (215, 140, 130), 24, 30, 4),
+]
+DUMMY_POS = (17, 10)
+
+#: Death animations are handed out round-robin at spawn rather than at random,
+#: so a single fight is guaranteed to show several different ones.
+DEATH_ORDER = ["spin", "topple", "launch", "melt", "burst"]
+
+#: How long an enemy waits between acting, and how long the player is locked
+#: out after acting. One shared pace keeps the raw-sim mode honest -- juice off
+#: changes how a turn *looks*, never how fast the game runs.
+TURN_TIME = MOVE_TIME
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +182,15 @@ TOGGLE_SPECS = [
      "Lift the step off the floor. Needs the move tween. A slide reads as a "
      "chess piece, an arc reads as a body."),
     ("squash", "squash & stretch", "movement",
-     "Stretch along the direction of travel, squash on landing. Conserve volume or it looks broken."),
+     "Flat on take-off and landing, drawn out at the apex. Get the sign "
+     "backwards and the two phases cancel into a jitter you cannot see."),
     ("bob", "idle breathing", "movement",
      "A slow scale wobble so a standing figure is not a dead pixel. Nobody notices it until it is gone."),
     ("ghost", "afterimage trail", "movement",
      "Faded echoes of the last few frames. Sells speed on a fast move, noise on a slow one."),
     ("dust", "landing dust", "movement",
-     "A puff of floor at the end of a hop. Tells you the feet touched something."),
+     "A puff of floor kicked sideways at the end of a hop. Tells you the feet "
+     "touched something, and gives the landing squash a reason."),
     ("wallbump", "wall bump", "movement",
      "A failed move still needs an answer. Bounce off and shiver, no damage."),
 
@@ -173,7 +207,10 @@ TOGGLE_SPECS = [
     ("shiver", "victim shiver", "attack",
      "Jitter the body it landed on, decaying fast. Reads as the blow ringing through."),
     ("slash", "weapon arc", "attack",
-     "A six-frame sweep across the target tile. The eye fills in a sword that is never drawn."),
+     "A six-frame sweep around the target tile. The eye fills in a sword that is never drawn."),
+    ("cut", "slash cut", "attack",
+     "The edge going through rather than around: a straight line that wipes on "
+     "fast and holds. The arc says a swing happened, the cut says it landed."),
     ("death", "death animation", "attack",
      "Spin, shrink, fall, fade. A thing that vanishes instantly leaves you unsure you hit it."),
 
@@ -257,15 +294,24 @@ class Entity:
     the juice layer be swapped out wholesale by the master toggle.
     """
 
-    def __init__(self, glyph: str, x: int, y: int, color, name: str, hp: int = 5):
-        self.glyph = glyph
-        self.color = color
+    def __init__(self, sprite: str, x: int, y: int, color, name: str, hp: int = 5,
+                 *, tint: bool = True, invincible: bool = False,
+                 stationary: bool = False, death: str = "spin"):
+        self.sprite = sprite            # key into tiles.SPRITES
+        self.color = color              # tint, and the colour of its sparks
+        self.tint = tint                # False for art that is already coloured
         self.name = name
         self.body = Body(tx=float(x), ty=float(y))
         self.anim = Animator()
         self.trail = GhostTrail()
         self.hp = hp
         self.max_hp = hp
+        # Invincible things still take the full hit *presentation* -- flash,
+        # knockback, sparks, screen shake -- and simply never run out of health.
+        # That is the whole point of a bench: you want to feel being hit.
+        self.invincible = invincible
+        self.stationary = stationary    # true for the training dummy
+        self.death = death              # which exit animation it plays
         self.dying = False
         self.death_timer = 0.0
         # Seeded off the position so a row of dummies does not breathe in step.
@@ -288,14 +334,33 @@ class Entity:
 
 
 def build_map():
-    """A room with a wall border and a few pillars to bump into."""
+    """A walled 40x20 arena with pillars and a few short walls.
+
+    The cover is not decoration: without something to walk around, the enemy
+    pathfinding is a straight line and there is nothing to see. The blocks are
+    placed so most approaches to the middle have a corner in them.
+    """
     grid = [[0] * GRID_W for _ in range(GRID_H)]
     for x in range(GRID_W):
         grid[0][x] = grid[GRID_H - 1][x] = 1
     for y in range(GRID_H):
         grid[y][0] = grid[y][GRID_W - 1] = 1
-    for (px, py) in [(7, 6), (7, 14), (17, 6), (17, 14), (12, 3), (12, 17)]:
+
+    for (px, py) in [(6, 4), (6, 15), (12, 7), (12, 12), (28, 7), (28, 12),
+                     (33, 4), (33, 15), (24, 3), (24, 16)]:
         grid[py][px] = 1
+    # Short walls, each with an open end, so there is somewhere to path around.
+    for x in range(9, 14):
+        grid[3][x] = 1
+    for x in range(26, 31):
+        grid[16][x] = 1
+    for y in range(7, 13):
+        grid[y][14] = 1
+    for y in range(6, 11):
+        grid[y][30] = 1
+    # The middle is deliberately left clear: the player spawns there and every
+    # neighbouring tile has to be walkable, or the first step of a fresh bench
+    # is a wall bump.
     return grid
 
 
@@ -320,21 +385,52 @@ class World:
         self.vignette_pulse = 0.0
         self.rgb_split = 0.0
         self.log: list[list] = []          # [text, age, colour]
+        self.turn = 0
+        self.turn_cooldown = 0.0           # seconds until the player may act
+        self.goal_map: list[list] = []     # distance-to-player, rebuilt per turn
+        self.player = None
         self.reset()
 
     # -- setup ------------------------------------------------------------
     def reset(self):
-        self.player = Entity("@", 12, 10, PLAYER_COLOR, "you", hp=99)
+        """Respawn the monsters, leaving the player exactly where they stand.
+
+        Resetting used to teleport you back to the middle, which is wrong for a
+        bench: you pick a spot with a good view of an effect, hit reset for a
+        fresh set of targets, and you want to still be looking at it.
+        """
+        first_run = getattr(self, "player", None) is None
+        if first_run:
+            self.player = Entity("player", GRID_W // 2, GRID_H // 2, PLAYER_COLOR,
+                                 "you", hp=99, tint=False, invincible=True)
+        else:
+            self.player.anim.clear()
+            self.player.trail.clear()
+            self.player.body.reset_juice()
+
+        px, py = self.player.tile
         self.entities = [self.player]
-        for i, (x, y) in enumerate([(10, 8), (14, 8), (10, 12), (14, 12)]):
+        for kind, name, color, hp, x, y in MONSTERS:
+            if (x, y) == (px, py) or self.blocked(x, y):
+                continue
+            self.entities.append(Entity(kind, x, y, color, name, hp=hp,
+                                        death=DEATH_ORDER[len(self.entities) %
+                                                          len(DEATH_ORDER)]))
+        # The punching bag: never moves, never dies, always tells you the number.
+        if (DUMMY_POS) != (px, py) and not self.blocked(*DUMMY_POS):
             self.entities.append(
-                Entity("k", x, y, DUMMY_COLORS[i], f"dummy {i + 1}", hp=4))
+                Entity("dummy", *DUMMY_POS, (190, 150, 110), "training dummy",
+                       hp=999, invincible=True, stationary=True))
+
         self.fx.clear()
         self.log.clear()
-        cx, cy = self.player.tile_center()
-        self.camera.snap(cx, cy)
-        self.clamp_camera()
-        self.say("bump a dummy to swing at it", ACCENT)
+        self.turn_cooldown = 0.0
+        self.rebuild_goal_map()
+        if first_run:
+            cx, cy = self.player.tile_center()
+            self.camera.snap(cx, cy)
+            self.clamp_camera()
+        self.say("walk into something to hit it", ACCENT)
 
     def clamp_camera(self):
         """Keep the viewport inside the map, centring on any axis too small.
@@ -367,45 +463,110 @@ class World:
                 return e
         return None
 
-    def nearest_dummy(self):
-        others = [e for e in self.entities if e is not self.player and not e.dying]
+    def rebuild_goal_map(self):
+        """Breadth-first flood outward from the player: a Dijkstra goal map.
+
+        Every enemy needs a route to the same place, so pathing them one at a
+        time with A* would solve the same problem over and over. One flood fill
+        costs a single pass over 800 cells and then *every* enemy's move is a
+        look at four neighbours and a comparison -- and it is naturally
+        cooperative, since walking downhill from different starts spreads them
+        out around corners instead of stacking them into a queue.
+
+        Unreachable cells keep `None`, which is how an enemy behind a sealed
+        wall knows to stand still rather than jitter against it.
+        """
+        self.goal_map = [[None] * GRID_W for _ in range(GRID_H)]
+        sx, sy = self.player.tile
+        if self.blocked(sx, sy):
+            return
+        self.goal_map[sy][sx] = 0
+        frontier = deque([(sx, sy)])
+        while frontier:
+            x, y = frontier.popleft()
+            d = self.goal_map[y][x] + 1
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = x + dx, y + dy
+                if self.blocked(nx, ny) or self.goal_map[ny][nx] is not None:
+                    continue
+                self.goal_map[ny][nx] = d
+                frontier.append((nx, ny))
+
+    def step_toward_player(self, e: Entity):
+        """One downhill step on the goal map. True if it moved or attacked."""
+        x, y = e.tile
+        here = self.goal_map[y][x]
+        if here is None:
+            return False
+
+        best = None
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            d = None if self.blocked(nx, ny) else self.goal_map[ny][nx]
+            if d is None or d >= here:
+                continue
+            occupant = self.entity_at(nx, ny)
+            if occupant is self.player:
+                e.body.facing = (dx, dy)
+                self.attack(e, self.player, dx, dy)
+                return True
+            if occupant is not None:
+                continue          # another monster has the tile; wait a turn
+            if best is None or d < best[0]:
+                best = (d, dx, dy)
+
+        if best is None:
+            return False
+        self.move_entity(e, best[1], best[2])
+        return True
+
+    def take_enemy_turns(self):
+        """Everything that is not the player gets one action."""
+        for e in list(self.entities):
+            if e is self.player or e.dying or e.stationary:
+                continue
+            self.step_toward_player(e)
+
+    def nearest_enemy(self, *, killable: bool = False, mobile: bool = False):
+        """The closest other entity, optionally filtered.
+
+        The filters matter now that not everything on the board is the same
+        kind of thing: the kill shortcut must skip the invincible training
+        dummy (or it silently does nothing), and the "hit me" key must skip it
+        too, since a punching bag that punches back is not a punching bag.
+        """
+        others = [e for e in self.entities
+                  if e is not self.player and not e.dying
+                  and not (killable and e.invincible)
+                  and not (mobile and e.stationary)]
         if not others:
             return None
         px, py = self.player.tile
         return min(others, key=lambda e: (e.tile[0] - px) ** 2 + (e.tile[1] - py) ** 2)
 
     # -- actions ----------------------------------------------------------
-    def try_move(self, e: Entity, dx: int, dy: int):
-        """One turn's worth of movement, which may turn into an attack.
+    def move_entity(self, e: Entity, dx: int, dy: int):
+        """Commit a move and attach whatever animation the juice asks for.
 
         Note the order: the *logical* move happens immediately and completely,
         and only then is an animation attached to drag the picture back to
-        where the entity used to be. The sim never waits for a tween.
+        where the entity used to be. The sim never waits for a tween -- which
+        is also why the enemies can path with no idea that animation exists.
         """
-        if e.anim.busy or self.hitstop.frozen:
-            return
         e.body.facing = (dx, dy)
-        nx, ny = e.tile[0] + dx, e.tile[1] + dy
+        e.body.tx += dx                              # instant, authoritative
+        e.body.ty += dy
 
-        target = self.entity_at(nx, ny)
-        if target is not None and target is not e:
-            self.attack(e, target, dx, dy)
-            return
-
-        if self.blocked(nx, ny):
-            self.bump_wall(e, dx, dy)
-            return
-
-        e.body.tx, e.body.ty = float(nx), float(ny)   # instant, authoritative
         j = self.juice
         if not j.on("tween"):
             # The raw sim: the sprite is simply somewhere else now. This is the
             # baseline every other movement effect is an argument against.
             return
+        e.anim.clear()
         if j.on("hop"):
             e.anim.play(Hop(duration=MOVE_TIME, dx=dx, dy=dy,
                             height=j.amt(0.34),
-                            squash=j.amt(0.26) if j.on("squash") else 0.0,
+                            squash=j.amt(0.30) if j.on("squash") else 0.0,
                             ease=EASINGS[j.move_ease]))
             if j.on("dust"):
                 # Fired at the end of the hop rather than the start, so it is
@@ -416,12 +577,44 @@ class World:
             e.anim.play(Slide(duration=MOVE_TIME, dx=dx, dy=dy,
                               ease=EASINGS[j.move_ease]))
 
+    def try_move(self, e: Entity, dx: int, dy: int):
+        """The player's turn: walk, or attack whatever is in the way."""
+        if e.anim.busy or self.hitstop.frozen or self.turn_cooldown > 0.0:
+            return
+        e.body.facing = (dx, dy)
+        nx, ny = e.tile[0] + dx, e.tile[1] + dy
+
+        target = self.entity_at(nx, ny)
+        if target is not None and target is not e:
+            self.attack(e, target, dx, dy)
+        elif self.blocked(nx, ny):
+            self.bump_wall(e, dx, dy)
+            return                       # a move into a wall costs no turn
+        else:
+            self.move_entity(e, dx, dy)
+        self.end_player_turn()
+
+    def end_player_turn(self):
+        """Everything else gets to act, and the player is locked out briefly."""
+        self.turn += 1
+        self.turn_cooldown = TURN_TIME
+        self.rebuild_goal_map()
+        self.take_enemy_turns()
+
     def landing_dust(self, e: Entity):
+        """A puff kicked out sideways from under the feet.
+
+        Thrown left and right along the floor rather than upwards, because dust
+        that rises reads as smoke. Slow, low gravity and high drag, so it
+        billows and stalls instead of arcing away like a spark.
+        """
         x, y = e.tile_center()
-        self.fx.particles.burst(
-            x, y + TILE * 0.34, count=6, direction=(0, -1), spread=2.4,
-            speed=(30 * PX, 110 * PX), life=(0.16, 0.34), size=3.0 * PX,
-            colors=((90, 96, 118), (70, 76, 96)), gravity=260.0 * PX, drag=3.0)
+        for direction in ((-1.0, -0.25), (1.0, -0.25)):
+            self.fx.particles.burst(
+                x, y + TILE * 0.42, count=5, direction=direction, spread=1.1,
+                speed=(70 * PX, 210 * PX), life=(0.25, 0.5), size=5.0 * PX,
+                colors=((132, 140, 166), (108, 116, 142), (92, 99, 124)),
+                gravity=120.0 * PX, drag=4.2)
 
     def bump_wall(self, e: Entity, dx: int, dy: int):
         """A move that failed. It still gets an animation -- silence reads as a
@@ -479,9 +672,10 @@ class World:
         if target.dying:
             return
         j = self.juice
-        damage = 1 + (abs(hash((target.name, target.hp))) % 3)
-        target.hp -= damage
-        killing = target.hp <= 0
+        damage = 2 + (abs(hash((target.name, target.hp, self.turn))) % 4)
+        if not target.invincible:
+            target.hp -= damage
+        killing = target.hp <= 0 and not target.invincible
 
         tx, ty = target.tile_center()
         # Sparks want to appear on the contact face, not in the middle of the
@@ -538,25 +732,43 @@ class World:
                               life=0.35, width=5.0 * PX * heavy,
                               color=(255, 240, 210))
         if j.on("ripple"):
-            self.fx.impact(cx, cy, strength=j.amt(7.0 * PX * heavy), life=0.5,
-                           speed=520.0 * PX, wavelength=60.0 * PX)
+            # Deliberately short-ranged: the wave front covers about three
+            # tiles before it dies. A ripple that crosses the whole arena reads
+            # as an earthquake rather than as a blow landing here, and it makes
+            # the renderer repaint the entire floor for a displacement of
+            # nothing.
+            self.fx.impact(cx, cy, strength=j.amt(7.5 * PX * heavy), life=0.42,
+                           speed=270.0 * PX, wavelength=46.0 * PX)
         if j.on("slash"):
             self.fx.slash(tx - dx * TILE * 0.25, ty - dy * TILE * 0.25,
                           angle=math.degrees(math.atan2(-dy, dx)),
                           radius=TILE * 0.62, life=0.16)
+        if j.on("cut"):
+            # Across the blow rather than along it, and canted, because a cut
+            # square to the attack direction reads as a wall rather than a swing.
+            self.fx.cut(tx, ty, angle=math.degrees(math.atan2(-dy, dx)) + 118.0,
+                        length=TILE * 1.5, thickness=6.0 * PX * heavy, life=0.15)
 
         if killing:
             self.kill(target)
+        elif target is self.player:
+            self.say(f"you shrug off {damage}", ACCENT)
         else:
             self.say(f"{target.name} takes {damage}", target.color)
 
     def kill(self, target: Entity):
+        if target.invincible:
+            return                       # the training dummy outlives everyone
         target.dying = True
         target.anim.clear()
         j = self.juice
         if j.on("death"):
-            target.anim.play(DeathSpin(duration=0.55, spin=430.0, drop=0.45))
-            target.death_timer = 0.55
+            # Which exit it plays was decided at spawn, so a fight shows a
+            # spread of them rather than the same one five times.
+            facing = 1.0 if target.body.tx >= self.player.body.tx else -1.0
+            motion = DEATHS[target.death](facing)
+            target.anim.play(motion)
+            target.death_timer = motion.duration
         else:
             target.death_timer = 0.0     # gone on the next frame, no ceremony
         if j.on("particles"):
@@ -570,7 +782,7 @@ class World:
     def strike_player(self):
         """Have the nearest dummy hit the player -- the same code, reversed, so
         the receiving end of every effect can be looked at too."""
-        d = self.nearest_dummy()
+        d = self.nearest_enemy(mobile=True)
         if d is None or d.anim.busy:
             return
         px, py = self.player.tile
@@ -585,12 +797,13 @@ class World:
     def swing(self):
         """Attack whatever is in front, or whiff at empty air."""
         p = self.player
-        if p.anim.busy or self.hitstop.frozen:
+        if p.anim.busy or self.hitstop.frozen or self.turn_cooldown > 0.0:
             return
         dx, dy = p.body.facing
         target = self.entity_at(p.tile[0] + dx, p.tile[1] + dy)
         if target is not None and target is not p:
             self.attack(p, target, dx, dy)
+            self.end_player_turn()
             return
 
         j = self.juice
@@ -608,6 +821,7 @@ class World:
             self.fx.slash(cx + dx * TILE * 0.55, cy + dy * TILE * 0.55,
                           angle=math.degrees(math.atan2(-dy, dx)),
                           radius=TILE * 0.55, life=0.16)
+        self.end_player_turn()
 
     # -- per-frame --------------------------------------------------------
     def update(self, dt: float):
@@ -652,6 +866,9 @@ class World:
         self.screen_flash = max(0.0, self.screen_flash - dt * 1.6)
         self.vignette_pulse = max(0.0, self.vignette_pulse - dt * 2.2)
         self.rgb_split = max(0.0, self.rgb_split - dt * 26.0)
+        # Ticks on the real clock, not the frozen one, so hit-stop does not
+        # silently lengthen the turn.
+        self.turn_cooldown = max(0.0, self.turn_cooldown - dt)
 
         for entry in self.log:
             entry[1] += dt
@@ -693,6 +910,8 @@ class Renderer:
         self.split_r = pygame.Surface((VIEW_W, VIEW_H)).convert()
         self.split_b = pygame.Surface((VIEW_W, VIEW_H)).convert()
         self.vignette = self._make_vignette()
+        self.sheet = tiles.SpriteSheet(TILE)
+        self._floor = None          # baked on first draw; the arena is static
         self._glyphs: dict = {}
         self.rows: list = []       # (rect, toggle key), rebuilt every panel draw
         self.hover: str | None = None
@@ -724,13 +943,10 @@ class Renderer:
             pygame.draw.rect(surf, (0, 0, 0, a), rect, width=band)
         return surf
 
-    def glyph(self, ch: str, color):
-        key = (ch, color)
-        surf = self._glyphs.get(key)
-        if surf is None:
-            surf = self.font_tile.render(ch, True, color).convert_alpha()
-            self._glyphs[key] = surf
-        return surf
+    def sprite_for(self, e: Entity):
+        """The resting sprite for an entity, tinted and cached by the sheet."""
+        col, row = tiles.SPRITES.get(e.sprite, tiles.SPRITES["goblin"])
+        return self.sheet.sprite(col, row, e.color if e.tint else None)
 
     def to_view(self, world: World, wx: float, wy: float):
         """World pixels -> view-surface pixels."""
@@ -744,49 +960,109 @@ class Renderer:
         self.draw_shockwaves(world)
         self.draw_entities(world)
         self.draw_slashes(world)
+        self.draw_cuts(world)
         self.draw_particles(world)
         self.draw_floaters(world)
 
-    def draw_floor(self, world: World):
-        """Tiles, each displaced by whatever impact waves are passing through.
+    def _tile_rect(self, cx: float, cy: float) -> pygame.Rect:
+        rect = pygame.Rect(0, 0, TILE - 2, TILE - 2)
+        rect.center = (int(cx), int(cy))
+        return rect
 
-        This is the effect people forget. Shaking the camera moves everything
-        together, which the eye reads as the *camera* being hit. Moving tiles
-        against each other is the only way the floor itself takes part.
+    def _paint_tile(self, surf, world: World, tx: int, ty: int, cx: float, cy: float):
+        rect = self._tile_rect(cx, cy)
+        if world.grid[ty][tx]:
+            pygame.draw.rect(surf, WALL, rect, border_radius=3)
+            pygame.draw.rect(surf, WALL_TOP, rect.inflate(-8, -8), border_radius=2)
+        else:
+            shade = FLOOR if (tx + ty) % 2 == 0 else FLOOR_ALT
+            pygame.draw.rect(surf, shade, rect, border_radius=3)
+
+    def _bake_floor(self, world: World):
+        """Draw the whole 40x20 arena once, into one surface.
+
+        Repainting 500-odd rounded rects every frame cost more than every
+        sprite, particle and slash in the bench put together. The arena never
+        changes, so it is baked once and the frame becomes a single blit; only
+        the handful of tiles a ripple is passing through get redrawn by hand.
+        """
+        surf = pygame.Surface((GRID_W * TILE, GRID_H * TILE)).convert()
+        surf.fill(BG)
+        for ty in range(GRID_H):
+            for tx in range(GRID_W):
+                self._paint_tile(surf, world, tx, ty,
+                                 (tx + 0.5) * TILE, (ty + 0.5) * TILE)
+        return surf
+
+    def draw_floor(self, world: World):
+        """The baked arena, plus any tiles an impact wave is shoving about.
+
+        The ripple is the effect people forget. Shaking the camera moves
+        everything together, which the eye reads as the *camera* being hit.
+        Moving tiles against each other is the only way the floor itself takes
+        part -- so where a wave is passing, the baked copy is painted out and
+        those tiles are redrawn at their displaced positions.
         """
         v = self.view
+        if self._floor is None:
+            self._floor = self._bake_floor(world)
+        v.blit(self._floor, (int(VIEW_W * 0.5 - world.camera.x),
+                             int(VIEW_H * 0.5 - world.camera.y)))
+
         rippling = world.juice.on("ripple") and world.fx.impacts
-        # Only walk the tiles that can be on screen.
-        x0 = max(0, int((world.camera.x - VIEW_W * 0.5) // TILE) - 1)
-        x1 = min(GRID_W, int((world.camera.x + VIEW_W * 0.5) // TILE) + 2)
-        y0 = max(0, int((world.camera.y - VIEW_H * 0.5) // TILE) - 1)
-        y1 = min(GRID_H, int((world.camera.y + VIEW_H * 0.5) // TILE) + 2)
+        if not rippling:
+            return
+        # A ripple only touches the tiles its wave front has reached, so the
+        # union of the live impacts' reach is computed once here and used to
+        # skip the per-tile displacement call for everything outside it. On a
+        # 40x20 arena that is the difference between 475 calls a frame and a
+        # few dozen.
+        # A wave only touches the tiles its front has reached, so the union of
+        # the live impacts bounds the repaint to a few dozen tiles.
+        box = None
+        for imp in world.fx.impacts:
+            reach = imp.speed * imp.t + imp.wavelength * 1.5 + TILE
+            r = pygame.Rect(imp.x - reach, imp.y - reach, reach * 2, reach * 2)
+            box = r if box is None else box.union(r)
+
+        x0 = max(0, int(box.left // TILE))
+        x1 = min(GRID_W, int(box.right // TILE) + 1)
+        y0 = max(0, int(box.top // TILE))
+        y1 = min(GRID_H, int(box.bottom // TILE) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return
 
         for ty in range(y0, y1):
             for tx in range(x0, x1):
                 wx, wy = (tx + 0.5) * TILE, (ty + 0.5) * TILE
-                ox = oy = 0.0
-                if rippling:
-                    ox, oy = world.fx.tile_offset(wx, wy)
+                ox, oy = world.fx.tile_offset(wx, wy)
+                if abs(ox) < 0.4 and abs(oy) < 0.4:
+                    continue          # the baked copy is already correct here
+                # Paint out the baked tile first, or the displaced one would be
+                # drawn on top of a stationary twin of itself.
+                sx, sy = self.to_view(world, wx, wy)
+                v.fill(BG, self._tile_rect(sx, sy).inflate(4, 4))
                 sx, sy = self.to_view(world, wx + ox, wy + oy)
-                rect = pygame.Rect(0, 0, TILE - 2, TILE - 2)
-                rect.center = (int(sx), int(sy))
-                if world.grid[ty][tx]:
-                    pygame.draw.rect(v, WALL, rect, border_radius=3)
-                    pygame.draw.rect(v, WALL_TOP, rect.inflate(-8, -8), border_radius=2)
-                else:
-                    shade = FLOOR if (tx + ty) % 2 == 0 else FLOOR_ALT
-                    pygame.draw.rect(v, shade, rect, border_radius=3)
+                self._paint_tile(v, world, tx, ty, sx, sy)
 
     def draw_entities(self, world: World):
         for e in world.entities:
             self.draw_trail(world, e)
             self.draw_body(world, e)
-            if not e.dying and e is not world.player:
+            # No bar on things that cannot lose the fight: the player and the
+            # training dummy are both invincible, and a full bar that never
+            # moves is just clutter.
+            if not e.dying and not e.invincible:
                 self.draw_hp(world, e)
 
     def _transform(self, base, sx: float, sy: float, angle: float):
-        """Squash, stretch and spin one glyph.
+        """Squash, stretch and spin one sprite.
+
+        Nearest-neighbour throughout -- `scale` and `rotate`, never
+        `smoothscale` or `rotozoom`. Pixel art put through a smooth filter goes
+        to mush, and squash-and-stretch resamples the sprite on every single
+        frame, so a smooth path would leave a monster blurry for the entire
+        length of every hop.
 
         The non-uniform scale has to happen before the rotation, or a squashed
         sprite would end up squashed along the *screen* axes instead of its own.
@@ -795,13 +1071,13 @@ class Renderer:
         if abs(sx - 1.0) > 0.005 or abs(sy - 1.0) > 0.005:
             w = max(1, int(base.get_width() * sx))
             h = max(1, int(base.get_height() * sy))
-            img = pygame.transform.smoothscale(base, (w, h))
+            img = pygame.transform.scale(base, (w, h))
         if abs(angle) > 0.1:
-            img = pygame.transform.rotozoom(img, angle, 1.0)
+            img = pygame.transform.rotate(img, angle)
         return img
 
     def draw_trail(self, world: World, e: Entity):
-        base = self.glyph(e.glyph, e.color)
+        base = self.sprite_for(e)
         for g in e.trail.ghosts:
             img = self._transform(base, g.sx, g.sy, g.angle).copy()
             img.set_alpha(int(110 * g.alpha))
@@ -810,12 +1086,12 @@ class Renderer:
 
     def draw_body(self, world: World, e: Entity):
         b = e.body
-        img = self._transform(self.glyph(e.glyph, e.color), b.sx, b.sy, b.angle)
+        img = self._transform(self.sprite_for(e), b.sx, b.sy, b.angle)
 
         if b.flash > 0.0 or b.alpha < 1.0:
             img = img.copy()
             if b.flash > 0.0:
-                # Adding to RGB but not to alpha whitens the glyph while
+                # Adding to RGB but not to alpha whitens the sprite while
                 # leaving its silhouette exactly as it was.
                 white = img.copy()
                 white.fill((255, 255, 255, 0), special_flags=pygame.BLEND_RGBA_ADD)
@@ -874,6 +1150,32 @@ class Renderer:
             sx, sy = self.to_view(world, s.x, s.y)
             self.view.blit(surf, (int(sx - r - 2), int(sy - r - 2)))
 
+    def _stamp(self, shapes):
+        """Draw translucent polygons onto the view via the scratch layer.
+
+        The scratch surface exists because pygame cannot draw a *translucent*
+        polygon straight onto an opaque surface. The trap is that clearing the
+        whole 800x600 scratch for every slash costs more than everything else
+        in the frame put together -- so only the shape's own bounding box is
+        cleared and blitted, which is typically a couple of tiles' worth.
+        """
+        bounds = None
+        for pts, _ in shapes:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            r = pygame.Rect(int(min(xs)) - 2, int(min(ys)) - 2,
+                            int(max(xs) - min(xs)) + 5, int(max(ys) - min(ys)) + 5)
+            bounds = r if bounds is None else bounds.union(r)
+        if bounds is None:
+            return
+        bounds = bounds.clip(self.scratch.get_rect())
+        if bounds.w <= 0 or bounds.h <= 0:
+            return
+        self.scratch.fill((0, 0, 0, 0), bounds)
+        for pts, color in shapes:
+            pygame.draw.polygon(self.scratch, color, pts)
+        self.view.blit(self.scratch, bounds.topleft, bounds)
+
     def draw_slashes(self, world: World):
         """The weapon sweep, as a lens-shaped polygon that opens over its life.
 
@@ -896,9 +1198,42 @@ class Renderer:
                 ca, sa = math.cos(ang), -math.sin(ang)
                 outer.append((sx + ca * (reach + thick), sy + sa * (reach + thick)))
                 inner.append((sx + ca * (reach - thick), sy + sa * (reach - thick)))
-            self.scratch.fill((0, 0, 0, 0))
-            pygame.draw.polygon(self.scratch, (*s.color, a), outer + inner[::-1])
-            self.view.blit(self.scratch, (0, 0))
+            self._stamp([(outer + inner[::-1], (*s.color, a))])
+
+    def draw_cuts(self, world: World):
+        """The straight cut: a lens tapering to a point at both ends.
+
+        Drawn twice -- a wide coloured body and a thin white core -- which is
+        the cheapest way to make a flat polygon look like it is glowing.
+        """
+        for c in world.fx.cuts:
+            a = int(255 * c.alpha)
+            if a <= 3:
+                continue
+            (tx, ty), (hx, hy) = c.endpoints()
+            tail = self.to_view(world, tx, ty)
+            head = self.to_view(world, hx, hy)
+            dx, dy = head[0] - tail[0], head[1] - tail[1]
+            span = math.hypot(dx, dy)
+            if span < 2.0:
+                continue
+            # Unit normal, to give the lens its width.
+            nx, ny = -dy / span, dx / span
+            shapes = []
+            for width, color in ((c.thickness, c.color),
+                                 (c.thickness * 0.35, (255, 255, 255))):
+                pts = []
+                steps = 9
+                for i in range(steps + 1):          # one edge out...
+                    t = i / steps
+                    w = math.sin(t * math.pi) ** 0.6 * width
+                    pts.append((tail[0] + dx * t + nx * w, tail[1] + dy * t + ny * w))
+                for i in range(steps, -1, -1):      # ...and the other back
+                    t = i / steps
+                    w = math.sin(t * math.pi) ** 0.6 * width
+                    pts.append((tail[0] + dx * t - nx * w, tail[1] + dy * t - ny * w))
+                shapes.append((pts, (*color, a)))
+            self._stamp(shapes)
 
     # -- compositing ------------------------------------------------------
     def composite(self, screen, world: World):
@@ -929,9 +1264,12 @@ class Renderer:
             roll += world.camera.tilt.value
         zoom = clamp(world.camera.zoom.value if j.on("zoom") else 1.0, 0.85, 1.3)
 
-        if abs(roll) > 0.05 or abs(zoom - 1.0) > 0.002:
-            # rotozoom allocates a whole new surface, so it is kept off the
-            # path entirely on frames where neither is actually in play.
+        if abs(roll) > 0.25 or abs(zoom - 1.0) > 0.004:
+            # rotozoom allocates and resamples a whole new surface, so it is
+            # kept off the path entirely on frames where neither is actually in
+            # play. The thresholds are set at the point where the roll and the
+            # zoom stop being visible rather than at zero, which skips the long
+            # decaying tail of every shake -- most of the frames, in a fight.
             shown = pygame.transform.rotozoom(self.view, roll, zoom)
         else:
             shown = self.view
@@ -1139,7 +1477,7 @@ def handle_event(event, world: World, renderer: Renderer) -> bool:
         return False
 
     if event.key == pygame.K_k and shift:
-        d = world.nearest_dummy()
+        d = world.nearest_enemy(killable=True)
         if d:
             d.hp = 1
             world.land_blow(world.player, d, *world.player.body.facing)
@@ -1228,13 +1566,22 @@ def run_headless(path: str):
         for _ in range(n):
             world.update(dt)
 
-    # The player starts at (12,10) and dummy 1 stands at (10,8): walk up and
-    # across to (10,9), then step north into it.
-    for move in [(0, -1), (-1, 0), (-1, 0)]:
-        world.try_move(world.player, *move)
-        step(14)
-    world.try_move(world.player, 0, -1)       # walks into dummy 1 -> attack
-    assert world.player.tile == (10, 9), "the scripted walk drifted off course"
+    # The player starts mid-arena and the training dummy stands at DUMMY_POS;
+    # walk over and hit it, which is reproducible because the dummy is the one
+    # thing on the board that never moves.
+    px, py = world.player.tile
+    tx, ty = DUMMY_POS
+    while (px, py) != (tx + 1, ty):
+        dx = (tx + 1 > px) - (tx + 1 < px)
+        dy = 0 if dx else (ty > py) - (ty < py)
+        if not dx and not dy:
+            break
+        world.try_move(world.player, dx, dy)
+        step(12)
+        if world.player.tile == (px, py):
+            break                             # blocked; near enough for a frame
+        px, py = world.player.tile
+    world.try_move(world.player, -1, 0)        # walks into the dummy -> attack
     # Stop a few frames past contact, with the sparks still in the air.
     step(int((ATTACK_WINDUP + ATTACK_TIME * 0.32) / dt) + 5)
 
