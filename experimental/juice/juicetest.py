@@ -537,6 +537,74 @@ def test_unjuiced_kill_removes_immediately():
     assert dummy not in world.entities
 
 
+def test_nothing_moves_at_all_with_the_juice_off():
+    """The A/B switch has to reach *everything*.
+
+    Walk, bump a wall, swing at air, take a hit and kill something, checking on
+    every single frame that no body has left its identity pose. Anything that
+    animates without a toggle behind it -- an idle breath, a move tween, a log
+    line scaling in -- shows up here as a body that is not exactly 1.0.
+    """
+    rj, world = _world()
+    world.juice.master = False
+    p = world.player
+
+    def assert_still(where):
+        for e in world.entities:
+            b = e.body
+            assert (b.ox, b.oy) == (0.0, 0.0), f"{e.name} shifted during {where}"
+            assert (b.sx, b.sy) == (1.0, 1.0), f"{e.name} scaled during {where}"
+            assert b.angle == 0.0 and b.alpha == 1.0, f"{e.name} moved in {where}"
+            assert b.flash == 0.0, f"{e.name} flashed during {where}"
+
+    for label, action in (
+        ("a walk", lambda: world.try_move(p, 0, -1)),
+        ("a wall bump", lambda: (setattr(p.body, "tx", 1.0),
+                                 setattr(p.body, "ty", 1.0),
+                                 world.try_move(p, -1, 0))),
+        ("a whiffed swing", world.swing),
+        ("taking a hit", world.strike_player),
+        ("a kill", lambda: world.kill(world.nearest_dummy())),
+    ):
+        action()
+        for _ in range(45):
+            world.update(1 / 60)
+            assert_still(label)
+
+
+def test_the_move_tween_is_what_makes_a_step_visible():
+    """`tween` off must teleport; on must not. Without this toggle there is no
+    way to see the baseline the rest of the movement effects improve on."""
+    # Breathing off too, since it legitimately nudges the body on its own and
+    # would otherwise mask what this test is actually asking about.
+    rj, world = _world(tween=False, bob=False)
+    world.try_move(world.player, 0, -1)
+    world.update(1 / 60)
+    assert world.player.body.ox == 0.0 and world.player.body.oy == 0.0
+
+    rj, world = _world()
+    world.try_move(world.player, 0, -1)
+    world.update(1 / 60)
+    assert abs(world.player.body.oy) > 0.5, "the tween did not lag the picture"
+
+
+def test_idle_breathing_actually_stops_when_switched_off():
+    """This one shipped broken: the breath was a persistent motion and nothing
+    ever consulted its toggle."""
+    rj, world = _world()
+    world.juice.toggles["bob"].on = False
+    for _ in range(120):
+        world.update(1 / 60)
+        assert world.player.body.sy == 1.0, "the idle breathing toggle does nothing"
+
+    rj, world = _world()
+    seen = set()
+    for _ in range(120):
+        world.update(1 / 60)
+        seen.add(round(world.player.body.sy, 4))
+    assert len(seen) > 10, "nothing breathes even with the toggle on"
+
+
 def test_master_switch_spawns_no_effects_at_all():
     """The A/B comparison has to be honest -- with the master off, a blow must
     produce a damage number and nothing else."""
@@ -694,9 +762,11 @@ def test_the_footer_text_fits_below_the_separator():
     import rogue_juice as rj
     pygame.font.init()
     line_h, avail = 14, rj.FOOTER_H - 7
-    assert 6 * line_h <= avail, "the control list overflows the footer"
     ui = pygame.font.Font(
-        pygame.font.match_font("dejavusansmono,couriernew,monospace"), 12)
+        pygame.font.match_font("dejavusansmono,couriernew,monospace"), 13)
+    assert len(rj.HELP_LINES) * line_h <= avail, "the control list overflows"
+    for line in rj.HELP_LINES:
+        assert ui.size(line)[0] <= rj.PANEL_W - 28, f"help line too wide: {line!r}"
     for t in rj.Juice().toggles.values():
         lines = rj.Renderer._wrap(t.blurb, rj.PANEL_W - 30, ui)
         assert 16 + len(lines) * line_h <= avail, f"{t.key} blurb is too long"

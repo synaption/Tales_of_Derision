@@ -604,6 +604,11 @@ class Animator:
     def __init__(self) -> None:
         self.motions: List[Motion] = []
         self.persistent: List[Motion] = []
+        # Persistent motions are ambient rather than triggered, so the only way
+        # to switch one off is a gate here. Without it an idle-breathing toggle
+        # has nothing to hold onto: there is no moment at which the breath is
+        # "played" that a caller could decline to reach.
+        self.persistent_enabled = True
 
     def play(self, motion: Optional[Motion]) -> None:
         """Add a one-shot Motion. `None` is accepted and ignored, so callers
@@ -626,8 +631,9 @@ class Animator:
 
     def update(self, body: Body, dt: float) -> None:
         body.reset_juice()
-        for m in self.persistent:
-            m.update(body, dt)
+        if self.persistent_enabled:
+            for m in self.persistent:
+                m.update(body, dt)
         if self.motions:
             self.motions = [m for m in self.motions if not m.update(body, dt)]
 

@@ -72,13 +72,31 @@ TILE = 34
 # The map is deliberately a little larger than the viewport in both axes, so
 # the camera has somewhere to move -- a camera that cannot pan cannot lag, and
 # camera lag is one of the effects on the list.
-GRID_W, GRID_H = 25, 21
-VIEW_W, VIEW_H = 800, 660
-PANEL_W = 316
-WIN_W, WIN_H = VIEW_W + PANEL_W, VIEW_H     # 1116x660, fits a 1366x768 laptop
-# Panel space reserved for the hover blurb / control list. Sized for the
-# longest of the two: six lines of help at 14px, plus the separator padding.
-FOOTER_H = 102
+GRID_W, GRID_H = 24, 18
+VIEW_W, VIEW_H = 800, 600
+# The toggles run in two columns, which is what keeps the window short enough
+# to fit under a taskbar -- a single column of 28 rows needs 640px of panel on
+# its own, before the header and the blurb.
+PANEL_W = 380
+WIN_W, WIN_H = VIEW_W + PANEL_W, VIEW_H     # 1180x600
+# Panel space reserved for the hover blurb / control list. Sized to swallow
+# the slack under the easing gallery rather than leave it as a dead band, so
+# the blurb gets room to wrap and the controls get room to be spelled out.
+FOOTER_H = 164
+
+#: The control list, shown whenever the mouse is not over a toggle.
+HELP_LINES = [
+    "click a row to toggle it",
+    "",
+    "wasd / arrows   move, and attack by",
+    "                walking into a dummy",
+    "space  swing at air     x  get hit",
+    "K      kill the nearest r  reset",
+    "",
+    "Tab  A/B the whole lot   F1/F2  all on/off",
+    "[ ]  move easing         - =  intensity",
+    "esc  quit",
+]
 FPS = 60
 
 #: Pixel-space scale factor. Distances on a Body are in tiles and so survive a
@@ -125,8 +143,12 @@ class Toggle:
 #: Order here is the order they appear in the panel.
 TOGGLE_SPECS = [
     # key          label               group       blurb
+    ("tween", "move tween", "movement",
+     "Animate the step at all. Off, the sprite teleports the instant the sim "
+     "moves it -- which is what the game actually does underneath."),
     ("hop", "hop arc", "movement",
-     "Lift the step off the floor. A slide reads as a chess piece; an arc reads as a body."),
+     "Lift the step off the floor. Needs the move tween. A slide reads as a "
+     "chess piece, an arc reads as a body."),
     ("squash", "squash & stretch", "movement",
      "Stretch along the direction of travel, squash on landing. Conserve volume or it looks broken."),
     ("bob", "idle breathing", "movement",
@@ -181,6 +203,9 @@ TOGGLE_SPECS = [
     ("rgbsplit", "RGB split", "world",
      "Separate the colour channels for a few frames. Watch the ms readout -- "
      "on the CPU this one effect is most of a 60Hz frame."),
+    ("logpop", "message pop", "world",
+     "Scale each log line in as it lands and fade it out after. Even the text "
+     "is animated -- turn it off and the log goes back to a printout."),
 ]
 
 
@@ -244,6 +269,8 @@ class Entity:
         self.dying = False
         self.death_timer = 0.0
         # Seeded off the position so a row of dummies does not breathe in step.
+        # Persistent, so it is gated by `anim.persistent_enabled` rather than by
+        # declining to play it -- see World.update.
         self.anim.add_persistent(Breathe(phase=(x * 3 + y * 7) % 7))
 
     @property
@@ -371,6 +398,10 @@ class World:
 
         e.body.tx, e.body.ty = float(nx), float(ny)   # instant, authoritative
         j = self.juice
+        if not j.on("tween"):
+            # The raw sim: the sprite is simply somewhere else now. This is the
+            # baseline every other movement effect is an argument against.
+            return
         if j.on("hop"):
             e.anim.play(Hop(duration=MOVE_TIME, dx=dx, dy=dy,
                             height=j.amt(0.34),
@@ -435,9 +466,12 @@ class World:
             steps.append(Parallel([lunge,
                                    Sequence([Wait(duration=ATTACK_TIME * 0.32),
                                              impact])]))
-        else:
+        elif j.on("tween"):
             steps.append(impact)
             steps.append(Wait(duration=ATTACK_TIME))
+        else:
+            # Nothing to watch, so nothing to wait for -- the blow simply lands.
+            steps.append(impact)
         attacker.anim.play(Sequence(steps))
 
     def land_blow(self, attacker: Entity, target: Entity, dx: int, dy: int):
@@ -564,9 +598,11 @@ class World:
         if j.on("windup"):
             steps.append(Anticipate(duration=ATTACK_WINDUP, dx=dx, dy=dy,
                                     amount=j.amt(0.18)))
-        steps.append(Lunge(duration=ATTACK_TIME, dx=dx, dy=dy,
-                           reach=j.amt(0.45), out_frac=0.32))
-        p.anim.play(Sequence(steps))
+        if j.on("lunge"):
+            steps.append(Lunge(duration=ATTACK_TIME, dx=dx, dy=dy,
+                               reach=j.amt(0.45), out_frac=0.32))
+        if steps:
+            p.anim.play(Sequence(steps))
         if j.on("slash"):
             cx, cy = p.tile_center()
             self.fx.slash(cx + dx * TILE * 0.55, cy + dy * TILE * 0.55,
@@ -585,8 +621,10 @@ class World:
         """
         anim_dt = self.hitstop.consume(dt)
 
+        breathing = self.juice.on("bob")
         for e in list(self.entities):
             was_busy = e.anim.busy
+            e.anim.persistent_enabled = breathing
             e.anim.update(e.body, anim_dt)
             if self.juice.on("ghost"):
                 x, y = e.world_pos()
@@ -641,8 +679,8 @@ class Renderer:
             return f
 
         self.font_tile = load(int(TILE * 0.82), bold=True)
-        self.font_ui = load(12)
-        self.font_ui_b = load(12, bold=True)
+        self.font_ui = load(13)
+        self.font_ui_b = load(13, bold=True)
         self.font_big = load(18, bold=True)
         self.font_num = load(18, bold=True)
 
@@ -936,48 +974,57 @@ class Renderer:
         screen.fill(PANEL_BG, pygame.Rect(x0, 0, PANEL_W, WIN_H))
         pygame.draw.line(screen, PANEL_LINE, (x0, 0), (x0, WIN_H))
 
-        y = 8
-        screen.blit(self.font_big.render("JUICE", True, INK), (x0 + 14, y))
+        screen.blit(self.font_big.render("JUICE", True, INK), (x0 + 14, 8))
         screen.blit(self.font_ui_b.render("ON" if j.master else "OFF (Tab)", True,
-                                          ACCENT if j.master else WARN), (x0 + 82, y + 5))
-        screen.blit(self.font_ui.render(f"x{j.intensity:.2f}", True, GOLD),
-                    (x0 + PANEL_W - 52, y + 5))
-        y += 24
-        screen.blit(self.font_ui.render(f"ease {j.move_ease}", True, DIM), (x0 + 14, y))
+                                          ACCENT if j.master else WARN), (x0 + 86, 13))
         cost = f"{self.frame_ms:4.1f} ms"
         # Red once a frame costs more than a 60Hz slot.
         cost_col = WARN if self.frame_ms > 16.7 else DIM
         screen.blit(self.font_ui.render(cost, True, cost_col),
-                    (x0 + PANEL_W - 14 - self.font_ui.size(cost)[0], y))
-        y += 15
-        self._draw_curve(screen, x0 + 14, y, EASINGS[j.move_ease])
-        y += 37
+                    (x0 + PANEL_W - 14 - self.font_ui.size(cost)[0], 13))
 
+        # Two columns, split so the taller pair of groups sits on the left.
+        # Anything that changes the toggle list will change the balance; the
+        # column bottoms are measured rather than assumed, so it stays tidy.
         self.rows.clear()
         self.hover = None
         mx, my = mouse
-        for group in j.groups:
-            screen.blit(self.font_ui_b.render(group.upper(), True, ACCENT), (x0 + 14, y))
-            pygame.draw.line(screen, PANEL_LINE,
-                             (x0 + 14, y + 14), (x0 + PANEL_W - 14, y + 14))
-            y += 17
-            for t in j.toggles.values():
-                if t.group != group:
-                    continue
-                rect = pygame.Rect(x0 + 10, y - 1, PANEL_W - 20, 14)
-                self.rows.append((rect, t.key))
-                if rect.collidepoint(mx, my):
-                    self.hover = t.key
-                    pygame.draw.rect(screen, (32, 34, 44), rect, border_radius=3)
-                label_col = INK if t.on else (78, 84, 100)
-                if not j.master:
-                    label_col = (58, 61, 72)
-                screen.blit(self.font_ui.render("[x]" if t.on else "[ ]", True,
-                                                ACCENT if t.on else (70, 74, 90)),
-                            (x0 + 16, y))
-                screen.blit(self.font_ui.render(t.label, True, label_col), (x0 + 46, y))
-                y += 14
-            y += 4
+        col_w = (PANEL_W - 34) // 2
+        bottom = 0
+        for ci, groups in enumerate((("movement", "attack"), ("camera", "world"))):
+            cx = x0 + 14 + ci * (col_w + 6)
+            y = 34
+            for gi, group in enumerate(groups):
+                if gi:
+                    y += 10
+                screen.blit(self.font_ui_b.render(group.upper(), True, ACCENT), (cx, y))
+                pygame.draw.line(screen, PANEL_LINE, (cx, y + 15), (cx + col_w, y + 15))
+                y += 19
+                for t in j.toggles.values():
+                    if t.group != group:
+                        continue
+                    rect = pygame.Rect(cx - 4, y - 2, col_w + 8, 18)
+                    self.rows.append((rect, t.key))
+                    if rect.collidepoint(mx, my):
+                        self.hover = t.key
+                        pygame.draw.rect(screen, (32, 34, 44), rect, border_radius=3)
+                    label_col = INK if t.on else (78, 84, 100)
+                    if not j.master:
+                        label_col = (58, 61, 72)
+                    screen.blit(self.font_ui.render("[x]" if t.on else "[ ]", True,
+                                                    ACCENT if t.on else (70, 74, 90)),
+                                (cx + 2, y))
+                    screen.blit(self.font_ui.render(t.label, True, label_col), (cx + 32, y))
+                    y += 18
+            bottom = max(bottom, y)
+
+        # The easing gallery, under the columns.
+        y = bottom + 12
+        screen.blit(self.font_ui.render(f"move ease  {j.move_ease}", True, DIM),
+                    (x0 + 14, y))
+        screen.blit(self.font_ui.render(f"x{j.intensity:.2f}", True, GOLD),
+                    (x0 + PANEL_W - 52, y))
+        self._draw_curve(screen, x0 + 14, y + 17, EASINGS[j.move_ease])
 
         # The blurb for whatever the mouse is over, wrapped into the footer.
         footer = WIN_H - FOOTER_H
@@ -991,20 +1038,16 @@ class Renderer:
                 screen.blit(self.font_ui.render(line, True, DIM), (x0 + 14, ty))
                 ty += 14
         else:
-            for line in ["click a row to toggle it",
-                         "F1 all on  F2 all off  Tab A/B",
-                         "wasd / arrows  move and attack",
-                         "space swing   x get hit   K kill",
-                         "[ ] ease   - = intensity",
-                         "r reset    esc quit"]:
-                screen.blit(self.font_ui.render(line, True, DIM), (x0 + 14, ty))
+            for line in HELP_LINES:
+                if line:
+                    screen.blit(self.font_ui.render(line, True, DIM), (x0 + 14, ty))
                 ty += 14
 
     def _draw_curve(self, screen, x, y, fn):
         """A little plot of the active easing curve. Seeing the overshoot in
         `out_back` as a line makes the on-screen snap far easier to reason about
         than staring at the sprite does."""
-        w, h = PANEL_W - 28, 33
+        w, h = PANEL_W - 28, 46
         pygame.draw.rect(screen, (26, 28, 36), (x, y, w, h), border_radius=3)
         pygame.draw.line(screen, PANEL_LINE, (x, y + h - 8), (x + w, y + h - 8))
         pts = [(x + i, y + h - 8 - fn(i / (w - 1)) * (h - 16)) for i in range(w)]
@@ -1025,20 +1068,25 @@ class Renderer:
         return lines
 
     def draw_hud(self, screen, world: World):
-        """The message log, each line popping in as it arrives."""
-        y = VIEW_H - 28
+        """The message log, each line popping in as it arrives.
+
+        Held well clear of the bottom edge: a window that ends up a few pixels
+        under a taskbar should lose empty floor, not the newest message.
+        """
+        popping = world.juice.on("logpop")
+        y = VIEW_H - 44
         for text, age, color in reversed(world.log):
-            a = int(255 * clamp((2.6 - age) / 0.8))
+            a = int(255 * clamp((2.6 - age) / 0.8)) if popping else 255
             if a > 4:
                 surf = self.font_ui_b.render(text, True, color)
-                if age < 0.18:      # a brief scale-up, so new text is noticed
+                if popping and age < 0.18:   # a scale-up, so new text is noticed
                     s = 1.0 + 0.35 * (1.0 - age / 0.18)
                     surf = pygame.transform.smoothscale(
                         surf, (int(surf.get_width() * s), int(surf.get_height() * s)))
                 surf = surf.copy()
                 surf.set_alpha(a)
                 screen.blit(surf, (16, y))
-            y -= 18
+            y -= 17
 
         if not world.juice.master:
             screen.blit(self.font_big.render("RAW SIM  (juice off)", True, WARN), (16, 14))
