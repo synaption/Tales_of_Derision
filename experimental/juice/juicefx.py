@@ -239,6 +239,18 @@ class Body:
 
     facing: Tuple[int, int] = (0, 1)
 
+    # Soft-body deformation. The sprite is cut into `len(shear)` bands and each
+    # is displaced by its own amount, in tiles, so different parts of one body
+    # can be in different places at the same time. `ox`/`sx` and friends can
+    # only ever move a sprite as a rigid block -- this is the channel that lets
+    # the leading edge of a slime outrun its own back end.
+    #
+    # Bands are listed in screen order and cut across the axis they slide
+    # along: `shear_axis` 0 means vertical strips that slide horizontally, 1
+    # means horizontal strips that slide vertically.
+    shear: Tuple[float, ...] = ()
+    shear_axis: int = 0
+
     def reset_juice(self) -> None:
         """Return every presentation field to "no effect applied"."""
         self.ox = self.oy = 0.0
@@ -246,6 +258,8 @@ class Body:
         self.angle = 0.0
         self.alpha = 1.0
         self.flash = 0.0
+        self.shear = ()
+        self.shear_axis = 0
 
     # The four accumulate operations. Motions only ever touch a Body through
     # these, which is what lets any number of them run at once without one
@@ -266,6 +280,19 @@ class Body:
 
     def whiten(self, f: float) -> None:
         self.flash = max(self.flash, f)
+
+    def deform(self, offsets: Seq[float], axis: int) -> None:
+        """Displace the sprite band by band, along `axis`.
+
+        Accumulates like everything else when two deformations agree on the
+        band count and the axis; otherwise the first one holds the channel,
+        since bands cut in different directions cannot be summed.
+        """
+        if not self.shear:
+            self.shear = tuple(offsets)
+            self.shear_axis = axis
+        elif axis == self.shear_axis and len(offsets) == len(self.shear):
+            self.shear = tuple(a + b for a, b in zip(self.shear, offsets))
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +623,166 @@ class DeathSpin(_Timed):
 
 
 @dataclass
+class Jelly:
+    """Slime: the body lags behind its own position and wobbles to a stop.
+
+    This is *secondary motion* -- deformation caused by the movement rather
+    than authored alongside it -- and it is the one effect here that cannot be
+    written as a fixed-length tween, because it has no idea what the body is
+    about to do. It only watches.
+
+    The model is a stack of damped springs -- one per band of the sprite --
+    each chasing wherever the body is actually being drawn this frame, hop arc
+    and all. They differ only in how hard they chase: the band at the leading
+    edge is stiff and nearly keeps up, and stiffness falls away towards the
+    back, so the trailing edge is still leaving as the front arrives. That
+    gradient is the whole effect. A single spring can only ever drag the sprite
+    about as a rigid block; a stack of them lets the body be in several places
+    at once, which is what a blob actually does.
+
+    What falls out of it:
+
+    * The front surges and the back is left behind, so the shape strings out
+      along the direction of travel while it moves and gathers back up when it
+      stops. The band offsets carry that, not a scale factor.
+    * The pinch across the direction of travel is a scale, because that part
+      *is* uniform -- a blob squeezed lengthways gets thinner all over.
+    * Because the springs are deliberately under-damped, each band overshoots
+      on arrival and rings down at its own rate -- which is the squish. Nothing
+      schedules that wobble, and nothing schedules the ripple that runs back
+      through the bands afterwards. It is what a row of loose springs does when
+      the thing they were chasing stops dead.
+
+    Tuning is all in the damping ratio. Critical damping for the head band's
+    stiffness is about 22; the default of 9 is roughly 0.4 of critical, which
+    gives two or three visible wobbles. Push it to 20 and you have rubber, drop
+    it to 4 and you have a water balloon. `spread` sets how much softer the
+    tail is than the head, and so how far the body can string out.
+
+    Note `enabled` rather than a gate on the Animator, unlike `Breathe`. The
+    springs have to keep tracking even while the effect is switched off, or
+    turning it back on mid-stride would snap the body across a stale lag. So it
+    always integrates and only declines to *apply* the result.
+    """
+
+    stiffness: float = 150.0    # of the leading band; the rest are softer
+    damping: float = 9.0
+    spread: float = 0.82        # how much of the stiffness the tail band loses
+    # Ten slices across a 32px sprite is about three pixels each. Fewer, and
+    # the steps between neighbouring bands become visible as the body strings
+    # out -- it stops looking soft and starts looking like it is coming apart.
+    bands: int = 10
+    drag: float = 0.62          # share of each band's lag that is applied
+    # Cross-axis pinch per tile of string-out. Tuned so a one-tile step peaks
+    # just *under* the cap: sitting on the clamp for most of the travel is what
+    # makes a wobble read as a statically squashed sprite instead of a moving one.
+    # Kept modest on purpose: this multiplies with whatever the hop's own
+    # squash is doing, and the two together were flattening the sprite to half
+    # its height. The band offsets are what should read; the pinch is support.
+    stretch: float = 0.35
+    max_stretch: float = 0.22
+    max_lag: float = 0.75       # tiles; stops a teleport tearing the sprite apart
+    # Maximum separation between neighbouring bands, in tiles. At ten bands
+    # this caps the total string-out at nine times it, and keeps every step
+    # small enough that the sprite stays continuous. About two pixels.
+    link: float = 0.06
+    enabled: bool = True
+
+    xs: List[float] = field(default_factory=list)
+    ys: List[float] = field(default_factory=list)
+    vxs: List[float] = field(default_factory=list)
+    vys: List[float] = field(default_factory=list)
+    _started: bool = False
+
+    def _band_gain(self, i: int) -> float:
+        """0 at the leading band, 1 at the trailing one."""
+        return i / (self.bands - 1) if self.bands > 1 else 0.0
+
+    def update(self, body: Body, dt: float) -> bool:
+        # Where the primary motion has put the body this frame. Read before
+        # this Motion adds anything, so the springs chase the real movement and
+        # never their own output.
+        px = body.tx + body.ox
+        py = body.ty + body.oy
+        n = self.bands
+        if not self._started:
+            self.xs = [px] * n
+            self.ys = [py] * n
+            self.vxs = [0.0] * n
+            self.vys = [0.0] * n
+            self._started = True
+
+        # Substepped for the same reason `Spring` is: a stiff spring taken in
+        # one big step at a low frame rate diverges.
+        steps = max(1, int(math.ceil(dt / (1.0 / 240.0))))
+        h = dt / steps if steps else 0.0
+        for _ in range(steps):
+            for i in range(n):
+                t = self._band_gain(i)
+                k = self.stiffness * (1.0 - self.spread * t)
+                d = self.damping * (1.0 - 0.45 * t)
+                self.vxs[i] += (-k * (self.xs[i] - px) - d * self.vxs[i]) * h
+                self.vys[i] += (-k * (self.ys[i] - py) - d * self.vys[i]) * h
+                self.xs[i] += self.vxs[i] * h
+                self.ys[i] += self.vys[i] * h
+
+        if not self.enabled:
+            return False
+
+        # Which way the body is pointing decides which end of it is the front,
+        # and that is taken from `facing` rather than inferred from the springs.
+        # The springs' own lag reverses sign every time the wobble crosses the
+        # target, and reading direction off that would swap the head and tail
+        # bands mid-ring-down -- the body would appear to turn round while
+        # standing still. A creature's front does not change when it overshoots.
+        fx, fy = body.facing
+        horizontal = abs(fx) >= abs(fy)
+        axis = 0 if horizontal else 1
+        forward = 1.0 if (fx if horizontal else fy) >= 0 else -1.0
+
+        head_dx, head_dy = px - self.xs[0], py - self.ys[0]
+        tail_dx, tail_dy = px - self.xs[n - 1], py - self.ys[n - 1]
+        if abs(tail_dx) < 1e-4 and abs(tail_dy) < 1e-4:
+            return False
+
+        offsets = []
+        for i in range(n):
+            lag = (px - self.xs[i]) if horizontal else (py - self.ys[i])
+            offsets.append(-clamp(lag, -self.max_lag, self.max_lag) * self.drag)
+
+        # Surface tension. Each band is springing at its own frequency, so
+        # given long enough they drift out of phase and one of them ends up
+        # stranded on its own -- which draws as a sliver of creature detached
+        # from the rest, and reads as the sprite falling apart rather than
+        # stretching. Neighbours are therefore held to a maximum separation,
+        # walking head to tail so the front leads and the rest are dragged into
+        # line behind it. It is also just true: a blob that stretches far
+        # enough stops being one blob.
+        for i in range(1, n):
+            offsets[i] = clamp(offsets[i],
+                               offsets[i - 1] - self.link,
+                               offsets[i - 1] + self.link)
+        # `xs[0]` is the band that keeps up, which is the one at the *front* of
+        # the sprite -- so for rightward travel it is the rightmost slice, and
+        # for leftward travel the leftmost. Bands are handed over in screen
+        # order, so the list is flipped when the body is moving forwards.
+        if forward > 0.0:
+            offsets.reverse()
+        body.deform(offsets, axis)
+
+        # The cross-axis pinch, from how far apart the ends have got.
+        strung = abs((tail_dx - head_dx) if horizontal else (tail_dy - head_dy))
+        k = min(strung * self.stretch, self.max_stretch)
+        if k > 1e-4:
+            sy = 1.0 - k if horizontal else 1.0
+            sx = 1.0 if horizontal else 1.0 - k
+            body.scale(sx, sy)
+            if horizontal:
+                body.shift(0.0, (1.0 - sy) * 0.45)   # keep it on the floor
+        return False
+
+
+@dataclass
 class DeathTopple(_Timed):
     """Falls over like a cut tree, then fades where it landed.
 
@@ -702,6 +889,7 @@ class Animator:
     def __init__(self) -> None:
         self.motions: List[Motion] = []
         self.persistent: List[Motion] = []
+        self.post: List[Motion] = []
         # Persistent motions are ambient rather than triggered, so the only way
         # to switch one off is a gate here. Without it an idle-breathing toggle
         # has nothing to hold onto: there is no moment at which the breath is
@@ -719,6 +907,17 @@ class Animator:
         """Add a Motion that is never dropped (idle breathing, a fear tremble)."""
         self.persistent.append(motion)
 
+    def add_post(self, motion: Motion) -> None:
+        """Add a Motion that runs *after* the one-shots, every frame.
+
+        Secondary motion goes here. A jelly wobble is a reaction to whatever
+        the primary motion did, so it has to read a Body that is already
+        carrying this frame's hop -- which means running last. Ordering does
+        not matter among the accumulating Motions, but it very much does
+        between something that moves and something that answers it.
+        """
+        self.post.append(motion)
+
     def clear(self) -> None:
         self.motions.clear()
 
@@ -734,6 +933,8 @@ class Animator:
                 m.update(body, dt)
         if self.motions:
             self.motions = [m for m in self.motions if not m.update(body, dt)]
+        for m in self.post:
+            m.update(body, dt)
 
 
 # ---------------------------------------------------------------------------

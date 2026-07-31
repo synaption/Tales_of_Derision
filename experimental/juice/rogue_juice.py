@@ -62,7 +62,7 @@ from juicefx import (  # noqa: E402
     ATTACK_TIME, ATTACK_WINDUP, DEATHS, EASINGS, FLASH_TIME, HITSTOP_HEAVY,
     HITSTOP_LIGHT, MOVE_TIME, TRAUMA_HEAVY, TRAUMA_LIGHT,
     Animator, Anticipate, Body, Breathe, Callback, Camera,
-    EffectField, Flash, GhostTrail, HitStop, Hop, Knockback, Lunge, Parallel,
+    EffectField, Flash, GhostTrail, HitStop, Hop, Jelly, Knockback, Lunge, Parallel,
     Sequence, Shiver, Slide, Spring, Trauma, Wait, clamp, lerp,
 )
 
@@ -184,6 +184,9 @@ TOGGLE_SPECS = [
     ("squash", "squash & stretch", "movement",
      "Flat on take-off and landing, drawn out at the apex. Get the sign "
      "backwards and the two phases cancel into a jitter you cannot see."),
+    ("jelly", "slime drag", "movement",
+     "Secondary motion: a loose spring chases the body, so it pours into a "
+     "move, stretches on the way and wobbles to a stop by itself."),
     ("bob", "idle breathing", "movement",
      "A slow scale wobble so a standing figure is not a dead pixel. Nobody notices it until it is gone."),
     ("ghost", "afterimage trail", "movement",
@@ -318,6 +321,21 @@ class Entity:
         # Persistent, so it is gated by `anim.persistent_enabled` rather than by
         # declining to play it -- see World.update.
         self.anim.add_persistent(Breathe(phase=(x * 3 + y * 7) % 7))
+        # Secondary motion, so it runs after the hop rather than alongside it.
+        # A slime is looser and heavier than everything else on the board.
+        loose = sprite == "slime"
+        # Only the spring differs by creature: the slime is softer and less
+        # damped, so it lags further and rings longer, and the deformation
+        # follows from that rather than being dialled up separately.
+        self.jelly = Jelly(stiffness=78.0 if loose else 120.0,
+                           damping=6.0 if loose else 9.0,
+                           drag=0.7 if loose else 0.55)
+        # Kept so the intensity dial can scale the amplitudes every frame. The
+        # stiffness and damping are *not* scaled -- those set the character of
+        # the wobble, and the dial is for how big everything is, not how it
+        # behaves.
+        self.jelly_base = (self.jelly.drag, self.jelly.stretch)
+        self.anim.add_post(self.jelly)
 
     @property
     def tile(self):
@@ -836,9 +854,16 @@ class World:
         anim_dt = self.hitstop.consume(dt)
 
         breathing = self.juice.on("bob")
+        wobbling = self.juice.on("jelly")
         for e in list(self.entities):
             was_busy = e.anim.busy
             e.anim.persistent_enabled = breathing
+            # The jelly spring keeps integrating either way -- see Jelly -- so
+            # switching it on mid-stride does not snap the body across a lag it
+            # accumulated while nobody was looking.
+            e.jelly.enabled = wobbling and not e.dying
+            e.jelly.drag, e.jelly.stretch = (v * self.juice.intensity
+                                             for v in e.jelly_base)
             e.anim.update(e.body, anim_dt)
             if self.juice.on("ghost"):
                 x, y = e.world_pos()
@@ -1084,6 +1109,38 @@ class Renderer:
             sx, sy = self.to_view(world, g.x, g.y)
             self.view.blit(img, img.get_rect(center=(int(sx), int(sy))))
 
+    def _blit_deformed(self, img, center, shear, axis: int):
+        """Blit a sprite in bands, each slid by its own amount.
+
+        This is the only place the renderer draws something that is not a rigid
+        sprite, and the whole difficulty is that bands which have slid apart
+        leave gaps of background *through* the creature -- which reads as the
+        sprite falling to pieces rather than stretching.
+
+        So each band is drawn wide enough to reach its neighbour: its own share
+        plus however far the two have slid apart. The extra pixels are the
+        neighbour's, redrawn at this band's offset, so a stretched body smears
+        along its own edge instead of tearing. Bands are drawn back to front,
+        and each one covers the overspill of the one before it.
+        """
+        w, h = img.get_size()
+        n = len(shear)
+        span = w if axis == 0 else h
+        left = center[0] - w * 0.5
+        top = center[1] - h * 0.5
+        for i, off in enumerate(shear):
+            lo = (i * span) // n
+            size = max(1, ((i + 1) * span) // n - lo)
+            if i < n - 1:
+                size += 1 + int(abs(shear[i + 1] - off) * TILE)
+            slide = off * TILE
+            if axis == 0:
+                self.view.blit(img, (int(left + lo + slide), int(top)),
+                               pygame.Rect(lo, 0, size, h))
+            else:
+                self.view.blit(img, (int(left), int(top + lo + slide)),
+                               pygame.Rect(0, lo, w, size))
+
     def draw_body(self, world: World, e: Entity):
         b = e.body
         img = self._transform(self.sprite_for(e), b.sx, b.sy, b.angle)
@@ -1102,7 +1159,10 @@ class Renderer:
 
         wx, wy = e.world_pos()
         sx, sy = self.to_view(world, wx, wy)
-        self.view.blit(img, img.get_rect(center=(int(sx), int(sy))))
+        if b.shear:
+            self._blit_deformed(img, (sx, sy), b.shear, b.shear_axis)
+        else:
+            self.view.blit(img, img.get_rect(center=(int(sx), int(sy))))
 
     def draw_hp(self, world: World, e: Entity):
         wx, wy = e.world_pos()
@@ -1341,7 +1401,7 @@ class Renderer:
                 for t in j.toggles.values():
                     if t.group != group:
                         continue
-                    rect = pygame.Rect(cx - 4, y - 2, col_w + 8, 18)
+                    rect = pygame.Rect(cx - 4, y - 2, col_w + 8, 16)
                     self.rows.append((rect, t.key))
                     if rect.collidepoint(mx, my):
                         self.hover = t.key
@@ -1353,7 +1413,7 @@ class Renderer:
                                                     ACCENT if t.on else (70, 74, 90)),
                                 (cx + 2, y))
                     screen.blit(self.font_ui.render(t.label, True, label_col), (cx + 32, y))
-                    y += 18
+                    y += 16
             bottom = max(bottom, y)
 
         # The easing gallery, under the columns.

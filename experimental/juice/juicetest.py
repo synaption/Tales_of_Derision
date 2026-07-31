@@ -306,6 +306,185 @@ def test_death_spin_fades_and_shrinks():
     assert abs(last[4]) > 300, "corpse never spun"
 
 
+def _run_jelly(jelly, path, dt=1 / 60):
+    """Drive a Jelly along a path of (tx, ty) tile positions, one per frame.
+
+    Uses the real Animator so the post stage and the reset ordering are
+    exercised, not just the maths. Each sample is
+    (shear tuple, axis, scale_x, scale_y).
+    """
+    body = jf.Body()
+    anim = jf.Animator()
+    anim.add_post(jelly)
+    samples = []
+    prev = path[0]
+    for tx, ty in path:
+        dx, dy = tx - prev[0], ty - prev[1]
+        if dx or dy:
+            # The Jelly reads facing to decide which end of the body is the
+            # front, so a caller that moves something has to say which way.
+            body.facing = ((1 if dx > 0 else -1), 0) if abs(dx) >= abs(dy) \
+                else (0, (1 if dy > 0 else -1))
+        prev = (tx, ty)
+        body.tx, body.ty = tx, ty
+        anim.update(body, dt)
+        samples.append((body.shear, body.shear_axis, body.sx, body.sy))
+    return samples
+
+
+def _lead_and_tail(sample, forward=True):
+    """The leading and trailing band offsets of one sample.
+
+    Bands come back in screen order, so for a move in +x the leading band is
+    the last one.
+    """
+    shear = sample[0]
+    if not shear:
+        return 0.0, 0.0
+    return (shear[-1], shear[0]) if forward else (shear[0], shear[-1])
+
+
+def test_jelly_leading_edge_outruns_the_trailing_edge():
+    """The point of the whole thing: the sprite is not a rigid block.
+
+    On the frames just after a move the band at the front must have travelled
+    measurably further than the band at the back, or this is a drag effect
+    with extra steps.
+    """
+    samples = _run_jelly(jf.Jelly(), [(0.0, 0.0)] * 5 + [(1.0, 0.0)] * 40)
+    worst = 0.0
+    for s in samples[5:25]:
+        lead, tail = _lead_and_tail(s)
+        # Offsets are negative while trailing the target, so the leading band
+        # is the one closer to zero.
+        worst = max(worst, lead - tail)
+        assert lead >= tail - 1e-9, "the back of the body overtook the front"
+    assert worst > 0.15, f"the body only strung out by {worst:.3f} tiles"
+
+
+def test_jelly_bands_are_ordered_head_to_tail_along_the_travel():
+    """Every band in between has to be graded too -- if only the two ends
+    differ, the middle of the sprite tears away as one lump."""
+    for path in ([(1.0, 0.0)], [(-1.0, 0.0)]):
+        samples = _run_jelly(jf.Jelly(), [(0.0, 0.0)] * 5 + path * 20)
+        s = samples[9]
+        # The sign of the lag depends on which way we went, so compare
+        # magnitudes: they must fall off steadily from one edge to the other.
+        mags = [abs(v) for v in s[0]]
+        assert mags == sorted(mags) or mags == sorted(mags, reverse=True), \
+            f"band lag is not graded across the sprite: {mags}"
+        assert abs(mags[0] - mags[-1]) > 0.05, f"the ends barely differ: {mags}"
+        assert s[1] == 0, "a horizontal move should slice into vertical strips"
+
+
+def test_jelly_slices_across_the_direction_of_travel():
+    """Horizontal travel cuts vertical strips, vertical travel cuts horizontal
+    ones. Slicing the wrong way makes the body shear sideways as it walks."""
+    across = _run_jelly(jf.Jelly(), [(0.0, 0.0)] * 5 + [(1.0, 0.0)] * 20)
+    assert across[9][1] == 0
+    down = _run_jelly(jf.Jelly(), [(0.0, 0.0)] * 5 + [(0.0, 1.0)] * 20)
+    assert down[9][1] == 1
+
+
+def test_jelly_lags_behind_a_move_then_catches_up():
+    """On the frame after the body teleports a tile, the slime is still most of
+    the way back where it started, and it arrives late."""
+    samples = _run_jelly(jf.Jelly(), [(0.0, 0.0)] * 5 + [(1.0, 0.0)] * 90)
+    _, tail = _lead_and_tail(samples[6])
+    assert tail < -0.3, "the slime kept up with the move"
+    assert all(abs(v) < 0.02 for v in samples[-1][0] or (0.0,)), "never caught up"
+
+
+def test_jelly_wobbles_past_its_target_and_rings_down():
+    """The squish. Under-damped springs must overshoot -- if they only ever
+    approach, this is a smoothing filter and not a slime."""
+    samples = _run_jelly(jf.Jelly(), [(0.0, 0.0)] * 5 + [(1.0, 0.0)] * 120)
+    tails = [_lead_and_tail(s)[1] for s in samples[5:]]
+
+    assert min(tails) < -0.3, "no lag on the way out"
+    assert max(tails) > 0.02, "the slime never overshot -- no wobble"
+    early = max(abs(v) for v in tails[:30])
+    late = max(abs(v) for v in tails[70:])
+    assert late < early * 0.4, "the wobble never rings down"
+
+
+def test_jelly_pinches_across_the_direction_of_travel():
+    """A blob squeezed lengthways gets thinner all over, and that part *is*
+    uniform, so it stays a scale rather than a band offset."""
+    across = _run_jelly(jf.Jelly(), [(0.0, 0.0)] * 5 + [(1.0, 0.0)] * 25)
+    assert min(s[3] for s in across[5:]) < 0.95, "no vertical pinch"
+    assert all(abs(s[2] - 1.0) < 1e-9 for s in across), "scaled along the travel"
+
+    down = _run_jelly(jf.Jelly(), [(0.0, 0.0)] * 5 + [(0.0, 1.0)] * 25)
+    assert min(s[2] for s in down[5:]) < 0.95, "no horizontal pinch"
+
+
+def test_jelly_deformation_is_capped():
+    """A teleport across the arena must not tear the sprite into a streak."""
+    samples = _run_jelly(jf.Jelly(), [(0.0, 0.0)] * 3 + [(30.0, 20.0)] * 40)
+    for shear, _, sx, sy in samples:
+        assert 0.5 < sx < 1.5 and 0.5 < sy < 1.5, f"deformed to {sx:.2f}x{sy:.2f}"
+        for off in shear:
+            assert abs(off) < 0.8, f"a band flew {off:.2f} tiles off the sprite"
+
+
+def test_a_still_jelly_is_perfectly_still():
+    """No jitter at rest. A slime that hums while standing is a bug, not life
+    -- that job belongs to idle breathing."""
+    samples = _run_jelly(jf.Jelly(), [(4.0, 3.0)] * 90)
+    for shear, _, sx, sy in samples:
+        assert not shear and (sx, sy) == (1.0, 1.0)
+
+
+def test_a_disabled_jelly_keeps_tracking_so_it_can_be_switched_on():
+    """The reason `enabled` lives on the Motion instead of on the Animator:
+    springs that stopped integrating while switched off would be pointing at a
+    stale position, and turning it back on would snap the body across it."""
+    jelly = jf.Jelly(enabled=False)
+    # Two seconds: the springs are under-damped, so a six-tile step rings for a
+    # good while before it is genuinely settled.
+    samples = _run_jelly(jelly, [(0.0, 0.0)] * 5 + [(6.0, 0.0)] * 120)
+    assert all(s == ((), 0, 1.0, 1.0) for s in samples), "disabled but applied"
+    assert all(abs(x - 6.0) < 0.05 for x in jelly.xs), "the springs stopped"
+
+    jelly.enabled = True
+    after = _run_jelly(jelly, [(6.0, 0.0)] * 10)
+    for shear, _, _, _ in after:
+        assert all(abs(v) < 0.05 for v in shear), "switching on snapped the body"
+
+
+def test_jelly_never_reads_its_own_output():
+    """It chases the *primary* motion. If it fed back on itself the lag would
+    compound and the bands would drift away for good."""
+    body = jf.Body(tx=0.0, ty=0.0)
+    anim = jf.Animator()
+    anim.play(jf.Hop(duration=0.16, dx=1, dy=0))
+    anim.add_post(jf.Jelly())
+    body.tx = 1.0
+    for _ in range(400):
+        anim.update(body, 1 / 60)
+        for off in body.shear:
+            assert abs(off) < 1.5, f"jelly ran away to {off:.2f}"
+    assert all(abs(v) < 0.02 for v in body.shear or (0.0,)), "never settled"
+
+
+def test_post_motions_run_after_the_one_shots():
+    """Ordering is the whole reason the post stage exists."""
+    seen = []
+
+    class Watcher:
+        def update(self, body, dt):
+            seen.append(body.ox)
+            return False
+
+    body = jf.Body()
+    anim = jf.Animator()
+    anim.play(jf.Knockback(duration=1.0, dx=1, dy=0, distance=0.5, ease=jf.linear))
+    anim.add_post(Watcher())
+    anim.update(body, 0.0)
+    assert seen and abs(seen[0] - 0.5) < 1e-6, "the post stage ran too early"
+
+
 def test_breathe_never_finishes_and_stays_small():
     body = jf.Body()
     anim = jf.Animator()
