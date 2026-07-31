@@ -1484,6 +1484,642 @@ class GhostTrail:
 
 
 # ---------------------------------------------------------------------------
+# Secondary motion and idles
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Lean(_Timed):
+    """Bank into a move and counter-swing on the way out.
+
+    `Hop` already lifts and squashes; this rotates. Two or three degrees is
+    invisible on a still frame and unmistakable in motion, because the eye
+    reads a tilted body as one that is *going* somewhere rather than one that
+    is being slid there.
+
+    The counter-swing past upright on the way back is what stops it looking
+    like a hinge: real mass overshoots when it stops leaning.
+
+    Only horizontal travel banks. A body moving straight down the screen has no
+    roll axis in a 2D view, and rotating it anyway reads as a stumble.
+    """
+
+    dx: float = 0.0
+    dy: float = 0.0
+    amount: float = 7.0        # degrees at full lean
+    # Extra sweep past a half cycle. The lean is a sine run slightly *long*, so
+    # it comes back through upright and out the other side before the envelope
+    # closes it down -- which is the counter-swing. A plain half sine returns to
+    # upright and stops dead, and reads as a hinge rather than as mass.
+    counter: float = 0.6
+    decay: float = 0.6         # envelope power; higher settles sooner
+    duration: float = 0.22
+
+    def update(self, body: Body, dt: float) -> bool:
+        p, done = self.tick(dt)
+        swing = (math.sin(math.pi * p * (1.0 + self.counter))
+                 * (1.0 - p) ** self.decay)
+        body.rotate(-self.dx * self.amount * swing)
+        return done
+
+
+@dataclass
+class FaceFlip(_Timed):
+    """Turn to face the other way by squashing through zero width.
+
+    A sprite that flips on one frame reads as a glitch. Squeezing it to nothing
+    and back out again over six frames reads as a body turning, and it costs one
+    scale term. The sprite is swapped at the pinch, where there is nothing to
+    see -- which is the whole reason the effect works.
+    """
+
+    duration: float = 0.12
+    thinnest: float = 0.08     # width at the pinch; never quite zero
+    swap: Optional[Callable[[], None]] = None
+    _swapped: bool = False
+
+    def update(self, body: Body, dt: float) -> bool:
+        p, done = self.tick(dt)
+        if not self._swapped and p >= 0.5:
+            self._swapped = True
+            if self.swap is not None:
+                self.swap()
+        k = abs(math.cos(math.pi * p))
+        sx = max(self.thinnest, k)
+        body.scale(sx, 1.0 + (1.0 - sx) * 0.16)   # a little taller as it narrows
+        return done
+
+
+@dataclass
+class Fidget:
+    """An idle that happens *sometimes*. Never finishes.
+
+    `Breathe` is continuous, and continuous motion becomes wallpaper -- after
+    ten seconds the eye stops seeing it. A twitch every few seconds does not,
+    because it is an event. Between twitches this costs one float compare.
+
+    The interval is jittered off a seeded hash rather than a fixed period, so a
+    room full of monsters never falls into step.
+    """
+
+    period: float = 3.4        # average seconds between twitches
+    duration: float = 0.16
+    amplitude: float = 0.05    # tiles
+    seed: int = 0
+    elapsed: float = 0.0
+    _next: float = 0.0
+    _count: int = 0
+
+    def update(self, body: Body, dt: float) -> bool:
+        self.elapsed += dt
+        if self._next <= 0.0:
+            self._next = self.period * (0.5 + 0.5 * (hash01(self._count, self.seed) + 1.0))
+        if self.elapsed < self._next:
+            return False
+        p = (self.elapsed - self._next) / self.duration
+        if p >= 1.0:
+            self.elapsed = 0.0
+            self._next = 0.0
+            self._count += 1
+            return False
+        # A quick flinch: out on the first third, back over the rest.
+        e = math.sin(math.pi * p) ** 0.6
+        a = self.amplitude * e
+        body.shift(hash01(self._count, self.seed + 5) * a,
+                   -abs(hash01(self._count, self.seed + 9)) * a)
+        body.scale(1.0 + 0.05 * e, 1.0 - 0.05 * e)
+        return False
+
+
+@dataclass
+class Tail:
+    """A chain of nodes dragged behind a body: a cape, a tail, a hanging chain.
+
+    `Jelly` deforms the body itself; this is the other half of follow-through
+    -- a part that is *attached* to the body and arrives late on its own. It is
+    what animators reach for first, because a trailing appendage tells you
+    where a character has been without moving the character at all.
+
+    Each node chases the one in front at a fixed spacing, on its own spring,
+    with a little gravity so it hangs rather than floating. The result is a
+    whip: the tip travels much further than the root, and keeps moving after the
+    body has stopped.
+
+    Like `Jelly` this is a Motion that contributes nothing to the Body -- it
+    only tracks, and the renderer reads `points()`. Add it with `add_post` so it
+    follows a Body that already carries this frame's hop.
+    """
+
+    nodes: int = 4
+    spacing: float = 0.2       # tiles between nodes
+    stiffness: float = 220.0
+    damping: float = 12.0
+    gravity: float = 2.0       # tiles per second squared, downward
+    # How strongly the chain wants to point *down* rather than wherever it
+    # happens to be. Gravity alone cannot do this job: the spring holds each
+    # node at `spacing` from its parent in whatever direction it already lies,
+    # so a chain flung sideways stays sideways for ever and the tail sticks out
+    # like a rod. Biasing the rest direction is what makes it hang.
+    droop: float = 2.0
+    anchor: Tuple[float, float] = (0.0, 0.1)   # where on the body it hangs from
+    enabled: bool = True
+
+    xs: List[float] = field(default_factory=list)
+    ys: List[float] = field(default_factory=list)
+    vxs: List[float] = field(default_factory=list)
+    vys: List[float] = field(default_factory=list)
+    _started: bool = False
+
+    def update(self, body: Body, dt: float) -> bool:
+        ax = body.tx + 0.5 + body.ox + self.anchor[0]
+        ay = body.ty + 0.5 + body.oy + self.anchor[1]
+        if not self._started:
+            self.xs = [ax] * self.nodes
+            self.ys = [ay + self.spacing * (i + 1) for i in range(self.nodes)]
+            self.vxs = [0.0] * self.nodes
+            self.vys = [0.0] * self.nodes
+            self._started = True
+
+        steps = max(1, int(math.ceil(dt / (1.0 / 240.0))))
+        h = dt / steps if steps else 0.0
+        for _ in range(steps):
+            px, py = ax, ay
+            for i in range(self.nodes):
+                # Target: `spacing` away from the node in front, in whatever
+                # direction this node has drifted. That is what turns a stack of
+                # independent springs into a chain with a length.
+                dx, dy = self.xs[i] - px, self.ys[i] - py
+                d = math.hypot(dx, dy)
+                if d < 1e-5:
+                    dx, dy, d = 0.0, 1.0, 1.0
+                # Bias the direction downwards before normalising, so the rest
+                # pose is a hanging chain and movement drags it off vertical.
+                dy += self.droop * d
+                d = math.hypot(dx, dy) or 1.0
+                tx = px + dx / d * self.spacing
+                ty = py + dy / d * self.spacing
+                self.vxs[i] += (-self.stiffness * (self.xs[i] - tx)
+                                - self.damping * self.vxs[i]) * h
+                self.vys[i] += (-self.stiffness * (self.ys[i] - ty)
+                                - self.damping * self.vys[i] + self.gravity) * h
+                self.xs[i] += self.vxs[i] * h
+                self.ys[i] += self.vys[i] * h
+
+                # Hard length limit, applied straight after the spring. Without
+                # it the chain is elastic rather than a rope: a fast step pulls
+                # the tip well past `spacing` and the tail draws as a spike
+                # twice its own length, sticking out sideways. The spring
+                # decides how it *swings*; this decides how long it is.
+                dx, dy = self.xs[i] - px, self.ys[i] - py
+                d = math.hypot(dx, dy)
+                if d > self.spacing and d > 1e-6:
+                    k = self.spacing / d
+                    self.xs[i] = px + dx * k
+                    self.ys[i] = py + dy * k
+                px, py = self.xs[i], self.ys[i]
+        return False
+
+    def points(self, body: Body) -> List[Tuple[float, float]]:
+        """Root first, tip last, in tile coordinates."""
+        ax = body.tx + 0.5 + body.ox + self.anchor[0]
+        ay = body.ty + 0.5 + body.oy + self.anchor[1]
+        return [(ax, ay)] + list(zip(self.xs, self.ys))
+
+
+# ---------------------------------------------------------------------------
+# Shadows
+# ---------------------------------------------------------------------------
+
+
+def shadow_of(body: Body, base: float = 0.6, lift: float = 1.5,
+              fade: float = 2.0) -> Tuple[float, float, float]:
+    """(x offset in tiles, size 0..1, alpha 0..1) for a blob under a body.
+
+    The cheapest height cue there is, and the bench went without one for far
+    too long: a hop that only moves the sprite upwards is ambiguous between
+    *rising* and *getting bigger*, and one dark ellipse that shrinks and fades
+    resolves it instantly. It is also the only thing that grounds a sprite on a
+    floor that is drawn flat.
+
+    The shadow stays on the tile it belongs to -- it takes the body's sideways
+    offset but never its lift, because a shadow that rises with the body is a
+    second sprite rather than a shadow.
+    """
+    height = max(0.0, -body.oy)
+    return body.ox, base / (1.0 + height * lift), 1.0 / (1.0 + height * fade)
+
+
+# ---------------------------------------------------------------------------
+# Hit tiers
+# ---------------------------------------------------------------------------
+#
+# Every blow in the bench used to get identical treatment, which wastes the
+# cheapest escalation there is. A tier is one multiplier applied to *every*
+# channel at once -- shake, freeze, particles, pitch, the size of the number --
+# so a crit is not a different effect, it is more of the one you already know.
+
+
+@dataclass(frozen=True)
+class Tier:
+    name: str
+    scale: float               # multiplies every amplitude
+    hitstop: float             # multiplies the freeze
+    pitch: float               # semitones added to the hit's layers
+
+
+TIERS = {
+    "normal": Tier("normal", 1.0, 1.0, 0.0),
+    "crit": Tier("crit", 1.5, 1.6, 2.0),
+    "kill": Tier("kill", 1.7, 2.0, -2.0),
+    "critkill": Tier("critkill", 2.1, 2.4, 0.0),
+}
+
+
+def tier_for(crit: bool, killing: bool) -> Tier:
+    return TIERS["critkill" if (crit and killing) else
+                 "kill" if killing else "crit" if crit else "normal"]
+
+
+# ---------------------------------------------------------------------------
+# Lagging UI values
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ChipBar:
+    """A health value and a second one that is late catching up.
+
+    Draw the ghost behind the real bar and the drop becomes legible: the player
+    sees *how much* was taken, as a width, rather than being told that the bar
+    is now shorter than it was when they last looked. The hold before it starts
+    draining is what makes it readable -- straight to a smooth lerp and the eye
+    misses it in the middle of a fight.
+    """
+
+    value: float = 1.0
+    ghost: float = 1.0
+    delay: float = 0.22        # seconds held before the ghost starts moving
+    speed: float = 1.1         # fraction of the bar drained per second
+    _hold: float = 0.0
+
+    def set(self, value: float) -> None:
+        value = clamp(value)
+        if value < self.value:
+            self._hold = self.delay
+        else:
+            self.ghost = max(self.ghost, value)   # healing: no ghost to show
+        self.value = value
+
+    def update(self, dt: float) -> None:
+        if self.ghost <= self.value:
+            self.ghost = self.value
+            return
+        if self._hold > 0.0:
+            self._hold = max(0.0, self._hold - dt)
+            return
+        self.ghost = max(self.value, self.ghost - self.speed * dt)
+
+
+# ---------------------------------------------------------------------------
+# Things the world remembers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Decal:
+    """A mark left on the floor. Outlives the effect that made it.
+
+    Everything else in this file is an *event* -- it happens and it is gone.
+    A decal is evidence, and that is a different feeling: a room you have
+    fought through should not look like a room you have not. It is also nearly
+    free, because a decal does not move and can be stamped into the floor once
+    rather than drawn every frame.
+    """
+
+    x: float                   # world pixels
+    y: float
+    radius: float
+    color: Tuple[int, int, int]
+    life: float = 22.0
+    max_life: float = 22.0
+    squash: float = 0.45       # drawn as an ellipse, so it lies on the floor
+    seed: int = 0
+
+    @property
+    def alpha(self) -> float:
+        """Full for most of its life, then out. Decals should not visibly pulse."""
+        return clamp(self.life / (self.max_life * 0.3))
+
+
+class DecalField:
+    """A capped pool of floor marks, oldest dropped first.
+
+    The cap is the whole design: unbounded decals turn a long session into a
+    solid red floor and an ever-growing draw list. A hundred is more than any
+    one screen can show.
+    """
+
+    def __init__(self, limit: int = 110, seed: int = 5) -> None:
+        self.decals: List[Decal] = []
+        self.limit = limit
+        self.seed = seed
+        self._n = 0
+        self.dirty = True      # set whenever the pool changes, so a cached
+        #                        floor layer knows it has to be restamped
+
+    def _rand(self) -> float:
+        self._n += 1
+        return (hash01(self._n, self.seed) + 1.0) * 0.5
+
+    def splat(self, x: float, y: float, color: Tuple[int, int, int],
+              count: int = 5, spread: float = 26.0, radius: float = 7.0,
+              life: float = 22.0) -> None:
+        """A scatter of blobs around a point, rather than one disc.
+
+        One circle reads as a sticker. Five overlapping ones of different sizes
+        read as a splash, for the same reason a particle burst needs varied
+        speeds.
+        """
+        for _ in range(count):
+            a = self._rand() * math.tau
+            d = self._rand() ** 0.6 * spread
+            self.decals.append(Decal(
+                x=x + math.cos(a) * d, y=y + math.sin(a) * d * 0.55,
+                radius=radius * lerp(0.45, 1.25, self._rand()),
+                color=color, life=life, max_life=life,
+                seed=int(self._rand() * 1000)))
+        if len(self.decals) > self.limit:
+            del self.decals[:len(self.decals) - self.limit]
+        self.dirty = True
+
+    def update(self, dt: float) -> None:
+        if not self.decals:
+            return
+        expired = False
+        for d in self.decals:
+            d.life -= dt
+            if d.life <= 0.0:
+                expired = True
+        if expired:
+            self.decals = [d for d in self.decals if d.life > 0.0]
+            self.dirty = True
+
+    def clear(self) -> None:
+        if self.decals:
+            self.decals.clear()
+            self.dirty = True
+
+    def __len__(self) -> int:
+        return len(self.decals)
+
+
+@dataclass
+class Corpse:
+    """What is left standing after the death animation finishes.
+
+    A body that plays a lovely death and then blinks out has undone its own
+    work. Leaving something behind -- flat, dim, and never in the way -- turns
+    the fight into a place that has a history. Faded rather than removed so a
+    long session still ends with a readable floor.
+    """
+
+    sprite: str
+    color: Tuple[int, int, int]
+    tint: bool
+    x: float                   # world pixels
+    y: float
+    angle: float = 90.0
+    life: float = 26.0
+    max_life: float = 26.0
+
+    @property
+    def alpha(self) -> float:
+        return 0.55 * clamp(self.life / (self.max_life * 0.25))
+
+
+# ---------------------------------------------------------------------------
+# Ambience
+# ---------------------------------------------------------------------------
+
+
+def ambient_offset(px: float, py: float, t: float, amplitude: float = 1.6,
+                   wavelength: float = 190.0, speed: float = 0.55
+                   ) -> Tuple[float, float]:
+    """A slow travelling wave over the world, in pixels.
+
+    Applied to the floor it is a room breathing rather than a room painted.
+    This is the ambient counterpart to `TileImpact`: the impact says something
+    happened *here*, the ambient wave says the place is alive at all. Two sines
+    at different scales so the pattern never obviously repeats.
+    """
+    if amplitude <= 0.0:
+        return 0.0, 0.0
+    a = (px + py * 0.6) / wavelength + t * speed
+    b = (px * 0.7 - py) / (wavelength * 1.7) - t * speed * 0.7
+    return (math.sin(a) * amplitude,
+            math.cos(b) * amplitude * 0.6)
+
+
+# ---------------------------------------------------------------------------
+# Input feel -- the juice that is not a pixel
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InputBuffer:
+    """Remembers one key press for a moment, so an early one is not thrown away.
+
+    The most valuable thing in this file and the only one with no visual at
+    all. A player pressing "left" 40ms before the current step finishes is
+    telling you exactly what they want; dropping it because the animator was
+    busy makes the game feel like it is ignoring them, and no amount of
+    animation polish covers for that. So the press is held, and the moment the
+    turn opens it is spent.
+
+    Deliberately one slot, not a queue. Buffering three presses means the
+    character carries on walking after the player has stopped, which is worse
+    than dropping them.
+    """
+
+    window: float = 0.16       # how long a press stays live
+    pending: Optional[object] = None
+    age: float = 0.0
+
+    def press(self, action: object) -> None:
+        self.pending = action
+        self.age = 0.0
+
+    def update(self, dt: float) -> None:
+        if self.pending is None:
+            return
+        self.age += dt
+        if self.age > self.window:
+            self.pending = None
+
+    def take(self) -> Optional[object]:
+        """Consume the buffered press, if there is a live one."""
+        action, self.pending = self.pending, None
+        return action
+
+    def clear(self) -> None:
+        self.pending = None
+
+
+@dataclass
+class TurnPacer:
+    """Speeds the animation up while the player keeps moving, and only then.
+
+    This is the roguelike-specific timing trick, and it resolves a fight the
+    genre always has with itself: a step slow enough to read as a body is far
+    too slow to cross a corridor with, and a step fast enough to cross a
+    corridor is not worth animating.
+
+    So the length of a turn is not a constant. Every consecutive step winds the
+    streak up and shortens the next one, towards `fastest`; the first step after
+    a pause is at full `base` length. Corridors get walked at a sprint and the
+    fight that opens at the end of one is back at full weight, without the
+    player ever asking for either.
+
+    The decay is fast enough that stopping for a moment resets it -- the streak
+    should measure "still walking", not "walked recently".
+    """
+
+    base: float = 0.16
+    fastest: float = 0.06
+    gain: float = 0.34         # streak gained per consecutive step: ~3 to full
+    decay: float = 3.2         # streak lost per second while not stepping
+    curve: float = 1.4
+    streak: float = 0.0        # 0..1
+    enabled: bool = True
+
+    def stepped(self) -> None:
+        """Call on every turn the player takes without pausing."""
+        self.streak = clamp(self.streak + self.gain)
+
+    def idle(self, dt: float) -> None:
+        self.streak = clamp(self.streak - self.decay * dt)
+
+    @property
+    def time(self) -> float:
+        if not self.enabled:
+            return self.base
+        return lerp(self.base, self.fastest, clamp(self.streak) ** self.curve)
+
+
+@dataclass
+class RumbleMap:
+    """Turns the shake budget into gamepad rumble.
+
+    Free, in the sense that the number already exists: the same trauma that
+    displaces the frame is the right strength for the motors, so the two can
+    never disagree about how hard something hit. Rate-limited because the SDL
+    call is not free and re-triggering a motor every frame makes it buzz rather
+    than thump.
+    """
+
+    interval: float = 0.05     # minimum seconds between calls
+    strength: float = 1.0
+    _cool: float = 0.0
+    last: Tuple[float, float, int] = (0.0, 0.0, 0)
+
+    def update(self, trauma: float, dt: float) -> Optional[Tuple[float, float, int]]:
+        """Returns (low motor, high motor, milliseconds) or None."""
+        self._cool = max(0.0, self._cool - dt)
+        s = clamp(trauma) * self.strength
+        if s <= 0.02 or self._cool > 0.0:
+            return None
+        self._cool = self.interval
+        # The low motor carries weight, the high one carries texture, so a big
+        # hit is mostly low and a small one is mostly high.
+        self.last = (clamp(s ** 0.8), clamp(s ** 1.6 * 0.7),
+                     int(self.interval * 1000 * 1.4))
+        return self.last
+
+
+# ---------------------------------------------------------------------------
+# Tunable parameters
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Param:
+    """One number with a range, a label and a reason for existing.
+
+    Every toggle in the bench answers "does this effect help?". A Param answers
+    the far more useful question, which is "how much of it?" -- almost every
+    effect here is good at some amplitude and terrible at twice it, and the only
+    way to find the line is to drag it past. Keeping the range with the value
+    means the panel needs no knowledge of what any given number means.
+    """
+
+    key: str
+    label: str
+    group: str
+    value: float
+    lo: float
+    hi: float
+    blurb: str = ""
+    fmt: str = "{:.2f}"
+    default: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.default = self.value
+
+    @property
+    def norm(self) -> float:
+        span = self.hi - self.lo
+        return clamp((self.value - self.lo) / span) if span else 0.0
+
+    def set_norm(self, t: float) -> None:
+        self.value = self.lo + (self.hi - self.lo) * clamp(t)
+
+    def nudge(self, steps: float) -> None:
+        self.set_norm(self.norm + steps * 0.05)
+
+    def reset(self) -> None:
+        self.value = self.default
+
+    @property
+    def text(self) -> str:
+        return self.fmt.format(self.value)
+
+
+class Params:
+    """The registry. `params("hop_height")` is the value; that is the whole API.
+
+    Reading through a call rather than an attribute is what lets a slider exist
+    at all -- there is one place the number comes from, so changing it changes
+    every use of it on the next frame with nothing to wire up.
+    """
+
+    def __init__(self, specs: Seq[tuple] = ()) -> None:
+        self.params: dict[str, Param] = {}
+        for spec in specs:
+            self.add(*spec)
+
+    def add(self, key, label, group, value, lo, hi, blurb="", fmt="{:.2f}") -> Param:
+        p = Param(key, label, group, value, lo, hi, blurb, fmt)
+        self.params[key] = p
+        return p
+
+    def __call__(self, key: str) -> float:
+        return self.params[key].value
+
+    def __getitem__(self, key: str) -> Param:
+        return self.params[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.params
+
+    def group(self, name: str) -> List[Param]:
+        return [p for p in self.params.values() if p.group == name]
+
+    def reset(self) -> None:
+        for p in self.params.values():
+            p.reset()
+
+
+# ---------------------------------------------------------------------------
 # Presets
 # ---------------------------------------------------------------------------
 #

@@ -153,6 +153,8 @@ def test_every_motion_ends_at_identity():
         jf.Flash(duration=0.1),
         jf.Pop(duration=0.2),
         jf.Shiver(duration=0.2),
+        jf.Lean(duration=0.2, dx=1, dy=0),
+        jf.FaceFlip(duration=0.12),
     ]
     for m in motions:
         body, _, _ = run_motion(m)
@@ -995,6 +997,72 @@ def test_every_key_binding_runs():
     pygame.quit()
 
 
+def _scroll_through(rj, screen, world, renderer, step=90):
+    """Yield (scroll position, rows) over the whole panel, top to bottom.
+
+    The list no longer fits on screen, so anything that used to assert over
+    `renderer.rows` in one pass has to walk it instead. This also exercises the
+    thing most likely to break: rows being registered where they are *not*
+    drawn.
+    """
+    renderer.scroll = 0.0
+    seen = 0
+    while True:
+        rj.draw_frame(screen, renderer, world, (0, 0))
+        yield renderer.scroll, list(renderer.rows)
+        if renderer.scroll >= renderer.content_h - renderer.panel_rect().h:
+            break
+        before = renderer.scroll
+        renderer.scroll_by(step, world)
+        seen += 1
+        if renderer.scroll == before or seen > 200:
+            break
+
+
+def test_every_control_is_reachable_by_scrolling():
+    """Every toggle, slider and choice must be clickable at *some* scroll.
+
+    A control that exists in the registry but never gets a row is invisible,
+    and the panel is now long enough that this can happen without anyone
+    noticing on screen.
+    """
+    import pygame
+
+    import rogue_juice as rj
+    pygame.init()
+    screen = pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
+    world = rj.World(rj.Juice())
+    renderer = rj.Renderer()
+
+    found = set()
+    for _, rows in _scroll_through(rj, screen, world, renderer):
+        for rect, kind, key in rows:
+            found.add((kind, key))
+    expected = ({("t", k) for k in world.juice.toggles}
+                | {("p", k) for k in world.juice.params.params}
+                | {("c", k) for k in world.juice.choices})
+    assert expected <= found, f"unreachable controls: {sorted(expected - found)}"
+    pygame.quit()
+
+
+def test_panel_rows_stay_inside_their_viewport():
+    """A row registered outside the clip is one you can click but not see."""
+    import pygame
+
+    import rogue_juice as rj
+    pygame.init()
+    screen = pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
+    world = rj.World(rj.Juice())
+    renderer = rj.Renderer()
+    view = renderer.panel_rect()
+    for _, rows in _scroll_through(rj, screen, world, renderer):
+        for rect, kind, key in rows:
+            assert rect.right <= rj.WIN_W, f"{key} runs off the panel"
+            assert rect.top >= view.top - 1, f"{key} is under the header"
+            assert rect.bottom <= view.bottom + 1, f"{key} overlaps the footer"
+    pygame.quit()
+
+
 def test_panel_clicks_toggle_the_row_under_the_cursor():
     import pygame
 
@@ -1003,19 +1071,80 @@ def test_panel_clicks_toggle_the_row_under_the_cursor():
     screen = pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
     world = rj.World(rj.Juice())
     renderer = rj.Renderer()
-    rj.draw_frame(screen, renderer, world, (0, 0))
 
-    assert len(renderer.rows) == len(world.juice.toggles), "a toggle has no row"
-    for rect, key in renderer.rows:
-        before = world.juice.toggles[key].on
-        assert renderer.panel_click(world, rect.center)
-        assert world.juice.toggles[key].on is not before, f"{key} did not toggle"
-    # Rows must stay inside the panel and clear of the footer blurb. The whole
-    # list has to fit on screen without scrolling, so this is the assertion
-    # that fails first if an effect is added or a font size grows.
-    for rect, key in renderer.rows:
-        assert rect.right <= rj.WIN_W, f"{key} row runs off the panel"
-        assert rect.bottom < rj.WIN_H - rj.FOOTER_H, f"{key} row overlaps the footer"
+    clicked = set()
+    for _, rows in _scroll_through(rj, screen, world, renderer):
+        for rect, kind, key in rows:
+            if kind != "t" or key in clicked:
+                continue
+            clicked.add(key)
+            before = world.juice.toggles[key].on
+            assert renderer.panel_click(world, rect.center)
+            assert world.juice.toggles[key].on is not before, f"{key} did not toggle"
+    assert clicked == set(world.juice.toggles)
+    pygame.quit()
+
+
+def test_dragging_a_slider_sets_its_value():
+    """Left edge is the minimum, right edge the maximum, right-click restores.
+
+    The bug this is here for is an off-by-a-few between the row that is
+    registered for hit testing and the track that is drawn inside it: the value
+    then never quite reaches either end and nobody can say why.
+    """
+    import pygame
+
+    import rogue_juice as rj
+    pygame.init()
+    screen = pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
+    world = rj.World(rj.Juice())
+    renderer = rj.Renderer()
+
+    checked = set()
+    for _, rows in _scroll_through(rj, screen, world, renderer):
+        for rect, kind, key in rows:
+            if kind != "p" or key in checked or rect.h < 8:
+                continue
+            p = world.juice.params[key]
+            default = p.value
+            renderer.panel_click(world, (rect.left + 2, rect.centery))
+            assert abs(p.value - p.lo) < 1e-6, f"{key} did not reach its minimum"
+            renderer.panel_drag(world, (rect.right - 2, rect.centery))
+            assert abs(p.value - p.hi) < 1e-6, f"{key} did not reach its maximum"
+            renderer.drag = None
+            renderer.panel_click(world, rect.center, button=3)
+            assert p.value == default, f"{key} did not reset on right-click"
+            checked.add(key)
+    assert checked == set(world.juice.params.params), \
+        f"never dragged: {sorted(set(world.juice.params.params) - checked)}"
+    pygame.quit()
+
+
+def test_the_wheel_scrolls_the_panel_and_stops_at_both_ends():
+    import pygame
+
+    import rogue_juice as rj
+    pygame.init()
+    screen = pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
+    world = rj.World(rj.Juice())
+    renderer = rj.Renderer()
+    rj.draw_frame(screen, renderer, world, (0, 0))
+    assert renderer.content_h > renderer.panel_rect().h, "nothing to scroll"
+
+    def wheel(y):
+        rj.handle_event(pygame.event.Event(pygame.MOUSEWHEEL, x=0, y=y),
+                        world, renderer)
+        rj.draw_frame(screen, renderer, world, (0, 0))
+
+    wheel(-1)
+    assert renderer.scroll > 0, "the wheel did not scroll down"
+    for _ in range(200):
+        wheel(-1)
+    limit = renderer.content_h - renderer.panel_rect().h
+    assert renderer.scroll <= limit + 1, "scrolled past the end of the list"
+    for _ in range(300):
+        wheel(1)
+    assert renderer.scroll == 0.0, "scrolling up did not stop at the top"
     pygame.quit()
 
 
@@ -1026,15 +1155,18 @@ def test_the_footer_text_fits_below_the_separator():
 
     import rogue_juice as rj
     pygame.font.init()
-    line_h, avail = 14, rj.FOOTER_H - 7
+    line_h, avail = 13, rj.FOOTER_H - 6
     ui = pygame.font.Font(
-        pygame.font.match_font("dejavusansmono,couriernew,monospace"), 13)
+        pygame.font.match_font("dejavusansmono,couriernew,monospace"), 12)
     assert len(rj.HELP_LINES) * line_h <= avail, "the control list overflows"
     for line in rj.HELP_LINES:
         assert ui.size(line)[0] <= rj.PANEL_W - 28, f"help line too wide: {line!r}"
-    for t in rj.Juice().toggles.values():
-        lines = rj.Renderer._wrap(t.blurb, rj.PANEL_W - 30, ui)
-        assert 16 + len(lines) * line_h <= avail, f"{t.key} blurb is too long"
+    juice = rj.Juice()
+    items = (list(juice.toggles.values()) + list(juice.choices.values())
+             + list(juice.params.params.values()))
+    for item in items:
+        lines = rj.Renderer._wrap(item.blurb, rj.PANEL_W - 30, ui)
+        assert 15 + len(lines) * line_h <= avail, f"{item.key} blurb is too long"
 
 
 def test_the_window_fits_a_small_laptop_screen():
@@ -1212,6 +1344,818 @@ def test_compositing_survives_every_whole_frame_effect_at_once():
         world.update(1 / 60)
         rj.draw_frame(screen, renderer, world, (rj.WIN_W - 200, 300))
     pygame.quit()
+
+
+# ---------------------------------------------------------------------------
+# The rest of the movement layer: lean, face flip, fidget, tails, shadows
+# ---------------------------------------------------------------------------
+
+
+def test_lean_banks_into_the_move_and_comes_back_upright():
+    _, _, samples = run_motion(jf.Lean(duration=0.24, dx=1, dy=0, amount=8.0))
+    angles = [s[4] for s in samples]
+    assert min(angles) < -3.0, "never banked into the move"
+    # The counter-swing is the part that stops it reading as a hinge: after
+    # the peak lean the body must pass *through* upright the other way.
+    assert max(angles) > 0.4, f"no counter-swing, peak the other way {max(angles):.2f}"
+    assert abs(angles[-1]) < 0.01, "left the body tilted"
+
+
+def test_lean_does_not_roll_a_vertical_move():
+    """A body walking straight down the screen has no roll axis in 2D, and
+    rolling it anyway reads as a stumble rather than as intent."""
+    _, _, samples = run_motion(jf.Lean(duration=0.2, dx=0, dy=1, amount=10.0))
+    assert all(abs(s[4]) < 1e-9 for s in samples)
+
+
+def test_face_flip_pinches_through_zero_and_swaps_at_the_narrowest():
+    """The sprite is swapped where there is nothing to see. If the swap drifts
+    off the pinch the flip stops hiding anything and reads as a pop."""
+    swapped_at = []
+    m = jf.FaceFlip(duration=0.12, swap=lambda: swapped_at.append(True))
+    body = jf.Body()
+    anim = jf.Animator()
+    anim.play(m)
+    widths, swap_frame = [], None
+    while anim.busy:
+        anim.update(body, 1 / 240)
+        widths.append(body.sx)
+        if swapped_at and swap_frame is None:
+            swap_frame = len(widths) - 1
+    assert len(swapped_at) == 1, "the sprite swapped more than once"
+    assert min(widths) < 0.12, f"never pinched, narrowest {min(widths):.2f}"
+    narrowest = widths.index(min(widths))
+    assert abs(swap_frame - narrowest) <= 2, \
+        f"swapped at frame {swap_frame}, pinch was at {narrowest}"
+
+
+def test_a_fidget_is_still_between_twitches():
+    """The whole value of a fidget is that it is an *event*. If it is moving
+    all the time it is just a second, worse breathe."""
+    body = jf.Body()
+    anim = jf.Animator()
+    anim.add_persistent(jf.Fidget(period=2.0, duration=0.16, amplitude=0.06, seed=3))
+    moving = 0
+    for _ in range(600):                    # ten seconds
+        anim.update(body, 1 / 60)
+        if abs(body.ox) > 1e-6 or abs(body.oy) > 1e-6:
+            moving += 1
+    assert moving > 0, "never twitched at all in ten seconds"
+    assert moving < 180, f"twitching {moving / 6:.0f}% of the time -- that is an idle"
+
+
+def test_fidgets_do_not_fall_into_step():
+    """Seeded off the entity, so a room full of monsters does not twitch in
+    unison like a chorus line."""
+    bodies = [jf.Body() for _ in range(6)]
+    anims = []
+    for i, b in enumerate(bodies):
+        a = jf.Animator()
+        a.add_persistent(jf.Fidget(period=2.5, seed=i * 37))
+        anims.append(a)
+    together = 0
+    for _ in range(900):
+        active = 0
+        for a, b in zip(anims, bodies):
+            a.update(b, 1 / 60)
+            active += abs(b.ox) > 1e-6 or abs(b.oy) > 1e-6
+        together = max(together, active)
+    assert together < len(bodies), "every fidget fired on the same frame"
+
+
+def _tail_span(tail, body):
+    pts = tail.points(body)
+    ax, ay = pts[0]
+    return max(math.hypot(x - ax, y - ay) for x, y in pts)
+
+
+def test_a_tail_hangs_down_at_rest():
+    body = jf.Body(tx=5, ty=5)
+    tail = jf.Tail(nodes=4, spacing=0.2)
+    for _ in range(240):
+        tail.update(body, 1 / 60)
+    pts = tail.points(body)
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        assert y1 > y0, "a link is not hanging downwards"
+        assert abs(x1 - x0) < 0.02, "the chain is not vertical at rest"
+
+
+def test_a_tail_can_never_stretch_past_its_own_length():
+    """A spring chain with no length limit is elastic, not a rope: a fast step
+    pulls the tip well past its spacing and the tail draws as a spike twice its
+    own length, sticking straight out sideways."""
+    body = jf.Body(tx=5, ty=5)
+    tail = jf.Tail(nodes=5, spacing=0.13)
+    for _ in range(120):
+        tail.update(body, 1 / 60)
+    limit = tail.nodes * tail.spacing
+    worst = 0.0
+    for step in range(6):                   # six fast steps, barely settling
+        body.tx -= 1
+        for f in range(14):
+            body.ox = -(1.0 - f / 14.0)     # the hop dragging the body along
+            tail.update(body, 1 / 60)
+            worst = max(worst, _tail_span(tail, body))
+    assert worst <= limit + 1e-6, \
+        f"chain stretched to {worst:.3f} tiles, its length is {limit:.3f}"
+
+
+def test_a_tail_trails_behind_a_move_and_the_tip_lags_most():
+    body = jf.Body(tx=5, ty=5)
+    tail = jf.Tail(nodes=4, spacing=0.2)
+    for _ in range(240):
+        tail.update(body, 1 / 60)
+    lags = []
+    for f in range(10):
+        body.tx += 0.1
+        tail.update(body, 1 / 60)
+        pts = tail.points(body)
+        lags.append([pts[0][0] - x for _, (x, _) in enumerate(pts)])
+    last = lags[-1]
+    assert last[-1] > last[1] > 0.0, \
+        f"the tip did not lag furthest behind the root: {last}"
+
+
+def test_the_shadow_shrinks_and_fades_as_the_body_rises():
+    body = jf.Body()
+    ground = jf.shadow_of(body)
+    body.oy = -0.5                          # half a tile in the air
+    air = jf.shadow_of(body)
+    assert air[1] < ground[1], "shadow did not shrink with height"
+    assert air[2] < ground[2], "shadow did not fade with height"
+
+
+def test_the_shadow_follows_sideways_but_never_leaves_the_ground():
+    """A shadow that rises with the body is a second sprite, not a shadow."""
+    body = jf.Body(ox=0.3, oy=-0.4)
+    ox, _, _ = jf.shadow_of(body)
+    assert abs(ox - 0.3) < 1e-9, "shadow ignored the sideways offset"
+    # There is no y in the return at all: the caller pins it to the tile.
+    assert len(jf.shadow_of(body)) == 3
+
+
+# ---------------------------------------------------------------------------
+# Chip bars, decals, corpses, tiers
+# ---------------------------------------------------------------------------
+
+
+def test_the_chip_bar_holds_then_drains():
+    bar = jf.ChipBar(delay=0.2, speed=1.0)
+    bar.set(0.4)
+    assert bar.ghost == 1.0, "the ghost moved on the same frame as the damage"
+    for _ in range(6):                      # 0.1s, inside the hold
+        bar.update(1 / 60)
+    assert bar.ghost == 1.0, "the ghost started draining during the hold"
+    for _ in range(30):                     # past the hold
+        bar.update(1 / 60)
+    assert 0.4 < bar.ghost < 1.0, f"ghost is {bar.ghost:.2f}, expected mid-drain"
+    for _ in range(120):
+        bar.update(1 / 60)
+    assert abs(bar.ghost - 0.4) < 1e-6, "the ghost never caught up"
+
+
+def test_the_chip_bar_does_not_lag_upwards():
+    """Healing has nothing to show, so the ghost jumps straight to the value."""
+    bar = jf.ChipBar()
+    bar.set(0.3)
+    for _ in range(200):
+        bar.update(1 / 60)
+    bar.set(0.9)
+    assert bar.ghost >= 0.9, "a heal left a ghost bar behind"
+
+
+def test_a_splat_is_scattered_rather_than_one_disc():
+    field = jf.DecalField()
+    field.splat(100.0, 100.0, (150, 40, 48), count=6, spread=20.0)
+    assert len(field) == 6
+    xs = {round(d.x, 3) for d in field.decals}
+    radii = {round(d.radius, 3) for d in field.decals}
+    assert len(xs) == 6, "every blob landed on the same spot"
+    assert len(radii) > 1, "every blob is the same size -- that reads as a sticker"
+
+
+def test_decals_are_capped_and_expire():
+    field = jf.DecalField(limit=20)
+    for i in range(30):
+        field.splat(float(i), 0.0, (1, 2, 3), count=4, life=1.0)
+    assert len(field) <= 20, "the decal pool is unbounded"
+    field.update(2.0)
+    assert len(field) == 0, "decals outlived their life"
+
+
+def test_decals_flag_themselves_dirty_only_when_they_change():
+    field = jf.DecalField()
+    field.splat(0.0, 0.0, (1, 2, 3), count=2, life=5.0)
+    field.dirty = False
+    field.update(1 / 60)
+    assert not field.dirty, "a quiet frame marked the pool dirty"
+    field.update(10.0)
+    assert field.dirty, "expiring decals did not mark the pool dirty"
+
+
+def test_tiers_escalate_every_channel_together():
+    """A crit is the same hit with more of everything, not a different one --
+    which is why it reads as an escalation instead of as a surprise."""
+    normal = jf.tier_for(False, False)
+    crit = jf.tier_for(True, False)
+    kill = jf.tier_for(False, True)
+    both = jf.tier_for(True, True)
+    assert normal.scale == 1.0 and normal.hitstop == 1.0
+    for t in (crit, kill, both):
+        assert t.scale > normal.scale and t.hitstop > normal.hitstop
+    assert both.scale > crit.scale and both.scale > kill.scale
+
+
+def test_a_corpse_fades_out_rather_than_blinking():
+    c = jf.Corpse(sprite="goblin", color=(1, 2, 3), tint=True, x=0.0, y=0.0,
+                  life=10.0, max_life=10.0)
+    full = c.alpha
+    c.life = 1.0
+    assert c.alpha < full, "the corpse held full opacity to the last frame"
+    c.life = 0.01
+    assert c.alpha < 0.05
+
+
+def test_the_ambient_wave_is_bounded_and_actually_moves():
+    peak = 0.0
+    a = jf.ambient_offset(100.0, 100.0, 0.0, amplitude=2.0)
+    b = jf.ambient_offset(100.0, 100.0, 1.7, amplitude=2.0)
+    assert a != b, "the ambient wave is not travelling"
+    for i in range(400):
+        for x, y in ((0.0, 0.0), (137.0, 91.0), (600.0, 320.0)):
+            ox, oy = jf.ambient_offset(x, y, i * 0.05, amplitude=2.0)
+            peak = max(peak, abs(ox), abs(oy))
+    assert peak <= 2.0 + 1e-6, f"exceeded its amplitude: {peak:.3f}"
+    assert jf.ambient_offset(5.0, 5.0, 1.0, amplitude=0.0) == (0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Input feel -- the juice with no pixels in it
+# ---------------------------------------------------------------------------
+
+
+def test_the_input_buffer_holds_a_press_then_lets_it_expire():
+    buf = jf.InputBuffer(window=0.15)
+    buf.press(("move", 1, 0))
+    buf.update(0.1)
+    assert buf.take() == ("move", 1, 0), "an in-window press was dropped"
+    assert buf.take() is None, "the press was spent twice"
+    buf.press(("move", 0, 1))
+    buf.update(0.2)
+    assert buf.take() is None, "a stale press survived its window"
+
+
+def test_the_input_buffer_keeps_only_the_latest_press():
+    """One slot, not a queue. Buffering three presses means the character walks
+    on after the player has stopped, which is worse than dropping them."""
+    buf = jf.InputBuffer()
+    buf.press("a")
+    buf.press("b")
+    buf.press("c")
+    assert buf.take() == "c"
+    assert buf.take() is None
+
+
+def test_turn_pacing_speeds_up_while_walking_and_gives_it_back_when_you_stop():
+    pacer = jf.TurnPacer(base=0.16, fastest=0.06)
+    assert abs(pacer.time - 0.16) < 1e-9, "the first step was not full length"
+    for _ in range(6):
+        pacer.stepped()
+    assert pacer.time < 0.08, f"never sped up: {pacer.time:.3f}s"
+    # Stopping has to hand the weight straight back, or the fight at the end of
+    # a corridor is fought at corridor speed.
+    for _ in range(60):
+        pacer.idle(1 / 60)
+    assert abs(pacer.time - 0.16) < 1e-3, f"still fast after a second: {pacer.time:.3f}s"
+
+
+def test_turn_pacing_switched_off_is_simply_a_constant():
+    pacer = jf.TurnPacer(base=0.16, fastest=0.06, enabled=False)
+    for _ in range(20):
+        pacer.stepped()
+    assert pacer.time == 0.16
+
+
+def test_rumble_is_rate_limited_and_tracks_the_shake():
+    r = jf.RumbleMap(interval=0.05)
+    fired = [r.update(0.8, 1 / 60) for _ in range(6)]
+    assert sum(x is not None for x in fired) <= 3, "re-triggered every frame"
+    assert r.update(0.0, 1.0) is None, "rumbled with no trauma"
+    r2 = jf.RumbleMap(interval=0.0)
+    small = r2.update(0.2, 0.1)
+    big = jf.RumbleMap(interval=0.0).update(0.9, 0.1)
+    assert big[0] > small[0], "a bigger hit did not rumble harder"
+    # Low motor carries the weight, high one the texture.
+    assert big[0] > big[1]
+
+
+def test_params_clamp_reset_and_round_trip():
+    p = jf.Param("k", "label", "grp", 0.5, 0.0, 2.0)
+    assert abs(p.norm - 0.25) < 1e-9
+    p.set_norm(1.5)
+    assert p.value == 2.0, "a slider dragged past the end escaped its range"
+    p.set_norm(-1.0)
+    assert p.value == 0.0
+    p.reset()
+    assert p.value == 0.5, "reset did not restore the value it was built with"
+
+    params = jf.Params([("a", "A", "g", 1.0, 0.0, 2.0, "", "{:.1f}"),
+                        ("b", "B", "h", 3.0, 1.0, 4.0, "", "{:.1f}")])
+    assert params("a") == 1.0 and "b" in params
+    assert [p.key for p in params.group("g")] == ["a"]
+    params["a"].value = 1.9
+    params.reset()
+    assert params("a") == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Sound: synthesis, pitch ladders and layering, with no audio device
+# ---------------------------------------------------------------------------
+
+
+def _audio():
+    import audiofx
+    return audiofx
+
+
+def test_resampling_changes_pitch_by_changing_length():
+    """The workaround for the one gap in pygame's mixer. Up a semitone is a
+    shorter buffer; down a semitone is a longer one."""
+    a = _audio()
+    if not a.HAVE_NUMPY:
+        return
+    import numpy as np
+    src = np.sin(np.linspace(0, 40, 4410, dtype=np.float32))
+    up = a.resample(src, a.semitone_ratio(12))       # an octave up
+    down = a.resample(src, a.semitone_ratio(-12))
+    assert abs(len(up) - len(src) / 2) <= 1, f"octave up gave {len(up)} samples"
+    assert abs(len(down) - len(src) * 2) <= 2
+    assert len(a.resample(src, 1.0)) == len(src)
+
+
+def test_a_pitch_ladder_is_centred_on_the_original():
+    """An odd count keeps the middle rung unshifted, so the ear anchors on one
+    sound and hears the rest as variation around it rather than as five
+    different sounds."""
+    a = _audio()
+    if not a.HAVE_NUMPY:
+        return
+    import numpy as np
+    src = np.sin(np.linspace(0, 20, 2000, dtype=np.float32))
+    rungs = a.pitch_variants(src, spread=2.0, count=5)
+    assert len(rungs) == 5
+    lengths = [len(r) for r in rungs]
+    assert lengths == sorted(lengths, reverse=True), "the ladder is not ordered"
+    assert lengths[2] == len(src), "the middle rung is not the original"
+    assert a.pitch_variants(src, spread=0.0, count=5) == [src]
+
+
+def test_every_synth_voice_is_finite_and_in_range():
+    """A NaN in a clip is silent-until-it-is-not: it survives the float maths,
+    poisons the int16 cast and comes out as a full-scale click."""
+    a = _audio()
+    if not a.HAVE_NUMPY:
+        return
+    import numpy as np
+    voices = {
+        "impact": a.synth_impact(), "swing": a.synth_swing(),
+        "step": a.synth_step(), "blip": a.synth_blip(),
+        "crit": a.synth_crit(), "death": a.synth_death(),
+        "pop": a.synth_pop(), "bump": a.synth_bump(), "hurt": a.synth_hurt(),
+    }
+    for kind in ("flesh", "bone", "stone", "metal", "slime"):
+        voices[kind] = a.synth_material(kind)
+    for name, clip in voices.items():
+        assert len(clip) > 100, f"{name} is empty"
+        assert np.isfinite(clip).all(), f"{name} contains a NaN or an infinity"
+        assert float(np.max(np.abs(clip))) <= 1.0, f"{name} clips"
+        assert float(np.max(np.abs(clip))) > 0.05, f"{name} is silence"
+        assert len(clip) < a.RATE, f"{name} is over a second long"
+
+
+def test_the_repo_wavs_load_to_mono_float():
+    a = _audio()
+    if not a.HAVE_NUMPY:
+        return
+    import numpy as np
+    path = os.path.join(a.SFX_DIR, "swipe.wav")
+    if not os.path.exists(path):
+        return
+    clip = a.load_wav(path)
+    assert clip.ndim == 1, "did not fold down to mono"
+    assert clip.dtype == np.float32
+    assert np.isfinite(clip).all() and float(np.max(np.abs(clip))) <= 1.0
+
+
+def test_a_hit_is_layered_rather_than_one_sample():
+    """One 'hit' is an impact plus a material. That is what gives a handful of
+    clips a combinatorial spread, and what lets a skeleton sound like bone."""
+    a = _audio()
+    if not a.HAVE_NUMPY:
+        return
+    bank = a.SoundBank()
+    bank.load_all()
+    bank.play_hit("bone")
+    names = [n for n, _, _ in bank.log]
+    assert "impact" in names and "mat_bone" in names, names
+    assert len(names) >= 2, "a hit played a single sample"
+
+
+def test_a_crit_adds_to_the_hit_instead_of_replacing_it():
+    a = _audio()
+    if not a.HAVE_NUMPY:
+        return
+    bank = a.SoundBank()
+    bank.load_all()
+    bank.play_hit("flesh", tier="normal")
+    plain = [n for n, _, _ in bank.log]
+    bank.log.clear()
+    bank.play_hit("flesh", tier="crit")
+    crit = [n for n, _, _ in bank.log]
+    assert crit[:len(plain)] == plain, "the crit swapped the sound out"
+    assert len(crit) > len(plain), "the crit added no layer"
+
+
+def test_the_bank_stays_silent_with_no_mixer_but_still_reports():
+    """Everything above the mixer boundary has to work with no audio device,
+    or the timing and the layering cannot be tested at all."""
+    a = _audio()
+    bank = a.SoundBank()          # no init_mixer
+    assert not bank.available
+    bank.load_all()
+    bank.play("impact", gain=0.5, pan=-0.3)
+    assert bank.log[-1][0] == "impact"
+    bank.play("no_such_voice")
+    assert bank.log[-1][0] == "impact", "an unknown voice was logged as played"
+
+
+def test_ducking_pushes_a_bus_down_and_lets_it_back_up():
+    a = _audio()
+    bus = a.Bus("music", volume=1.0, recover=3.0)
+    assert bus.gain == 1.0
+    bus.duck(0.5, hold=0.05)
+    assert abs(bus.gain - 0.5) < 1e-9, "the duck did not take"
+    bus.update(0.04)
+    assert abs(bus.gain - 0.5) < 1e-9, "recovered during the hold"
+    for _ in range(60):
+        bus.update(1 / 60)
+    assert bus.gain > 0.99, "the music never came back up"
+
+
+def test_the_pitch_ladder_survives_the_int16_cast():
+    a = _audio()
+    if not a.HAVE_NUMPY:
+        return
+    import numpy as np
+    clip = a.synth_impact()
+    for rung in a.pitch_variants(clip, 2.5, 5):
+        out = a.to_int16(rung)
+        assert out.dtype == np.int16
+        assert np.abs(out).max() <= 32767
+
+
+# ---------------------------------------------------------------------------
+# The new sim behaviour, in the workbench
+# ---------------------------------------------------------------------------
+
+
+def test_an_early_press_is_buffered_and_spent_when_the_turn_opens():
+    """The single most valuable thing in the bench and the only one with no
+    visual at all: a press that arrives mid-animation must not be thrown away."""
+    rj, world = _world()
+    world.juice.params["buffer_win"].value = 0.3
+    start = world.player.tile
+    world.try_move(world.player, -1, 0)
+    assert world.player.tile[0] == start[0] - 1
+    world.update(1 / 60)
+    assert not world.can_act(), "the turn did not lock out"
+    world.try_move(world.player, -1, 0)             # too early
+    assert world.player.tile[0] == start[0] - 1, "the early press acted immediately"
+    assert world.buffer.pending is not None, "the early press was dropped"
+    _step(world, 30)
+    assert world.player.tile[0] == start[0] - 2, "the buffered press was never spent"
+
+
+def test_without_buffering_an_early_press_is_simply_lost():
+    """The baseline the buffer is an argument against."""
+    rj, world = _world(buffer=False)
+    start = world.player.tile
+    world.try_move(world.player, -1, 0)
+    world.update(1 / 60)
+    world.try_move(world.player, -1, 0)
+    _step(world, 40)
+    assert world.player.tile[0] == start[0] - 1, "something acted on a dropped press"
+
+
+def _walk_until_free(world, dx, dy, steps):
+    """Hold a direction: act the instant the turn opens, like a player would."""
+    lockouts = []
+    for i in range(steps):
+        while not world.can_act():
+            world.update(1 / 60)
+        world.try_move(world.player, dx if i % 2 == 0 else -dx,
+                       dy if i % 2 == 0 else -dy)
+        lockouts.append(world.turn_cooldown)
+    return lockouts
+
+
+def test_turn_pacing_shortens_the_lockout_while_walking():
+    """The roguelike-specific timing trick: corridors sprint, fights stay heavy.
+
+    The first step of a run is deliberately at full weight -- the speed-up is
+    earned by the steps that follow it.
+    """
+    rj, world = _world()
+    lockouts = _walk_until_free(world, 0, 1, 8)
+    assert abs(lockouts[0] - world.juice.p("move_time")) < 1e-6, \
+        f"the first step was already shortened: {lockouts[0]:.3f}"
+    assert lockouts[-1] < lockouts[0] * 0.7, \
+        f"pacing did nothing: {lockouts[-1]:.3f} vs {lockouts[0]:.3f}"
+    assert lockouts[-1] >= world.juice.p("turn_fast") - 1e-9, "faster than the floor"
+
+
+def test_turn_pacing_gives_the_weight_back_when_you_stop():
+    rj, world = _world()
+    _walk_until_free(world, 0, 1, 8)
+    _step(world, 90)                              # a second and a half standing still
+    while not world.can_act():
+        world.update(1 / 60)
+    world.try_move(world.player, 0, 1)
+    assert abs(world.turn_cooldown - world.juice.p("move_time")) < 1e-3, \
+        f"still sprinting after a pause: {world.turn_cooldown:.3f}"
+
+
+def test_turn_pacing_switched_off_keeps_every_turn_the_same_length():
+    rj, world = _world(pacing=False)
+    lockouts = _walk_until_free(world, 0, 1, 8)
+    assert max(lockouts) - min(lockouts) < 1e-9, "the turn length drifted"
+
+
+def test_weight_divides_the_reaction():
+    """One number turns one knockback into nine. The raven flies, the ogre
+    barely rocks, and there is no special case anywhere."""
+    rj, world = _world(crit=False)
+    light = min((e for e in world.entities if e is not world.player),
+                key=lambda e: e.weight)
+    heavy = max((e for e in world.entities if e is not world.player),
+                key=lambda e: e.weight)
+    assert heavy.weight > light.weight * 2, "the roster has no spread of weights"
+
+    def shove(target):
+        target.anim.clear()
+        target.hp = target.max_hp
+        world.land_blow(world.player, target, 1, 0)
+        peak = 0.0
+        for _ in range(30):
+            world.update(1 / 60)
+            peak = max(peak, abs(target.body.ox))
+        return peak
+
+    assert shove(light) > shove(heavy) * 1.5, "weight made no difference"
+
+
+def test_crits_escalate_the_whole_frame_not_just_the_number():
+    rj, world = _world()
+    world.juice.params["crit_chance"].value = 0.0
+    d = world.nearest_enemy(killable=True)
+    world.land_blow(world.player, d, 1, 0)
+    plain = (world.trauma.amount, world.hitstop.remaining, len(world.fx.particles))
+
+    rj, world = _world()
+    world.juice.params["crit_chance"].value = 1.0
+    d = world.nearest_enemy(killable=True)
+    world.land_blow(world.player, d, 1, 0)
+    crit = (world.trauma.amount, world.hitstop.remaining, len(world.fx.particles))
+
+    for i, name in enumerate(("trauma", "hit-stop", "particles")):
+        assert crit[i] > plain[i], f"a crit did not raise the {name}"
+
+
+def test_corpses_are_left_behind_and_then_fade():
+    rj, world = _world()
+    world.juice.params["corpse_life"].value = 2.0
+    d = world.nearest_enemy(killable=True)
+    d.hp = 1
+    world.land_blow(world.player, d, 1, 0)
+    _step(world, 90)                       # past the longest death animation
+    assert world.corpses, "the body blinked out of existence"
+    _step(world, 180)
+    assert not world.corpses, "corpses never expire"
+
+
+def test_corpses_can_be_switched_off():
+    rj, world = _world(corpse=False)
+    d = world.nearest_enemy(killable=True)
+    d.hp = 1
+    world.land_blow(world.player, d, 1, 0)
+    _step(world, 90)
+    assert not world.corpses
+
+
+def test_blows_leave_blood_where_they_landed():
+    rj, world = _world()
+    assert len(world.decals) == 0
+    d = world.nearest_enemy(killable=True)
+    world.land_blow(world.player, d, 1, 0)
+    assert len(world.decals) > 0, "no decal from a hit"
+    tx, ty = d.tile_center()
+    for dec in world.decals.decals:
+        assert abs(dec.x - tx) < rj.TILE * 3 and abs(dec.y - ty) < rj.TILE * 3, \
+            "blood landed nowhere near the blow"
+
+
+def test_the_sound_bank_hears_the_whole_attack_in_order():
+    """The swing goes out on the wind-up and the impact on contact. Audio that
+    travels ahead of the picture is what makes the picture land on time."""
+    import audiofx
+    if not audiofx.HAVE_NUMPY:
+        return
+    import rogue_juice as rj
+    bank = audiofx.SoundBank()
+    bank.load_all()
+    juice = rj.Juice()
+    world = rj.World(juice, bank)
+    d = world.nearest_enemy(killable=True)
+    d.body.tx = world.player.body.tx + 1
+    d.body.ty = world.player.body.ty
+    bank.log.clear()
+    world.try_move(world.player, 1, 0)              # walks into it -> attack
+    assert [n for n, _, _ in bank.log if n == "swing"], \
+        "no swing sound on the wind-up"
+    before = len(bank.log)
+    _step(world, 30)
+    landed = [n for n, _, _ in bank.log[before:]]
+    assert "impact" in landed, f"nothing played on contact: {landed}"
+
+
+def test_a_live_mixer_accepts_every_voice():
+    """The one part that cannot be checked above the mixer boundary: that the
+    numpy buffers survive `sndarray.make_sound` and that a channel takes them.
+
+    Runs against the dummy audio driver, so nothing comes out of the speakers
+    and nothing opens a device on the desktop.
+    """
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+    import audiofx
+    if not audiofx.HAVE_NUMPY:
+        return
+    import pygame
+    pygame.init()
+    bank = audiofx.SoundBank()
+    if not bank.init_mixer():                # no device at all: nothing to test
+        return
+    bank.load_all()
+    assert bank.voices, "no voices loaded"
+    for name, voice in bank.voices.items():
+        assert voice.sounds, f"{name} never reached the mixer"
+        assert len(voice.sounds) == len(voice.variants)
+    for pan in (-1.0, 0.0, 1.0):
+        bank.play_hit("slime", pan=pan, tier="kill")
+    bank.duck(0.5)
+    bank.update(1 / 60)
+    bank.stop_all()
+    pygame.quit()
+
+
+def test_sound_is_panned_to_where_it_happened():
+    import rogue_juice as rj
+    world = rj.World(rj.Juice())
+    world.camera.x = 500.0
+    assert world.pan_of(500.0) == 0.0
+    assert world.pan_of(100.0) < -0.5
+    assert world.pan_of(900.0) > 0.5
+    assert -1.0 <= world.pan_of(-100000.0) <= 1.0, "pan escaped its range"
+
+
+def test_switching_sound_off_stops_the_bank_being_asked():
+    import audiofx
+    if not audiofx.HAVE_NUMPY:
+        return
+    import rogue_juice as rj
+    bank = audiofx.SoundBank()
+    bank.load_all()
+    juice = rj.Juice()
+    juice.toggles["sound"].on = False
+    world = rj.World(juice, bank)
+    bank.log.clear()
+    d = world.nearest_enemy(killable=True)
+    world.land_blow(world.player, d, 1, 0)
+    _step(world, 20)
+    assert not bank.log, f"sound played with the toggle off: {bank.log}"
+
+
+def test_every_pixel_mode_renders_a_frame():
+    """Three defensible answers and no free one, so all three have to work."""
+    import pygame
+
+    import rogue_juice as rj
+    pygame.init()
+    screen = pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
+    world = rj.World(rj.Juice())
+    renderer = rj.Renderer()
+    world.try_move(world.player, -1, 0)
+    _step(world, 4)                       # mid-hop, so the offsets are fractional
+    seen = set()
+    for mode in rj.Juice().choices["pixel_mode"].options:
+        c = world.juice.choices["pixel_mode"]
+        c.index = c.options.index(mode)
+        rj.draw_frame(screen, renderer, world, (0, 0))
+        seen.add(mode)
+    assert seen == set(rj.Juice().choices["pixel_mode"].options)
+    pygame.quit()
+
+
+def test_snapping_puts_the_camera_on_whole_pixels():
+    """A fractional camera re-rounds every sprite differently each frame, so a
+    stationary row of pillars crawls. Snapping the camera is the fix."""
+    import pygame
+
+    import rogue_juice as rj
+    pygame.init()
+    pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
+    world = rj.World(rj.Juice())
+    renderer = rj.Renderer()
+    world.camera.x, world.camera.y = 400.37, 300.62
+    c = world.juice.choices["pixel_mode"]
+
+    c.index = c.options.index("snapped")
+    sx, sy = renderer.to_view(world, 0.0, 0.0)
+    assert sx == int(sx) and sy == int(sy), "snapped mode left a fractional camera"
+
+    c.index = c.options.index("rounded")
+    sx2, _ = renderer.to_view(world, 0.0, 0.0)
+    assert sx2 != sx, "rounded mode snapped the camera anyway"
+    pygame.quit()
+
+
+def test_the_real_startup_order_works():
+    """`run()` brings the mixer up *before* `pygame.init()`, on purpose.
+
+    Pygame's own init would otherwise open the mixer with a 4096-sample buffer
+    -- 93ms, nearly six frames -- and there is no way to change it afterwards.
+    That ordering is easy to undo by accident and impossible to notice by
+    reading, so it gets a test: build the bench exactly as `run()` does and
+    drive a few frames of the real loop.
+    """
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+    import pygame
+
+    import rogue_juice as rj
+    audio = rj.make_audio()
+    pygame.init()
+    pygame.joystick.init()
+    screen = pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
+    world = rj.World(rj.Juice(), audio)
+    renderer = rj.Renderer()
+    if audio is not None and audio.available:
+        import pygame.mixer
+        assert pygame.mixer.get_init()[0] == audio.rate
+    for i in range(30):
+        if i == 5:
+            world.try_move(world.player, -1, 0)
+        if i == 12:
+            world.swing()
+        world.update(1 / 60)
+        rj.draw_frame(screen, renderer, world, (rj.VIEW_W + 100, 200))
+    if audio is not None:
+        audio.stop_all()
+    pygame.quit()
+
+
+def test_every_toggle_belongs_to_a_group_the_panel_draws():
+    """A toggle in a group the panel does not know about is unreachable."""
+    import rogue_juice as rj
+    juice = rj.Juice()
+    for t in juice.toggles.values():
+        assert t.group in rj.GROUPS, f"{t.key} is in unknown group {t.group!r}"
+    for p in juice.params.params.values():
+        assert p.group in rj.GROUPS, f"{p.key} is in unknown group {p.group!r}"
+    for c in juice.choices.values():
+        assert c.group in rj.GROUPS, f"{c.key} is in unknown group {c.group!r}"
+
+
+def test_defaults_restore_every_slider_and_choice():
+    import rogue_juice as rj
+    juice = rj.Juice()
+    before = {k: p.value for k, p in juice.params.params.items()}
+    for p in juice.params.params.values():
+        p.set_norm(0.87)
+    juice.choices["pixel_mode"].cycle()
+    juice.defaults()
+    assert {k: p.value for k, p in juice.params.params.items()} == before
+    assert juice.choices["pixel_mode"].index == 0
+
+
+def test_the_intensity_dial_is_a_slider_like_everything_else():
+    """It used to be an attribute on Juice with its own clamp. Now it is one
+    Param, so the keyboard and the panel cannot disagree about it."""
+    import rogue_juice as rj
+    juice = rj.Juice()
+    assert "intensity" in juice.params
+    juice.params["intensity"].set_norm(0.0)
+    assert juice.intensity == 0.0
+    juice.intensity = 1.5
+    assert juice.params("intensity") == 1.5
 
 
 # ---------------------------------------------------------------------------
