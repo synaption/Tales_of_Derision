@@ -6,24 +6,29 @@ that occasionally changes a cell and every drop of physicality has to be
 manufactured on top of it.
 
 ```
-python3 rogue_juice.py                   # the bench
-python3 rogue_juice.py --headless a.png  # one scripted swing, no window
-python3 juicetest.py                     # 142 headless tests
-python3 -m pytest juicetest.py -q        # the same, under pytest
+python3 rogue_juice.py                      # the bench, on the CPU
+python3 rogue_juice_gl.py                   # the same bench, on the card
+python3 rogue_juice.py --headless a.png     # one scripted swing, no window
+python3 rogue_juice_gl.py --headless b.png  # the same, through the shaders
+python3 juicetest.py                        # 143 headless tests
+python3 gltest.py                           # 31 more, on a windowless context
+python3 -m pytest juicetest.py gltest.py -q # all of them
 ```
 
 Walk into something to hit it. `Tab` flips the whole thing between "raw sim"
 and "juiced" mid-swing, which is the comparison the bench exists for -- reading
 about hit-stop is nothing like turning it off and hitting a dummy.
 
-## The four files
+## The files
 
-| file | what is in it | pygame? |
-|---|---|---|
-| `juicefx.py` | every effect, as maths | **no** |
-| `audiofx.py` | synthesis, pitch ladders, buses | only inside `SoundBank` |
-| `tiles.py` | slicing and tinting the sheet | yes |
-| `rogue_juice.py` | the sim, the panel, the compositing | yes |
+| file | what is in it | pygame? | GL? |
+|---|---|---|---|
+| `juicefx.py` | every effect, as maths | **no** | **no** |
+| `audiofx.py` | synthesis, pitch ladders, buses | only in `SoundBank` | no |
+| `tiles.py` | slicing and tinting the sheet | yes | no |
+| `rogue_juice.py` | the sim, the panel, software compositing | yes | no |
+| `glfx.py` | shaders, batching, post chain, normals | only to upload | yes |
+| `rogue_juice_gl.py` | the same bench, drawn on the card | yes | yes |
 
 That split is the point rather than tidiness. An effect you cannot test without
 opening a window is an effect you will never tune, so the maths runs, and is
@@ -31,6 +36,10 @@ tested, with no display anywhere; the audio's synthesis and pitch machinery are
 plain numpy and are tested with no sound card. `SoundBank` keeps a log of what
 it was asked to play, so "the swing fires on the wind-up and the impact on
 contact" is an assertion rather than something you listen for.
+
+It also means the GL version is not a fork. `rogue_juice_gl.py` imports `World`,
+`Juice`, `Entity` and every toggle and slider from `rogue_juice.py` and replaces
+only the drawing; `juicefx.py` does not know it exists.
 
 ## The governing idea
 
@@ -161,7 +170,7 @@ r      reset (keeps your position)
 Tab    A/B the whole lot        F1 / F2  all on / all off
 F3     sliders back to defaults
 [ ]    move easing              - =  master intensity
-p      pixel mode               m    music
+p      pixel mode (software)    m    music
 esc    quit
 ```
 
@@ -179,14 +188,84 @@ esc    quit
 * The arena is baked into one surface. Only the tiles a ripple is passing
   through are redrawn.
 
+## The same bench on the graphics card
+
+`rogue_juice_gl.py` is the identical bench with the presentation moved to
+ModernGL. Everything above still applies -- same sim, same panel, same sliders,
+same sounds -- and four things stop being compromises.
+
+**The slime deforms continuously.** `Jelly` is drawn on the CPU as ten bands
+with a surface-tension clamp holding them together, and that entire design
+exists because `Surface.blit` can move rectangles and nothing else. In the
+shader the deformation is a function: every fragment asks where the material it
+is showing came from. No band count, no `link` constraint, nothing to tear. The
+same springs drive it.
+
+**Creatures are lit rather than tinted.** Each sprite carries a normal map
+generated from its own silhouette -- a blurred alpha mask's gradient *is* the
+normal of an inflated shape -- so a torch rakes across a body and a hit flash
+shades the room. No new art. The software bench multiplies a flat frame by a
+light map, which is why it needs a compensating additive pass; here there is
+nothing to compensate for.
+
+**Pixel art is crisp *and* moves smoothly.** The three-way `pixel mode` choice
+is a `blit` artefact, not a property of pixel art. A textured quad sampled flat
+inside a texel and blended across the seam over one screen pixel is exactly as
+sharp as nearest at rest and smooth at any sub-pixel speed. The GL build drops
+`pixel mode` and gains a `filter sharpness` slider you can drag to zero to watch
+what the filter is actually buying.
+
+**One draw call.** Sprites, particles, shadows, decals, corpses, tails,
+afterimages, damage numbers, shockwave rings, weapon arcs and slash cuts are all
+instanced quads in one buffer, with the fragment shader branching on a shape id
+to draw a ring or an arc procedurally. Particle counts stop being a budget.
+
+The floor is a texture, so the ripple is a displacement of the coordinate that
+samples it rather than a repaint of the tiles it passes -- and the ambient sway
+can move the whole floor instead of a few dozen props, because it costs the
+same either way.
+
+The panel is the deliberate exception: it is drawn by the *software* renderer
+into an offscreen surface and uploaded as a texture. Text layout is the one
+thing pygame does better than a weekend of shader work, and it means every
+slider, blurb, scroll and drag behaves identically in both builds.
+
+### Notes on the GL build
+
+* Under WSL, Mesa silently rasterises on the processor unless it is pointed at
+  the card. `glfx.py` carries the same check and override as
+  `experimental/fantacy_maps/inkfx.py`, and `run()` relaunches itself once if it
+  finds it started on llvmpipe.
+* `gltest.py` runs against a standalone EGL context with no window, per the
+  repo rule about ModernGL tests not opening windows on the desktop.
+* Shaders have no assertions and no stack traces -- a wrong uniform does not
+  raise, it just draws something slightly wrong for ever. So `gltest.py` mostly
+  renders and reads pixels back. Every real bug found writing it was of that
+  kind: an atlas uploaded flipped, an array uniform the driver spelled
+  `u_lights[0]`, a displacement that compressed where it should have stretched,
+  and a "sharp" filter that snapped to texel seams and came out blurrier than
+  bilinear. None of them raised anything.
+* The floor palette is brightened before it becomes a texture. A colour chosen
+  to look right *unlit* is far too dark to be an albedo: at 28/255 a torch can
+  multiply it by two and it is still black. Switching lighting off scales it
+  back so the toggle still compares like with like.
+
 ## Cost
 
-On this machine, at 800x600, with a fight going on:
+On this machine, at 800x600, with a fight going on. Software is one core;
+GL is a D3D12/WSL context on an RTX 4080.
 
-| | median | p95 |
-|---|---|---|
-| defaults | 6.8ms | 14.1ms |
-| every effect on | 10.9ms | 18.4ms |
+| | software median | software p95 | GL median | GL p95 |
+|---|---|---|---|---|
+| defaults | 6.8ms | 14.1ms | **0.98ms** | 1.6ms |
+| every effect on | 10.9ms | 18.4ms | **0.99ms** | 1.6ms |
 
-Lighting is ~3.8ms and the RGB split is most of a frame on its own. Both are
-toggles, and both are supposed to be.
+The second row is the interesting one. On the CPU, switching everything on
+costs 60% more frame; on the card it costs nothing measurable, because the
+entire `screen` group is one fragment shader either way. Software lighting is
+~3.8ms and the RGB split is most of a frame on its own; in GL neither is worth
+a toggle except to see what it does.
+
+What is left in the GL frame is mostly *not* graphics: the sim is 0.25ms and a
+panel redraw is about 1.2ms of pygame text layout, which is why the panel is
+throttled to 30Hz and any input forces one immediately.
