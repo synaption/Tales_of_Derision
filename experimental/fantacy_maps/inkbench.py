@@ -12,7 +12,6 @@ Run it with `python3 inkGL.py`, which is a two-line launcher for this.
 from __future__ import annotations
 
 import math
-import os
 import random
 import sys
 from dataclasses import dataclass, replace
@@ -22,7 +21,6 @@ import moderngl
 import pygame
 
 from inkfx import (
-    DRIVER_SETTLED,
     INK_DRY_SECONDS,
     INK_SUPERSAMPLE,
     PAGE_WET_FLOOR,
@@ -31,7 +29,6 @@ from inkfx import (
     PANEL_TEXT,
     PANEL_TITLE,
     PEN_SPEED,
-    SOFTWARE_RENDERERS,
     InkCanvas,
     InkSettings,
     Panel,
@@ -40,9 +37,9 @@ from inkfx import (
     View,
     load_ink_image,
     make_panel_surface,
+    open_window,
+    restart_on_the_graphics_card,
     sprite_reveal,
-    use_wsl_graphics_card,
-    wsl_graphics_card_available,
 )
 
 
@@ -55,34 +52,6 @@ DESIGN_SIZE = (1000, 700)
 # nobody told us about; once a second is often enough to be invisible and rare
 # enough to cost nothing.
 IDLE_REDRAW_FRAMES = 60
-
-def restart_on_the_graphics_card(renderer_name: str) -> None:
-    """If this is WSL rasterising on the CPU, start again on the card.
-
-    The demo is a single full-screen quad, so the entire frame is fragment
-    shader; run on the processor it costs about thirty milliseconds at 4K and
-    keeps several cores busy, and on the card it costs under two. That is worth
-    a relaunch, and a relaunch is the only way to take it: Mesa chooses its
-    driver when the first context is created and will not revisit the decision.
-
-    Nothing happens unless every sign points the same way -- a software
-    renderer, the WSL graphics device present, and no driver already asked for
-    by hand. `INKGL_DRIVER` set to anything, including empty, opts out.
-    """
-    if os.environ.get(DRIVER_SETTLED) or not wsl_graphics_card_available():
-        return
-    if not any(name in renderer_name.lower() for name in SOFTWARE_RENDERERS):
-        return
-
-    print(
-        f"Rendering on the processor ({renderer_name}); "
-        f"restarting on the graphics card.",
-        file=sys.stderr,
-    )
-    use_wsl_graphics_card()
-    pygame.quit()
-    os.execve(sys.executable, [sys.executable, *sys.argv], dict(os.environ))
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SPRITE_SHEET_PATH = (
@@ -1154,31 +1123,6 @@ class DemoPage:
         self.sliders.release()
         self.menu.release()
         self.renderer.release()
-
-
-def open_window(size: tuple[int, int], fullscreen: bool = False) -> tuple[int, int]:
-    """Open the window with a core OpenGL context; return the size granted.
-
-    A window manager is free to refuse what it is asked for. Fullscreen usually
-    lands on the desktop resolution whatever mode was requested, and growing an
-    existing window past the desktop may simply not happen. Everything from the
-    page outwards is sized from this, so the size that came back is the one to
-    believe rather than the one that was asked for.
-    """
-    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
-    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
-    pygame.display.gl_set_attribute(
-        pygame.GL_CONTEXT_PROFILE_MASK,
-        pygame.GL_CONTEXT_PROFILE_CORE,
-    )
-    pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
-    pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 0)
-
-    flags = pygame.OPENGL | pygame.DOUBLEBUF
-    if fullscreen:
-        flags |= pygame.FULLSCREEN
-    pygame.display.set_mode(size, flags)
-    return pygame.display.get_window_size()
 
 
 def rebuild_page(

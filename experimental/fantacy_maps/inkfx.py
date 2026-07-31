@@ -128,6 +128,63 @@ def use_wsl_graphics_card() -> None:
     )
 
 
+def restart_on_the_graphics_card(renderer_name: str) -> None:
+    """If this is WSL rasterising on the CPU, start again on the card.
+
+    A page is a single full-screen quad, so the entire frame is fragment
+    shader; run on the processor it costs about thirty milliseconds at 4K and
+    keeps several cores busy, and on the card it costs under two. That is worth
+    a relaunch, and a relaunch is the only way to take it: Mesa chooses its
+    driver when the first context is created and will not revisit the decision.
+
+    Nothing happens unless every sign points the same way -- a software
+    renderer, the WSL graphics device present, and no driver already asked for
+    by hand. `INKGL_DRIVER` set to anything, including empty, opts out.
+
+    This re-executes the running program, so only ever call it from something
+    that was run as a program. Importing a module must never relaunch anything,
+    or a test harness that imported it would restart itself.
+    """
+    if os.environ.get(DRIVER_SETTLED) or not wsl_graphics_card_available():
+        return
+    if not any(name in renderer_name.lower() for name in SOFTWARE_RENDERERS):
+        return
+
+    print(
+        f"Rendering on the processor ({renderer_name}); "
+        f"restarting on the graphics card.",
+        file=sys.stderr,
+    )
+    use_wsl_graphics_card()
+    pygame.quit()
+    os.execve(sys.executable, [sys.executable, *sys.argv], dict(os.environ))
+
+
+def open_window(size: tuple[int, int], fullscreen: bool = False) -> tuple[int, int]:
+    """Open a window with a core OpenGL context; return the size granted.
+
+    A window manager is free to refuse what it is asked for. Fullscreen usually
+    lands on the desktop resolution whatever mode was requested, and growing an
+    existing window past the desktop may simply not happen. Everything from the
+    page outwards is sized from this, so the size that came back is the one to
+    believe rather than the one that was asked for.
+    """
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    pygame.display.gl_set_attribute(
+        pygame.GL_CONTEXT_PROFILE_MASK,
+        pygame.GL_CONTEXT_PROFILE_CORE,
+    )
+    pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
+    pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 0)
+
+    flags = pygame.OPENGL | pygame.DOUBLEBUF
+    if fullscreen:
+        flags |= pygame.FULLSCREEN
+    pygame.display.set_mode(size, flags)
+    return pygame.display.get_window_size()
+
+
 # The relief of the sheet itself, as a tangent-space normal map. Without it the
 # parchment falls back to the normal generated alongside its albedo.
 CANVAS_NORMAL_PATH = Path(__file__).resolve().parent / "canvas_normal.png"
