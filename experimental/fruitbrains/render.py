@@ -119,15 +119,17 @@ class ArtCache:
 CACHE = ArtCache()
 
 
-def blit_art(surface: pygame.Surface, cam: Camera, art: PixelArt, wx: float, wy: float) -> None:
+def blit_art(surface: pygame.Surface, cam: Camera, art: PixelArt, wx: float, wy: float,
+             w: float | None = None, h: float | None = None) -> None:
     """Draw pixel art at a world position, seam-free at fractional zoom.
 
     Both corners are rounded independently so neighbouring tiles always share
     an edge -- rounding only the origin leaves 1 px cracks when zoom is not a
-    whole number.
+    whole number.  ``w``/``h`` override the world-space size, which is how
+    villagers squash and stretch as they bounce along.
     """
     x0, y0 = cam.to_screen(wx, wy)
-    x1, y1 = cam.to_screen(wx + art.w, wy + art.h)
+    x1, y1 = cam.to_screen(wx + (art.w if w is None else w), wy + (art.h if h is None else h))
     left, top = round(x0), round(y0)
     w, h = round(x1) - left, round(y1) - top
     if w <= 0 or h <= 0 or left > surface.get_width() or top > surface.get_height():

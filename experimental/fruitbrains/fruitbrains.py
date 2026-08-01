@@ -10,9 +10,15 @@ default (each asset carries its own scale, so mixed scales are fine), while
 faces, limbs, speech bubbles and all text are drawn at screen resolution, and
 the whole thing zooms smoothly between 0.5x and 5x.
 
+Villagers answer back: press E to open a conversation, type, and a small local
+LLM (Ollama / llama.cpp / KoboldCpp -- see chat.py) writes their reply in
+character.  With no server running they fall back to hand-written lines, so the
+prototype never depends on the model being up.
+
 Controls
     WASD / arrows   walk           mouse wheel or -/=   zoom
-    E or ENTER      talk           TAB                  take over another fruit
+    E               talk           TAB                  take over another fruit
+    type + ENTER    say something  ESC                  leave the conversation
     1-8             set your mood  SPACE                hop
     click           take over the fruit you clicked     ESC  quit
 """
@@ -25,6 +31,7 @@ import random
 import pygame
 
 from assets import Assets
+from chat import ChatService
 from fruit import EMOTIONS, MOOD_KEYS, Fruit
 from render import Camera, clamp, hd_font, hd_text
 import world
@@ -35,8 +42,26 @@ FPS = 60
 CREAM = (255, 247, 218)
 
 
+TALK_RANGE = 130          # world units you can chat across
+
+
+def mood_from_text(text: str, current: str) -> str:
+    """Read the villager's own reply back and let it colour their face."""
+    low = text.lower()
+    for mood, cues in (("excited", ("!", "yay", "wow", "let's", "party")),
+                       ("love", ("love", "adore", "sweet", "heart", "darling")),
+                       ("sad", ("sorry", "sad", "miss", "alone", "sigh")),
+                       ("angry", ("no!", "rude", "hate", "grr", "jam")),
+                       ("surprised", ("?!", "oh!", "really", "goodness")),
+                       ("sleepy", ("nap", "sleep", "yawn", "tired", "zzz")),
+                       ("worried", ("worry", "rain", "afraid", "hope not", "bruise"))):
+        if any(cue in low for cue in cues):
+            return mood
+    return current if current != "happy" else "happy"
+
+
 class Game:
-    def __init__(self) -> None:
+    def __init__(self, chat_service: ChatService | None = None) -> None:
         pygame.init()
         pygame.display.set_caption("Fruit Brains")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -56,6 +81,13 @@ class Game:
         self.door_cooldown = 0.0
         self.hint = ""
         self._shade: pygame.Surface | None = None
+
+        # Dialogue: a local model if one is listening, hand-written lines if not.
+        self.chat = chat_service if chat_service is not None else ChatService()
+        self.talking: Fruit | None = None
+        self.typed = ""
+        self.transcript: list[tuple[str, str]] = []
+        self.chat_error = ""
         self.mood_hotkeys = {getattr(pygame, f"K_{i + 1}"): name for i, name in enumerate(MOOD_KEYS)}
 
         self.cam.bounds = self.scene.bounds
@@ -95,6 +127,8 @@ class Game:
     def handle(self, event: pygame.event.Event) -> bool:
         if event.type == pygame.QUIT:
             return False
+        if self.talking is not None and self._handle_chat(event):
+            return True
         if event.type == pygame.MOUSEWHEEL:
             self.cam.zoom_by(1.12 ** event.y)
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -127,25 +161,89 @@ class Game:
                 self.talk()
         return True
 
-    def talk(self) -> None:
+    # -- conversation --------------------------------------------------------
+
+    def nearest(self) -> Fruit | None:
         neighbours = [f for f in self.here() if f is not self.player]
         if not neighbours:
-            return
+            return None
         other = min(neighbours, key=lambda f: f.pos.distance_to(self.player.pos))
-        if other.pos.distance_to(self.player.pos) < 110:
-            other.greet(self.player)
-            self.player.facing = 1 if other.pos.x > self.player.pos.x else -1
+        return other if other.pos.distance_to(self.player.pos) < TALK_RANGE else None
+
+    def talk(self) -> None:
+        """Open a conversation with the villager you're standing next to."""
+        other = self.nearest()
+        if other is None:
+            return
+        other.greet(self.player)
+        self.player.facing = 1 if other.pos.x > self.player.pos.x else -1
+        self.talking = other
+        self.typed = ""
+        self.transcript = [(other.name, other.line)]
+        pygame.key.start_text_input()
+
+    def end_chat(self) -> None:
+        pygame.key.stop_text_input()
+        self.talking = None
+        self.typed = ""
+
+    def _handle_chat(self, event: pygame.event.Event) -> bool:
+        """Keyboard belongs to the chat box while a conversation is open."""
+        other = self.talking
+        if event.type == pygame.TEXTINPUT:
+            if len(self.typed) < 120:
+                self.typed += event.text
+            return True
+        if event.type != pygame.KEYDOWN:
+            return False
+        if event.key == pygame.K_ESCAPE:
+            self.end_chat()
+        elif event.key == pygame.K_BACKSPACE:
+            self.typed = self.typed[:-1]
+        elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            said = self.typed.strip()
+            if said and not self.chat.busy(other.name):
+                self.transcript.append((self.player.name, said))
+                self.chat.ask(other.name, other.emotion, self.player.name, said)
+                self.typed = ""
+        else:
+            return event.key not in (pygame.K_F1,)      # swallow everything else
+        return True
+
+    def collect_replies(self) -> None:
+        """Pick up whatever the model finished while we were drawing frames."""
+        for villager, text, error in self.chat.poll():
+            speaker = next((f for f in self.fruits if f.name == villager), None)
+            if speaker is None:
+                continue
+            speaker.say(text, 7.0)
+            speaker.feel(mood_from_text(text, speaker.emotion), 5.0)
+            self.transcript.append((villager, text))
+            del self.transcript[:-6]
+            if error:
+                self.chat_error = error
 
     # -- simulation ----------------------------------------------------------
 
     def update(self, dt: float, now: float) -> None:
+        self.collect_replies()
         keys = pygame.key.get_pressed()
-        control = pygame.Vector2(
+        control = pygame.Vector2(0, 0) if self.talking is not None else pygame.Vector2(
             int(keys[pygame.K_RIGHT] or keys[pygame.K_d]) - int(keys[pygame.K_LEFT] or keys[pygame.K_a]),
             int(keys[pygame.K_DOWN] or keys[pygame.K_s]) - int(keys[pygame.K_UP] or keys[pygame.K_w]))
 
+        if self.talking is not None:
+            gone = (self.talking.scene != self.scene.name
+                    or self.talking.pos.distance_to(self.player.pos) > TALK_RANGE * 1.8)
+            if gone:
+                self.end_chat()
+            else:
+                self.talking.walk_target.update(self.talking.pos)   # stay and chat
+                self.talking.facing = 1 if self.player.pos.x > self.talking.pos.x else -1
+
         for fruit in self.fruits:
             scene = self.scenes[fruit.scene]
+            fruit.thinking = self.chat.busy(fruit.name)
             fruit.update(dt, now, control if fruit is self.player else None, scene)
         for bird in self.scene.birds:
             bird.update(dt, self.player.feet)
@@ -162,15 +260,18 @@ class Game:
             if box.inflate(80, 80).colliderect(door.rect):
                 self.hint = f"walk in to visit {door.label}"
 
-        neighbours = [f for f in self.here() if f is not self.player]
-        if neighbours and not self.hint:
-            other = min(neighbours, key=lambda f: f.pos.distance_to(self.player.pos))
-            if other.pos.distance_to(self.player.pos) < 110:
+        if self.talking is None and not self.hint:
+            other = self.nearest()
+            if other is not None:
                 self.hint = f"E -- talk to {other.name}"
 
-        self.cam.update(dt, self.player.pos + pygame.Vector2(0, 10))
+        focus = self.player.pos + pygame.Vector2(0, 10)
+        if self.talking is not None:            # frame both of you mid-conversation
+            focus = (focus + self.talking.pos) / 2
+        self.cam.update(dt, focus)
 
     def enter(self, door: world.Door) -> None:
+        self.end_chat()
         self.scene = self.scenes[door.target]
         self.player.scene = door.target
         self.player.pos.update(door.spawn)
@@ -202,6 +303,8 @@ class Game:
                            actor.pos.distance_to(self.player.pos) < near)
             else:
                 actor.draw(screen, cam, now)
+        for fruit in self.here():
+            fruit.draw_overlay(screen, cam, now)      # balloons ride above the world
 
         if self.scene.indoors:
             self._vignette()
@@ -232,6 +335,8 @@ class Game:
         hero = self.player
         hd_text(screen, f"{hero.name} is feeling {hero.mood.label}", (380, 21), 24, CREAM)
         hd_text(screen, f"{self.cam.zoom:.2f}x", (WIDTH - 78, 21), 24, (168, 214, 200))
+        tint = (150, 208, 160) if self.chat.online else (150, 150, 158)
+        hd_text(screen, self.chat.name, (WIDTH - 320, 22), 20, tint)
 
         moods = "  ".join(f"{i + 1} {EMOTIONS[n].label}" for i, n in enumerate(MOOD_KEYS))
         foot = pygame.Surface((WIDTH, 34), pygame.SRCALPHA)
@@ -241,10 +346,48 @@ class Game:
         moods_w = hd_font(21).size(moods)[0]
         hd_text(screen, moods, (WIDTH - moods_w - 18, HEIGHT - 26), 21, (188, 200, 210))
 
-        if self.hint:
+        if self.talking is not None:
+            self.chat_panel(now)
+        elif self.hint:
             glow = 210 + math.sin(now * 6) * 45
             hd_text(screen, self.hint, (WIDTH // 2, HEIGHT - 78), 26,
                     (255, round(glow), 190), center=True, shadow=(30, 30, 36))
+
+    def chat_panel(self, now: float) -> None:
+        """The typed half of the conversation, drawn HD at the foot of the screen."""
+        screen = self.screen
+        other = self.talking
+        panel = pygame.Rect(56, HEIGHT - 214, WIDTH - 112, 168)
+        board = pygame.Surface(panel.size, pygame.SRCALPHA)
+        board.fill((26, 32, 38, 232))
+        screen.blit(board, panel)
+        pygame.draw.rect(screen, (120, 168, 150), panel, 2, border_radius=6)
+
+        hd_text(screen, f"talking with {other.name}", (panel.x + 16, panel.y + 12), 23, (255, 228, 111))
+        hd_text(screen, "ENTER send    ESC leave", (panel.right - 210, panel.y + 14), 20, (140, 156, 168))
+
+        y = panel.y + 44
+        for speaker, line in self.transcript[-3:]:
+            mine = speaker == self.player.name
+            colour = (168, 214, 240) if mine else CREAM
+            text = f"{speaker}: {line}"
+            font = hd_font(21)
+            while font.size(text)[0] > panel.width - 32 and len(text) > 12:
+                text = text[:-2] + "…"
+            hd_text(screen, text, (panel.x + 16, y), 21, colour)
+            y += 26
+
+        prompt = pygame.Rect(panel.x + 12, panel.bottom - 44, panel.width - 24, 32)
+        pygame.draw.rect(screen, (16, 20, 24), prompt, border_radius=4)
+        if self.chat.busy(other.name):
+            dots = "." * (1 + int(now * 3) % 3)
+            hd_text(screen, f"{other.name} is thinking{dots}", (prompt.x + 10, prompt.y + 7), 21,
+                    (150, 208, 160))
+        else:
+            caret = "_" if int(now * 2) % 2 else " "
+            hd_text(screen, f"> {self.typed}{caret}", (prompt.x + 10, prompt.y + 7), 21, CREAM)
+        if self.chat_error:
+            hd_text(screen, self.chat_error[:90], (panel.x + 16, panel.bottom - 66), 18, (226, 138, 138))
 
     # -- loop ----------------------------------------------------------------
 

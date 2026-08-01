@@ -13,14 +13,18 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("FRUITBRAINS_LLM", "canned")   # never probe the network in tests
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pygame
 
+import chat as chat_mod
 import fruitbrains
+from chat import CannedBackend, ChatService, tidy
 from fruit import EMOTIONS, Fruit
 from render import MAX_ZOOM, MIN_ZOOM
 
@@ -113,6 +117,114 @@ def test_talking(game: fruitbrains.Game) -> None:
     step(game, 10)
 
 
+class ScriptedBackend(chat_mod.Backend):
+    """A stand-in model: deterministic, optionally slow, never touches a socket."""
+
+    name = "scripted"
+    online = True
+
+    def __init__(self, delay: float = 0.0, text: str = "Oh! Lovely to see you, neighbour.") -> None:
+        self.delay, self.text = delay, text
+        self.seen: list[list[dict]] = []
+
+    def reply(self, messages: list[dict], mood: str) -> str:
+        self.seen.append(messages)
+        if self.delay:
+            time.sleep(self.delay)
+        return self.text
+
+
+class BrokenBackend(chat_mod.Backend):
+    name = "broken"
+    online = True
+
+    def reply(self, messages: list[dict], mood: str) -> str:
+        raise ConnectionRefusedError("nothing listening on :11434")
+
+
+def test_prompt_is_in_character(game: fruitbrains.Game) -> None:
+    backend = ScriptedBackend()
+    service = ChatService(backend)
+    service.ask("Lemon", "angry", "Apple", "how are you?")
+    for _ in range(200):
+        if service.poll():
+            break
+        time.sleep(0.005)
+    system = backend.seen[0][0]["content"]
+    assert "Lemon" in system and "sour" in system, system
+    assert "angry" in system, "the villager's mood never reaches the model"
+    assert service.conversation("Lemon").history, "history was not kept for the next turn"
+
+
+def test_dialogue_round_trip(game: fruitbrains.Game) -> None:
+    game.chat = ChatService(ScriptedBackend(text="Mind the puddles by the fountain!"))
+    other = min((f for f in game.here() if f is not game.player),
+                key=lambda f: f.pos.distance_to(game.player.pos))
+    other.pos.update(game.player.pos + pygame.Vector2(50, 0))
+    game.talk()
+    assert game.talking is other, "conversation did not open"
+
+    for ch in "hello there":
+        game.handle(pygame.event.Event(pygame.TEXTINPUT, text=ch))
+    game.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_BACKSPACE, mod=0))
+    assert game.typed == "hello ther"
+    game.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0))
+    assert game.typed == "" and game.chat.busy(other.name)
+
+    for _ in range(240):
+        step(game, 1, 40)
+        if not game.chat.busy(other.name):
+            break
+    assert other.line == "Mind the puddles by the fountain!", other.line
+    assert game.transcript[-1][0] == other.name
+    step(game, 4, 41)                                   # draw the reply balloon
+
+    game.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE, mod=0))
+    assert game.talking is None, "ESC did not close the conversation"
+
+
+def test_walking_is_not_blocked_by_the_model(game: fruitbrains.Game) -> None:
+    """A slow Pi must cost frames rate, not gameplay."""
+    game.chat = ChatService(ScriptedBackend(delay=0.6, text="Sorry, I was daydreaming."))
+    other = min((f for f in game.here() if f is not game.player),
+                key=lambda f: f.pos.distance_to(game.player.pos))
+    other.pos.update(game.player.pos + pygame.Vector2(50, 0))
+    game.talk()
+    game.chat.ask(other.name, other.emotion, game.player.name, "are you awake?")
+    start = time.perf_counter()
+    step(game, 12, 50)
+    assert time.perf_counter() - start < 0.4, "the frame loop waited on the model"
+    assert other.thinking, "no thinking indicator while the model works"
+    for _ in range(400):
+        step(game, 1, 52)
+        if not game.chat.busy(other.name):
+            break
+    assert other.line == "Sorry, I was daydreaming."
+    game.end_chat()
+
+
+def test_dead_server_falls_back(game: fruitbrains.Game) -> None:
+    service = ChatService(BrokenBackend())
+    service.ask("Pear", "happy", "Apple", "hello?")
+    replies = []
+    for _ in range(400):
+        replies = service.poll()
+        if replies:
+            break
+        time.sleep(0.005)
+    villager, text, error = replies[0]
+    assert villager == "Pear" and text, "no fallback line after a backend failure"
+    assert error and "ConnectionRefused" in error, error
+
+
+def test_reply_tidying(game: fruitbrains.Game) -> None:
+    assert tidy('  "Hello there!"  ') == "Hello there!"
+    assert tidy("Lemon: *shrugs* fine, I suppose.") == "fine, I suppose."
+    long = tidy("word " * 200)
+    assert len(long) <= chat_mod.REPLY_CHARS + 3
+    assert CannedBackend().reply([{"role": "user", "content": "how are you?"}], "sad")
+
+
 def contact_sheet(game: fruitbrains.Game) -> None:
     """One PNG: town at a distance, a close-up, and the cottage interior."""
     shots = []
@@ -145,7 +257,10 @@ def contact_sheet(game: fruitbrains.Game) -> None:
 def main() -> int:
     game = fruitbrains.Game()
     checks = (test_moods_decay_to_happy, test_every_mood_draws, test_solids_block,
-              test_door_round_trip, test_zoom_is_bounded, test_mixed_pixel_scales, test_talking)
+              test_door_round_trip, test_zoom_is_bounded, test_mixed_pixel_scales, test_talking,
+              test_prompt_is_in_character, test_dialogue_round_trip,
+              test_walking_is_not_blocked_by_the_model, test_dead_server_falls_back,
+              test_reply_tidying)
     for check in checks:
         check(game)
         print(f"  ok  {check.__name__}")

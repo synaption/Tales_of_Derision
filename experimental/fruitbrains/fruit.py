@@ -27,6 +27,10 @@ BODY = 64.0          # villager body size in world units (32 px art at 2x)
 FEET = 38.0          # world units from body centre down to the soles
 ART_SPACE = BODY / 96.0   # the face/limb art was tuned in a 96 px space
 
+PLAYER_SPEED = 235.0      # world units/second -- about 7 tiles/s at a trot
+WANDER_SPEED = 150.0      # villagers mooching about are a touch slower
+BOUNCE = 13.0             # hop height at a full run, in old-space pixels
+
 
 @dataclass(frozen=True)
 class Emotion:
@@ -97,6 +101,8 @@ class Fruit:
         self.repath = 0.0
         self.line = ""
         self.line_left = 0.0
+        self.thinking = False     # set while a local model is writing their reply
+        self._overlay = None      # screen-space handoff from draw() to draw_overlay()
 
     # -- state ---------------------------------------------------------------
 
@@ -154,17 +160,17 @@ class Fruit:
         pace = self.mood.pace
         if control is not None:
             if control.length_squared():
-                self.velocity += control.normalize() * 620 * dt
+                self.velocity += control.normalize() * 1500 * dt
         else:
             self.repath -= dt
             if self.pos.distance_to(self.walk_target) < 12 or self.repath <= 0:
                 self._pick_target(scene)
             step = self.walk_target - self.pos
             if step.length_squared():
-                self.velocity += step.normalize() * 90 * pace * dt
+                self.velocity += step.normalize() * 260 * pace * dt
 
         self.velocity *= 0.86 ** (dt * 60)
-        limit = 130 * pace
+        limit = (PLAYER_SPEED if control is not None else WANDER_SPEED) * pace
         if self.velocity.length() > limit:
             self.velocity.scale_to_length(limit)
         self.velocity.y *= 0.82 if control is not None else 1.0   # gentle top-down feel
@@ -207,29 +213,39 @@ class Fruit:
              show_name: bool = True) -> None:
         mood = self.mood
         k = cam.zoom * ART_SPACE          # old 96 px art space -> screen pixels
-        walking = clamp(self.velocity.length() / 110, 0, 1)
-        cycle = now * (7 + walking * 4) + self.phase
+        walking = clamp(self.velocity.length() / (PLAYER_SPEED * 0.8), 0, 1)
+        cycle = now * (8 + walking * 9) + self.phase
+
+        # Every step is a little hop: `air` peaks mid-stride, so the body lifts,
+        # stretches on the way up and squashes as it lands.
+        air = abs(math.sin(cycle)) * walking
         idle_bob = math.sin(now * 3.1 + self.phase) * mood.bounce
-        bob = math.sin(cycle * 2) * (2.7 * walking) + idle_bob - (7 if self.gesture else 0)
+        bob = -air * BOUNCE + idle_bob - (7 if self.gesture else 0)
+        stretch = 1 + (air - 0.4) * 0.16 * walking
 
         wx, wy = self.pos.x, self.pos.y + bob * ART_SPACE
         x, y = cam.to_screen(wx, wy)
         foot_x, foot_y = cam.to_screen(self.pos.x, self.pos.y + FEET)
+        foot_y -= air * 3 * cam.zoom       # toes come off the ground too
 
         def px(dx: float, dy: float) -> tuple[float, float]:
             return x + dx * k, y + dy * k
 
-        # Shadow (HD -- a crisp ellipse at any zoom).
-        shade = pygame.Surface((max(2, round(74 * k)), max(2, round(16 * k))), pygame.SRCALPHA)
-        pygame.draw.ellipse(shade, (40, 70, 45, 90), shade.get_rect())
-        surface.blit(shade, shade.get_rect(center=(foot_x, foot_y + 2 * k)))
+        # Shadow (HD -- a crisp ellipse at any zoom). It shrinks as they hop,
+        # which is what actually sells the height.
+        ground_y = cam.to_screen(0, self.pos.y + FEET)[1]
+        tuck = 1 - air * 0.3
+        shade = pygame.Surface((max(2, round(74 * k * tuck)), max(2, round(16 * k * tuck))),
+                               pygame.SRCALPHA)
+        pygame.draw.ellipse(shade, (40, 70, 45, round(90 * tuck)), shade.get_rect())
+        surface.blit(shade, shade.get_rect(center=(foot_x, ground_y + 2 * k)))
         if selected:
             pulse = (46 + math.sin(now * 5) * 3) * k
             hd_ellipse(surface, (255, 235, 116),
-                       (foot_x - pulse, foot_y - pulse * .34, pulse * 2, pulse * .68), 2 * k)
+                       (foot_x - pulse, ground_y - pulse * .34, pulse * 2, pulse * .68), 2 * k)
 
         # Rubber-hose legs, HD, behind the body.
-        stride = math.sin(cycle) * 16 * walking
+        stride = math.sin(cycle) * 20 * walking
         lw = max(1.0, 5 * k)
         left_foot = (foot_x + (-16 + stride) * k, foot_y)
         right_foot = (foot_x + (16 - stride) * k, foot_y)
@@ -240,11 +256,24 @@ class Fruit:
 
         self._draw_arms(surface, px, k, now, cycle, walking, mood)
 
-        blit_art(surface, cam, self.art, wx - BODY / 2, wy - BODY / 2)
+        body_h = BODY * stretch
+        body_w = BODY / stretch
+        blit_art(surface, cam, self.art, wx - body_w / 2, wy + BODY / 2 - body_h, body_w, body_h)
 
         self._draw_face(surface, px, k, now, walking, mood)
         self._draw_mood_fx(surface, px, k, now)
-        self._draw_speech(surface, px, k, cam, mood, show_name and not selected)
+        self._overlay = (px, k, show_name and not selected)
+
+    def draw_overlay(self, surface: pygame.Surface, cam: Camera, now: float) -> None:
+        """Balloons and name tags, drawn after the world so nothing occludes them.
+
+        Uses the same screen-space mapping :meth:`draw` just built, so the tag
+        rides the villager's hop instead of trailing a frame behind.
+        """
+        if self._overlay is None:
+            return
+        px, k, name_tag = self._overlay
+        self._draw_speech(surface, px, k, cam, self.mood, now, name_tag)
 
     def _draw_arms(self, surface, px, k, now, cycle, walking, mood: Emotion) -> None:
         swing = math.sin(cycle) * 12 * walking
@@ -393,8 +422,19 @@ class Fruit:
                         [px(math.cos(a) * r0, -6 + math.sin(a) * r0),
                          px(math.cos(a) * r1, -6 + math.sin(a) * r1)], max(1.0, 3 * k))
 
-    def _draw_speech(self, surface, px, k, cam: Camera, mood: Emotion, name_tag: bool) -> None:
+    def _draw_speech(self, surface, px, k, cam: Camera, mood: Emotion, now: float,
+                     name_tag: bool) -> None:
         on_screen = cam.safe.collidepoint(px(0, 0))
+        if self.thinking and on_screen:
+            centre = px(50, -64)
+            hd_circle(surface, CREAM, centre, 22 * k)
+            hd_circle(surface, INK, centre, 22 * k, 2 * k)
+            for i in range(3):                  # three dots, chasing each other
+                lift = math.sin(now * 6 - i * 0.9) * 3
+                bright = 1 if math.sin(now * 6 - i * 0.9) > 0 else 0.45
+                hd_circle(surface, tuple(round(c * bright + 150 * (1 - bright)) for c in INK),
+                          (centre[0] + (i - 1) * 11 * k, centre[1] + lift * k), 3.5 * k)
+            return
         if self.line_left > 0 and on_screen:
             self._speech_bubble(surface, px, k, cam, self.line)
             return                       # a name tag would sit under the balloon
