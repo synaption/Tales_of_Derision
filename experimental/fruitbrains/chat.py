@@ -14,6 +14,17 @@ canned line is ever passed off as a reply.
 content -- barks, tutorials, shopkeeper patter, anything you want deterministic
 -- selected with ``FRUITBRAINS_LLM=canned`` or ``--canned``.
 
+Backends come in two shapes, and the difference matters upstream:
+
+* *stateless* (Ollama, OpenAI-compatible) -- the game owns the conversation and
+  sends a system card plus the last few turns every time.  Cheap, and the
+  villager forgets you when you quit.
+* *stateful* (:mod:`letta_backend`) -- the villager is a long-lived agent with
+  its own memory; the game sends only the new line and must **not** replay the
+  history, or every memory lands twice.
+
+:meth:`ChatService.ask` picks the right one off ``Backend.stateful``.
+
 Sizing, because a Pi is the target:
 
 * Pi 4 (4 GB):  a 0.5 B or 360 M instruct model at Q4_K_M -- ``qwen2.5:0.5b``,
@@ -25,34 +36,39 @@ ramble, and every request runs on a worker thread so the 60 fps loop never
 stalls waiting on a token.
 
 Environment overrides
-    FRUITBRAINS_LLM        ollama | openai | canned   (default: auto-detect)
+    FRUITBRAINS_LLM        ollama | openai | letta | canned  (default: auto-detect)
     FRUITBRAINS_LLM_URL    e.g. http://127.0.0.1:8080
+    FRUITBRAINS_LETTA_URL  e.g. http://127.0.0.1:8283
     FRUITBRAINS_MODEL      e.g. qwen2.5:0.5b
     FRUITBRAINS_DEBUG=1    print every prompt and reply to the console
 """
 
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import queue
 import random
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import hardware
+import letta_backend
 from fruit import EMOTIONS, LINES
+from letta_backend import LETTA_URL, LettaBackend, start_letta
+from serve import (BOOT_TIMEOUT, CHECK_TIMEOUT, FIRST_TOKEN_TIMEOUT, PROBE_TIMEOUT,
+                   STALL_TIMEOUT, ManagedServer, NoLocalModel, launch, log_tail)
+from serve import get_json as _get_json
+from serve import post_json as _post_json
+from serve import post_stream as _post_stream
+from serve import reachable as _reachable
 
 
 MAX_TOKENS = 72          # enough to finish a sentence; still quick on a Pi
@@ -61,12 +77,8 @@ DEBUG = os.environ.get("FRUITBRAINS_DEBUG", "") not in ("", "0")
 HISTORY_TURNS = 6        # messages kept per villager -- tiny models have tiny context
 REPLY_CHARS = 180
 KEEP_ALIVE = "30m"       # keep the weights resident between conversations
-PROBE_TIMEOUT = 0.4      # how long auto-detect waits for a local server
-CHECK_TIMEOUT = 4.0      # the startup "is the model really there?" call
-FIRST_TOKEN_TIMEOUT = float(os.environ.get("FRUITBRAINS_LOAD_TIMEOUT", 120))
-STALL_TIMEOUT = 25.0     # mid-reply silence that means something has gone wrong
-BOOT_TIMEOUT = 30.0      # a cold `ollama serve` on a Pi takes its time
 SERVER_LOG = Path(tempfile.gettempdir()) / "fruitbrains-ollama.log"
+EMBEDDING_MODEL = letta_backend.EMBEDDING_MODEL   # Letta needs one for archival memory
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 OPENAI_URLS = ("http://127.0.0.1:8080", "http://127.0.0.1:5001", "http://127.0.0.1:5000")
@@ -102,57 +114,6 @@ PERSONAS: dict[str, str] = {
 DEFAULT_PERSONA = "a friendly fruit who likes the quiet life"
 
 
-class NoLocalModel(RuntimeError):
-    """Raised at startup when no local model is serving. Message is user-facing."""
-
-
-def _get_json(url: str, timeout: float = PROBE_TIMEOUT) -> dict | None:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            return json.loads(response.read().decode())
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-
-
-def _post_json(url: str, payload: dict, timeout: float) -> dict:
-    data = json.dumps(payload).encode()
-    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode())
-
-
-def _post_stream(url: str, payload: dict):
-    """Yield response lines as they arrive, with a deadline on each read.
-
-    Streaming is what makes a slow model bearable: the first token proves it is
-    alive, and a stall becomes an error instead of a villager who thinks
-    forever.  The read timeout starts generous (weights may be loading from a
-    cold disk) and tightens once tokens are flowing.
-    """
-    data = json.dumps(payload).encode()
-    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=FIRST_TOKEN_TIMEOUT) as response:
-        first = True
-        for line in response:
-            if first:
-                first = False
-                try:                       # tighten the clock now that it is talking
-                    response.fp.raw._sock.settimeout(STALL_TIMEOUT)
-                except (AttributeError, OSError):
-                    pass
-            line = line.strip()
-            if line:
-                yield line
-
-
-def _reachable(url: str, timeout: float = PROBE_TIMEOUT) -> bool:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout):
-            return True
-    except (urllib.error.URLError, OSError, ValueError):
-        return False
-
-
 def tidy(text: str) -> str:
     """Small models pad, narrate and over-run. Take the first sentence or two."""
     text = text.strip().strip('"').replace("\n", " ")
@@ -178,12 +139,33 @@ class Backend:
     name = "backend"
     online = False
     scripted = False
+    stateful = False        # True when the backend keeps its own per-villager memory
 
     def reply(self, messages: list[dict], mood: str, on_token=None) -> str:
         raise NotImplementedError
 
+    def converse(self, villager: str, persona: str, mood: str, player: str,
+                 said: str, on_token=None) -> str:
+        """Stateful route: one line in, one line out, memory kept server-side.
+
+        Stateless backends never see this -- :meth:`ChatService.ask` sends them
+        the assembled message list instead.
+        """
+        raise NotImplementedError
+
     def check(self) -> None:
         """Raise :class:`NoLocalModel` unless this backend is ready to serve."""
+
+    def warm(self) -> None:
+        """Nudge the weights into memory. Failure here is never fatal."""
+        try:
+            self.reply([{"role": "user", "content": "hi"}], "happy")
+        except Exception:
+            pass                              # a cold start failing costs a slow first chat
+
+    def memory(self, villager: str, label: str = "human") -> str:
+        """What the backend remembers about the player. Stateless: nothing."""
+        return ""
 
 
 class CannedBackend(Backend):
@@ -344,44 +326,8 @@ def _no_server_help(why: str) -> str:
             "                respond to what you type -- it is for scripted beats)")
 
 
-class ManagedServer:
-    """An ``ollama serve`` we started, and are therefore responsible for.
-
-    A server that was already running is never wrapped in one of these -- the
-    game must not shut down something it did not start.
-    """
-
-    def __init__(self, process: subprocess.Popen, url: str) -> None:
-        self.process = process
-        self.url = url
-        self._stopped = False
-        atexit.register(self.stop)          # belt and braces for a hard exit
-
-    def stop(self, timeout: float = 6.0) -> None:
-        if self._stopped:
-            return
-        self._stopped = True
-        if self.process.poll() is not None:
-            return
-        try:
-            # The child gets its own session, so the whole group goes down with it.
-            os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-        except (AttributeError, OSError, ProcessLookupError):
-            self.process.terminate()
-        try:
-            self.process.wait(timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-            except (AttributeError, OSError, ProcessLookupError):
-                self.process.kill()
-
-
 def _log_tail(lines: int = 12) -> str:
-    try:
-        return "\n".join(SERVER_LOG.read_text(errors="replace").splitlines()[-lines:])
-    except OSError:
-        return "(no log)"
+    return log_tail(SERVER_LOG, lines)
 
 
 def start_ollama(url: str, model: str) -> ManagedServer:
@@ -396,40 +342,77 @@ def start_ollama(url: str, model: str) -> ManagedServer:
 
     host = url.split("://", 1)[-1].rstrip("/")
     env = dict(os.environ, OLLAMA_HOST=host)
-    print(f"Fruit Brains: starting ollama on {host} (log: {SERVER_LOG})", flush=True)
-    log = open(SERVER_LOG, "ab")
-    process = subprocess.Popen([exe, "serve"], stdout=log, stderr=log, env=env,
-                               start_new_session=True)
-    server = ManagedServer(process, url)
-
-    deadline = time.monotonic() + BOOT_TIMEOUT
-    while time.monotonic() < deadline:
-        if _reachable(f"{url}/api/tags", 0.5):
-            return server
-        if process.poll() is not None:
-            server.stop()
-            raise NoLocalModel(f"`ollama serve` exited immediately.\n\n{_log_tail()}")
-        time.sleep(0.25)
-    server.stop()
-    raise NoLocalModel(f"`ollama serve` did not come up within {BOOT_TIMEOUT:.0f}s.\n\n{_log_tail()}")
+    return launch("ollama", [exe, "serve"], env, SERVER_LOG, f"{url}/api/tags", BOOT_TIMEOUT)
 
 
 def warm_up(backend: Backend) -> None:
     """Nudge the model into memory in the background, so the first chat is quick."""
-    def work() -> None:
-        try:
-            backend.reply([{"role": "user", "content": "hi"}], "happy")
-        except Exception:
-            pass                                  # a cold start failing is not fatal
-    threading.Thread(target=work, name="chat-warmup", daemon=True).start()
+    threading.Thread(target=backend.warm, name="chat-warmup", daemon=True).start()
+
+
+def _open_ollama(url: str, model: str, require: bool, autostart: bool,
+                 pull: bool) -> tuple[OllamaBackend, ManagedServer | None]:
+    """An Ollama with the model in it, started by us if nobody else has one."""
+    base = (url or OLLAMA_URL).rstrip("/")
+    if _reachable(f"{base}/api/tags"):
+        backend = OllamaBackend(base, model)
+        if require:
+            backend.check(pull)        # a server we didn't start still needs the model
+        return backend, None           # ...but its lifetime is not ours to end
+    if not autostart:
+        raise NoLocalModel(_no_server_help(f"nothing is listening on {base}"))
+    server = start_ollama(base, model)
+    backend = OllamaBackend(base, model)
+    try:
+        if require:
+            backend.check(pull)
+    except BaseException:
+        server.stop()                  # never leave our own server orphaned behind an error
+        raise
+    return backend, server
+
+
+def _open_letta(url: str, model: str, require: bool, autostart: bool,
+                pull: bool) -> tuple[LettaBackend, list[ManagedServer]]:
+    """Letta on top of Ollama: agents here, inference there.
+
+    Both layers have to be up, so both get the same treatment -- attach to
+    whatever is already running, otherwise start it and own it.  Letta also
+    wants an embedding model for archival memory, which is small and pulled
+    alongside the chat model.
+    """
+    servers: list[ManagedServer] = []
+    letta_url = (os.environ.get("FRUITBRAINS_LETTA_URL", "") or LETTA_URL).rstrip("/")
+    backend = LettaBackend(letta_url, model)
+    try:
+        if not backend.alive():
+            if not autostart:
+                raise NoLocalModel(letta_backend.no_letta_help(
+                    f"nothing is listening on {letta_url}"))
+            # Nothing is serving agents, so we are building the whole stack:
+            # inference first, because Letta is useless without it.
+            ollama, server = _open_ollama(url, model, require, autostart, pull)
+            if server is not None:
+                servers.append(server)
+            if pull and not OllamaBackend(ollama.url, EMBEDDING_MODEL).has_model():
+                pull_model(ollama.url, EMBEDDING_MODEL)   # small, and Letta needs one
+            servers.append(start_letta(letta_url, ollama.url))
+        if require:
+            backend.check(pull)    # a Letta someone else started still has to know our model
+    except BaseException:
+        for server in reversed(servers):
+            server.stop()
+        raise
+    return backend, servers
 
 
 def open_backend(require: bool = True, autostart: bool = True,
-                 pull: bool = True) -> tuple[Backend, ManagedServer | None]:
-    """Pick a backend, starting our own model server if nothing is listening.
+                 pull: bool = True) -> tuple[Backend, list[ManagedServer]]:
+    """Pick a backend, starting our own servers if nothing is listening.
 
-    Returns the backend and -- only if we launched it -- the server to shut down
-    on the way out.  An already-running server is used as-is and left alone.
+    Returns the backend and -- only for the servers we launched -- the ones to
+    shut down on the way out, innermost last.  An already-running server is used
+    as-is and left alone.
     """
     choice = os.environ.get("FRUITBRAINS_LLM", "auto").lower()
     url = os.environ.get("FRUITBRAINS_LLM_URL", "")
@@ -437,38 +420,40 @@ def open_backend(require: bool = True, autostart: bool = True,
     print(f"Fruit Brains: {why} -> model {model}", flush=True)
 
     if choice == "canned":
-        return CannedBackend(), None
+        return CannedBackend(), []
     if choice in ("openai", "llamacpp", "kobold"):
         backend = OpenAIChatBackend(url or OPENAI_URLS[0], model)
         if require:
             backend.check()
-        return backend, None
+        warm_up(backend)
+        return backend, []
+    if choice == "letta":
+        backend, servers = _open_letta(url, model, require, autostart, pull)
+        return backend, servers
+
+    # Auto: a Letta already serving is the richer town -- villagers there
+    # remember you -- so it wins over a bare model server.
+    if choice == "auto" and _reachable(f"{LETTA_URL}{letta_backend.HEALTH_PATH}"):
+        backend = LettaBackend(LETTA_URL, model)
+        if require:
+            backend.check(pull)
+        return backend, []
 
     found = _probe(url, model) if choice == "auto" else None
-    if choice == "ollama" and _reachable(f"{(url or OLLAMA_URL).rstrip('/')}/api/tags"):
-        found = OllamaBackend(url or OLLAMA_URL, model)
     if found is not None:
         if require:
-            found.check(pull)          # a server we didn't start still needs the model
+            found.check(pull)
         warm_up(found)
-        return found, None             # ...but its lifetime is not ours to end
+        return found, []
 
     if autostart:
-        base = (url or OLLAMA_URL).rstrip("/")
-        server = start_ollama(base, model)
-        backend = OllamaBackend(base, model)
-        try:
-            if require:
-                backend.check(pull)
-        except BaseException:
-            server.stop()              # never leave our own server orphaned behind an error
-            raise
+        backend, server = _open_ollama(url, model, require, True, pull)
         warm_up(backend)
-        return backend, server
+        return backend, [server] if server else []
     if require:
         where = url or f"{OLLAMA_URL} or {', '.join(OPENAI_URLS)}"
         raise NoLocalModel(_no_server_help(f"nothing is listening on {where}"))
-    return CannedBackend(), None
+    return CannedBackend(), []
 
 
 def detect_backend(require: bool = True, autostart: bool = False) -> Backend:
@@ -505,7 +490,8 @@ class Conversation:
                 f"Personality: {self.persona}. Mood: {feeling}. "
                 f"You are chatting with your neighbour {player}.\n"
                 "Rules: answer what they actually said, directly. One short sentence, "
-                "20 words max. Stay in character. No narration, no asterisks, no emoji.")
+                "20 words max, in English. Stay in character. No narration, no "
+                "asterisks, no emoji.")
 
     def messages(self, mood: str, player: str, said: str) -> list[dict]:
         """System card, recent turns, then their line -- restated so a 0.5 B
@@ -526,15 +512,17 @@ class ChatService:
     def __init__(self, backend: Backend | None = None, require: bool = True,
                  autostart: bool = True, pull: bool = True) -> None:
         if backend is not None:
-            self.backend, self.server = backend, None
+            self.backend, self.servers = backend, []
         else:
-            self.backend, self.server = open_backend(require, autostart, pull)
+            self.backend, self.servers = open_backend(require, autostart, pull)
         self.conversations: dict[str, Conversation] = {}
         self._results: queue.Queue = queue.Queue()
         self._pending: set[str] = set()
         self._partial: dict[str, str] = {}      # reply-so-far, updated as it streams
         self._started: dict[str, float] = {}
         self._cancelled: set[str] = set()
+        self._memories: dict[str, str] = {}     # what a stateful villager recalls of you
+        self._recalling: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -549,12 +537,22 @@ class ChatService:
         """True when dialogue is coming from the scripted-lines mode."""
         return self.backend.scripted
 
+    @property
+    def stateful(self) -> bool:
+        """True when villagers remember you between sessions (the Letta backend)."""
+        return self.backend.stateful
+
+    @property
+    def server(self) -> ManagedServer | None:
+        """The outermost server we started, if any. ``None`` means we started none."""
+        return self.servers[0] if self.servers else None
+
     def shutdown(self) -> None:
-        """Stop the model server, but only if this session started it."""
-        if self.server is not None:
-            print("Fruit Brains: stopping ollama", flush=True)
-            self.server.stop()
-            self.server = None
+        """Stop the servers this session started -- and only those, innermost first."""
+        for server in reversed(self.servers):
+            print(f"Fruit Brains: stopping {server.label}", flush=True)
+            server.stop()
+        self.servers = []
 
     def conversation(self, villager: str) -> Conversation:
         chat = self.conversations.get(villager)
@@ -583,12 +581,39 @@ class ChatService:
             self._partial.pop(villager, None)
             self._started.pop(villager, None)
 
+    def memory(self, villager: str) -> str:
+        """What this villager remembers about the player -- "" until it's fetched."""
+        return self._memories.get(villager, "")
+
+    def recall(self, villager: str) -> None:
+        """Ask the backend what it remembers, off the main thread.
+
+        Only stateful backends have anything to say; for the rest this is a
+        no-op, so the caller can fire it whenever a conversation opens.
+        """
+        if not self.backend.stateful or villager in self._recalling:
+            return
+        self._recalling.add(villager)
+
+        def work() -> None:
+            try:
+                text = self.backend.memory(villager)
+            except Exception:
+                text = ""                 # a missing memory line is not worth an error
+            if text:
+                self._memories[villager] = text
+            self._recalling.discard(villager)
+
+        threading.Thread(target=work, name=f"recall-{villager}", daemon=True).start()
+
     def ask(self, villager: str, mood: str, player: str, said: str) -> bool:
         """Queue a reply. Returns False if that villager is already thinking."""
         if villager in self._pending:
             return False
         chat = self.conversation(villager)
-        messages = chat.messages(mood, player, said)
+        # A stateful backend is sent the line alone -- assembling a prompt for it
+        # would only be misleading in the debug log.
+        messages = [] if self.backend.stateful else chat.messages(mood, player, said)
         self._pending.add(villager)
         self._partial[villager] = ""
         self._started[villager] = time.monotonic()
@@ -605,9 +630,17 @@ class ChatService:
         def work() -> None:
             if DEBUG:
                 print(f"\n[chat] -> {villager} ({mood})\n"
-                      + "\n".join(f"  {m['role']}: {m['content']}" for m in messages))
+                      + "\n".join(f"  {m['role']}: {m['content']}" for m in messages)
+                      + (f"  (agent) {player}: {said}" if not messages else ""))
             try:
-                text = tidy(self.backend.reply(messages, mood, on_token))
+                if self.backend.stateful:
+                    # The villager's agent already holds the history; sending it
+                    # again would file every memory twice.
+                    raw = self.backend.converse(villager, chat.persona, mood,
+                                                player, said, on_token)
+                else:
+                    raw = self.backend.reply(messages, mood, on_token)
+                text = tidy(raw)
             except Cancelled:
                 return                       # the player walked off; nothing to report
             except Exception as exc:
@@ -640,4 +673,7 @@ class ChatService:
                 chat = self.conversation(villager)
                 chat.history.append({"role": "user", "content": said})
                 chat.history.append({"role": "assistant", "content": text})
+                # A stateful villager may have just written something down about
+                # you; ask again so the panel shows what changed.
+                self.recall(villager)
             out.append((villager, text, error))

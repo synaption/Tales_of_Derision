@@ -5,8 +5,7 @@ small enough to run on a raspberry pi
 
 ## Running
 
-    python3 experimental/fruitbrains/fruitbrains.py       # the prototype
-    python3 experimental/fruitbrains/headlesstest.py      # asserts + contact sheet, no window
+    python3 experimental/fruitbrains/fruitbrains.py       
 
 ## Controls
 
@@ -77,9 +76,71 @@ goes to `$TMPDIR/fruitbrains-ollama.log`.
 
 Pi sizing: a 0.5 B / 360 M instruct model at Q4_K_M on a Pi 4, a 1 B on a Pi 5.
 Replies are capped at `MAX_TOKENS` and generated on a worker thread, so a slow
-reply costs seconds of waiting, never frames.  Adding another backend (Letta, a
-remote box, anything with a persona-shaped API) means one class with `reply()`
-and `check()` in `chat.py`.
+reply costs seconds of waiting, never frames.  Adding another backend means one
+class with `reply()` and `check()` -- or `converse()` and `stateful = True` if
+it keeps its own memory, the way `letta_backend.py` does.
+
+### Persistent personalities (Letta)
+
+    python3 fruitbrains.py --letta
+
+Without this, a villager's memory is the last six messages and it dies with the
+process.  With it, **each villager is a Letta agent** -- `fruitbrains-Peach`,
+tagged `fruitbrains`, living in Letta's database -- with a `persona` block for
+who they are and a `human` block for what they've worked out about you.  Tell
+Peach you keep bees and she still knows next week.
+
+What persists is the conversation itself, held by the agent -- quit, restart,
+come back tomorrow, and Peach still knows about the bees.  The chat panel shows
+her `human` block next to her name, so what she has written down is on screen
+rather than in a log.
+
+**Verified against Letta 0.16.8 with `qwen2.5:7b`**, and one caveat came out of
+it: the agents are given Letta's base tools, including core-memory writes, but
+whether they *use* them depends on the model.  Ollama's OpenAI-compatible
+endpoint returns no native tool calls for qwen2.5 (`tool_calls: null`, even with
+tools in the request), so a villager talks well and remembers the conversation
+but rarely edits its own memory block -- and when it tries, it writes
+`memory_insert(...)` as dialogue.  That never reaches the screen: `spoken()`
+strips tool-call syntax and fails the turn rather than have a villager read JSON
+at you.  A model with working tool calls gets the self-editing memory too; the
+lever is `FRUITBRAINS_MODEL`.
+
+Letta is the agent layer, not the model: it runs inference through the same
+local Ollama and the same [model ladder](#model-sizing), plus a small embedding
+model (`nomic-embed-text`, ~270 MB) for archival memory.  With nothing running,
+`--letta` starts Ollama, pulls both models, starts `letta server` pointed at
+Ollama, and stops both on exit.  Anything already listening is used as-is and
+never shut down.
+
+Letta's server keeps its state in Postgres, so the docker image (which brings
+one) is the path that works with nothing else installed:
+
+    docker run -d -p 8283:8283 --add-host=host.docker.internal:host-gateway \
+      -e OLLAMA_BASE_URL=http://host.docker.internal:11434 letta/letta:latest
+    python3 fruitbrains.py --letta          # finds it on :8283 and leaves it alone
+
+Ollama binds `127.0.0.1` by default, which the container cannot reach, and the
+symptom is Letta listing no models at all -- so it needs
+`OLLAMA_HOST=0.0.0.0 ollama serve` (or any address the container can get to).
+Startup says so if the handle it wants isn't on offer.
+
+    pip install letta                       # the game starts this one itself, but
+    LETTA_PG_URI=postgresql://...           # only with a Postgres to point at
+    python3 fruitbrains.py --forget         # delete the agents, meet the town fresh
+
+    FRUITBRAINS_LETTA_URL=http://pi.local:8283   # or an existing/docker Letta
+    FRUITBRAINS_EMBEDDING=nomic-embed-text
+    LETTA_API_KEY=...                            # sent as a bearer token
+
+A Letta already serving on `:8283` is picked up automatically, `--letta` or
+not.  Memory costs latency -- the agent re-reads its blocks each turn -- so a Pi
+is happier on the plain Ollama backend, and both are the same game.
+
+The persona block is written once, at creation, and never overwritten: a game
+that rewrote it every launch would be a game where nothing persists.  Edit
+`PERSONAS` in `chat.py` and existing villagers keep the personality they grew;
+`--forget` is how you start them over.
 
 ### Scripted lines
 
@@ -100,6 +161,8 @@ to what you type come from the model.
 | `world.py` | the town and cottage scenes, props, collision, doors |
 | `fruit.py` | villagers: emotions, wandering, HD faces and rubber-hose limbs |
 | `chat.py` | local-LLM backends, personas, threaded conversation service |
+| `letta_backend.py` | one Letta agent per villager: memory that outlives the process |
+| `serve.py` | HTTP with deadlines, and child servers we start and stop |
 | `hardware.py` | GPU/RAM detection and the model ladder |
 
 ## Mixed pixel scales

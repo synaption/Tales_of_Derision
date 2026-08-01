@@ -17,6 +17,9 @@ stops it again on exit; a server that was already running is used as-is and
 left alone.
 
 Options
+    --letta       persistent villagers: each one is a Letta agent that
+                  remembers you between sessions (see letta_backend.py)
+    --forget      delete the Letta agents and let the town meet you fresh
     --canned      scripted lines instead of a model (deterministic, for beats)
     --no-serve    never start a server; fail if one isn't already up
     --no-pull     never download a model
@@ -185,6 +188,7 @@ class Game:
         if other is None:
             return
         other.greet(self.player)
+        self.chat.recall(other.name)      # what do they already know about me?
         self.player.facing = 1 if other.pos.x > self.player.pos.x else -1
         self.talking = other
         self.typed = ""
@@ -378,6 +382,14 @@ class Game:
             hd_text(screen, self.hint, (WIDTH // 2, HEIGHT - 78), 26,
                     (255, round(glow), 190), center=True, shadow=(30, 30, 36))
 
+    def fit_text(self, text: str, pos: tuple[int, int], size: int,
+                 colour: tuple[int, int, int], width: int) -> None:
+        """HD text trimmed with an ellipsis until it fits `width` pixels."""
+        font = hd_font(size)
+        while font.size(text)[0] > width and len(text) > 4:
+            text = text[:-2] + "…"
+        hd_text(self.screen, text, pos, size, colour)
+
     def chat_panel(self, now: float) -> None:
         """The typed half of the conversation, drawn HD at the foot of the screen."""
         screen = self.screen
@@ -393,16 +405,18 @@ class Game:
         if self.chat.scripted:
             hd_text(screen, "scripted lines - not reading your input", (panel.x + 232, panel.y + 14),
                     20, (240, 186, 110))
+        elif self.chat.stateful:
+            # What the villager has actually written down about you -- the whole
+            # reason for the agent layer, so it belongs on screen, not in a log.
+            note = " ".join(self.chat.memory(other.name).split()) or "nothing about you yet"
+            self.fit_text(f"remembers: {note}", (panel.x + 232, panel.y + 15), 19,
+                          (128, 150, 170), panel.right - 232 - 226)
 
         y = panel.y + 44
         for speaker, line in self.transcript[-3:]:
             mine = speaker == self.player.name
             colour = (168, 214, 240) if mine else CREAM
-            text = f"{speaker}: {line}"
-            font = hd_font(21)
-            while font.size(text)[0] > panel.width - 32 and len(text) > 12:
-                text = text[:-2] + "…"
-            hd_text(screen, text, (panel.x + 16, y), 21, colour)
+            self.fit_text(f"{speaker}: {line}", (panel.x + 16, y), 21, colour, panel.width - 32)
             y += 26
 
         prompt = pygame.Rect(panel.x + 12, panel.bottom - 44, panel.width - 24, 32)
@@ -416,10 +430,8 @@ class Game:
                 dots = "." * (1 + int(now * 3) % 3)
                 loading = "  (loading the model, first reply is the slow one)" if waited > 8 else ""
                 status = f"{other.name} is thinking{dots}  {waited:.0f}s{loading}"
-            font = hd_font(21)
-            while font.size(status)[0] > prompt.width - 100 and len(status) > 20:
-                status = status[:-2] + "…"
-            hd_text(screen, status, (prompt.x + 10, prompt.y + 7), 21, (150, 208, 160))
+            self.fit_text(status, (prompt.x + 10, prompt.y + 7), 21, (150, 208, 160),
+                          prompt.width - 100)
             hd_text(screen, "ESC cancels", (prompt.right - 96, prompt.y + 7), 20, (140, 156, 168))
         else:
             caret = "_" if int(now * 2) % 2 else " "
@@ -451,6 +463,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if "--canned" in args:
         os.environ["FRUITBRAINS_LLM"] = "canned"
+    if "--letta" in args or "--forget" in args:
+        os.environ["FRUITBRAINS_LLM"] = "letta"
 
     try:
         service = ChatService(autostart="--no-serve" not in args, pull="--no-pull" not in args)
@@ -458,10 +472,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{exc}\n", file=sys.stderr)
         return 2
 
+    if "--forget" in args:
+        # Deliberately destructive, so it is its own run: wipe, say what went, exit.
+        try:
+            gone = service.backend.forget()
+            print(f"Fruit Brains: forgot {len(gone)} villager(s): {', '.join(gone) or 'none'}")
+        finally:
+            service.shutdown()
+        return 0
+
     if service.scripted:
         print("Fruit Brains: scripted-lines mode -- villagers will not answer what you type.")
     else:
-        print(f"Fruit Brains: talking to {service.name}")
+        print(f"Fruit Brains: talking to {service.name}"
+              + (" -- villagers remember you between sessions" if service.stateful else ""))
     try:
         Game(service).run()
     except KeyboardInterrupt:
