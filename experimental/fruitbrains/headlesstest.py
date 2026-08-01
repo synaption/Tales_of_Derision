@@ -203,6 +203,29 @@ def test_walking_is_not_blocked_by_the_model(game: fruitbrains.Game) -> None:
     game.end_chat()
 
 
+def test_nobody_wanders_off_mid_chat(game: fruitbrains.Game) -> None:
+    game.chat = ChatService(ScriptedBackend(text="Stay a while!"))
+    other = min((f for f in game.here() if f is not game.player),
+                key=lambda f: f.pos.distance_to(game.player.pos))
+    other.pos.update(game.player.pos + pygame.Vector2(60, 0))
+    other.velocity.update(90, 40)                  # already strolling when you say hi
+    game.talk()
+    start_other = pygame.Vector2(other.pos)
+    start_player = pygame.Vector2(game.player.pos)
+
+    step(game, 600, 60)                            # ten seconds of conversation
+    assert game.talking is other, "conversation dropped itself"
+    assert other.pos.distance_to(start_other) < 24, (
+        f"villager wandered {other.pos.distance_to(start_other):.0f} units away")
+    assert game.player.pos.distance_to(start_player) < 24, "player drifted mid-chat"
+    assert other.velocity.length() < 4, "villager never came to a stop"
+
+    game.end_chat()
+    assert not other.chatting and not game.player.chatting
+    step(game, 240, 70)
+    assert other.pos.distance_to(start_other) > 24, "villager never resumed wandering"
+
+
 def test_dead_server_falls_back(game: fruitbrains.Game) -> None:
     service = ChatService(BrokenBackend())
     service.ask("Pear", "happy", "Apple", "hello?")
@@ -259,7 +282,8 @@ def main() -> int:
     checks = (test_moods_decay_to_happy, test_every_mood_draws, test_solids_block,
               test_door_round_trip, test_zoom_is_bounded, test_mixed_pixel_scales, test_talking,
               test_prompt_is_in_character, test_dialogue_round_trip,
-              test_walking_is_not_blocked_by_the_model, test_dead_server_falls_back,
+              test_walking_is_not_blocked_by_the_model, test_nobody_wanders_off_mid_chat,
+              test_dead_server_falls_back,
               test_reply_tidying)
     for check in checks:
         check(game)

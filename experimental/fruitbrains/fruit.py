@@ -101,6 +101,7 @@ class Fruit:
         self.repath = 0.0
         self.line = ""
         self.line_left = 0.0
+        self.chatting = False     # planted: mid-conversation, nobody wanders off
         self.thinking = False     # set while a local model is writing their reply
         self._overlay = None      # screen-space handoff from draw() to draw_overlay()
 
@@ -158,7 +159,14 @@ class Fruit:
             self.mood_at = now + random.uniform(6.0, 14.0)
 
         pace = self.mood.pace
-        if control is not None:
+        if self.chatting:
+            # Mid-conversation: plant your feet and hear the other one out.
+            # (Skipping the repath matters -- a wander target that's already
+            # reached is exactly what makes them stroll off mid-sentence.)
+            self.velocity *= 0.55 ** (dt * 60)
+            self.walk_target.update(self.pos)
+            self.repath = random.uniform(0.4, 1.6)
+        elif control is not None:
             if control.length_squared():
                 self.velocity += control.normalize() * 1500 * dt
         else:

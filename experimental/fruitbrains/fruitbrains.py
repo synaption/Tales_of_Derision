@@ -184,6 +184,9 @@ class Game:
 
     def end_chat(self) -> None:
         pygame.key.stop_text_input()
+        if self.talking is not None:
+            self.talking.chatting = False
+        self.player.chatting = False
         self.talking = None
         self.typed = ""
 
@@ -233,13 +236,13 @@ class Game:
             int(keys[pygame.K_DOWN] or keys[pygame.K_s]) - int(keys[pygame.K_UP] or keys[pygame.K_w]))
 
         if self.talking is not None:
-            gone = (self.talking.scene != self.scene.name
-                    or self.talking.pos.distance_to(self.player.pos) > TALK_RANGE * 1.8)
-            if gone:
+            if self.talking.scene != self.scene.name:
                 self.end_chat()
             else:
-                self.talking.walk_target.update(self.talking.pos)   # stay and chat
+                # Both of you hold position and face each other until ESC.
+                self.talking.chatting = self.player.chatting = True
                 self.talking.facing = 1 if self.player.pos.x > self.talking.pos.x else -1
+                self.player.facing = -self.talking.facing
 
         for fruit in self.fruits:
             scene = self.scenes[fruit.scene]
