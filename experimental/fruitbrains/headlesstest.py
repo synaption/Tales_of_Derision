@@ -11,9 +11,16 @@ game.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
+import socket
 import sys
+import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -24,7 +31,8 @@ import pygame
 
 import chat as chat_mod
 import fruitbrains
-from chat import CannedBackend, ChatService, tidy
+import hardware
+from chat import CannedBackend, ChatService, _reachable, tidy
 from fruit import EMOTIONS, Fruit
 from render import MAX_ZOOM, MIN_ZOOM
 
@@ -127,10 +135,12 @@ class ScriptedBackend(chat_mod.Backend):
         self.delay, self.text = delay, text
         self.seen: list[list[dict]] = []
 
-    def reply(self, messages: list[dict], mood: str) -> str:
+    def reply(self, messages: list[dict], mood: str, on_token=None) -> str:
         self.seen.append(messages)
         if self.delay:
             time.sleep(self.delay)
+        if on_token is not None:
+            on_token(self.text)
         return self.text
 
 
@@ -138,8 +148,84 @@ class BrokenBackend(chat_mod.Backend):
     name = "broken"
     online = True
 
-    def reply(self, messages: list[dict], mood: str) -> str:
+    def reply(self, messages: list[dict], mood: str, on_token=None) -> str:
         raise ConnectionRefusedError("nothing listening on :11434")
+
+
+def _ollama_pids(path_hint: str) -> set[int]:
+    """PIDs of fake-ollama servers running out of this test's temp dir."""
+    tmp = path_hint.split(os.pathsep)[0]
+    found = set()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if tmp in (entry / "cmdline").read_bytes().decode(errors="replace"):
+                found.add(int(entry.name))
+        except OSError:
+            continue
+    return found
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def fake_ollama(models: list[str], content: str = "Hello!", token_delay: float = 0.0,
+                stall_after: int | None = None):
+    """A stand-in Ollama: /api/tags, and /api/chat streaming NDJSON like the real one.
+
+    ``token_delay`` slows each token; ``stall_after`` stops sending mid-reply so
+    the stall path can be exercised.
+    """
+    seen: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, payload: dict) -> None:
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._send({"models": [{"name": name} for name in models]})
+
+        def do_POST(self):
+            seen.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            words = content.split(" ")
+            try:
+                for i, word in enumerate(words):
+                    if stall_after is not None and i >= stall_after:
+                        time.sleep(30)          # go quiet mid-sentence
+                        return
+                    chunk = word if i == 0 else " " + word
+                    self.wfile.write(json.dumps({"message": {"content": chunk},
+                                                 "done": False}).encode() + b"\n")
+                    self.wfile.flush()
+                    if token_delay:
+                        time.sleep(token_delay)
+                self.wfile.write(json.dumps({"message": {"content": ""}, "done": True}).encode() + b"\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass                            # the client gave up; that's allowed
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    server.seen = seen
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
 
 
 def test_prompt_is_in_character(game: fruitbrains.Game) -> None:
@@ -226,18 +312,355 @@ def test_nobody_wanders_off_mid_chat(game: fruitbrains.Game) -> None:
     assert other.pos.distance_to(start_other) > 24, "villager never resumed wandering"
 
 
-def test_dead_server_falls_back(game: fruitbrains.Game) -> None:
-    service = ChatService(BrokenBackend())
-    service.ask("Pear", "happy", "Apple", "hello?")
-    replies = []
+def test_dead_server_reports_instead_of_faking(game: fruitbrains.Game) -> None:
+    """A failed request must read as a failure, never as a scripted line."""
+    game.chat = ChatService(BrokenBackend())
+    other = min((f for f in game.here() if f is not game.player),
+                key=lambda f: f.pos.distance_to(game.player.pos))
+    other.pos.update(game.player.pos + pygame.Vector2(50, 0))
+    game.talk()
+    other.line, other.line_left = "", 0.0      # drop the scripted hello-bark
+    before = len(game.transcript)
+    game.chat.ask(other.name, other.emotion, game.player.name, "hello?")
     for _ in range(400):
-        replies = service.poll()
-        if replies:
+        step(game, 1, 80)
+        if not game.chat.busy(other.name):
             break
-        time.sleep(0.005)
-    villager, text, error = replies[0]
-    assert villager == "Pear" and text, "no fallback line after a backend failure"
-    assert error and "ConnectionRefused" in error, error
+    assert game.chat_error and "ConnectionRefused" in game.chat_error, game.chat_error
+    assert len(game.transcript) == before, "a fake reply reached the transcript"
+    assert not other.line, "villager spoke a line the model never produced"
+    assert not game.chat.conversation(other.name).history, "a failure polluted the history"
+    game.end_chat()
+
+
+FAKE_OLLAMA = '''#!/usr/bin/env python3
+"""A stand-in `ollama` binary: `serve` runs a tiny API, `pull` pretends to fetch."""
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+STORE = os.environ["FAKE_OLLAMA_STORE"]
+
+def models():
+    return json.load(open(STORE)) if os.path.exists(STORE) else []
+
+if sys.argv[1] == "pull":
+    json.dump(models() + [sys.argv[2]], open(STORE, "w"))
+    print(f"pulled {sys.argv[2]}")
+    sys.exit(0)
+
+host, port = os.environ["OLLAMA_HOST"].split(":")
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _s(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", "application/json"); self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self): self._s({"models": [{"name": n} for n in models()]})
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path.endswith("/api/pull"):        # same API the real server exposes
+            json.dump(models() + [body["model"]], open(STORE, "w"))
+            self.send_response(200); self.end_headers()
+            self.wfile.write(json.dumps({"status": "pulling", "completed": 1,
+                                         "total": 2}).encode() + b"\\n")
+            self.wfile.write(json.dumps({"status": "success"}).encode() + b"\\n")
+            return
+        self._s({"message": {"content": "Served by the fake ollama."}, "done": True})
+
+HTTPServer((host, int(port)), H).serve_forever()
+'''
+
+
+@contextlib.contextmanager
+def _no_real_servers():
+    """Point the default probe targets at dead ports.
+
+    Without this, a real Ollama running on the developer's machine gets adopted
+    and the autostart tests silently test nothing.
+    """
+    saved_ollama, saved_openai = chat_mod.OLLAMA_URL, chat_mod.OPENAI_URLS
+    chat_mod.OLLAMA_URL, chat_mod.OPENAI_URLS = "http://127.0.0.1:9", ()
+    try:
+        yield
+    finally:
+        chat_mod.OLLAMA_URL, chat_mod.OPENAI_URLS = saved_ollama, saved_openai
+
+
+def _fake_ollama_on_path(tmp: Path, installed: list[str]) -> dict:
+    """Env with a fake `ollama` first on PATH and a spare port to bind."""
+    exe = tmp / "ollama"
+    exe.write_text(FAKE_OLLAMA)
+    exe.chmod(0o755)
+    store = tmp / "models.json"
+    store.write_text(json.dumps(installed))
+    with socket.socket() as probe:                 # grab a free port, then let go
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    return {"PATH": f"{tmp}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_OLLAMA_STORE": str(store),
+            "FRUITBRAINS_LLM": "auto",
+            "FRUITBRAINS_LLM_URL": f"http://127.0.0.1:{port}",
+            "FRUITBRAINS_MODEL": "qwen2.5:0.5b"}
+
+
+def test_game_starts_and_stops_its_own_server(game: fruitbrains.Game) -> None:
+    saved = dict(os.environ)
+    with tempfile.TemporaryDirectory() as tmp, _no_real_servers():
+        try:
+            os.environ.update(_fake_ollama_on_path(Path(tmp), installed=["qwen2.5:0.5b"]))
+            service = ChatService()
+            assert service.server is not None, "no server was started"
+            assert not service.scripted and service.online
+            pid = service.server.process.pid
+
+            service.ask("Pear", "happy", "Apple", "are you there?")
+            for _ in range(600):
+                out = service.poll()
+                if out:
+                    break
+                time.sleep(0.005)
+            assert out[0][1] == "Served by the fake ollama.", out
+
+            service.shutdown()
+            for _ in range(200):                   # it should actually die
+                if not _alive(pid):
+                    break
+                time.sleep(0.02)
+            assert not _alive(pid), "the server we started outlived the game"
+            assert service.server is None
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+
+def test_a_server_we_did_not_start_is_left_alone(game: fruitbrains.Game) -> None:
+    """Attaching to someone else's Ollama must not hand us a kill switch."""
+    saved = dict(os.environ)
+    server, port = fake_ollama(models=["qwen2.5:0.5b"], content="Already running here.")
+    try:
+        os.environ["FRUITBRAINS_LLM"] = "auto"
+        os.environ["FRUITBRAINS_LLM_URL"] = f"http://127.0.0.1:{port}"
+        os.environ["FRUITBRAINS_MODEL"] = "qwen2.5:0.5b"      # what this server has
+        service = ChatService()
+        assert service.server is None, "adopted a server it did not start"
+        service.shutdown()
+        assert _reachable(f"http://127.0.0.1:{port}/api/tags"), "shut down someone else's server"
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        server.shutdown()
+
+
+def test_missing_model_is_pulled_once(game: fruitbrains.Game) -> None:
+    saved = dict(os.environ)
+    with tempfile.TemporaryDirectory() as tmp, _no_real_servers():
+        try:
+            env = _fake_ollama_on_path(Path(tmp), installed=[])      # nothing installed
+            os.environ.update(env)
+            service = ChatService()                                   # should pull, then run
+            try:
+                assert json.load(open(env["FAKE_OLLAMA_STORE"])) == ["qwen2.5:0.5b"]
+            finally:
+                service.shutdown()
+
+            os.environ["FAKE_OLLAMA_STORE"] = str(Path(tmp) / "empty.json")
+            before = _ollama_pids(env["PATH"])
+            try:
+                ChatService(pull=False).shutdown()
+            except chat_mod.NoLocalModel as exc:
+                assert "--no-pull" in str(exc), str(exc)
+            else:
+                raise AssertionError("--no-pull still downloaded a model")
+            for _ in range(200):
+                leaked = _ollama_pids(env["PATH"]) - before
+                if not leaked:
+                    break
+                time.sleep(0.02)
+            assert not leaked, f"a failed startup orphaned the server: {leaked}"
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+
+def test_startup_requires_a_model(game: fruitbrains.Game) -> None:
+    """No server, no launch -- with a message that says how to fix it."""
+    saved = dict(os.environ)
+    try:
+        os.environ["FRUITBRAINS_LLM"] = "auto"
+        os.environ["FRUITBRAINS_LLM_URL"] = "http://127.0.0.1:9"   # discard port
+        try:
+            chat_mod.detect_backend(require=True, autostart=False)
+        except chat_mod.NoLocalModel as exc:
+            assert "ollama serve" in str(exc) and "--canned" in str(exc), str(exc)
+        else:
+            raise AssertionError("detect_backend accepted a town with no model in it")
+        # Scripted lines stay available, but only when asked for by name.
+        os.environ["FRUITBRAINS_LLM"] = "canned"
+        backend = chat_mod.detect_backend()
+        assert backend.scripted and not backend.online
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert fruitbrains.main(["--canned", "--help"]) == 0
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def test_startup_checks_the_model_is_loaded(game: fruitbrains.Game) -> None:
+    """A running server with the wrong model is caught before a window opens."""
+    server, port = fake_ollama(models=["llama3.2:1b"])
+    try:
+        backend = chat_mod.OllamaBackend(f"http://127.0.0.1:{port}", "qwen2.5:0.5b")
+        try:
+            backend.check(pull=False)
+        except chat_mod.NoLocalModel as exc:
+            assert "ollama pull qwen2.5:0.5b" in str(exc), str(exc)
+        else:
+            raise AssertionError("a missing model was not reported")
+        chat_mod.OllamaBackend(f"http://127.0.0.1:{port}", "llama3.2:1b").check()   # present
+        assert not chat_mod.OllamaBackend(f"http://127.0.0.1:{port}", "llama3.2:70b").has_model(), (
+            "family match let a missing tag through -- every request would 404")
+    finally:
+        server.shutdown()
+
+
+def test_live_http_round_trip(game: fruitbrains.Game) -> None:
+    """The real request/response shape, against a stand-in Ollama."""
+    server, port = fake_ollama(models=["qwen2.5:0.5b"],
+                               content='  "Peachy! *waves* I napped in the sun."  ')
+    try:
+        os.environ["FRUITBRAINS_LLM"] = "auto"
+        os.environ["FRUITBRAINS_LLM_URL"] = f"http://127.0.0.1:{port}"
+        os.environ["FRUITBRAINS_MODEL"] = "qwen2.5:0.5b"
+        backend = chat_mod.detect_backend()
+        assert isinstance(backend, chat_mod.OllamaBackend)
+        service = ChatService(backend)
+        service.ask("Peach", "sleepy", "Apple", "what have you been up to?")
+        replies = []
+        for _ in range(600):
+            replies = service.poll()
+            if replies:
+                break
+            time.sleep(0.005)
+        villager, text, error = replies[0]
+        assert error is None and text == "Peachy! I napped in the sun.", (text, error)
+        sent = server.seen[-1]
+        assert sent["options"]["num_predict"] == chat_mod.MAX_TOKENS
+        asked = sent["messages"][-1]["content"]
+        assert "what have you been up to?" in asked and "answering them" in asked, asked
+    finally:
+        os.environ.pop("FRUITBRAINS_LLM_URL", None)
+        os.environ["FRUITBRAINS_LLM"] = "canned"
+        server.shutdown()
+
+
+def test_reply_streams_word_by_word(game: fruitbrains.Game) -> None:
+    """The player must see progress, not an opaque 'thinking' state."""
+    server, port = fake_ollama(models=["m"], content="The tulips are coming along nicely.",
+                               token_delay=0.02)
+    try:
+        game.chat = ChatService(chat_mod.OllamaBackend(f"http://127.0.0.1:{port}", "m"))
+        other = min((f for f in game.here() if f is not game.player),
+                    key=lambda f: f.pos.distance_to(game.player.pos))
+        other.pos.update(game.player.pos + pygame.Vector2(50, 0))
+        game.talk()
+        game.chat.ask(other.name, other.emotion, game.player.name, "how's the garden?")
+
+        seen_partial, seen_timer = "", 0.0
+        for _ in range(900):
+            step(game, 1, 90)
+            seen_partial = seen_partial or game.chat.partial(other.name)
+            seen_timer = max(seen_timer, game.chat.waited(other.name))
+            if not game.chat.busy(other.name):
+                break
+        assert seen_partial and seen_partial != "The tulips are coming along nicely.", (
+            f"never saw a partial reply ({seen_partial!r})")
+        assert seen_timer > 0, "no elapsed-time signal for the UI"
+        assert other.line == "The tulips are coming along nicely.", other.line
+        assert game.chat.partial(other.name) == "", "partial text outlived the reply"
+        game.end_chat()
+    finally:
+        server.shutdown()
+
+
+def test_cancelling_a_slow_reply(game: fruitbrains.Game) -> None:
+    """ESC out of a conversation and the pending reply is dropped, not spoken later."""
+    server, port = fake_ollama(models=["m"], content="I will ramble on for quite a while yet",
+                               token_delay=0.25)
+    try:
+        game.chat = ChatService(chat_mod.OllamaBackend(f"http://127.0.0.1:{port}", "m"))
+        other = min((f for f in game.here() if f is not game.player),
+                    key=lambda f: f.pos.distance_to(game.player.pos))
+        other.pos.update(game.player.pos + pygame.Vector2(50, 0))
+        game.talk()
+        game.chat.ask(other.name, other.emotion, game.player.name, "say something long")
+        step(game, 30, 100)
+        assert game.chat.busy(other.name)
+
+        game.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE, mod=0))
+        assert game.talking is None
+        assert not game.chat.busy(other.name), "cancel did not clear the pending state"
+        other.line, other.line_left = "", 0.0
+        step(game, 180, 105)
+        assert not other.line, "a cancelled reply was spoken anyway"
+        assert not game.chat.conversation(other.name).history, "cancelled reply entered history"
+    finally:
+        server.shutdown()
+
+
+def test_a_stalled_model_becomes_an_error(game: fruitbrains.Game) -> None:
+    """A server that goes quiet mid-reply must not hang the conversation forever."""
+    server, port = fake_ollama(models=["m"], content="one two three four", stall_after=2)
+    saved = chat_mod.STALL_TIMEOUT
+    chat_mod.STALL_TIMEOUT = 0.75            # don't make the suite wait 25 s
+    try:
+        game.chat = ChatService(chat_mod.OllamaBackend(f"http://127.0.0.1:{port}", "m"))
+        other = min((f for f in game.here() if f is not game.player),
+                    key=lambda f: f.pos.distance_to(game.player.pos))
+        other.pos.update(game.player.pos + pygame.Vector2(50, 0))
+        game.talk()
+        other.line, other.line_left = "", 0.0
+        game.chat.ask(other.name, other.emotion, game.player.name, "hello?")
+        for _ in range(900):
+            step(game, 1, 110)
+            if not game.chat.busy(other.name):
+                break
+        assert not game.chat.busy(other.name), "a stalled reply never resolved"
+        assert game.chat_error, "a stall was not reported as an error"
+        game.end_chat()
+    finally:
+        chat_mod.STALL_TIMEOUT = saved
+        server.shutdown()
+
+
+def test_model_is_sized_to_the_machine(game: fruitbrains.Game) -> None:
+    big = hardware.Hardware("RTX 4090", 24564, 65536)
+    mid = hardware.Hardware("RTX 3060", 12288, 32768)
+    desktop_cpu = hardware.Hardware("", 0, 16000)
+    pi4 = hardware.Hardware("", 0, 3800, pi=True)
+    tiny = hardware.Hardware("", 0, 900, pi=True)
+    assert hardware.recommend_model(big) == "qwen2.5:14b"
+    assert hardware.recommend_model(mid) == "qwen2.5:7b"
+    assert hardware.recommend_model(desktop_cpu) == "qwen2.5:3b"
+    assert hardware.recommend_model(pi4) == "qwen2.5:0.5b"
+    assert hardware.recommend_model(tiny) == "smollm2:360m"
+    # Bigger hardware never picks a smaller model.
+    ladder = [hardware.recommend_model(hardware.Hardware("gpu", vram, 65536))
+              for vram in (3600, 6100, 10500, 23000)]
+    assert ladder == ["qwen2.5:1.5b", "qwen2.5:3b", "qwen2.5:7b", "qwen2.5:14b"], ladder
+
+    saved = dict(os.environ)
+    try:
+        os.environ["FRUITBRAINS_MODEL"] = "smollm2:360m"
+        assert chat_mod.chosen_model() == ("smollm2:360m", "FRUITBRAINS_MODEL")
+        os.environ.pop("FRUITBRAINS_MODEL")
+        model, why = chat_mod.chosen_model()
+        assert model and why, (model, why)          # whatever this machine is
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    assert hardware.probe().ram_mb > 0, "no RAM detected at all"
 
 
 def test_reply_tidying(game: fruitbrains.Game) -> None:
@@ -283,11 +706,19 @@ def main() -> int:
               test_door_round_trip, test_zoom_is_bounded, test_mixed_pixel_scales, test_talking,
               test_prompt_is_in_character, test_dialogue_round_trip,
               test_walking_is_not_blocked_by_the_model, test_nobody_wanders_off_mid_chat,
-              test_dead_server_falls_back,
-              test_reply_tidying)
-    for check in checks:
-        check(game)
-        print(f"  ok  {check.__name__}")
+              test_dead_server_reports_instead_of_faking,
+              test_game_starts_and_stops_its_own_server,
+              test_a_server_we_did_not_start_is_left_alone, test_missing_model_is_pulled_once,
+              test_startup_requires_a_model, test_startup_checks_the_model_is_loaded,
+              test_live_http_round_trip, test_reply_streams_word_by_word,
+              test_cancelling_a_slow_reply, test_a_stalled_model_becomes_an_error,
+              test_model_is_sized_to_the_machine, test_reply_tidying)
+    # Nothing in here may touch a real model server on the developer's machine:
+    # tests that need one stand up their own fake on a spare port.
+    with _no_real_servers():
+        for check in checks:
+            check(game)
+            print(f"  ok  {check.__name__}")
     contact_sheet(game)
     print(f"  ok  contact sheet -> {SHOT.name}")
     pygame.quit()

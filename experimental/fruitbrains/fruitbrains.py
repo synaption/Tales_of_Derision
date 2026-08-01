@@ -12,8 +12,15 @@ the whole thing zooms smoothly between 0.5x and 5x.
 
 Villagers answer back: press E to open a conversation, type, and a small local
 LLM (Ollama / llama.cpp / KoboldCpp -- see chat.py) writes their reply in
-character.  With no server running they fall back to hand-written lines, so the
-prototype never depends on the model being up.
+character.  If nothing is serving, the game starts its own `ollama serve` and
+stops it again on exit; a server that was already running is used as-is and
+left alone.
+
+Options
+    --canned      scripted lines instead of a model (deterministic, for beats)
+    --no-serve    never start a server; fail if one isn't already up
+    --no-pull     never download a model
+    --help
 
 Controls
     WASD / arrows   walk           mouse wheel or -/=   zoom
@@ -26,12 +33,14 @@ Controls
 from __future__ import annotations
 
 import math
+import os
 import random
+import sys
 
 import pygame
 
 from assets import Assets
-from chat import ChatService
+from chat import ChatService, NoLocalModel
 from fruit import EMOTIONS, MOOD_KEYS, Fruit
 from render import Camera, clamp, hd_font, hd_text
 import world
@@ -185,7 +194,9 @@ class Game:
     def end_chat(self) -> None:
         pygame.key.stop_text_input()
         if self.talking is not None:
+            self.chat.cancel(self.talking.name)     # don't leave a reply in flight
             self.talking.chatting = False
+            self.talking.thinking = False
         self.player.chatting = False
         self.talking = None
         self.typed = ""
@@ -219,12 +230,16 @@ class Game:
             speaker = next((f for f in self.fruits if f.name == villager), None)
             if speaker is None:
                 continue
+            if error or not text:
+                # Say nothing rather than fake it -- a scripted line here would
+                # read as a villager ignoring the question.
+                self.chat_error = error or "empty reply from the model"
+                continue
+            self.chat_error = ""
             speaker.say(text, 7.0)
             speaker.feel(mood_from_text(text, speaker.emotion), 5.0)
             self.transcript.append((villager, text))
             del self.transcript[:-6]
-            if error:
-                self.chat_error = error
 
     # -- simulation ----------------------------------------------------------
 
@@ -247,6 +262,13 @@ class Game:
         for fruit in self.fruits:
             scene = self.scenes[fruit.scene]
             fruit.thinking = self.chat.busy(fruit.name)
+            if fruit.thinking:
+                # Show the words as the model produces them: a half-finished
+                # sentence is proof it's working, where dots never are.
+                sofar = self.chat.partial(fruit.name)
+                if sofar:
+                    fruit.thinking = False
+                    fruit.say(sofar + " ...", 1.0)
             fruit.update(dt, now, control if fruit is self.player else None, scene)
         for bird in self.scene.birds:
             bird.update(dt, self.player.feet)
@@ -368,6 +390,9 @@ class Game:
 
         hd_text(screen, f"talking with {other.name}", (panel.x + 16, panel.y + 12), 23, (255, 228, 111))
         hd_text(screen, "ENTER send    ESC leave", (panel.right - 210, panel.y + 14), 20, (140, 156, 168))
+        if self.chat.scripted:
+            hd_text(screen, "scripted lines - not reading your input", (panel.x + 232, panel.y + 14),
+                    20, (240, 186, 110))
 
         y = panel.y + 44
         for speaker, line in self.transcript[-3:]:
@@ -383,14 +408,25 @@ class Game:
         prompt = pygame.Rect(panel.x + 12, panel.bottom - 44, panel.width - 24, 32)
         pygame.draw.rect(screen, (16, 20, 24), prompt, border_radius=4)
         if self.chat.busy(other.name):
-            dots = "." * (1 + int(now * 3) % 3)
-            hd_text(screen, f"{other.name} is thinking{dots}", (prompt.x + 10, prompt.y + 7), 21,
-                    (150, 208, 160))
+            waited = self.chat.waited(other.name)
+            sofar = self.chat.partial(other.name)
+            if sofar:
+                status = f"{other.name}: {sofar}"
+            else:
+                dots = "." * (1 + int(now * 3) % 3)
+                loading = "  (loading the model, first reply is the slow one)" if waited > 8 else ""
+                status = f"{other.name} is thinking{dots}  {waited:.0f}s{loading}"
+            font = hd_font(21)
+            while font.size(status)[0] > prompt.width - 100 and len(status) > 20:
+                status = status[:-2] + "…"
+            hd_text(screen, status, (prompt.x + 10, prompt.y + 7), 21, (150, 208, 160))
+            hd_text(screen, "ESC cancels", (prompt.right - 96, prompt.y + 7), 20, (140, 156, 168))
         else:
             caret = "_" if int(now * 2) % 2 else " "
             hd_text(screen, f"> {self.typed}{caret}", (prompt.x + 10, prompt.y + 7), 21, CREAM)
         if self.chat_error:
-            hd_text(screen, self.chat_error[:90], (panel.x + 16, panel.bottom - 66), 18, (226, 138, 138))
+            hd_text(screen, f"model error: {self.chat_error[:76]}", (panel.x + 16, panel.bottom - 66),
+                    19, (238, 132, 132))
 
     # -- loop ----------------------------------------------------------------
 
@@ -407,9 +443,33 @@ class Game:
         pygame.quit()
 
 
-def main() -> None:
-    Game().run()
+def main(argv: list[str] | None = None) -> int:
+    """Check the model is up *before* opening a window, and say so plainly if not."""
+    args = sys.argv[1:] if argv is None else argv
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+    if "--canned" in args:
+        os.environ["FRUITBRAINS_LLM"] = "canned"
+
+    try:
+        service = ChatService(autostart="--no-serve" not in args, pull="--no-pull" not in args)
+    except NoLocalModel as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    if service.scripted:
+        print("Fruit Brains: scripted-lines mode -- villagers will not answer what you type.")
+    else:
+        print(f"Fruit Brains: talking to {service.name}")
+    try:
+        Game(service).run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        service.shutdown()          # only stops a server this session started
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
