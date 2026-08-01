@@ -18,7 +18,9 @@ The three things a caller deals with:
     ParchmentInkRenderer
                 the GL side: builds the parchment, holds the textures, and
                 draws the page. It can be created without a window at all --
-                `headless=True` -- which is how it is tested.
+                `headless=True` -- which is how it is tested. `set_light_mask`
+                lets a caller say what stands between the lamp and the sheet,
+                for anything that wants the light stopped by its own walls.
 
 Coordinates: every rectangle crossing `InkCanvas`'s boundary is in page pixels,
 whatever the coverage mask is actually stored at. The conversion happens once,
@@ -32,6 +34,7 @@ import os
 import random
 import sys
 from array import array
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +65,16 @@ PAPER_TEXTURE_WIDTH = 512
 # time, and costs nothing per frame. At rest the extra samples are not wasted
 # either: the bilinear fetch lands exactly between texels and box-filters them.
 INK_SUPERSAMPLE = 2
+
+# How many lamps a page can have at once. Four because the occlusion map gives
+# each lamp one channel of an RGBA texture, and there are four of those; the
+# limit is the shadowing, not the lighting. A caller with more lights than this
+# picks the ones that matter -- usually the nearest.
+MAX_LIGHTS = 4
+
+# The colour of an ordinary desk lamp, in sRGB. The shader linearises it, so
+# this is the number you would pick off a colour wheel.
+LAMP_COLOUR = (1.00, 0.84, 0.61)
 
 # How fast the drawing pen travels, in design-space units per second, and how
 # long it pauses between one stroke and the next. The pause is short because a
@@ -239,6 +252,9 @@ void main() {
 FRAGMENT_SHADER = """
 #version 330
 
+// Substituted from the Python constant below, so the two can never drift.
+#define MAX_LIGHTS @MAX_LIGHTS@
+
 uniform sampler2D u_paper_albedo;
 uniform sampler2D u_paper_normal;
 uniform sampler2D u_ink_grain;
@@ -266,7 +282,6 @@ uniform float u_swirl_dryness;
 uniform float u_swirl_span;
 
 uniform vec2 u_resolution;
-uniform vec2 u_light_uv;
 uniform float u_light_height;
 uniform float u_page_wetness;
 uniform float u_wet_gain;
@@ -274,6 +289,29 @@ uniform float u_exposure;
 uniform int u_debug_mode;
 uniform float u_zoom;
 uniform vec2 u_center_uv;
+
+// The lamps. Position is in screen UV, so they hang in front of the viewer
+// and the page slides underneath them; colour is sRGB, linearised here.
+uniform int u_light_count;
+uniform vec2 u_light_uv[MAX_LIGHTS];
+uniform vec3 u_light_colour[MAX_LIGHTS];
+uniform float u_light_gain[MAX_LIGHTS];
+// How strongly to draw the little ring that says where a lamp is. An
+// inspection aid, so anything that would rather not have rings over its
+// artwork asks for none.
+uniform float u_light_marker[MAX_LIGHTS];
+
+// How much of each lamp reaches each part of the page: 1 where all of it
+// arrives, 0 where none does, and anything between. One channel per lamp, in
+// the order above, so a wall can stop one light without touching the next.
+// Any resolution, filtered linearly, so a coarse map is both cheap and
+// smooth -- which is the point, since a lamp's falloff lives in here.
+uniform sampler2D u_light_mask;
+// Which part of the page the map covers, as page UV: xy origin, zw size. A
+// caller lighting one region of a larger sheet maps the map onto that region
+// instead of stretching it over the whole thing; outside it, clamping to the
+// map's own edge is what decides how the lighting ends.
+uniform vec4 u_light_mask_rect;
 
 in vec2 v_uv;
 out vec4 frag_color;
@@ -309,19 +347,30 @@ void main() {
     // the lamp keeps behaving like a fixed desk light above the viewer.
     vec2 page_uv = (v_uv - 0.5) / u_zoom + u_center_uv;
 
-    vec2 marker_delta = (v_uv - u_light_uv) * vec2(aspect, 1.0);
-    float marker_distance = length(marker_delta);
-    float marker = 1.0 - smoothstep(0.010, 0.012, abs(marker_distance - 0.013));
-
-    vec3 warm_light = to_linear(vec3(1.00, 0.84, 0.61));
     vec3 ambient_light = to_linear(vec3(0.34, 0.29, 0.22));
+
+    // One pass over the lamps for the two things that do not depend on the
+    // surface at all: the small ring drawn at each of them, and how much they
+    // throw onto the desk beyond the edge of the sheet. Both accumulate, so a
+    // second lamp adds its own ring and its own pool rather than replacing
+    // the first one's.
+    vec3 marker_glow = vec3(0.0);
+    float desk_light = 0.0;
+    for (int i = 0; i < u_light_count; ++i) {
+        vec2 delta = (v_uv - u_light_uv[i]) * vec2(aspect, 1.0);
+        float distance_to_lamp = length(delta);
+        float ring = 1.0 - smoothstep(0.010, 0.012, abs(distance_to_lamp - 0.013));
+        marker_glow += to_linear(u_light_colour[i]) * ring * u_light_marker[i];
+        desk_light += u_light_gain[i]
+            / (1.0 + 4.5 * distance_to_lamp * distance_to_lamp);
+    }
 
     // Anything off the sheet is the desk it is lying on.
     if (any(lessThan(page_uv, vec2(0.0))) || any(greaterThan(page_uv, vec2(1.0)))) {
         vec3 desk = to_linear(vec3(0.078, 0.062, 0.049));
-        desk *= 1.0 / (1.0 + 4.5 * marker_distance * marker_distance);
+        desk *= desk_light;
         if (u_debug_mode == 0) {
-            desk += warm_light * marker * 0.22;
+            desk += marker_glow * 0.22;
         }
         frag_color = vec4(to_srgb(desk * u_exposure), 1.0);
         return;
@@ -400,27 +449,14 @@ void main() {
     float roughness = mix(paper_roughness, ink_roughness, ink);
 
     vec3 surface_position = vec3(v_uv.x * aspect, v_uv.y, 0.0);
-    vec3 light_position = vec3(u_light_uv.x * aspect, u_light_uv.y, u_light_height);
-    vec3 light_vector = light_position - surface_position;
-    float light_distance = length(light_vector);
-    vec3 light_direction = light_vector / max(light_distance, 0.0001);
     vec3 view_direction = vec3(0.0, 0.0, 1.0);
-    vec3 half_vector = normalize(light_direction + view_direction);
-
-    float n_dot_l = saturate(dot(normal, light_direction));
-    float n_dot_h = saturate(dot(normal, half_vector));
     float n_dot_v = saturate(dot(normal, view_direction));
-
-    // A close desk-lamp falloff, softened so the whole sheet remains visible.
-    float attenuation = 1.0 / (0.45 + 3.5 * light_distance * light_distance);
-    attenuation = min(attenuation, 1.6);
 
     // High roughness gives parchment a wide, weak reflection. Wet ink gets a
     // much narrower coat highlight. This is intentionally lightweight rather
     // than a full PBR BRDF, but the controls behave like material properties.
     float shininess = mix(8.0, 420.0, pow(1.0 - roughness, 2.1));
     float normalized_specular = (shininess + 2.0) / (2.0 * PI);
-    float specular_lobe = pow(n_dot_h, shininess) * normalized_specular;
 
     vec3 paper_f0 = vec3(0.025);
     vec3 ink_f0 = mix(vec3(0.030), vec3(0.115), wetness);
@@ -478,22 +514,63 @@ void main() {
         vec3(1.0), slick / slick_luminance, coat * 0.9 * u_slick_opacity
     );
 
-    vec3 diffuse = albedo * (ambient_light + warm_light * n_dot_l * attenuation * 0.68);
-    vec3 specular = warm_light * highlight_tint
-        * fresnel * specular_lobe * specular_strength * attenuation;
-
     // The film mirrors more of the room than just the lamp, and most strongly
     // where it curves away from the viewer. u_slick_gain normalises the photo to
     // a mean luminance of one, so this adds the pattern, not a brightness bias.
     // Squaring the wetness keeps it a liquid effect: iridescence is gone well
     // before the last of the shine is, and dry ink never shimmers.
     float grazing = pow(1.0 - n_dot_v, 2.0);
-    specular += slick * u_slick_gain * coat * wetness
-        * (0.016 + 0.055 * grazing) * attenuation * 0.85 * u_slick_opacity;
 
-    // A small extra meniscus glint along the stroke boundary sells fresh ink.
-    float edge_glint = edge * ink * wetness * pow(n_dot_h, 34.0) * attenuation;
-    specular += warm_light * edge_glint * 0.16;
+    // How much of each lamp reaches this pixel, one channel apiece. Sampled
+    // in page space, so the shadows pan and zoom with the sheet; a page with
+    // no map has a single white texel here and every lamp is unobstructed.
+    vec4 reach = texture(
+        u_light_mask, (page_uv - u_light_mask_rect.xy) / u_light_mask_rect.zw
+    );
+
+    // Everything above this point is the same for every lamp -- the material,
+    // the view direction, the oil film -- and everything below it is not. The
+    // lamps accumulate: each adds its own diffuse pool and its own highlight,
+    // and each is shadowed on its own, so a wall between one lamp and this
+    // pixel does nothing to the light arriving from another.
+    vec3 direct_diffuse = vec3(0.0);
+    vec3 direct_specular = vec3(0.0);
+    for (int i = 0; i < u_light_count; ++i) {
+        vec3 light_position = vec3(
+            u_light_uv[i].x * aspect, u_light_uv[i].y, u_light_height
+        );
+        vec3 light_vector = light_position - surface_position;
+        float light_distance = length(light_vector);
+        vec3 light_direction = light_vector / max(light_distance, 0.0001);
+        vec3 half_vector = normalize(light_direction + view_direction);
+
+        float n_dot_l = saturate(dot(normal, light_direction));
+        float n_dot_h = saturate(dot(normal, half_vector));
+
+        // A close desk-lamp falloff, softened so the whole sheet remains
+        // visible. Occlusion is folded in here rather than applied to any one
+        // term, so a shadowed patch loses its diffuse light, its highlight and
+        // its iridescence together, the way a patch the lamp cannot see would.
+        // The ambient term is outside this loop, so nothing goes to black.
+        float attenuation = 1.0 / (0.45 + 3.5 * light_distance * light_distance);
+        attenuation = min(attenuation, 1.6) * reach[i] * u_light_gain[i];
+
+        vec3 lamp = to_linear(u_light_colour[i]);
+        float specular_lobe = pow(n_dot_h, shininess) * normalized_specular;
+
+        direct_diffuse += lamp * n_dot_l * attenuation * 0.68;
+        direct_specular += lamp * highlight_tint
+            * fresnel * specular_lobe * specular_strength * attenuation;
+        direct_specular += slick * u_slick_gain * coat * wetness
+            * (0.016 + 0.055 * grazing) * attenuation * 0.85 * u_slick_opacity;
+
+        // A small extra meniscus glint along the stroke boundary sells fresh ink.
+        float edge_glint = edge * ink * wetness * pow(n_dot_h, 34.0) * attenuation;
+        direct_specular += lamp * edge_glint * 0.16;
+    }
+
+    vec3 diffuse = albedo * (ambient_light + direct_diffuse);
+    vec3 specular = direct_specular;
 
     // Darken the sheet perimeter without baking it into the generated texture.
     vec2 border_distance = min(page_uv, 1.0 - page_uv);
@@ -512,14 +589,41 @@ void main() {
         color = vec3(wetness);
     }
 
-    // Draw a tiny unobtrusive ring at the movable light position.
+    // Draw a tiny unobtrusive ring at each lamp.
     if (u_debug_mode == 0) {
-        color += warm_light * marker * 0.22;
+        color += marker_glow * 0.22;
     }
 
     frag_color = vec4(to_srgb(color), 1.0);
 }
-"""
+""".replace("@MAX_LIGHTS@", str(MAX_LIGHTS))
+
+
+@dataclass
+class Light:
+    """One lamp over the page.
+
+    `position` is in window pixels, the same coordinates a mouse event
+    arrives in, because the shader hangs the lamps in front of the viewer
+    rather than on the sheet -- the page slides underneath them. Anything
+    wanting a lamp to follow something drawn on the page converts with
+    `View.canvas_to_screen`.
+
+    `colour` is sRGB and `intensity` scales it. How high the lamps float above
+    the page is not per-lamp: it is `InkSettings.light_height`, a property of
+    the setup rather than of any one light.
+
+    A lamp's index in the list handed to `render` chooses which channel of the
+    occlusion map shadows it -- lamp 0 is red, lamp 1 green, and so on.
+    """
+
+    position: tuple[float, float]
+    colour: tuple[float, float, float] = LAMP_COLOUR
+    intensity: float = 1.0
+    # Whether to draw the small ring marking where this lamp is. Useful for
+    # a lamp being dragged about by hand, and unwanted for one that stands
+    # for something already drawn on the page.
+    marker: float = 1.0
 
 
 OVERLAY_VERTEX_SHADER = """
@@ -632,6 +736,21 @@ class View:
     def screen_to_canvas(self, position: tuple[int, int]) -> tuple[int, int]:
         x, y = self.screen_to_canvas_f(position)
         return (round(x), round(y))
+
+    def canvas_to_screen(
+        self, position: tuple[float, float]
+    ) -> tuple[float, float]:
+        """Where a page pixel currently is on screen: the inverse of the above.
+
+        Needed by anything that has to line something up in window space with
+        something drawn on the page -- the lamp, which the shader places in
+        front of the screen rather than on the sheet, so following a figure
+        about the page means converting where that figure has ended up.
+        """
+        return (
+            (position[0] - self.center_x) * self.zoom + self.size[0] * 0.5,
+            (position[1] - self.center_y) * self.zoom + self.size[1] * 0.5,
+        )
 
     def pan_by(self, screen_delta: tuple[int, int]) -> None:
         """Drag the page with the cursor rather than moving the camera."""
@@ -1698,6 +1817,12 @@ class ParchmentInkRenderer:
         self.ink_wet.repeat_x = False
         self.ink_wet.repeat_y = False
 
+        # Nothing stands between the lamp and the page until a caller says
+        # otherwise. One white texel, so the shader can sample unconditionally
+        # instead of branching on whether a map exists.
+        self.light_mask = self._blank_light_mask()
+        self.light_mask_rect = (0.0, 0.0, 1.0, 1.0)
+
         slick, slick_gain = load_oil_slick()
         # The shader folds the coordinate to tile it, so clamping is what we want.
         self.oil_slick = surface_to_texture(self.context, slick)
@@ -1716,6 +1841,7 @@ class ParchmentInkRenderer:
         self.program["u_ink_wet"].value = 4
         self.program["u_oil_slick"].value = 5
         self.program["u_ink_grain"].value = 6
+        self.program["u_light_mask"].value = 7
         self.program["u_slick_gain"].value = self.slick_gain
         self.program["u_resolution"].value = tuple(float(value) for value in size)
         # The dry-down stops here rather than at zero, which is what the weave's
@@ -1735,6 +1861,77 @@ class ParchmentInkRenderer:
         """
         self.canvas.set_base(art)
         self.upload_ink(changed)
+
+    def _blank_light_mask(self) -> moderngl.Texture:
+        """A one-texel map that blocks nothing, for a page in the open."""
+        return self._new_light_mask((1, 1), b"\xff\xff\xff\xff")
+
+    def _new_light_mask(
+        self, size: tuple[int, int], data: bytes | None = None
+    ) -> moderngl.Texture:
+        texture = self.context.texture(size, 4, data=data)
+        texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        texture.repeat_x = False
+        texture.repeat_y = False
+        return texture
+
+    def set_light_mask(
+        self,
+        mask: pygame.Surface | None,
+        region: pygame.Rect | None = None,
+        covers: pygame.Rect | None = None,
+    ) -> None:
+        """Say how much of each lamp reaches the page.
+
+        `mask` is a surface with one channel per lamp, in the order they are
+        handed to `render`: red for lamp 0, green for lamp 1, blue for lamp 2,
+        alpha for lamp 3. A channel is 255 where all of that lamp's light
+        arrives, 0 where none of it does, and anything between for a place
+        that is partly lit -- the edge of a pool of light, or a shadow that is
+        not total. A surface with no alpha reads as 255 there, which is what a
+        caller with three lamps or fewer wants.
+
+        It is deliberately not tied to the resolution of the page. The map is
+        filtered linearly, so a coarse one is smooth rather than blocky, and a
+        lamp's falloff is better drawn at one texel per tile and interpolated
+        than at one texel per pixel and uploaded.
+
+        `covers` is the part of the page the map applies to, in page pixels;
+        by default it is the whole sheet. Outside it the map clamps to its own
+        edge, so a caller lighting a region should leave a dark border around
+        the map rather than run the light right up to its edge.
+
+        `region` names the only part that can have changed, in the mask's own
+        pixels, for a caller updating a corner of a large map; it is ignored
+        when the mask changes shape, since then everything has to go up anyway.
+
+        Pass None to light the page evenly again.
+        """
+        if mask is None:
+            self.light_mask.release()
+            self.light_mask = self._blank_light_mask()
+            self.light_mask_rect = (0.0, 0.0, 1.0, 1.0)
+            return
+
+        if self.light_mask.size != mask.get_size():
+            self.light_mask.release()
+            self.light_mask = self._new_light_mask(mask.get_size())
+            region = None
+
+        width, height = self.size
+        # Bottom-up, to match the vertical flip every upload goes through and
+        # the page UV the shader samples with.
+        self.light_mask_rect = (
+            (0.0, 0.0, 1.0, 1.0)
+            if covers is None
+            else (
+                covers.left / width,
+                1.0 - covers.bottom / height,
+                covers.width / width,
+                covers.height / height,
+            )
+        )
+        self._write_region(self.light_mask, mask, region)
 
     def _write_region(
         self,
@@ -1853,20 +2050,67 @@ class ParchmentInkRenderer:
         self.seed += 1
         self._replace_paper_textures(self.seed)
 
+    def _upload_lights(self, lights: Sequence[Light]) -> int:
+        """Hand the lamps to the shader; returns how many of them fitted.
+
+        Anything past `MAX_LIGHTS` is dropped rather than merged: which lamps
+        matter is the caller's judgement, and silently blending two of them
+        into one would be a worse answer than leaving the extras out.
+        """
+        width, height = self.size
+        kept = list(lights)[:MAX_LIGHTS]
+
+        positions: list[float] = []
+        colours: list[float] = []
+        gains: list[float] = []
+        markers: list[float] = []
+        for lamp in kept:
+            # Clamped, so a lamp following something off the edge of the page
+            # ends up at the nearest edge rather than wrapping or vanishing.
+            positions += [
+                max(0.0, min(1.0, lamp.position[0] / width)),
+                max(0.0, min(1.0, 1.0 - lamp.position[1] / height)),
+            ]
+            colours += list(lamp.colour)
+            gains.append(lamp.intensity)
+            markers.append(lamp.marker)
+
+        # The unused tail is never read -- the loop stops at u_light_count --
+        # but it still has to be a well-formed value to write.
+        while len(gains) < MAX_LIGHTS:
+            positions += [0.0, 0.0]
+            colours += list(LAMP_COLOUR)
+            gains.append(0.0)
+            markers.append(0.0)
+
+        self.program["u_light_count"].value = len(kept)
+        self.program["u_light_uv"].write(array("f", positions).tobytes())
+        self.program["u_light_colour"].write(array("f", colours).tobytes())
+        self.program["u_light_gain"].write(array("f", gains).tobytes())
+        self.program["u_light_marker"].write(array("f", markers).tobytes())
+        return len(kept)
+
     def render(
         self,
-        light_position: tuple[int, int],
+        light: tuple[int, int] | Sequence[Light],
         settings: InkSettings,
         view: View | None = None,
     ) -> None:
-        width, height = self.size
-        light_uv = (
-            max(0.0, min(1.0, light_position[0] / width)),
-            max(0.0, min(1.0, 1.0 - light_position[1] / height)),
+        """Draw the page under one or more lamps.
+
+        `light` is either a single window-pixel position -- the common case,
+        one lamp of the usual colour -- or a sequence of `Light`, up to
+        `MAX_LIGHTS` of them, each shadowed by its own channel of whatever
+        `set_light_mask` was given.
+        """
+        lights = (
+            [Light(tuple(light))]
+            if light and isinstance(light[0], (int, float))
+            else list(light)
         )
 
         self.target.use()
-        self.context.viewport = (0, 0, width, height)
+        self.context.viewport = (0, 0, *self.size)
         # No clear: the page is one quad covering the whole viewport, drawn
         # without blending, so every pixel is written before anything reads it.
         # Clearing first is a second full pass over the framebuffer for nothing,
@@ -1879,8 +2123,10 @@ class ParchmentInkRenderer:
         self.ink_wet.use(location=4)
         self.oil_slick.use(location=5)
         self.ink_grain.use(location=6)
+        self.light_mask.use(location=7)
 
-        self.program["u_light_uv"].value = light_uv
+        self._upload_lights(lights)
+        self.program["u_light_mask_rect"].value = self.light_mask_rect
         self.program["u_light_height"].value = settings.light_height
         self.program["u_paper_relief"].value = settings.paper_relief * self.normal_gain
         self.program["u_weave_soak"].value = max(settings.weave_soak, 1e-3)
@@ -1930,6 +2176,7 @@ class ParchmentInkRenderer:
         self.paper_roughness.release()
         self.ink_mask.release()
         self.ink_wet.release()
+        self.light_mask.release()
         self.oil_slick.release()
         self.vertex_array.release()
         self.vertex_buffer.release()

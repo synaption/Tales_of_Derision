@@ -97,6 +97,21 @@ class Brain:
 
 
 @dataclass(slots=True)
+class Lantern:
+    """Tag for something that carries its own light, and how far it throws.
+
+    Radius only. What a light looks like is the renderer's business, not the
+    dungeon's, and at present every light in the place burns the same colour
+    anyway -- they differ in how far they reach, which is this number.
+
+    Nothing takes this off a corpse. A dropped torch goes on burning where it
+    fell, which is both true and the more interesting of the two options.
+    """
+
+    radius: int = 5
+
+
+@dataclass(slots=True)
 class Name:
     text: str
 
@@ -494,21 +509,49 @@ def approach_map(
 
 @dataclass(frozen=True, slots=True)
 class Species:
-    """One kind of monster, as data rather than as a subclass."""
+    """One kind of monster, as data rather than as a subclass.
+
+    `lantern` is how far it carries a light, or 0 for something that does not
+    carry one. It is what makes the bestiary worth being data: giving the
+    ogre a brand is a number in this table, not a class.
+    """
 
     name: str
     code: int
     health: int
     power: int
     weight: int
+    lantern: int = 0
 
 
 BESTIARY = (
+    # Vermin go about in the dark. The two that use tools carry a light, which
+    # is often how you know one is there before you can see it.
     Species("rat", ord("r"), health=3, power=1, weight=5),
-    Species("kobold", ord("k"), health=5, power=2, weight=3),
+    Species("kobold", ord("k"), health=5, power=2, weight=3, lantern=6),
     Species("goblin", ord("g"), health=8, power=3, weight=2),
-    Species("ogre", ord("O"), health=14, power=5, weight=1),
+    Species("ogre", ord("O"), health=14, power=5, weight=1, lantern=9),
 )
+
+
+@dataclass(slots=True)
+class LightSource:
+    """One lamp burning in the dungeon, and which cells it can see.
+
+    `reach` is a shadowcast from `cell`, so a wall stops this light exactly
+    where it would stop sight from the same spot. Each source carries its own,
+    because two lamps in different places have different shadows and merging
+    them would put light through walls.
+
+    It is occlusion and nothing else -- where the light can get to, not how
+    much of it arrives. How a lamp fades with distance is a property of light
+    rather than of the dungeon, so it belongs to whatever is drawing this and
+    is worked out from `cell` and `radius` there.
+    """
+
+    cell: tuple[int, int]
+    radius: int
+    reach: numpy.ndarray
 
 PLAYER_GLYPH = ord("@")
 WALL_GLYPH = ord("#")
@@ -534,16 +577,22 @@ class Game:
         seed: int = 0,
         fov_radius: int = 9,
         monsters: int = 8,
+        light_slots: int = 4,
     ) -> None:
         width, height = size
         self.rng = random.Random(seed)
         self.dungeon = generate_dungeon(width, height, self.rng)
         self.world = World()
         self.fov_radius = fov_radius
+        # How many lamps can burn at once. Passed in rather than assumed: it
+        # is a limit of whatever is drawing the dungeon -- the occlusion map
+        # has one channel per lamp -- and not of the dungeon itself.
+        self.light_slots = max(1, light_slots)
         self.turn = 0
 
         self.visible = numpy.zeros((width, height), dtype=bool)
         self.explored = numpy.zeros((width, height), dtype=bool)
+        self.lights: list[LightSource] = []
 
         # What the renderer has not caught up with yet.
         self.dirty: set[tuple[int, int]] = set()
@@ -778,6 +827,56 @@ class Game:
         for x, y in numpy.argwhere(was_visible != self.visible):
             self.dirty.add((int(x), int(y)))
 
+        self._relight()
+
+    def _relight(self) -> None:
+        """Work out which lamps are burning, and which cells each can see.
+
+        Slot 0 is always the player, whose lamp reaches exactly what the
+        player can see -- the shadowcast already done above, so it is free.
+
+        The rest go to other lights, and the test for whether one counts is
+        not whether you can see the thing holding it. It is whether any of the
+        light it throws lands somewhere you can see. A torch around a corner
+        lights the far wall of the passage you are standing in, and you see
+        that wall lit long before you see what is lighting it, which is most
+        of the reason a light in someone else's hand is worth having at all.
+
+        What is clipped away is only the part falling where the player cannot
+        see: light on a cell you have no view of would be drawing you a room
+        you have never been shown.
+        """
+        player_cell = self.player_position
+        lights = [
+            LightSource(player_cell, self.fov_radius, self.visible.copy())
+        ]
+
+        candidates = []
+        for entity, position, lantern in self.world.query(Position, Lantern):
+            if entity == self.player:
+                continue
+            span = max(
+                abs(position.x - player_cell[0]), abs(position.y - player_cell[1])
+            )
+            # Nothing this lamp throws could possibly land inside the player's
+            # sight, so it is not worth a shadowcast to find that out.
+            if span > self.fov_radius + lantern.radius:
+                continue
+
+            reach = field_of_view(self.dungeon, position.cell, lantern.radius)
+            reach &= self.visible
+            if not reach.any():
+                continue
+            candidates.append((span, entity, position.cell, lantern.radius, reach))
+
+        # Nearest first, so when there are more lamps than slots the ones that
+        # are dropped are the ones contributing least.
+        candidates.sort(key=lambda found: (found[0], found[1]))
+        for _, _, cell, radius, reach in candidates[: self.light_slots - 1]:
+            lights.append(LightSource(cell, radius, reach))
+
+        self.lights = lights
+
     def _populate(self, count: int) -> None:
         """Scatter monsters through every room but the one the player is in."""
         rooms = self.dungeon.rooms[1:]
@@ -800,7 +899,7 @@ class Game:
             occupied.add(cell)
 
             kind = self.rng.choice(species)
-            self.world.spawn(
+            monster = self.world.spawn(
                 Position(*cell),
                 Glyph(kind.code, layer=2),
                 Blocker(),
@@ -809,3 +908,5 @@ class Game:
                 Brain(),
                 Name(kind.name),
             )
+            if kind.lantern:
+                self.world.add(monster, Lantern(kind.lantern))

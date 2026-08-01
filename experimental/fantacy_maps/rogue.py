@@ -13,6 +13,27 @@ catching the lamp -- and dries into the page over the next few seconds. Walk
 away and it stays behind as a faint, dry memory of itself, because that is
 what a map you drew as you went would look like.
 
+A lamp hangs over the player and the walls stop it. That falls out of the game
+rather than being a second system: the sim already shadowcasts to decide what
+the player can see, and since the light is where the player is, what it can
+see and what the lamp reaches are the same set of cells. It is handed to the
+renderer as an occlusion map and costs one texture lookup.
+
+The player is not the only thing carrying a light: a kobold has a lantern and
+an ogre a brand. Every light in the place burns the same colour, and they
+differ in how far they throw. Each is a lamp of its own with its own reach
+and -- because the light map keeps one channel per lamp -- its own shadows, so
+a wall between you and the ogre stops your light without touching his.
+
+You do not have to see what is holding a light to see the light. The test is
+whether any of what it throws lands where you can see, so a torch around a
+corner lights the far wall of your passage well before its owner appears.
+
+None of it is on or off. The map is drawn at three texels to the tile and
+filtered on the way to the shader, and each lamp eases out towards the edge of
+its reach, so a tile can be half lit -- and past the last of the light the
+sheet is left to the ambient term, which is as dark as the page gets.
+
 The pieces:
 
     roguesim.py  the dungeon: entities, rooms, sight, hunting. No pixels and
@@ -23,29 +44,41 @@ The pieces:
 Run it with `python3 rogue.py`. `python3 rogue.py --headless out.png` plays a
 few turns and saves the page with no window involved anywhere.
 
+The map is ink and belongs to the sheet, so it pans and zooms with it. The
+reading down the right is not: it is composited over the finished frame in
+window pixels and stays put whatever the camera does. The lamp splits the
+difference -- it is placed in window pixels, because that is where the shader
+hangs it, but it is aimed at wherever on the page the player is standing.
+
 Controls are on the `?` card; the short version is that the arrows, the numeric
-keypad or the vi keys move, `.` waits, `Shift+N` starts a new dungeon and `R`
-a new sheet of parchment.
+keypad or the vi keys move, `.` waits, the middle mouse button drags the page
+about, `Shift+N` starts a new dungeon and `R` a new sheet of parchment.
 """
 
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import moderngl
+import numpy
 import pygame
 
 import roguesim
 from inkfx import (
     INK_SUPERSAMPLE,
+    LAMP_COLOUR,
+    MAX_LIGHTS,
     PAGE_WET_FLOOR,
+    PANEL_EDGE,
     PANEL_KEY,
     PANEL_TEXT,
     PANEL_TITLE,
     InkCanvas,
     InkSettings,
+    Light,
     Panel,
     ParchmentInkRenderer,
     View,
@@ -67,10 +100,10 @@ TILESET_PATH = TILESET_DIR / "hack_square_64x64_x8_hard1.png"
 # The pixel-art original, if the big one has not been built yet.
 TILESET_FALLBACK = TILESET_DIR / "hack_square_64x64.png"
 
-# Roughly how many dungeon cells fit across the page, whatever size it is. The
-# cell size follows from this, so the game looks the same at 800x560 as at 4K
-# rather than turning into a differently sized dungeon.
-TARGET_COLUMNS = 30
+# Roughly how many dungeon cells fit across the board, whatever size the page
+# is. The cell size follows from this, so the game looks the same at 800x560
+# as at 4K rather than turning into a differently sized dungeon.
+TARGET_COLUMNS = 26
 
 # How dark the ink is. Cells in sight are drawn at full strength; cells you
 # have been to but cannot currently see are the same glyph, faint -- a map
@@ -78,7 +111,33 @@ TARGET_COLUMNS = 30
 INK_SEEN = 255
 INK_REMEMBERED = 84
 
-STATUS_LINES = 5
+# How much of the player's own lamp still finds a mapped cell they cannot
+# currently see. Small on purpose: it is there to keep the remembered map
+# faintly legible on unlit parchment and nothing more. Everything the player
+# has never been to gets none of it at all, which is what keeps the sheet
+# around the map properly dark.
+REMEMBERED_GLOW = 16
+
+# How finely the light map is drawn, in texels per dungeon cell. The map is
+# filtered linearly on the way to the shader, so this is not the resolution
+# the light is seen at -- it is how often the falloff is resampled, and three
+# is enough for a gradient with no steps in it. It also sets how sharp a wall
+# edge can be, since occlusion is per cell: a shadow boundary is soft over
+# one texel, which at three per cell is a third of a tile of penumbra.
+LIGHT_TEXELS = 3
+
+# Where a lamp starts to fade, as a fraction of its radius. Kept low, so most
+# of a lamp's reach is spent fading: the shader's own falloff is gentle across
+# a span this small, and without a long ramp here a pool of light reads as a
+# flat disc with an edge on it rather than as light.
+LIGHT_FADE_FROM = 0.20
+
+# How much of the window the reading down the right takes, and the range it is
+# allowed to take it in. A share alone would give an unreadable sliver on a
+# small window and a column of enormous type on a large one.
+PANEL_SHARE = 0.26
+PANEL_MIN_WIDTH = 230
+PANEL_MAX_WIDTH = 420
 
 
 # --- the tileset ----------------------------------------------------------
@@ -174,20 +233,24 @@ def load_tileset() -> CodePage437 | None:
 
 @dataclass(frozen=True)
 class Layout:
-    """The page divided into a grid, with a strip of text under it.
+    """The window divided into a board on the left and a reading on the right.
 
-    All page pixels. The ink mask is `scale` times finer, and that conversion
-    happens at the point of drawing rather than being carried around, so there
-    is only ever one kind of coordinate in this file.
+    Two different kinds of coordinate meet here, so it is worth being exact
+    about which is which. `origin`, `cell` and everything `cell_rect` returns
+    are *page* pixels: they are drawn onto the sheet, and they pan and zoom
+    with it. `panel` is *window* pixels: it is composited over the finished
+    frame and the camera never touches it.
+
+    They happen to coincide at rest, because the page is exactly the size of
+    the window. They stop coinciding the moment anything is panned, which is
+    the entire reason the reading is a panel and not ink.
     """
 
     cell: int
     columns: int
     rows: int
     origin: tuple[int, int]
-    status_top: int
-    text_size: int
-    line_height: int
+    panel: pygame.Rect
 
     @property
     def grid_size(self) -> tuple[int, int]:
@@ -204,28 +267,38 @@ class Layout:
 
 
 def layout_for(size: tuple[int, int]) -> Layout:
-    """Fit a dungeon and a message strip onto a page of this size."""
+    """Fit a dungeon and a reading onto a window of this size."""
     width, height = size
-    cell = max(8, width // TARGET_COLUMNS)
-    margin = max(4, cell // 2)
-    text_size = max(11, round(cell * 0.46))
-    line_height = round(text_size * 1.35)
-    status = STATUS_LINES * line_height + margin
+    margin = max(6, width // 70)
 
-    columns = max(4, (width - margin * 2) // cell)
-    rows = max(4, (height - status - margin * 2) // cell)
+    panel_width = min(
+        max(round(width * PANEL_SHARE), PANEL_MIN_WIDTH), PANEL_MAX_WIDTH
+    )
+    # However the shares work out, the board keeps the larger half.
+    panel_width = min(panel_width, width // 2)
+    panel = pygame.Rect(
+        width - panel_width - margin, margin, panel_width, height - margin * 2
+    )
 
-    # Centre the grid in whatever is left over, so a page whose width does not
+    # The board is what is left, and the cell size comes off that rather than
+    # off the window, so widening the reading does not silently make the
+    # dungeon a different shape.
+    board_width = max(8, panel.left - margin * 2)
+    cell = max(8, board_width // TARGET_COLUMNS)
+
+    columns = max(4, board_width // cell)
+    rows = max(4, (height - margin * 2) // cell)
+
+    # Centre the grid in whatever is left over, so a board whose width does not
     # divide evenly does not put all its slack down one side.
-    left = margin + ((width - margin * 2) - columns * cell) // 2
+    left = margin + (board_width - columns * cell) // 2
+    top = margin + ((height - margin * 2) - rows * cell) // 2
     return Layout(
         cell=cell,
         columns=columns,
         rows=rows,
-        origin=(left, margin),
-        status_top=margin + rows * cell + margin,
-        text_size=text_size,
-        line_height=line_height,
+        origin=(left, top),
+        panel=panel,
     )
 
 
@@ -259,13 +332,9 @@ class RoguePage:
         self.layout = layout_for(size)
         self.tileset = load_tileset()
 
-        scale = self.canvas.scale
-        self.font = pygame.font.SysFont("serif", self.layout.text_size * scale)
-        self.title_font = pygame.font.SysFont(
-            "serif", round(self.layout.text_size * 1.15) * scale, bold=True
-        )
-
-        self.help = _help_card(self.renderer.context, size)
+        context = self.renderer.context
+        self.status = StatusPanel(context, size, self.layout.panel)
+        self.help = _help_card(context, size)
         self.new_dungeon(seed)
 
     # --- the seam the loop talks to --------------------------------------
@@ -278,13 +347,43 @@ class RoguePage:
     def size(self) -> tuple[int, int]:
         return self.renderer.size
 
-    def draw(self, light_position: tuple[int, int], view: View) -> None:
+    def lamps(self, view: View) -> list[Light]:
+        """Every light burning on the page, in the slots the mask expects.
+
+        The shader hangs lamps in front of the *screen*, not on the sheet, so
+        following something around the page means asking the view where it has
+        ended up. Panning slides every pool of light along with the map instead
+        of leaving them behind.
+
+        The order matters and is the game's: slot 0 is the player, and each
+        one after is a light-carrier in sight. It has to match the order the
+        channels were written in `catch_up`, which is why both read the same
+        `game.lights` list rather than each working it out.
+        """
+        return [
+            Light(
+                view.canvas_to_screen(self.layout.cell_rect(*source.cell).center),
+                LAMP_COLOUR,
+                # No ring. The workbench draws one to show where a lamp being
+                # dragged about has got to; here the lamps stand for things
+                # already on the page, and a lamp whose owner is round a
+                # corner would otherwise leave a disc hanging in the dark.
+                marker=0.0,
+            )
+            for source in self.game.lights[:MAX_LIGHTS]
+        ]
+
+    def draw(self, lights: Sequence[Light], view: View) -> None:
         """The page, then the chrome, in the order they have to appear."""
-        self.renderer.render(light_position, self.settings, view)
+        self.renderer.render(lights, self.settings, view)
+        if self.status.visible:
+            self.status.draw()
+        # The help card is modal-ish, so it goes over the reading as well.
         if self.help.visible:
             self.help.draw()
 
     def release(self) -> None:
+        self.status.release()
         self.help.release()
         self.renderer.release()
 
@@ -293,7 +392,11 @@ class RoguePage:
     def new_dungeon(self, seed: int) -> None:
         """Start a fresh game, and print its opening view on a blank sheet."""
         self.seed = seed
-        self.game = roguesim.Game(self.layout.grid_size, seed=seed)
+        # The renderer's occlusion map has one channel per lamp, so that is
+        # how many the dungeon is allowed to light at once.
+        self.game = roguesim.Game(
+            self.layout.grid_size, seed=seed, light_slots=MAX_LIGHTS
+        )
 
         art = pygame.Surface(self.canvas.mask_size, pygame.SRCALPHA)
         art.fill((0, 0, 0, 0))
@@ -308,7 +411,8 @@ class RoguePage:
         self.settings.drying = True
 
         self.catch_up()
-        self._draw_status()
+        self.status.refresh(self.game)
+        self.game.messages_changed = False
 
     def catch_up(self) -> None:
         """Repaint whatever the game says has changed, and wet what is new.
@@ -319,30 +423,120 @@ class RoguePage:
         best part of a tenth of a second to send to the card.
         """
         dirty, fresh = self.game.take_dirty()
-        if not dirty:
-            return
-
         base = self.canvas.base
         for x, y in dirty:
             region = self.layout.cell_rect(x, y)
             mask_rect = self.canvas.mask_rect(region)
             base.fill((0, 0, 0, 0), mask_rect)
 
+            lit = bool(self.game.visible[x, y])
             code = self._glyph_at(x, y)
             if code is not None and self.tileset is not None:
                 base.blit(
                     self.tileset.glyph(
                         code,
                         self.layout.cell * self.canvas.scale,
-                        INK_SEEN if self.game.visible[x, y] else INK_REMEMBERED,
+                        INK_SEEN if lit else INK_REMEMBERED,
                     ),
                     mask_rect,
                     special_flags=pygame.BLEND_RGBA_MAX,
                 )
             self._publish(region)
 
+        # The lamps have all moved, so the light map is redrawn whole rather
+        # than followed cell by cell -- see `relight`.
+        self.relight()
+
         if fresh:
             self._wet(fresh)
+
+    def relight(self) -> None:
+        """Redraw the light map from every lamp currently burning.
+
+        Rebuilt whole rather than patched cell by cell. It is a few thousand
+        texels -- one map for the whole board, three per tile -- so working it
+        out with array arithmetic and sending all of it costs less than
+        deciding which parts of it moved, and every lamp moves every turn
+        anyway.
+
+        Two things combine into each texel. Occlusion comes from the sim, per
+        cell, and is what makes a wall a wall. Falloff is worked out here, per
+        texel, from the texel's own distance to the lamp -- so a pool of light
+        is bright in the middle and fades out at its edge, and a cell can be
+        half lit rather than only lit or unlit.
+        """
+        layout = self.layout
+        columns, rows = layout.columns, layout.rows
+        step = layout.cell / LIGHT_TEXELS
+
+        # A cell of margin all round. The map clamps to its own edge outside
+        # itself, so the border has to be dark or the lighting would smear
+        # outwards across the rest of the sheet forever.
+        across = (columns + 2) * LIGHT_TEXELS
+        down = (rows + 2) * LIGHT_TEXELS
+        left = layout.origin[0] - layout.cell
+        top = layout.origin[1] - layout.cell
+
+        # The middle of each texel, in page pixels, and the cell it falls in.
+        columns_index = numpy.arange(across)
+        rows_index = numpy.arange(down)
+        page_x = left + (columns_index + 0.5) * step
+        page_y = top + (rows_index + 0.5) * step
+        cell_x = columns_index // LIGHT_TEXELS
+        cell_y = rows_index // LIGHT_TEXELS
+
+        channels = numpy.zeros((across, down, 4), dtype=numpy.uint8)
+        padded = numpy.zeros((columns + 2, rows + 2), dtype=bool)
+
+        for slot, source in enumerate(self.game.lights[:MAX_LIGHTS]):
+            padded[:] = False
+            padded[1:-1, 1:-1] = source.reach
+            visible = padded[cell_x][:, cell_y]
+
+            centre = layout.cell_rect(*source.cell).center
+            span = max(1.0, source.radius * layout.cell)
+            away = numpy.hypot(
+                page_x[:, None] - centre[0], page_y[None, :] - centre[1]
+            ) / span
+            strength = numpy.where(visible, 1.0 - _smoothstep(LIGHT_FADE_FROM, 1.0, away), 0.0)
+
+            if slot == 0:
+                # The one place light is added rather than shaped: enough of
+                # the reader's own lamp to keep a mapped room legible once
+                # they have walked out of it. Nowhere they have never been
+                # gets any, which is what keeps the rest of the sheet dark.
+                mapped = numpy.zeros_like(padded)
+                mapped[1:-1, 1:-1] = self.game.explored
+                strength = numpy.maximum(
+                    strength,
+                    mapped[cell_x][:, cell_y] * (REMEMBERED_GLOW / 255.0),
+                )
+
+            channels[..., slot] = numpy.round(strength * 255.0)
+
+        surface = pygame.Surface((across, down), pygame.SRCALPHA)
+        pygame.surfarray.pixels3d(surface)[:] = channels[..., :3]
+        pygame.surfarray.pixels_alpha(surface)[:] = channels[..., 3]
+
+        # Kept, not just sent: it is what the page is actually lit by, so it
+        # is the thing worth asking questions of.
+        self.light_map = surface
+        self.light_rect = pygame.Rect(
+            left, top, (columns + 2) * layout.cell, (rows + 2) * layout.cell
+        )
+        self.renderer.set_light_mask(surface, covers=self.light_rect)
+
+    def light_at(self, cell: tuple[int, int], slot: int = 0) -> int:
+        """How much of one lamp lands in the middle of a cell, 0 to 255.
+
+        Reads the map that was built and sent rather than working the answer
+        out again, so a caller asks the same question the shader does.
+        """
+        x, y = cell
+        middle = LIGHT_TEXELS // 2
+        return self.light_map.get_at(
+            ((x + 1) * LIGHT_TEXELS + middle, (y + 1) * LIGHT_TEXELS + middle)
+        )[slot]
 
     def _glyph_at(self, x: int, y: int) -> int | None:
         """What a cell shows: nothing, the floor plan, or whoever is on it."""
@@ -399,51 +593,157 @@ class RoguePage:
         self.renderer.upload_ink(region)
 
     def refresh_status(self) -> None:
-        """Reprint the message strip, if the game has said anything new."""
-        if not self.game.messages_changed:
-            return
-        self.game.messages_changed = False
-        self._draw_status()
+        """Redraw the reading after a turn.
 
-    def _draw_status(self) -> None:
-        """The health, the turn count and the last few messages, in ink.
-
-        Written onto the page rather than composited over it as a panel: it is
-        the margin of the map, so it should soak into the parchment and dry
-        alongside everything else drawn there.
+        Unconditional in the numbers -- the turn count moves every time --
+        but it is only ever called when a turn actually passed, so a keypress
+        that bumped into a wall does not re-upload the card.
         """
-        layout = self.layout
-        scale = self.canvas.scale
-        strip = pygame.Rect(
-            0,
-            layout.status_top,
-            self.size[0],
-            self.size[1] - layout.status_top,
-        )
-        self.canvas.base.fill((0, 0, 0, 0), self.canvas.mask_rect(strip))
+        self.game.messages_changed = False
+        self.status.refresh(self.game)
 
-        health = self.game.health
-        left = layout.origin[0] * scale
-        top = layout.status_top * scale
 
-        heading = (
-            f"turn {self.game.turn}     "
-            f"health {max(0, health.current)}/{health.maximum}     "
-            f"still moving: {self.game.monsters_left}"
+def _smoothstep(low: float, high: float, values: numpy.ndarray) -> numpy.ndarray:
+    """The usual S-curve between two edges, over a whole array at once.
+
+    Flat at both ends and steepest in the middle, which is what a light wants
+    at the edge of its reach: a linear ramp gives away where it was cut off.
+    """
+    eased = numpy.clip((values - low) / (high - low), 0.0, 1.0)
+    return eased * eased * (3.0 - 2.0 * eased)
+
+
+# --- the reading down the right -------------------------------------------
+
+
+def wrap(text: str, font: pygame.font.Font, width: int) -> list[str]:
+    """Break a line into as many as it takes to fit `width`.
+
+    Greedy and measured against the font itself rather than a character
+    count, because the panel is narrow enough that guessing would be wrong
+    often and visibly.
+    """
+    words = text.split()
+    if not words:
+        return [""]
+
+    lines, line = [], words[0]
+    for word in words[1:]:
+        candidate = f"{line} {word}"
+        if font.size(candidate)[0] <= width:
+            line = candidate
+        else:
+            lines.append(line)
+            line = word
+    lines.append(line)
+    return lines
+
+
+class StatusPanel(Panel):
+    """The reading of the game, over the page rather than written on it.
+
+    Everything here is in window pixels and stays where it is put, whatever
+    the camera does -- which is the point of it being a panel. The map is ink
+    and belongs to the sheet; the turn count and the message log are the
+    player's instruments and belong to the screen.
+
+    The card is redrawn onto a surface of fixed size and re-uploaded, because
+    `Panel` fixes its quad at construction; a reading whose box changed shape
+    as the numbers in it got longer would be worse than one that does not.
+    """
+
+    def __init__(
+        self,
+        context: moderngl.Context,
+        window_size: tuple[int, int],
+        rect: pygame.Rect,
+    ) -> None:
+        super().__init__(
+            context, window_size, make_panel_surface(rect.size), rect.topleft
         )
-        self.canvas.base.blit(
-            self.title_font.render(heading, True, (255, 255, 255)), (left, top)
+        body = max(12, rect.width // 19)
+        self.title_font = pygame.font.SysFont("serif", round(body * 1.5), bold=True)
+        self.label_font = pygame.font.SysFont("sans", body, bold=True)
+        self.body_font = pygame.font.SysFont("sans", body)
+        self.padding = max(10, rect.width // 18)
+        self.visible = True
+
+    def refresh(self, game: roguesim.Game) -> None:
+        """Redraw the card from the game and send it to the card's texture."""
+        surface = make_panel_surface(self.rect.size)
+        pad = self.padding
+        inner = self.rect.width - pad * 2
+        y = pad
+
+        surface.blit(self.title_font.render("Ink & Dungeon", True, PANEL_TITLE), (pad, y))
+        y += self.title_font.get_linesize() + pad // 2
+
+        health = game.health
+        y = self._reading(surface, "turn", str(game.turn), pad, y)
+        y = self._reading(
+            surface,
+            "health",
+            f"{max(0, health.current)} / {health.maximum}",
+            pad,
+            y,
         )
-        for index, message in enumerate(self.game.messages, start=1):
-            self.canvas.base.blit(
-                self.font.render(message, True, (255, 255, 255)),
-                (left, top + index * layout.line_height * scale),
+        y = self._bar(surface, max(0, health.current) / health.maximum, pad, y, inner)
+        y = self._reading(
+            surface,
+            "still moving",
+            str(game.monsters_left) if game.alive else "-",
+            pad,
+            y,
+        )
+
+        y += pad // 2
+        pygame.draw.line(
+            surface, PANEL_EDGE, (pad, y), (self.rect.width - pad, y), 1
+        )
+        y += pad
+
+        # Newest last, the way a log reads, and clipped rather than scrolled:
+        # anything that will not fit is older than the player still cares about.
+        for message in game.messages:
+            for line in wrap(message, self.body_font, inner):
+                if y + self.body_font.get_linesize() > self.rect.height - pad:
+                    break
+                surface.blit(
+                    self.body_font.render(line, True, PANEL_TEXT), (pad, y)
+                )
+                y += self.body_font.get_linesize()
+            y += 3
+
+        hint = self.body_font.render("? for controls", True, PANEL_EDGE)
+        surface.blit(hint, (pad, self.rect.height - pad - hint.get_height()))
+
+        self.update(surface)
+
+    def _reading(
+        self, surface: pygame.Surface, label: str, value: str, pad: int, y: int
+    ) -> int:
+        """One label on the left, its value against the right edge."""
+        surface.blit(self.body_font.render(label, True, PANEL_TEXT), (pad, y))
+        rendered = self.label_font.render(value, True, PANEL_KEY)
+        surface.blit(rendered, (self.rect.width - pad - rendered.get_width(), y))
+        return y + self.label_font.get_linesize()
+
+    def _bar(
+        self, surface: pygame.Surface, fraction: float, pad: int, y: int, width: int
+    ) -> int:
+        """The health, again, as something readable without arithmetic."""
+        gap = max(3, pad // 3)
+        height = max(6, self.body_font.get_linesize() // 2)
+        track = pygame.Rect(pad, y + gap, width, height)
+        pygame.draw.rect(surface, PANEL_EDGE, track, 1)
+        filled = round((width - 2) * max(0.0, min(1.0, fraction)))
+        if filled:
+            pygame.draw.rect(
+                surface,
+                PANEL_KEY,
+                pygame.Rect(track.left + 1, track.top + 1, filled, height - 2),
             )
-
-        self._publish(strip)
-        # It was written just now, so it is wet just like the map is.
-        self.canvas.wetness.fill((255, 255, 255), strip)
-        self.renderer.upload_wetness(self.canvas.mark_wet(strip))
+        return track.bottom + pad // 2
 
 
 # --- the help card --------------------------------------------------------
@@ -455,7 +755,7 @@ HELP_LINES = (
     ("Shift+N", "a new dungeon on a clean sheet"),
     ("R", "a fresh sheet of parchment"),
     ("W", "wet the whole page again"),
-    ("mouse", "move the lamp"),
+    ("middle drag", "pan the page"),
     ("wheel", "zoom into the ink; 0 resets"),
     ("1 2 3 4 5", "final / normals / roughness / ink / wetness"),
     ("?", "this card"),
@@ -600,8 +900,8 @@ def main(allow_restart: bool = False) -> None:
 
     clock = pygame.time.Clock()
     view = View(size)
-    light_position = (size[0] // 2, size[1] // 2)
     elapsed = 0.0
+    panning = False
     update_caption(page, view)
 
     running = True
@@ -620,8 +920,15 @@ def main(allow_restart: bool = False) -> None:
         for event in events:
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.MOUSEMOTION:
-                light_position = event.pos
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 2:
+                panning = True
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 2:
+                panning = False
+            elif event.type == pygame.MOUSEMOTION and panning:
+                # Drag the sheet under the cursor rather than move a camera
+                # over it: the page follows the hand, which is what the
+                # gesture reads as.
+                view.pan_by(event.rel)
             elif event.type == pygame.MOUSEWHEEL:
                 view.zoom_by(event.y, pygame.mouse.get_pos())
             elif event.type == pygame.KEYDOWN:
@@ -644,7 +951,10 @@ def main(allow_restart: bool = False) -> None:
             settings.drying and settings.wetness > PAGE_WET_FLOOR + 1e-4
         )
         if handled_event or moving or needs_frame or idle_frames >= IDLE_REDRAW_FRAMES:
-            page.draw(light_position, view)
+            # Worked out per frame rather than stored: the lamp is over the
+            # player in page space, but it is placed in window space, so
+            # panning and zooming move it just as much as walking does.
+            page.draw(page.lamps(view), view)
             pygame.display.flip()
             needs_frame = False
             idle_frames = 0
@@ -685,7 +995,8 @@ def play_headless(
             page.catch_up()
             page.refresh_status()
 
-    page.draw((size[0] // 2, size[1] // 3), View(size))
+    view = View(size)
+    page.draw(page.lamps(view), view)
     pygame.image.save(page.renderer.snapshot(), str(destination))
     page.release()
     pygame.quit()
