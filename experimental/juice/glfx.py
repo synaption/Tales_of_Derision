@@ -158,6 +158,7 @@ def create_context(headless: bool = False):
 
 MAX_LIGHTS = 24
 MAX_WAVES = 8
+MAX_SHADOW_CASTERS = 32
 
 QUAD_VS = """
 #version 330
@@ -253,6 +254,14 @@ uniform int u_light_count;
 uniform vec3 u_ambient;
 uniform float u_light_height;           // how far the lights float above the plane
 uniform float u_lit;                    // 0 = lighting off, sprites are flat
+uniform sampler2D u_wall_grid;
+uniform ivec2 u_grid_size;
+uniform vec2 u_grid_extent;
+uniform vec4 u_shadow_casters[MAX_SHADOW_CASTERS]; // xy centre, z radius, w softness
+uniform int u_shadow_caster_count;
+uniform float u_light_contrast;
+uniform float u_wall_shadow_amount;
+uniform float u_npc_shadow_amount;
 
 uniform float u_soft_power;             // shape of the soft-body gradient
 uniform float u_soft_pinch;             // cross-axis squeeze per unit of lag
@@ -293,8 +302,51 @@ vec2 sharp_uv(vec2 uv, vec2 tex_size) {
     return mix(uv, (seam + f) / tex_size, u_sharpness);
 }
 
+float shadow_visibility(vec2 world, vec2 light_pos) {
+    vec2 ray = light_pos - world;
+    ivec2 origin_cell = ivec2(clamp(floor(world / u_grid_extent * vec2(u_grid_size)),
+                                    vec2(0.0), vec2(u_grid_size - 1)));
+    ivec2 light_cell = ivec2(clamp(floor(light_pos / u_grid_extent * vec2(u_grid_size)),
+                                   vec2(0.0), vec2(u_grid_size - 1)));
+    bool receiver_is_wall = texelFetch(u_wall_grid, origin_cell, 0).r > 0.5;
+    // The occupancy texture makes walls binary occluders. Fixed-count samples
+    // retain a genuinely hard transition instead of filtering the mask.
+    float wall_visible = 1.0;
+    for (int step = 1; step <= 64; ++step) {
+        float t = float(step) / 65.0;
+        vec2 p = world + ray * t;
+        ivec2 cell = ivec2(floor(p / u_grid_extent * vec2(u_grid_size)));
+        if (any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, u_grid_size)))
+            continue;
+        if (!receiver_is_wall && cell != origin_cell && cell != light_cell
+                && texelFetch(u_wall_grid, cell, 0).r > 0.5) {
+            wall_visible = 0.0;
+            break;
+        }
+    }
+
+    float visible = 1.0;
+    float ray_len2 = max(dot(ray, ray), 1e-4);
+    for (int i = 0; i < u_shadow_caster_count; ++i) {
+        vec4 caster = u_shadow_casters[i];
+        float t = clamp(dot(caster.xy - world, ray) / ray_len2, 0.0, 1.0);
+        // Do not let a receiver shadow itself or a caster sitting on the light.
+        if (t < 0.03 || t > 0.97) continue;
+        float d = length((world + ray * t) - caster.xy);
+        visible *= smoothstep(caster.z - caster.w, caster.z + caster.w, d);
+    }
+    float wall_shadow = mix(1.0, wall_visible, u_wall_shadow_amount);
+    float npc_shadow = mix(1.0, visible, u_npc_shadow_amount);
+    return wall_shadow * npc_shadow;
+}
+
 vec3 light_at(vec2 world, vec3 n) {
-    vec3 sum = u_ambient;
+    float contrast = max(u_light_contrast, 0.01);
+    // From the authored value at contrast 1 to literally no ambient at 10.
+    // This is linear so the last part of the slider remains useful instead of
+    // approaching black asymptotically without ever reaching it.
+    float ambient_scale = 1.0 - clamp((contrast - 1.0) / 9.0, 0.0, 1.0);
+    vec3 sum = u_ambient * ambient_scale;
     for (int i = 0; i < u_light_count; ++i) {
         vec4 L = u_lights[i];
         vec2 d = L.xy - world;
@@ -308,7 +360,10 @@ vec3 light_at(vec2 world, vec3 n) {
         // Half-lambert: a creature's unlit side goes dim, not black. Fully
         // black silhouettes read as holes at this sprite size.
         float ndl = 0.35 + 0.65 * max(dot(n, dir), 0.0);
-        sum += u_light_color * L.w * atten * ndl;
+        float visibility = shadow_visibility(world, L.xy);
+        visibility = mix(1.0, visibility, min(contrast, 1.0));
+        sum += u_light_color * L.w * atten * ndl * visibility
+               * mix(0.65, 1.35, clamp(contrast * 0.5, 0.0, 1.0));
     }
     return sum;
 }
@@ -475,6 +530,14 @@ uniform float u_lit;
 uniform float u_unlit_scale;
 uniform float u_ambient_sway;
 uniform float u_time;
+uniform sampler2D u_wall_grid;
+uniform ivec2 u_grid_size;
+uniform vec2 u_grid_extent;
+uniform vec4 u_shadow_casters[MAX_SHADOW_CASTERS];
+uniform int u_shadow_caster_count;
+uniform float u_light_contrast;
+uniform float u_wall_shadow_amount;
+uniform float u_npc_shadow_amount;
 
 out vec4 frag_color;
 const float PI = 3.14159265;
@@ -495,6 +558,40 @@ vec2 sharp_uv(vec2 uv, vec2 tex_size) {
     vec2 seam = floor(p + 0.5);
     vec2 f = clamp((p - seam) / fw, -0.5, 0.5);
     return mix(uv, (seam + f) / tex_size, u_sharpness);
+}
+
+float shadow_visibility(vec2 world, vec2 light_pos) {
+    vec2 ray = light_pos - world;
+    ivec2 origin_cell = ivec2(clamp(floor(world / u_grid_extent * vec2(u_grid_size)),
+                                    vec2(0.0), vec2(u_grid_size - 1)));
+    ivec2 light_cell = ivec2(clamp(floor(light_pos / u_grid_extent * vec2(u_grid_size)),
+                                   vec2(0.0), vec2(u_grid_size - 1)));
+    bool receiver_is_wall = texelFetch(u_wall_grid, origin_cell, 0).r > 0.5;
+    float wall_visible = 1.0;
+    for (int step = 1; step <= 64; ++step) {
+        float t = float(step) / 65.0;
+        ivec2 cell = ivec2(floor((world + ray * t) / u_grid_extent
+                                 * vec2(u_grid_size)));
+        if (any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, u_grid_size)))
+            continue;
+        if (!receiver_is_wall && cell != origin_cell && cell != light_cell
+                && texelFetch(u_wall_grid, cell, 0).r > 0.5) {
+            wall_visible = 0.0;
+            break;
+        }
+    }
+    float visible = 1.0;
+    float ray_len2 = max(dot(ray, ray), 1e-4);
+    for (int i = 0; i < u_shadow_caster_count; ++i) {
+        vec4 caster = u_shadow_casters[i];
+        float t = clamp(dot(caster.xy - world, ray) / ray_len2, 0.0, 1.0);
+        if (t < 0.03 || t > 0.97) continue;
+        float d = length((world + ray * t) - caster.xy);
+        visible *= smoothstep(caster.z - caster.w, caster.z + caster.w, d);
+    }
+    float wall_shadow = mix(1.0, wall_visible, u_wall_shadow_amount);
+    float npc_shadow = mix(1.0, visible, u_npc_shadow_amount);
+    return wall_shadow * npc_shadow;
 }
 
 void main() {
@@ -530,7 +627,9 @@ void main() {
     vec3 rgb = texture(u_floor, suv).rgb;
     if (u_lit > 0.5) {
         vec3 n = normalize(texture(u_floor_normal, suv).xyz * 2.0 - 1.0);
-        vec3 sum = u_ambient;
+        float contrast = max(u_light_contrast, 0.01);
+        float ambient_scale = 1.0 - clamp((contrast - 1.0) / 9.0, 0.0, 1.0);
+        vec3 sum = u_ambient * ambient_scale;
         for (int i = 0; i < u_light_count; ++i) {
             vec4 L = u_lights[i];
             vec2 d = L.xy - world;
@@ -544,7 +643,11 @@ void main() {
             // a low light lands as a coin-sized dot; the wrap keeps the pool
             // the size the radius says it is and leaves the normals to pick out
             // the tile edges, which is all they are there for.
-            sum += u_light_color * L.w * atten * (0.45 + 0.55 * max(dot(n, dir), 0.0));
+            float visibility = shadow_visibility(world, L.xy);
+            visibility = mix(1.0, visibility, min(contrast, 1.0));
+            sum += u_light_color * L.w * atten
+                   * (0.45 + 0.55 * max(dot(n, dir), 0.0)) * visibility
+                   * mix(0.65, 1.35, clamp(contrast * 0.5, 0.0, 1.0));
         }
         rgb *= sum;
     } else {
@@ -693,7 +796,8 @@ void main() {
 def _inject(src: str) -> str:
     """Substitute the array sizes the shaders share with Python."""
     return (src.replace("MAX_LIGHTS", str(MAX_LIGHTS))
-               .replace("MAX_WAVES", str(MAX_WAVES)))
+               .replace("MAX_WAVES", str(MAX_WAVES))
+               .replace("MAX_SHADOW_CASTERS", str(MAX_SHADOW_CASTERS)))
 
 
 # ---------------------------------------------------------------------------

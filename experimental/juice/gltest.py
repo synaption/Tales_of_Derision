@@ -753,6 +753,307 @@ def test_the_camera_transform_is_geometry_not_a_resample():
 
 
 # ---------------------------------------------------------------------------
+# Corpse physics
+# ---------------------------------------------------------------------------
+#
+# `RagdollField` is the one thing in the GL bench that is not a renderer, and
+# every test below except the last runs without a context, without a window and
+# without a single pixel -- which is the whole reason it was written as a
+# solver over `world.grid` rather than as something the draw call does on the
+# way past. A physics bug is a number being wrong, and a number can be asserted
+# on; the shader tests further up have to read pixels back because a shader
+# cannot be asked anything.
+
+
+def _corpses(kills=1, seed=0x1D0D, settle=90):
+    """A world with `kills` bodies on the floor, and the field that owns them.
+
+    Killing and then waiting is the only way to get a corpse: the sim makes one
+    when a death *animation* runs out, so anything less than the full ~0.5s is
+    testing an entity that is still on its way down.
+    """
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    world = rj.World(gl.gl_juice(), None)
+    field = gl.RagdollField(seed=seed)
+    for _ in range(kills):
+        victim = world.nearest_enemy(killable=True)
+        if victim is None:
+            break
+        world.kill(victim)
+    _run(world, field, settle)
+    return world, field
+
+
+def _run(world, field, n, dt=1 / 60):
+    for _ in range(n):
+        world.update(dt)
+        field.update(world, dt)
+
+
+def _in_a_wall(world, body):
+    import rogue_juice as rj
+    return world.blocked(int(body.x // rj.TILE), int(body.y // rj.TILE))
+
+
+def test_a_dead_body_is_adopted_and_a_living_one_is_not():
+    world, field = _corpses(kills=2)
+    assert len(world.corpses) == 2, f"{len(world.corpses)} corpses"
+    assert len(field.bodies) == 2, f"{len(field.bodies)} ragdolls"
+    for c in world.corpses:
+        assert field.of(c) is not None, "a corpse with no physics behind it"
+    # Nothing that still takes a turn may be in here: the field is what a thing
+    # becomes *instead of* being on the grid.
+    tracked = {id(b.corpse) for b in field.bodies}
+    for e in world.entities:
+        assert id(e) not in tracked
+
+
+def test_a_body_comes_to_rest_lying_flat():
+    """A corpse frozen mid-tumble reads as one still falling. The settle is the
+    difference between a physics demo and a body."""
+    world, field = _corpses()
+    body = field.bodies[0]
+    body.angle = 17.0            # stopped at an angle that means nothing
+    body.spin = 0.0
+    _run(world, field, 180)
+    assert body.speed == 0.0, f"still sliding at {body.speed}"
+    assert body.resting, "never went to sleep"
+    # +-90 is the Corpse convention for a body lying down.
+    assert abs(abs(body.angle % 180.0) - 90.0) < 1.0, f"stopped at {body.angle}"
+
+
+def test_a_body_never_ends_up_inside_a_wall():
+    """The one failure that is unforgivable, because it is permanent: a corpse
+    inside the masonry stays there until it fades. Driven at the extremes --
+    maximum blast, double intensity, and a 20Hz frame, which is the slowest
+    `run()` will ever hand the solver -- because that is where a fixed step
+    tunnels."""
+    world, field = _corpses(kills=9)
+    world.juice.params["rag_blast"].value = 6000.0
+    world.juice.params["intensity"].value = 2.0
+    assert len(field.bodies) >= 6, f"only {len(field.bodies)} bodies to throw"
+    for _ in range(6):
+        field.detonate(world, *world.player.world_pos())
+        _run(world, field, 30, dt=1 / 20)
+        for b in field.bodies:
+            assert not _in_a_wall(world, b), f"a body reached {b.x:.0f},{b.y:.0f}"
+
+
+def test_walking_through_a_corpse_shoves_it_aside():
+    """The entire argument for taking the dead off the grid. On the grid there
+    are two possible answers to walking into a body -- blocked, or nothing
+    there -- and this is the third one."""
+    import rogue_juice as rj
+    world, field = _corpses()
+    body = field.bodies[0]
+    px, py = world.player.world_pos()
+    body.x, body.y = px + rj.TILE * 0.25, py       # standing on it
+    body.vx = body.vy = 0.0
+    before = abs(body.x - px)
+    _run(world, field, 20)
+    after = abs(body.x - px)
+    assert after > before + rj.TILE * 0.3, \
+        f"the body stayed under the player ({before:.0f} -> {after:.0f}px)"
+    assert not _in_a_wall(world, body), "shoved through a wall"
+
+
+def _clear_spot(world):
+    """The centre of an empty 5x5 patch of floor, well away from the player.
+
+    Corpses land where their owners happened to be standing, which is no use to
+    a test that wants to know what a blast did: half of them start outside the
+    wave and the other half start against a pillar. Everything below that cares
+    about a specific geometry puts the bodies somewhere known instead.
+    """
+    import rogue_juice as rj
+    px, py = world.player.tile
+    best = None
+    for ty in range(2, rj.GRID_H - 2):
+        for tx in range(2, rj.GRID_W - 2):
+            if any(world.blocked(tx + ox, ty + oy)
+                   for oy in range(-2, 3) for ox in range(-2, 3)):
+                continue
+            d = abs(tx - px) + abs(ty - py)
+            if d >= 8 and (best is None or d < best[0]):
+                best = (d, (tx + 0.5) * rj.TILE, (ty + 0.5) * rj.TILE)
+    assert best is not None, "no clear patch of floor in the arena"
+    return best[1], best[2]
+
+
+def test_an_explosion_throws_the_dead_outwards():
+    import math
+    import rogue_juice as rj
+    world, field = _corpses(kills=4)
+    cx, cy = _clear_spot(world)
+    ring = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    for b, (ox, oy) in zip(field.bodies, ring):
+        b.x, b.y = cx + ox * rj.TILE * 1.2, cy + oy * rj.TILE * 1.2
+        b.vx = b.vy = b.spin = 0.0
+    assert len(field.bodies) >= 4, f"only {len(field.bodies)} bodies"
+    thrown = list(zip(field.bodies, ring))
+    field.detonate(world, cx, cy)
+    # The direction is asserted on the velocity the blast wrote, with no frame
+    # in between: the arena is forty tiles across and a body thrown hard enough
+    # to be worth testing crosses it, bounces off the far wall and comes back.
+    for i, (b, (ox, oy)) in enumerate(thrown):
+        assert b.speed > 300.0, f"body {i} left the blast at {b.speed:.0f}px/s"
+        outward = (b.vx * ox + b.vy * oy) / b.speed
+        assert outward > 0.9, f"body {i} was thrown sideways ({outward:.2f})"
+    reached = [0.0] * len(thrown)
+    for _ in range(60):
+        _run(world, field, 1)
+        for i, (b, _dir) in enumerate(thrown):
+            reached[i] = max(reached[i], math.hypot(b.x - cx, b.y - cy))
+    # Only a little further than the 1.2-tile ring is asked for, because the
+    # clear patch is five tiles across and a body that leaves it is against a
+    # wall: what is being tested here is that the velocity became distance, not
+    # how far the arena lets it fly.
+    for i, d in enumerate(reached):
+        assert d > rj.TILE * 1.6, f"body {i} only got {d / rj.TILE:.1f} tiles out"
+
+
+def test_a_blast_falls_off_with_distance():
+    """Otherwise it is not an explosion, it is a global event that happens to
+    have a ring drawn at one end of it."""
+    import rogue_juice as rj
+    world, field = _corpses(kills=2)
+    near, far = field.bodies[0], field.bodies[1]
+    for b in field.bodies:
+        b.vx = b.vy = 0.0
+        b.mass = 1.0
+    near.x, near.y = 400.0, 400.0
+    far.x, far.y = 400.0 + rj.TILE * 4.0, 400.0
+    field.blast(world, 380.0, 400.0, rj.TILE * 6.0, 1000.0)
+    assert near.speed > far.speed * 2.0, \
+        f"near {near.speed:.0f} vs far {far.speed:.0f}"
+    assert far.speed > 0.0, "nothing reached the far body at all"
+
+
+def test_a_body_blown_up_while_it_is_still_dying_is_paid_when_it_lands():
+    """The case a player is most likely to try first, and the one that quietly
+    does nothing unless the force is written down: at the moment of the blast
+    the victim is still an entity playing a death animation, and there is no
+    ragdoll to push."""
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    world = rj.World(gl.gl_juice(), None)
+    field = gl.RagdollField()
+    victim = world.nearest_enemy(killable=True)
+    world.kill(victim)
+    _run(world, field, 2)
+    assert victim.dying and not field.bodies, "the body landed too early to test"
+    vx, vy = victim.world_pos()
+    field.detonate(world, vx - rj.TILE, vy)
+    _run(world, field, 1)
+    assert field._owed, "the blast was thrown away"
+    for _ in range(200):
+        _run(world, field, 1)
+        if field.bodies:
+            break
+    assert field.bodies, "no body ever landed"
+    assert field.bodies[0].speed > 200.0, \
+        f"landed at {field.bodies[0].speed:.0f}px/s -- the debt was not paid"
+    assert not field._owed, "the debt was paid and then kept"
+
+
+def test_two_corpses_do_not_occupy_the_same_place():
+    world, field = _corpses(kills=5)
+    for i, b in enumerate(field.bodies):     # stack them all on one spot
+        b.x, b.y = 600.0, 400.0
+        b.vx = b.vy = 0.0
+    _run(world, field, 120)
+    import math
+    for i, a in enumerate(field.bodies):
+        for b in field.bodies[i + 1:]:
+            gap = math.hypot(a.x - b.x, a.y - b.y)
+            assert gap > (a.radius + b.radius) * 0.9, \
+                f"two bodies {gap:.1f}px apart with radii {a.radius:.0f}"
+
+
+def test_switching_ragdolls_off_leaves_the_body_where_it_fell():
+    """The A/B the panel exists for: off, this is the sim's own `leave_corpse`
+    and nothing else."""
+    world, field = _corpses(settle=0)
+    world.juice.toggles["ragdoll"].on = False
+    _run(world, field, 120)
+    assert world.corpses, "nothing died"
+    for c in world.corpses:
+        assert field.of(c) is not None, \
+            "not adopted -- the toggle stops the physics, not the tracking, or "\
+            "switching it back on would teleport every body in the room"
+    # The corpse must still sit on its own tile centre, untouched.
+    import rogue_juice as rj
+    c = world.corpses[0]
+    assert abs((c.x % rj.TILE) - rj.TILE * 0.5) < 0.01, \
+        f"the body moved to {c.x} with the physics switched off"
+
+
+def test_the_same_fight_gives_the_same_pile_every_time():
+    """Deterministic noise, like every other random-looking thing in the bench.
+    A workbench that cannot replay itself cannot be compared against itself."""
+    def once():
+        world, field = _corpses(kills=5)
+        field.detonate(world, *world.player.world_pos())
+        _run(world, field, 120)
+        return [(round(b.x, 6), round(b.y, 6), round(b.angle, 6))
+                for b in field.bodies]
+    assert once() == once()
+
+
+def test_the_solver_is_cheap_enough_to_be_free():
+    """Forty bodies is the cap `leave_corpse` enforces, and this runs every
+    frame next to a renderer that draws the whole world in one draw call."""
+    import time
+    world, field = _corpses(kills=9)
+    field.detonate(world, *world.player.world_pos())
+    _run(world, field, 10)
+    t0 = time.perf_counter()
+    for _ in range(200):
+        field.update(world, 1 / 60)
+    ms = (time.perf_counter() - t0) / 200 * 1000.0
+    print(f"        ({len(field.bodies)} bodies in {ms:.3f}ms)")
+    assert ms < 1.5, f"{ms:.2f}ms a frame for {len(field.bodies)} bodies"
+
+
+def test_a_ragdoll_moves_the_pixels_it_is_drawn_at():
+    """The one test here that needs the card: the physics can be perfect and
+    still be invisible if the renderer keeps drawing corpses at `tile_center`.
+    """
+    if not gl_available():
+        return
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    ctx, target, _world, renderer = bench()
+    world = rj.World(gl.gl_juice(), None)
+    world.juice.toggles["light"].on = False      # keep the torches out of it
+    saved, renderer.ragdolls = renderer.ragdolls, gl.RagdollField()
+    try:
+        victim = world.nearest_enemy(killable=True)
+        world.kill(victim)
+        for _ in range(90):
+            world.update(1 / 60)
+            renderer.ragdolls.update(world, 1 / 60)
+        assert renderer.ragdolls.bodies, "nothing to look at"
+        before = view_of(frame(world)).astype(np.int16)
+        body = renderer.ragdolls.bodies[0]
+        was = (body.x, body.y)
+        renderer.ragdolls.blast(world, body.x, body.y + 40.0, 200.0, 2400.0)
+        for _ in range(30):
+            world.update(1 / 60)
+            renderer.ragdolls.update(world, 1 / 60)
+        assert abs(body.y - was[1]) > 20.0, "the solver did not move it"
+        assert (body.x, body.y) == (body.corpse.x, body.corpse.y), \
+            "the corpse the renderer reads was left behind by the solver"
+        after = view_of(frame(world)).astype(np.int16)
+        delta = np.abs(after - before).max(axis=2)
+        assert (delta > 20).sum() > 60, \
+            f"only {(delta > 20).sum()} pixels changed -- the body did not move"
+    finally:
+        renderer.ragdolls = saved
+
+
+# ---------------------------------------------------------------------------
 # The bench is still the bench
 # ---------------------------------------------------------------------------
 

@@ -23,6 +23,12 @@ What is different to look at, in the order it is worth looking at it:
   offer as a three-way compromise;
 * **the floor ripples continuously**, as a displacement of the texture rather
   than a repaint of the tiles it passes;
+* **the dead come off the grid**, into a real-time circle-and-velocity solver:
+  bodies slide, bounce off walls and each other, are shoved out of the way by
+  anything that walks through them, and cartwheel away from an explosion.
+  `RagdollField` is the only thing here that is not a renderer, and it is here
+  because a corpse takes no turn and blocks no tile, so nothing is left that
+  needs it on a grid at all. Press **B** to drop a bomb;
 * **one draw call** for every sprite, spark, shadow, decal, ring, arc and cut.
 
 The panel is drawn by the software renderer into an offscreen surface and
@@ -38,8 +44,10 @@ from __future__ import annotations
 
 import math
 import os
+import signal
 import sys
 import time
+from dataclasses import dataclass
 
 if "--headless" in sys.argv:
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -54,7 +62,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glfx  # noqa: E402
 import rogue_juice as rj  # noqa: E402
 import tiles  # noqa: E402
-from juicefx import ambient_offset, clamp, shadow_of  # noqa: E402
+from juicefx import ambient_offset, clamp, hash01, shadow_of  # noqa: E402
 
 try:
     import audiofx
@@ -105,6 +113,13 @@ GL_TOGGLES = [
     ("refract", "heat refraction", "screen",
      "Bend the frame around each torch. The software bench re-blits ninety rows "
      "per torch to fake this; here every fragment simply asks where to sample."),
+    ("ragdoll", "corpse ragdolls", "attack",
+     "Take the dead off the grid. A corpse has no turn and blocks nothing, so "
+     "nothing is left that needs it on a tile -- it becomes a circle with a "
+     "velocity that slides, bounces off walls, is shoved aside in real time by "
+     "anything that walks through it, and goes end over end when something "
+     "detonates next to it. Press B to drop a bomb and watch. Off, bodies lie "
+     "exactly where they fell, which is what `leave_corpse` does on its own."),
 ]
 
 GL_PARAMS = [
@@ -123,6 +138,16 @@ GL_PARAMS = [
      "decides whether a torch lights a room or lights a coin: low is a raking, "
      "dramatic light that dies within a tile, high flattens everything out.",
      "{:.0f}"),
+    ("light_contrast", "light / dark contrast", "screen", 1.0, 0.0, 10.0,
+     "Difference between lit and shadowed areas. Zero flattens the lighting; "
+     "one is natural; ten removes ambient light completely, making areas "
+     "outside direct light pitch black.", "{:.2f}"),
+    ("wall_shadow_amt", "wall shadow amount", "screen", 1.0, 0.0, 1.0,
+     "Opacity of shadows cast by walls. One makes walls fully block direct "
+     "light; zero lets light pass through them.", "{:.2f}"),
+    ("npc_shadow_amt", "NPC shadow amount", "screen", 0.55, 0.0, 1.0,
+     "Opacity of the soft shadows cast by monsters and the training dummy, "
+     "independent of wall shadows.", "{:.2f}"),
     ("bloom_knee", "bloom knee", "screen", 0.45, 0.01, 2.0,
      "How softly the threshold lets a pixel in. A hard knee makes bloom "
      "flicker on moving highlights.", "{:.2f}"),
@@ -130,6 +155,37 @@ GL_PARAMS = [
      "How far the frame is pushed warm on impact.", "{:.2f}"),
     ("scanline_amt", "scanline depth", "screen", 0.14, 0.0, 0.6,
      "", "{:.2f}"),
+
+    ("rag_size", "corpse radius", "attack", 0.34, 0.12, 0.70,
+     "Collision radius of a body, in tiles. This is the one number that "
+     "decides whether a pile of corpses reads as a heap or as a stack of "
+     "coins, and it is also what keeps them out of walls.", "{:.2f}"),
+    ("rag_bounce", "corpse bounce", "attack", 0.36, 0.0, 0.95,
+     "How much speed survives hitting a wall. Zero is a sack of wet sand, "
+     "which is honest; a third of it back is what reads as a body with bones "
+     "in. Past about 0.7 they pinball and stop looking dead.", "{:.2f}"),
+    ("rag_drag", "floor drag", "attack", 5.0, 0.2, 14.0,
+     "How fast the floor takes the speed back, per second. A body coasts "
+     "roughly its launch speed divided by this, in pixels, before it stops -- "
+     "so low numbers slide corpses around the room like curling stones.",
+     "{:.1f}"),
+    ("rag_shove", "shove strength", "attack", 1.8, 0.0, 6.0,
+     "How hard a walking body pushes a dead one out of the way. This is the "
+     "whole point of taking corpses off the grid: on it, the only two answers "
+     "to walking into a body are 'blocked' and 'nothing there'.", "{:.2f}"),
+    ("rag_blast", "blast force", "attack", 1100.0, 0.0, 6000.0,
+     "Speed, in pixels a second, given to a body at the dead centre of a "
+     "bomb, falling off to nothing at the edge of the wave and divided by the "
+     "body's weight. Smaller rings -- the one an ordinary killing blow raises "
+     "-- get a steeply smaller share of it.", "{:.0f}"),
+    ("rag_launch", "death launch", "attack", 170.0, 0.0, 900.0,
+     "The shove a fresh corpse gets away from whatever killed it, on top of "
+     "whatever speed the death animation left it carrying. Zero drops it "
+     "straight down where it stood.", "{:.0f}"),
+    ("rag_spin", "tumble", "attack", 1.3, 0.0, 5.0,
+     "How much of a body's sideways speed turns into rotation on a bounce. "
+     "Zero slides them around flat; high numbers make everything cartwheel.",
+     "{:.2f}"),
 ]
 
 #: Software-only controls that the hardware makes meaningless.
@@ -162,6 +218,651 @@ def gl_juice() -> rj.Juice:
     juice.params["light_radius"].value = 7.5
     juice.params["light_radius"].default = 7.5
     return juice
+
+
+# ---------------------------------------------------------------------------
+# Corpse physics
+# ---------------------------------------------------------------------------
+#
+# Everything alive in this bench is on the grid, and it is on the grid because
+# the *sim* needs it there: a living thing takes a turn, occupies a tile, and
+# has to be something you can walk into. A corpse has none of that. It takes no
+# turn, it blocks nothing, and the only thing left that cares where it is, is
+# the eye.
+#
+# So the moment `leave_corpse` drops one on the floor it is adopted by this
+# field, and from there it stops being a tile and becomes a circle with a
+# velocity: it slides, it bounces off walls and off other bodies, it is shoved
+# aside in real time by anything that walks through it, and it goes end over
+# end when something detonates next to it. None of that is turn-based, because
+# none of it needs to be -- there is no question the sim can ask that this can
+# answer wrongly.
+#
+# Two deliberate non-features:
+#
+# * it is a *circle*, not a jointed skeleton. Sixteen sprites' worth of art is
+#   one quad each; there are no limbs to articulate, so a per-limb solver would
+#   be solving for a picture nobody is drawing. One circle plus a rotation is
+#   the whole of what a 40x40 body can show.
+# * it never touches `rogue_juice.py`. It reads the wall grid through
+#   `world.blocked`, reads entity positions through `world.entities`, watches
+#   `world.fx.shockwaves` for explosions, and writes `x`, `y` and `angle` back
+#   onto the `Corpse` objects the renderer was already drawing. Nothing in here
+#   imports moderngl and nothing in here needs a frame, which is what lets
+#   `gltest.py` drive the whole system on a machine with no GL at all.
+
+
+@dataclass
+class Ragdoll:
+    """One dead body, off the grid, in world pixels.
+
+    `corpse` is the `juicefx.Corpse` this drives; the field owns a strong
+    reference to it for exactly as long as it is tracked, which is also what
+    makes it safe to key the lookup table on `id()`.
+    """
+
+    corpse: object
+    x: float
+    y: float
+    vx: float = 0.0
+    vy: float = 0.0
+    angle: float = 90.0            # degrees, the Corpse convention: +-90 is flat
+    spin: float = 0.0              # degrees a second
+    radius: float = TILE * 0.34
+    mass: float = 1.0
+    #: An impact wobble, as a signed fraction: +ve is squat and wide. Sprung
+    #: rather than decayed, so a body that lands hard overshoots once.
+    squash: float = 0.0
+    squash_vel: float = 0.0
+    resting: bool = False
+
+    @property
+    def speed(self) -> float:
+        return math.hypot(self.vx, self.vy)
+
+    @property
+    def scale(self):
+        """(sx, sy) for the quad. Along the sprite's own axes, so a body that
+        slams into a wall flattens across whichever way it happens to be
+        lying -- which is the right answer often enough at this size."""
+        q = clamp(self.squash, -0.4, 0.4)
+        return 1.0 + q, 1.0 - q
+
+
+class RagdollField:
+    """The bodies on the floor, and the physics that moves them.
+
+    Stepped by the game loop, not by the renderer: `render()` must be free to
+    run twice on the same world (the headless path does exactly that) without
+    time passing, so nothing in here is called from a draw.
+
+    Owned by `GLRenderer` only because the bench has nowhere else to hang
+    per-world state without editing the sim -- see `GLRenderer.ragdolls`.
+    """
+
+    #: The physics runs at a fixed rate and the frame is chopped into as many
+    #: of these as it needs. A body leaving a blast at 3000px/s covers two
+    #: tiles in a 60Hz frame, and a single step that long walks straight
+    #: through a wall without ever overlapping it.
+    MAX_SUBSTEPS = 8
+
+    #: Below this, in pixels a second, a body is simply stopped. Without a
+    #: floor on the speed, drag is asymptotic and every corpse in the room
+    #: creeps forever at a hundredth of a pixel.
+    SLEEP_SPEED = 5.0 * PX
+    SLEEP_SPIN = 8.0               # degrees a second
+
+    #: A bomb's ring, and the yardstick every other shockwave in the bench is
+    #: measured against -- see `_wave_force`.
+    BOMB_RADIUS = TILE * 4.2
+    #: Force reaches this much further than the ring is drawn, so a body just
+    #: outside the visible edge still gets shifted.
+    BLAST_REACH = 1.6
+
+    def __init__(self, seed: int = 0x1D0D):
+        self.bodies: list[Ragdoll] = []
+        self._by_corpse: dict[int, Ragdoll] = {}
+        #: id(entity) -> [entity, x, y, vx, vy], last frame. The strong
+        #: reference is the point: it keeps `id()` from being recycled under
+        #: us, and it keeps the corpse's killer alive for the one frame
+        #: between an entity being removed and its body being adopted.
+        self._tracked: dict[int, list] = {}
+        #: id(entity) -> (vx, vy, spin) owed to a body that was blown up while
+        #: it was still playing its death animation. Spent when it lands.
+        self._owed: dict[int, tuple] = {}
+        #: id(shockwave) -> shockwave, for the ones already turned into force.
+        self._seen_waves: dict[int, object] = {}
+        self.seed = seed
+        self._n = 0
+
+    # -- deterministic noise ----------------------------------------------
+    def _rand(self) -> float:
+        """0..1, from the same integer sequence every run. Same reason the
+        particle system has one: a bench that cannot be replayed cannot be
+        compared against itself."""
+        self._n += 1
+        return (hash01(self._n, self.seed) + 1.0) * 0.5
+
+    # -- lookup -------------------------------------------------------------
+    def of(self, corpse):
+        """The physics state for a corpse, or None if it is not tracked."""
+        return self._by_corpse.get(id(corpse))
+
+    def clear(self):
+        self.bodies.clear()
+        self._by_corpse.clear()
+        self._tracked.clear()
+        self._owed.clear()
+        self._seen_waves.clear()
+
+    # -- the frame ----------------------------------------------------------
+    def update(self, world: rj.World, dt: float):
+        """Adopt, then simulate. Call once per frame, after `world.update`."""
+        self._retire(world)
+        gone = self._departed(world)
+        self._adopt(world, gone)
+        self._track(world, dt)
+        self._watch_explosions(world)
+
+        j = world.juice
+        if not j.on("ragdoll") or dt <= 0.0:
+            # Left exactly where they are, including any velocity they had
+            # when the toggle went off, so switching it back on resumes rather
+            # than teleporting. This is the A/B the panel is for.
+            return
+
+        # Sub-stepping is priced off the fastest body in the room, so the
+        # common case -- everything lying still -- is one step.
+        fastest = max((b.speed for b in self.bodies), default=0.0)
+        steps = 1
+        if fastest * dt > TILE * 0.3:
+            steps = min(self.MAX_SUBSTEPS, int(fastest * dt / (TILE * 0.3)) + 1)
+        h = dt / steps
+        for _ in range(steps):
+            for b in self.bodies:
+                self._integrate(world, b, h)
+
+        # Body-on-body and body-under-foot run once a frame at the full `dt`.
+        # Neither is a fast collision: two corpses settling into each other
+        # move at walking pace, and the thing shoving them is a walking pace by
+        # definition. Sub-stepping them would triple the cost of the frame to
+        # resolve contacts that were never going to tunnel.
+        self._separate(world)
+        self._shove(world, dt)
+        # Both contact passes move bodies by hand, and either can put one
+        # inside the masonry: a heap settling against a wall, or someone
+        # standing on a corpse that is already up against one. The wall pass
+        # gets the last word, so nothing is ever *drawn* embedded.
+        for b in self.bodies:
+            self._walls(world, b)
+            b.corpse.x, b.corpse.y, b.corpse.angle = b.x, b.y, b.angle
+
+    # -- bookkeeping --------------------------------------------------------
+    def _retire(self, world: rj.World):
+        """Drop the bodies whose corpses have faded out of the world.
+
+        Rebuilt rather than diffed, because a frame in which one corpse fades
+        and another appears leaves the counts equal and the contents different
+        -- and a `Ragdoll` holding the only reference to a dead `Corpse` is
+        exactly how `id()` gets recycled underneath the lookup table.
+        """
+        if not self.bodies:
+            return
+        live = {id(c) for c in world.corpses}
+        self.bodies = [b for b in self.bodies if id(b.corpse) in live]
+        self._by_corpse = {id(b.corpse): b for b in self.bodies}
+
+    def _departed(self, world: rj.World) -> list:
+        """Entities that were here last frame and are not here now.
+
+        `leave_corpse` runs in the same `world.update` that removes the entity,
+        so the thing that just died and the body that just appeared are always
+        one frame apart -- which is how a corpse gets told how fast it was
+        moving and how heavy it was, without the sim having to record either.
+        """
+        here = {id(e) for e in world.entities}
+        gone = [rec for key, rec in self._tracked.items() if key not in here]
+        for rec in gone:
+            self._tracked.pop(id(rec[0]), None)
+        return gone
+
+    def _track(self, world: rj.World, dt: float):
+        """Remember where everything alive is, and how fast it got there.
+
+        The velocity is a plain frame difference, which is noisy and exactly
+        right: what the shove wants to know is how fast this creature moved
+        *this* frame, not the average of a walk it finished half a second ago.
+        """
+        inv = 1.0 / max(dt, 1e-4)
+        for e in world.entities:
+            x, y = e.world_pos()
+            rec = self._tracked.get(id(e))
+            if rec is None:
+                self._tracked[id(e)] = [e, x, y, 0.0, 0.0]
+            else:
+                rec[3], rec[4] = (x - rec[1]) * inv, (y - rec[2]) * inv
+                rec[1], rec[2] = x, y
+        # Anything owed a blast that never became a corpse -- the toggle is
+        # off, or the sim was reset -- has missed its chance. Dropped here,
+        # after `_adopt` has had the frame it needs to claim it.
+        if self._owed:
+            here = {id(e) for e in world.entities}
+            self._owed = {k: v for k, v in self._owed.items() if k in here}
+
+    def _adopt(self, world: rj.World, gone: list):
+        """Give every untracked corpse a body, and throw it."""
+        j = world.juice
+        for c in world.corpses:
+            if id(c) in self._by_corpse:
+                continue
+            rec = self._nearest_departure(c, gone)
+            mass = 1.0
+            vx = vy = spin = 0.0
+            if rec is not None:
+                e = rec[0]
+                mass = max(0.35, getattr(e, "weight", 1.0))
+                # Whatever the death animation was doing when it ran out. A
+                # burst throws the body; a slump barely moves it.
+                vx, vy = rec[3], rec[4]
+                owed = self._owed.pop(id(e), None)
+                if owed is not None:
+                    # Blown up mid-death: the blast was spent on a thing that
+                    # was not a ragdoll yet, so it was kept until now.
+                    vx += owed[1]
+                    vy += owed[2]
+                    spin += owed[3]
+            # Away from the player, who is standing where the blow came from.
+            # `leave_corpse` already picks which way up the body lands on the
+            # same reasoning, so this only makes the two agree.
+            px, py = world.player.world_pos()
+            dx, dy = c.x - px, c.y - py
+            d = math.hypot(dx, dy) or 1.0
+            launch = j.p("rag_launch") * PX * j.intensity
+            vx += dx / d * launch
+            vy += dy / d * launch
+            spin += (self._rand() - 0.5) * 2.0 * launch * j.p("rag_spin")
+            b = Ragdoll(corpse=c, x=c.x, y=c.y, vx=vx, vy=vy, angle=c.angle,
+                        spin=spin, radius=TILE * j.p("rag_size"), mass=mass)
+            self.bodies.append(b)
+            self._by_corpse[id(c)] = b
+
+    @staticmethod
+    def _nearest_departure(corpse, gone: list):
+        """Match a fresh corpse to the entity it came from, by position.
+
+        Identity would be nicer, but a `Corpse` does not carry one and giving
+        it one is an edit to the sim. Two things cannot die on the same tile in
+        the same frame, so 'the departure that was closest' is exact whenever
+        it matters and harmless when it does not.
+        """
+        best, best_d = None, TILE * 2.5
+        for rec in gone:
+            d = math.hypot(rec[1] - corpse.x, rec[2] - corpse.y)
+            if d < best_d:
+                best, best_d = rec, d
+        return best
+
+    # -- integration --------------------------------------------------------
+    def _integrate(self, world: rj.World, b: Ragdoll, h: float):
+        j = world.juice
+        drag = j.p("rag_drag")
+        # Exponential rather than linear, so the same slider means the same
+        # thing whatever the frame rate and a body never drags itself backwards
+        # through zero on a long frame.
+        keep = math.exp(-drag * h)
+        b.vx *= keep
+        b.vy *= keep
+        b.spin *= math.exp(-drag * 0.85 * h)
+
+        if b.speed < self.SLEEP_SPEED:
+            b.vx = b.vy = 0.0
+        else:
+            b.x += b.vx * h
+            b.y += b.vy * h
+
+        b.angle += b.spin * h
+        self._walls(world, b)
+
+        # The squash is a spring, not a decay: a body that lands hard flattens,
+        # overshoots on the way back and settles. A decay only ever flattens.
+        b.squash_vel += (-b.squash * 340.0 - b.squash_vel * 13.0) * h
+        b.squash += b.squash_vel * h
+
+        b.resting = b.speed <= 0.0 and abs(b.spin) < self.SLEEP_SPIN
+        if b.resting:
+            b.spin = 0.0
+            # Settle flat. `leave_corpse`'s convention is that +-90 is a body
+            # lying down, so a ragdoll that has stopped rolls the last few
+            # degrees into the nearest of them rather than freezing mid-tumble
+            # -- a corpse stopped at 20 degrees reads as one still falling.
+            flat = round((b.angle - 90.0) / 180.0) * 180.0 + 90.0
+            b.angle += (flat - b.angle) * min(1.0, 5.0 * h)
+
+    def _walls(self, world: rj.World, b: Ragdoll):
+        """Push the circle out of every solid tile it overlaps, and bounce it.
+
+        Circle against the tile *rectangle*, not against the tile centre: the
+        nearest point on a box is what gives a body sliding along a wall a
+        clean tangent, and what stops it catching on the seam between two
+        tiles of the same wall.
+        """
+        j = world.juice
+        bounce = j.p("rag_bounce")
+        spin_gain = j.p("rag_spin")
+        r = b.radius
+        hardest = 0.0
+        tx0, tx1 = int((b.x - r) // TILE), int((b.x + r) // TILE)
+        ty0, ty1 = int((b.y - r) // TILE), int((b.y + r) // TILE)
+        for ty in range(ty0, ty1 + 1):
+            for tx in range(tx0, tx1 + 1):
+                if not world.blocked(tx, ty):
+                    continue
+                left, top = tx * TILE, ty * TILE
+                nearest_x = clamp(b.x, left, left + TILE)
+                nearest_y = clamp(b.y, top, top + TILE)
+                dx, dy = b.x - nearest_x, b.y - nearest_y
+                d2 = dx * dx + dy * dy
+                if d2 >= r * r:
+                    continue
+                if d2 > 1e-9:
+                    d = math.sqrt(d2)
+                    nx, ny, pen = dx / d, dy / d, r - d
+                else:
+                    # Dead centre inside the tile -- a body that was launched
+                    # through a wall by a big enough blast. There is no nearest
+                    # point to push away from, so it leaves by the shallowest
+                    # face it is behind.
+                    nx, ny, pen = self._escape(b, left, top, r)
+                b.x += nx * pen
+                b.y += ny * pen
+                vn = b.vx * nx + b.vy * ny
+                if vn >= 0.0:
+                    continue                      # already leaving; do not grab it
+                tvx, tvy = b.vx - vn * nx, b.vy - vn * ny
+                # The tangent keeps most of itself (a body scrapes along a
+                # wall), the normal comes back scaled by the restitution, and
+                # the part of the tangent the wall ate turns into rotation.
+                b.vx = tvx * 0.82 - vn * nx * bounce
+                b.vy = tvy * 0.82 - vn * ny * bounce
+                tangent = tvx * -ny + tvy * nx
+                b.spin += tangent * spin_gain * 0.55
+                # Deliberately not scaled by the tumble slider: a body still
+                # deforms on a wall with the spin turned all the way down.
+                b.squash_vel -= vn * 0.006
+                # One noise per step, however many tiles of the same wall the
+                # body happens to be touching -- an inside corner is two
+                # contacts and one thud.
+                hardest = max(hardest, -vn)
+        if hardest > 120.0 * PX:
+            self._thud(world, b, hardest)
+
+    @staticmethod
+    def _escape(b: Ragdoll, left: float, top: float, r: float):
+        """Shallowest way out of a tile a body is entirely inside of."""
+        outs = ((-1.0, 0.0, b.x - left + r),
+                (1.0, 0.0, left + TILE - b.x + r),
+                (0.0, -1.0, b.y - top + r),
+                (0.0, 1.0, top + TILE - b.y + r))
+        return min(outs, key=lambda o: o[2])
+
+    def _thud(self, world: rj.World, b: Ragdoll, speed: float):
+        """A hard landing is worth a noise and a puff, at most a few a second."""
+        j = world.juice
+        if j.on("particles"):
+            world.fx.particles.burst(
+                b.x, b.y, count=3, speed=(40 * PX, 150 * PX), life=(0.15, 0.32),
+                size=3.0 * PX, gravity=700.0 * PX, colors=((90, 96, 116),))
+        if speed > 420.0 * PX:
+            world.sfx("bump", gain=0.5, wx=b.x)
+
+    # -- contacts -----------------------------------------------------------
+    def _separate(self, world: rj.World):
+        """Corpse against corpse, so a pile is a pile and not one sprite.
+
+        Naive pairs, which is the right algorithm at forty bodies: a grid or a
+        sweep costs more to build each frame than the 800 distance checks it
+        saves, and the corpse list is capped at 40 by `leave_corpse` anyway.
+        The x-gap test in front of the square root is what actually pays.
+        """
+        n = len(self.bodies)
+        if n < 2:
+            return
+        bounce = world.juice.p("rag_bounce")
+        for i in range(n - 1):
+            a = self.bodies[i]
+            for k in range(i + 1, n):
+                c = self.bodies[k]
+                lim = a.radius + c.radius
+                dx = c.x - a.x
+                if dx > lim or dx < -lim:
+                    continue
+                dy = c.y - a.y
+                if dy > lim or dy < -lim:
+                    continue
+                d2 = dx * dx + dy * dy
+                if d2 >= lim * lim:
+                    continue
+                if d2 > 1e-9:
+                    d = math.sqrt(d2)
+                    nx, ny = dx / d, dy / d
+                else:
+                    # Perfectly stacked: any direction will do, as long as it
+                    # is the *same* one every frame or the pair will buzz --
+                    # and it must not come from `id()`, which is a different
+                    # number every run and would take determinism with it.
+                    ang = i * 2.39996                     # the golden angle
+                    nx, ny, d = math.cos(ang), math.sin(ang), 0.0
+                pen = lim - d
+                total = a.mass + c.mass
+                a.x -= nx * pen * (c.mass / total)
+                a.y -= ny * pen * (c.mass / total)
+                c.x += nx * pen * (a.mass / total)
+                c.y += ny * pen * (a.mass / total)
+                # Approach speed along the contact, shared out by mass. Bodies
+                # are soft, so most of it is absorbed rather than returned.
+                vn = (c.vx - a.vx) * nx + (c.vy - a.vy) * ny
+                if vn >= 0.0:
+                    continue
+                imp = -vn * (1.0 + bounce * 0.5) / total
+                a.vx -= nx * imp * c.mass
+                a.vy -= ny * imp * c.mass
+                c.vx += nx * imp * a.mass
+                c.vy += ny * imp * a.mass
+                spin = world.juice.p("rag_spin") * 0.25
+                a.spin -= vn * spin
+                c.spin += vn * spin
+
+    def _shove(self, world: rj.World, dt: float):
+        """The living walk through the dead, and the dead give way.
+
+        The whole argument for taking corpses off the grid is in this method.
+        On the grid there are exactly two things walking into a body can mean
+        -- blocked, or nothing there -- and both are wrong. Here the body moves
+        out of the way at the speed of the thing pushing it, this frame, in the
+        middle of a step, with no turn taken and no tile changing hands.
+        """
+        j = world.juice
+        shove = j.p("rag_shove")
+        if shove <= 0.0 or not self.bodies:
+            return
+        for e in world.entities:
+            rec = self._tracked.get(id(e))
+            if rec is None:
+                continue
+            ex, ey, evx, evy = rec[1], rec[2], rec[3], rec[4]
+            reach = TILE * 0.38
+            for b in self.bodies:
+                lim = reach + b.radius
+                dx, dy = b.x - ex, b.y - ey
+                if dx > lim or dx < -lim or dy > lim or dy < -lim:
+                    continue
+                d2 = dx * dx + dy * dy
+                if d2 >= lim * lim:
+                    continue
+                if d2 > 1e-9:
+                    d = math.sqrt(d2)
+                    nx, ny = dx / d, dy / d
+                else:
+                    nx, ny, d = 0.0, 1.0, 0.0
+                pen = lim - d
+                # The walker is immovable -- it is still a grid creature and
+                # its tile is not negotiable -- so the body takes all of the
+                # separation.
+                b.x += nx * pen
+                b.y += ny * pen
+                # Speed comes from two places: the walker's own motion along
+                # the contact, which is what makes a body skid ahead of a
+                # charging ogre, and the overlap itself, which is what makes
+                # one squeeze out from under someone standing still on it.
+                #
+                # Written as a target speed the contact drives the body up to,
+                # not as an impulse added every frame: an impulse applied for
+                # as long as two things overlap accumulates, and a corpse you
+                # lean on quietly builds up enough speed to cross the arena.
+                closing = max(0.0, evx * nx + evy * ny)
+                target = (closing + pen * 6.0) * shove / b.mass
+                along = b.vx * nx + b.vy * ny
+                if target > along:
+                    gain = (target - along) * min(1.0, 16.0 * dt)
+                    b.vx += nx * gain
+                    b.vy += ny * gain
+                    b.spin += (nx * evy - ny * evx) * j.p("rag_spin") * 0.05
+                    b.squash_vel += gain * 0.004
+
+    # -- explosions ---------------------------------------------------------
+    def _watch_explosions(self, world: rj.World):
+        """Turn every shockwave the sim raises into force on the bodies.
+
+        Watching the effect rather than the cause means every explosion in the
+        bench -- a killing blow, a bomb, anything added later -- throws corpses
+        without knowing that corpses can be thrown. The ring on screen and the
+        force in the physics are then the same event by construction, which is
+        the part that would otherwise drift.
+        """
+        live = world.fx.shockwaves
+        if not live:
+            self._seen_waves.clear()
+            return
+        for s in live:
+            if id(s) in self._seen_waves:
+                continue
+            self._seen_waves[id(s)] = s
+            self.blast(world, s.x, s.y, s.max_radius * self.BLAST_REACH,
+                       self._wave_force(world, s.max_radius))
+        if len(self._seen_waves) > len(live):
+            ids = {id(s) for s in live}
+            self._seen_waves = {k: v for k, v in self._seen_waves.items()
+                                if k in ids}
+
+    def _wave_force(self, world: rj.World, ring_radius: float) -> float:
+        """How hard a ring of that size throws things, in pixels a second.
+
+        Measured against a bomb's ring and raised to the fourth, which is
+        steeper than any physics would give you and is the point. An ordinary
+        killing blow raises a shockwave too, at a little over half a bomb's
+        radius, and on any gentler curve every sword stroke fires the body
+        across the arena -- leaving the actual explosion with nothing left to
+        be. A kill should tumble a corpse a couple of tiles; a bomb should
+        clear the room.
+        """
+        scale = (max(ring_radius, 1.0) / self.BOMB_RADIUS) ** 4
+        return world.juice.p("rag_blast") * PX * scale
+
+    def blast(self, world: rj.World, x: float, y: float, radius: float,
+              force: float):
+        """Throw everything dead within `radius` away from (x, y).
+
+        Anything still playing its death animation is not a ragdoll yet, so its
+        share is written down and handed over the moment its body lands --
+        otherwise the one case a player is most likely to try, blowing up
+        something as it dies, is the one case that does nothing.
+        """
+        j = world.juice
+        spin_gain = j.p("rag_spin")
+        for b in self.bodies:
+            dx, dy = b.x - x, b.y - y
+            d = math.hypot(dx, dy)
+            if d > radius:
+                continue
+            if d < 1e-3:
+                a = self._rand() * math.tau
+                dx, dy, d = math.cos(a), math.sin(a), 1.0
+            fall = (1.0 - d / radius) ** 1.4
+            imp = force * fall * j.intensity / b.mass
+            b.vx += dx / d * imp
+            b.vy += dy / d * imp
+            b.spin += (self._rand() - 0.5) * 2.2 * imp * spin_gain
+            b.squash_vel += imp * 0.004
+
+        for e in world.entities:
+            if not e.dying:
+                continue
+            ex, ey = e.world_pos()
+            dx, dy = ex - x, ey - y
+            d = math.hypot(dx, dy)
+            if d > radius:
+                continue
+            fall = (1.0 - d / radius) ** 1.4
+            imp = force * fall * j.intensity / max(0.35, getattr(e, "weight", 1.0))
+            d = d or 1.0
+            owed = self._owed.get(id(e), (e, 0.0, 0.0, 0.0))
+            self._owed[id(e)] = (e,
+                                 owed[1] + dx / d * imp,
+                                 owed[2] + dy / d * imp,
+                                 owed[3] + (self._rand() - 0.5) * 2.2 * imp
+                                 * spin_gain)
+
+    def detonate(self, world: rj.World, x: float, y: float,
+                 radius: float = BOMB_RADIUS):
+        """A bomb: the reason the bench has an explosion to test against.
+
+        Nothing here is new -- it is the same shockwave, the same particles,
+        the same trauma and the same light that a killing blow already raises,
+        fired at a point instead of at a victim. Anything caught in it dies,
+        which is what puts bodies in the air rather than merely nudging the
+        ones already on the floor.
+        """
+        j = world.juice
+        world.sfx("death", gain=1.0, wx=x, pitch=-7.0)
+        world.sfx("pop", gain=0.9, wx=x, pitch=-4.0)
+        world.say("BOOM", rj.GOLD)
+
+        for e in list(world.entities):
+            if e is world.player or e.invincible or e.dying:
+                continue
+            ex, ey = e.world_pos()
+            if math.hypot(ex - x, ey - y) <= radius * 0.8:
+                world.kill(e)
+
+        if j.on("particles"):
+            world.fx.particles.burst(
+                x, y, count=int(j.p("part_count") * 3.5),
+                speed=(180 * PX, j.p("part_speed") * 2.0 * PX),
+                life=(0.3, 0.85), size=5.0 * PX, gravity=760.0 * PX,
+                colors=((255, 238, 190), (255, 170, 70), (190, 90, 40)))
+        if j.on("decals"):
+            world.decals.splat(x, y, (70, 58, 46), count=10, spread=34.0 * PX,
+                               radius=9.0 * PX, life=j.p("decal_life"))
+        if j.on("shockwave"):
+            world.fx.shockwave(x, y, max_radius=radius, life=0.45,
+                               width=8.0 * PX, color=(255, 226, 170))
+            # Claimed before `_watch_explosions` sees it. The force below is
+            # the same number the watcher would have worked out from the ring,
+            # but it has to be applied whether or not the ring was drawn.
+            self._seen_waves[id(world.fx.shockwaves[-1])] = world.fx.shockwaves[-1]
+        if j.on("ripple"):
+            world.fx.impact(x, y, strength=j.amt(j.p("ripple_str") * 2.0 * PX),
+                            life=0.55, speed=j.p("ripple_speed") * PX,
+                            wavelength=54.0 * PX)
+        if j.on("light"):
+            world.lights.append([x, y, 2.6, 0.3, 0.3])
+        if j.on("shake"):
+            world.trauma.add(j.amt(0.85))
+        if j.on("scrflash"):
+            world.screen_flash = max(world.screen_flash, j.amt(0.55))
+
+        self.blast(world, x, y, radius * self.BLAST_REACH,
+                   self._wave_force(world, radius))
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +907,12 @@ class GLRenderer:
         # it, and a stack of sparks reads as a glow rather than as paint.
         ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
 
+        # Not a rendering concern, and it knows nothing about GL -- but the
+        # bench has nowhere else to keep per-world state without editing the
+        # sim, and everything that builds a renderer wants one. Stepped by the
+        # loop (`run`, `run_headless`), never from `render`.
+        self.ragdolls = RagdollField()
+
         self.sheet = tiles.SpriteSheet(TILE)
         self.atlas = self._build_atlas()
         self.digit_uv = {ch: self.atlas.uv[f"digit_{ch}"] for ch in self.DIGITS
@@ -235,6 +942,16 @@ class GLRenderer:
         self.ui_tex.repeat_x = self.ui_tex.repeat_y = False
 
         self._build_floor(world)
+        # `u1` textures sampled through sampler2D are normalized: byte 255 is
+        # 1.0. The logical grid uses 0/1, so uploading it directly turns a wall
+        # into 1/255 and the shader's > 0.5 occupancy test never sees it.
+        wall_bytes = (np.asarray(world.grid, dtype=np.uint8) * 255).tobytes()
+        # `f1` is an 8-bit normalized texture, matching the shader's sampler2D.
+        # `u1` would create an integer texture and requires usampler2D; pairing
+        # it with sampler2D silently yielded zero occupancy on Mesa.
+        self.wall_grid = ctx.texture((GRID_W, GRID_H), 1, wall_bytes, dtype="f1")
+        self.wall_grid.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.wall_grid.repeat_x = self.wall_grid.repeat_y = False
 
     # -- setup ------------------------------------------------------------
     def _build_atlas(self):
@@ -358,6 +1075,25 @@ class GLRenderer:
             program["u_lit"] = 1.0 if j.on("light") else 0.0
         if "u_sharpness" in program:
             program["u_sharpness"] = j.p("sharpness") if j.on("sharp") else 0.0
+        if "u_light_contrast" in program:
+            program["u_light_contrast"] = j.p("light_contrast")
+            program["u_wall_shadow_amount"] = j.p("wall_shadow_amt")
+            program["u_npc_shadow_amount"] = j.p("npc_shadow_amt")
+        if "u_grid_size" in program:
+            program["u_grid_size"] = (GRID_W, GRID_H)
+            program["u_grid_extent"] = (GRID_W * TILE, GRID_H * TILE)
+            casters = []
+            # The player carries the principal light, so only NPC silhouettes
+            # cast the deliberately soft dynamic shadows requested here.
+            for e in world.entities[1:]:
+                if not e.dying:
+                    x, y = e.world_pos()
+                    casters.append((x, y, TILE * 0.32, TILE * 0.14))
+            count = glfx.write_vec4_array(program, "u_shadow_casters", casters,
+                                           glfx.MAX_SHADOW_CASTERS)
+            program["u_shadow_caster_count"] = count
+            self.wall_grid.use(2)
+            program["u_wall_grid"] = 2
 
     def draw_floor(self, world: rj.World, lights):
         j = world.juice
@@ -434,13 +1170,25 @@ class GLRenderer:
                       TILE * size * 1.3, TILE * size * 0.55, uv=white,
                       color=(0.0, 0.0, 0.0), alpha=alpha,
                       shape=glfx.SHAPE_DISC, params=(0.7, 0, 0, 0))
+            # A corpse that slides needs a shadow for the same reason a hop
+            # does: without one it reads as a decal painted on the floor
+            # rather than as an object being moved across it.
+            for c in world.corpses:
+                a = c.alpha * j.p("shadow_alpha") * j.intensity * 1.1
+                if a <= 0.02:
+                    continue
+                b.add(c.x, c.y + TILE * 0.16, TILE * 0.92, TILE * 0.34,
+                      uv=white, color=(0.0, 0.0, 0.0), alpha=a,
+                      shape=glfx.SHAPE_DISC, params=(0.62, 0, 0, 0))
 
         for c in world.corpses:
             uv = self.atlas.uv.get(c.sprite)
             if uv is None:
                 continue
-            b.add(c.x, c.y, TILE, TILE, rot=math.radians(c.angle), uv=uv,
-                  color=self._tint(c), alpha=c.alpha)
+            rag = self.ragdolls.of(c)
+            sx, sy = rag.scale if rag is not None else (1.0, 1.0)
+            b.add(c.x, c.y, TILE * sx, TILE * sy, rot=math.radians(c.angle),
+                  uv=uv, color=self._tint(c), alpha=c.alpha)
 
         for e in world.entities:
             self._add_trail(b, e)
@@ -679,6 +1427,7 @@ class GLRenderer:
         self.atlas.release()
         self.floor_tex.release()
         self.floor_normal.release()
+        self.wall_grid.release()
         self.floor_vao.release()
         self.floor_vbo.release()
         self.ui_tex.release()
@@ -701,6 +1450,18 @@ def handle_event(event, world: rj.World, renderer: GLRenderer) -> bool:
     renderer.ui_dirty = True                     # any input can change the panel
     if event.type == pygame.KEYDOWN and event.key == pygame.K_p:
         return True                              # pixel mode has no meaning here
+    if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
+        # Thrown a tile and a half ahead rather than dropped underfoot, so the
+        # player is outside their own blast and can watch it from the side.
+        px, py = world.player.world_pos()
+        dx, dy = world.player.body.facing
+        renderer.ragdolls.detonate(world, px + dx * TILE * 1.5,
+                                   py + dy * TILE * 1.5)
+        return True
+    if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+        # The sim's reset empties `world.corpses`; the field has to let go of
+        # the bodies that were pointing at them in the same breath.
+        renderer.ragdolls.clear()
     return rj.handle_event(event, world, renderer.ui)
 
 
@@ -739,48 +1500,76 @@ def run():
     # so unlike the software bench there is no second region to size: the GL
     # surface is the whole window.
     bank = None
-    if HAVE_AUDIO:
-        bank = audiofx.SoundBank()
-        bank.init_mixer()
-        bank.load_all()
-
-    pygame.init()
-    pygame.font.init()
-    pygame.joystick.init()
-    glfx.open_gl_window((WIN_W, WIN_H))
-    ctx = glfx.create_context()
-    glfx.restart_on_the_card(ctx.info["GL_RENDERER"])
-
-    target = ctx.screen
-    target.viewport = (0, 0, WIN_W, WIN_H)
-    world = rj.World(gl_juice(), bank)
-    if pygame.joystick.get_count():               # pragma: no cover
-        world.pad = pygame.joystick.Joystick(0)
-        world.pad.init()
-    renderer = GLRenderer(ctx, target, world)
-    print(f"rendering on {ctx.info['GL_RENDERER']}")
-
-    pygame.key.set_repeat(180, 70)
-    clock = pygame.time.Clock()
+    renderer = None
     running = True
-    while running:
-        dt = min(clock.tick(FPS) / 1000.0, 1.0 / 20.0)
-        for event in pygame.event.get():
-            if not handle_event(event, world, renderer):
-                running = False
 
-        t0 = time.perf_counter()
-        world.update(dt)
-        ctx.screen.viewport = (0, 0, WIN_W, WIN_H)
-        renderer.render(world, pygame.mouse.get_pos())
-        ms = (time.perf_counter() - t0) * 1000.0
-        renderer.frame_ms += (ms - renderer.frame_ms) * 0.08
-        pygame.display.flip()
+    # SIGINT normally becomes KeyboardInterrupt, but treating both common
+    # termination signals as a request to leave the loop gives terminals,
+    # launchers and IDE stop buttons the same orderly shutdown as Escape.
+    def request_exit(_signum, _frame):
+        nonlocal running
+        running = False
 
-    renderer.release()
-    if bank is not None:
-        bank.stop_all()
-    pygame.quit()
+    old_sigint = signal.signal(signal.SIGINT, request_exit)
+    old_sigterm = signal.signal(signal.SIGTERM, request_exit)
+    try:
+        if HAVE_AUDIO:
+            bank = audiofx.SoundBank()
+            bank.init_mixer()
+            bank.load_all()
+
+        pygame.init()
+        pygame.font.init()
+        pygame.joystick.init()
+        glfx.open_gl_window((WIN_W, WIN_H))
+        ctx = glfx.create_context()
+        glfx.restart_on_the_card(ctx.info["GL_RENDERER"])
+
+        target = ctx.screen
+        target.viewport = (0, 0, WIN_W, WIN_H)
+        world = rj.World(gl_juice(), bank)
+        if pygame.joystick.get_count():           # pragma: no cover
+            world.pad = pygame.joystick.Joystick(0)
+            world.pad.init()
+        renderer = GLRenderer(ctx, target, world)
+        print(f"rendering on {ctx.info['GL_RENDERER']}")
+        # The one control that is not on the panel and not in `HELP_LINES`,
+        # which belongs to the software bench and does not know about it.
+        world.say("K kills, B drops a bomb -- the dead are off the grid",
+                  rj.ACCENT)
+
+        pygame.key.set_repeat(180, 70)
+        clock = pygame.time.Clock()
+        while running:
+            dt = min(clock.tick(FPS) / 1000.0, 1.0 / 20.0)
+            for event in pygame.event.get():
+                if not handle_event(event, world, renderer):
+                    running = False
+                    break
+            # Do not submit another expensive frame after Escape/window-close.
+            if not running:
+                break
+
+            t0 = time.perf_counter()
+            world.update(dt)
+            # After the sim, because it adopts the corpses the sim just laid
+            # down; before the render, because the render reads what it wrote.
+            renderer.ragdolls.update(world, dt)
+            ctx.screen.viewport = (0, 0, WIN_W, WIN_H)
+            renderer.render(world, pygame.mouse.get_pos())
+            ms = (time.perf_counter() - t0) * 1000.0
+            renderer.frame_ms += (ms - renderer.frame_ms) * 0.08
+            pygame.display.flip()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+        if renderer is not None:
+            renderer.release()
+        if bank is not None:
+            bank.stop_all()
+        pygame.quit()
 
 
 def run_headless(path: str):
@@ -807,6 +1596,7 @@ def run_headless(path: str):
     def step(n):
         for _ in range(n):
             world.update(dt)
+            renderer.ragdolls.update(world, dt)
 
     px, py = world.player.tile
     tx, ty = rj.DUMMY_POS

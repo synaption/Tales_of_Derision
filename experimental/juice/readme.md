@@ -28,7 +28,7 @@ about hit-stop is nothing like turning it off and hitting a dummy.
 | `tiles.py` | slicing and tinting the sheet | yes | no |
 | `rogue_juice.py` | the sim, the panel, software compositing | yes | no |
 | `glfx.py` | shaders, batching, post chain, normals | only to upload | yes |
-| `rogue_juice_gl.py` | the same bench, drawn on the card | yes | yes |
+| `rogue_juice_gl.py` | the same bench, drawn on the card, plus corpse physics | yes | yes |
 
 That split is the point rather than tidiness. An effect you cannot test without
 opening a window is an effect you will never tune, so the maths runs, and is
@@ -39,7 +39,11 @@ contact" is an assertion rather than something you listen for.
 
 It also means the GL version is not a fork. `rogue_juice_gl.py` imports `World`,
 `Juice`, `Entity` and every toggle and slider from `rogue_juice.py` and replaces
-only the drawing; `juicefx.py` does not know it exists.
+only the drawing; `juicefx.py` does not know it exists. Its one non-drawing
+addition, `RagdollField`, follows the same rule from the other side: it reads
+the wall grid, the entity list and the shockwave pool through the sim's own
+public surface and writes back onto the `Corpse` objects, so it too is a layer
+on top of `rogue_juice.py` rather than an edit to it.
 
 ## The governing idea
 
@@ -171,6 +175,7 @@ Tab    A/B the whole lot        F1 / F2  all on / all off
 F3     sliders back to defaults
 [ ]    move easing              - =  master intensity
 p      pixel mode (software)    m    music
+b      drop a bomb (GL only)
 esc    quit
 ```
 
@@ -224,6 +229,40 @@ The floor is a texture, so the ripple is a displacement of the coordinate that
 samples it rather than a repaint of the tiles it passes -- and the ambient sway
 can move the whole floor instead of a few dozen props, because it costs the
 same either way.
+
+**The dead come off the grid.** The one addition here that is not a rendering
+argument. Everything alive is on a tile because the *sim* needs it there: it
+takes a turn, it occupies a square, you have to be able to walk into it. A
+corpse has none of that -- no turn, no collision the rules care about -- so the
+grid is the last thing still holding it, and `RagdollField` takes it away. From
+the moment `leave_corpse` drops one, a body is a circle with a velocity:
+
+* it **bounces off walls**, circle against the tile rectangle rather than the
+  tile centre, so it slides along a wall on a clean tangent instead of catching
+  on the seam between two tiles of the same wall;
+* it **is shoved aside in real time** by anything that walks through it, at the
+  speed of the thing pushing it, mid-step, with no turn taken and no tile
+  changing hands. On the grid there are exactly two things walking into a body
+  can mean -- blocked, or nothing there -- and both are wrong;
+* it **goes end over end when something explodes near it**. The field watches
+  `world.fx.shockwaves` rather than the code that raises them, so every
+  explosion in the bench throws corpses without knowing corpses can be thrown,
+  and the ring on screen and the force in the physics are the same event by
+  construction. **B** drops a bomb;
+* bodies **collide with each other** and settle into a heap, and a body that
+  has stopped rolls the last few degrees flat -- a corpse frozen at twenty
+  degrees reads as one still falling.
+
+Seven sliders (`corpse radius`, `bounce`, `floor drag`, `shove strength`,
+`blast force`, `death launch`, `tumble`) and one toggle, in the **attack** group
+next to `corpses remain`. It runs at a fixed step with the frame chopped into as
+many sub-steps as the fastest body needs, because a body leaving a blast at
+3000px/s covers two tiles in a 60Hz frame and a single step that long walks
+straight through a wall without ever overlapping it. Nine bodies cost 0.02ms.
+
+`RagdollField` imports no GL, needs no frame and is stepped by the loop rather
+than by `render`, so `gltest.py` drives all of it -- adoption, walls, shoving,
+blasts, settling, determinism -- on a machine that cannot open a window.
 
 The panel is the deliberate exception: it is drawn by the *software* renderer
 into an offscreen surface and uploaded as a texture. Text layout is the one
