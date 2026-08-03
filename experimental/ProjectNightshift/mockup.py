@@ -30,14 +30,14 @@ SHEET = HERE / "MSX-UnDeadPeopleEdition.png"
 
 SHEET_CELL = 32          # native glyph size in the sheet
 CELL = 16                # internal-surface cell size
-COLS, ROWS = 40, 26      # internal surface in cells
-SCALE = 2                # nearest-neighbour upscale factor
+COLS, ROWS = 40, 25      # internal surface in cells -> 640x400
+MAX_SCALE = 4            # nearest-neighbour upscale ceiling; actual pick fits the desktop
 
-VIEW_W, VIEW_H = 26, 21  # map viewport, top-left at (0, 1)
+VIEW_W, VIEW_H = 26, 20  # map viewport, top-left at (0, 1)
 MAP_X, MAP_Y = 0, 1
 DIVIDER_X = 26
 PANEL_X, PANEL_W = 27, 13
-LOG_Y = 23
+LOG_Y = 22
 
 LEVEL_W, LEVEL_H = 56, 38
 
@@ -921,8 +921,9 @@ def draw_hud(surface, font: Font, world: World, tick_count: int, debug: bool) ->
         (f"CARRY    {world.carried()}/8", UI_DIM),
     ]
     for name, count in list(world.inventory.items())[:5]:
-        suffix = f" x{count}" if count > 1 else ""
-        panel.append((f"- {name}{suffix}"[:PANEL_W], UI_TEXT))
+        # Count goes in front: a trailing "x2" is what gets clipped at 13 columns.
+        prefix = f"{count}x" if count > 1 else "-"
+        panel.append((f"{prefix} {name}"[:PANEL_W], UI_TEXT))
     panel.append((rule, UI_DIM))
     panel.append((f"NOISE  {bar(world.noise, 10, 5)}", UI_TEXT))
     panel.append((f"THREAT {threat:>6}", threat_colour))
@@ -939,13 +940,51 @@ def draw_hud(surface, font: Font, world: World, tick_count: int, debug: bool) ->
         alive = sum(1 for e in world.level.enemies if e.alive)
         footer = f"ROOMS {len(world.level.rooms)}  LIVE {alive}  AWAKE {awake}  FLOW {len(world.level.flow)}"
     else:
-        footer = "MOVE 100  SPRINT 150  FIRE 100  DOOR 75"
+        footer = "MOVE 100  SPRINT 150  FIRE 100  ? KEYS"
     font.text(surface, footer[:COLS], 0, LOG_Y + 2, UI_DIM)
 
     if world.dead:
         banner(surface, font, "YOU DIED", "N FOR A NEW SEED", tick_count)
     elif world.descended:
         banner(surface, font, "STAIRS DOWN", "SPACE TO DESCEND", tick_count)
+
+
+HELP_LINES = [
+    ("WASD / ARROWS", "MOVE 100"),
+    ("  + SHIFT", "SPRINT 150"),
+    ("BUMP ENEMY", "ATTACK 100"),
+    ("BUMP DOOR", "OPEN 75"),
+    ("SPACE", "WAIT 50"),
+    ("F  FIRE REVOLVER", "100"),
+    ("R  RELOAD", "125"),
+    ("Q  FIRST AID", "150"),
+    (None, None),
+    ("N", "NEW LEVEL"),
+    ("F1", "DEBUG OVERLAY"),
+    ("?", "THIS LIST"),
+    ("ESC", "QUIT"),
+]
+
+
+def draw_help(surface, font: Font) -> None:
+    inner = VIEW_W - 2
+    body = [f"{left:<{inner - len(right)}}{right}" if left else "─" * inner
+            for left, right in HELP_LINES]
+    body = ["CONTROLS", "─" * inner, *body, "─" * inner,
+            "ENERGY BUYS ACTIONS.", "TIME PASSES TO AFFORD."]
+
+    body = body[:VIEW_H - 2]          # never overflow the viewport
+    height = len(body) + 2
+    top = MAP_Y + max(0, (VIEW_H - height) // 2)
+    surface.fill(BLACK, pygame.Rect(MAP_X * CELL, top * CELL, VIEW_W * CELL, height * CELL))
+
+    font.text(surface, "┌" + "─" * inner + "┐", MAP_X, top, UI_DIM)
+    for offset, line in enumerate(body, start=1):
+        font.blit(surface, "│", MAP_X, top + offset, UI_DIM)
+        font.blit(surface, "│", MAP_X + VIEW_W - 1, top + offset, UI_DIM)
+        colour = UI_WARM if offset == 1 else UI_TEXT
+        font.text(surface, line[:inner], MAP_X + 1, top + offset, colour)
+    font.text(surface, "└" + "─" * inner + "┘", MAP_X, top + height - 1, UI_DIM)
 
 
 def banner(surface, font: Font, title: str, hint: str, tick_count: int) -> None:
@@ -987,18 +1026,22 @@ def make_grain(size, rng: random.Random) -> pygame.Surface:
     return surface
 
 
-def render_frame(font, internal, scanlines, vignette, grain, world, tick_count, debug) -> pygame.Surface:
+def render_frame(font, internal, scanlines, vignette, grain, world, tick_count,
+                 debug=False, show_help=False) -> pygame.Surface:
     flicker = 1.0 + 0.045 * math.sin(tick_count * 0.19) + 0.02 * math.sin(tick_count * 0.71)
 
     internal.fill(BLACK)
     draw_map(internal, font, world, flicker, debug)
     draw_hud(internal, font, world, tick_count, debug)
+    if show_help:
+        draw_help(internal, font)
 
     offset = (tick_count * 7) % grain.get_height()
     internal.blit(grain, (0, -offset), special_flags=pygame.BLEND_RGB_ADD)
     internal.blit(grain, (0, grain.get_height() - offset), special_flags=pygame.BLEND_RGB_ADD)
 
-    frame = pygame.transform.scale(internal, (COLS * CELL * SCALE, ROWS * CELL * SCALE))
+    # The post-pass surfaces were built for the window, so they define the size.
+    frame = pygame.transform.scale(internal, scanlines.get_size())
     frame.blit(scanlines, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
     frame.blit(vignette, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
     return frame
@@ -1013,6 +1056,29 @@ DIRECTIONS = {
     pygame.K_UP: (0, -1), pygame.K_w: (0, -1),
     pygame.K_DOWN: (0, 1), pygame.K_s: (0, 1),
 }
+
+
+def pick_scale(requested: int | None) -> int:
+    """Largest integer upscale that fits the desktop, leaving room for chrome.
+
+    Nearest-neighbour only looks right at whole multiples, so this steps down to
+    the next whole factor rather than fitting the screen exactly.
+    """
+    if requested:
+        return max(1, requested)
+    try:
+        desktop_w, desktop_h = pygame.display.get_desktop_sizes()[0]
+    except (AttributeError, IndexError, pygame.error):
+        info = pygame.display.Info()
+        desktop_w, desktop_h = info.current_w, info.current_h
+    # Title bar, borders, and a taskbar all eat into what a window can claim.
+    fits = min((desktop_w - 32) // (COLS * CELL), (desktop_h - 96) // (ROWS * CELL))
+    return max(1, min(MAX_SCALE, fits))
+
+
+def is_help_key(event) -> bool:
+    """'?' is shift+/ on US layouts but its own key elsewhere; accept either."""
+    return getattr(event, "unicode", "") == "?" or event.key == pygame.K_QUESTION
 
 
 def handle_key(world: World, event) -> World:
@@ -1049,6 +1115,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Project Nightshift prototype")
     parser.add_argument("--out", type=Path, help="render one frame headless and exit")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--scale", type=int, default=None,
+                        help="integer upscale factor (default: largest that fits the desktop)")
     args = parser.parse_args()
 
     if args.out:
@@ -1057,9 +1125,11 @@ def main() -> None:
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
     pygame.init()
-    size = (COLS * CELL * SCALE, ROWS * CELL * SCALE)
+    scale = pick_scale(args.scale)
+    size = (COLS * CELL * scale, ROWS * CELL * scale)
     pygame.display.set_mode(size)
     pygame.display.set_caption("Project Nightshift")
+    print(f"{size[0]}x{size[1]} (scale {scale}) -- override with --scale N")
 
     seed = args.seed if args.seed is not None else random.randrange(10**5)
     world = new_world(seed)
@@ -1081,20 +1151,26 @@ def main() -> None:
     clock = pygame.time.Clock()
     tick_count = 0
     debug = False
+    show_help = False
     running = True
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+                if show_help:
+                    # Any key dismisses, so Escape closes the list before it quits.
+                    show_help = False
+                elif is_help_key(event):
+                    show_help = True
+                elif event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_F1:
                     debug = not debug
                 else:
                     world = handle_key(world, event)
         screen.blit(render_frame(font, internal, scanlines, vignette, grain,
-                                 world, tick_count, debug), (0, 0))
+                                 world, tick_count, debug, show_help), (0, 0))
         pygame.display.flip()
         tick_count += 1
         clock.tick(30)
