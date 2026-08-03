@@ -5,7 +5,8 @@ surface, and runs the Phase 1 core underneath it: a seeded room-and-corridor
 generator, raycast field of view with tile memory, the energy scheduler, and
 enemies that chase down a flow field.
 
-    python mockup.py                 # play
+    python mockup.py                 # play; window auto-fits the desktop
+    python mockup.py --cell 24       # 960x600, between the 16px 1x and 2x rungs
     python mockup.py --seed 18421    # fixed seed
     python mockup.py --out shot.png  # headless screenshot
 
@@ -29,9 +30,15 @@ HERE = Path(__file__).parent
 SHEET = HERE / "MSX-UnDeadPeopleEdition.png"
 
 SHEET_CELL = 32          # native glyph size in the sheet
-CELL = 16                # internal-surface cell size
-COLS, ROWS = 40, 25      # internal surface in cells -> 640x400
-MAX_SCALE = 4            # nearest-neighbour upscale ceiling; actual pick fits the desktop
+DEFAULT_CELL = 16
+CELL = DEFAULT_CELL      # internal-surface cell size; pick_geometry may raise it at startup
+COLS, ROWS = 40, 25      # internal surface in cells
+
+# (cell, upscale) rungs in ascending window size. Cell size is the only way to
+# land between 640x400 and 1280x800 without fractional scaling.
+#   16,1 = 640x400   24,1 = 960x600   16,2 = 1280x800
+#   16,3 = 1920x1200   16,4 = 2560x1600
+SIZE_LADDER = [(16, 1), (24, 1), (16, 2), (16, 3), (16, 4)]
 
 VIEW_W, VIEW_H = 26, 20  # map viewport, top-left at (0, 1)
 MAP_X, MAP_Y = 0, 1
@@ -1058,22 +1065,27 @@ DIRECTIONS = {
 }
 
 
-def pick_scale(requested: int | None) -> int:
-    """Largest integer upscale that fits the desktop, leaving room for chrome.
+def pick_geometry(cell: int | None, scale: int | None) -> tuple[int, int]:
+    """Largest (cell, upscale) pair from SIZE_LADDER that fits the desktop.
 
-    Nearest-neighbour only looks right at whole multiples, so this steps down to
-    the next whole factor rather than fitting the screen exactly.
+    Upscale alone jumps 640 -> 1280 with nothing usable between, so the ladder
+    varies the cell size too. Both stay whole numbers: nearest-neighbour only
+    looks right at integer multiples.
     """
-    if requested:
-        return max(1, requested)
+    if cell or scale:
+        return cell or DEFAULT_CELL, scale or 1
     try:
         desktop_w, desktop_h = pygame.display.get_desktop_sizes()[0]
     except (AttributeError, IndexError, pygame.error):
         info = pygame.display.Info()
         desktop_w, desktop_h = info.current_w, info.current_h
     # Title bar, borders, and a taskbar all eat into what a window can claim.
-    fits = min((desktop_w - 32) // (COLS * CELL), (desktop_h - 96) // (ROWS * CELL))
-    return max(1, min(MAX_SCALE, fits))
+    avail_w, avail_h = desktop_w - 32, desktop_h - 96
+    best = SIZE_LADDER[0]
+    for rung in SIZE_LADDER:
+        if COLS * rung[0] * rung[1] <= avail_w and ROWS * rung[0] * rung[1] <= avail_h:
+            best = rung
+    return best
 
 
 def is_help_key(event) -> bool:
@@ -1117,6 +1129,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--scale", type=int, default=None,
                         help="integer upscale factor (default: largest that fits the desktop)")
+    parser.add_argument("--cell", type=int, default=None,
+                        help=f"glyph cell size in px, e.g. 16 or 24 (default {DEFAULT_CELL})")
     args = parser.parse_args()
 
     if args.out:
@@ -1125,11 +1139,14 @@ def main() -> None:
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
     pygame.init()
-    scale = pick_scale(args.scale)
+    # CELL is read by every draw call, so the chosen cell has to land before the
+    # font is sliced and the internal surface is made.
+    global CELL
+    CELL, scale = pick_geometry(args.cell, args.scale)
     size = (COLS * CELL * scale, ROWS * CELL * scale)
     pygame.display.set_mode(size)
     pygame.display.set_caption("Project Nightshift")
-    print(f"{size[0]}x{size[1]} (scale {scale}) -- override with --scale N")
+    print(f"{size[0]}x{size[1]}  (cell {CELL}, scale {scale}) -- override with --cell N / --scale N")
 
     seed = args.seed if args.seed is not None else random.randrange(10**5)
     world = new_world(seed)
