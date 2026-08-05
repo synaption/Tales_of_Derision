@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import esper
+import ecs
 
 from components import (
     Bed, Blueprint, Corpse, Deer, Dialogue, Enemy, Equipment, Friendly, Inventory,
@@ -191,13 +191,13 @@ def _action_from_held_keys(
 
 def _find_interaction_npc(direction_action: str | None) -> int | None:
     player_ent = first_player_entity()
-    if player_ent is None or not esper.has_component(player_ent, Position):
+    if player_ent is None or not ecs.has_component(player_ent, Position):
         return None
 
-    player_pos = esper.component_for_entity(player_ent, Position)
+    player_pos = ecs.component_for_entity(player_ent, Position)
     position_to_npc: dict[tuple[int, int], int] = {}
-    for ent, (pos, _npc) in esper.get_components(Position, NPC):
-        if esper.has_component(ent, Enemy):
+    for ent, (pos, _npc) in ecs.get_components(Position, NPC):
+        if ecs.has_component(ent, Enemy):
             continue
         position_to_npc[(pos.x, pos.y)] = ent
 
@@ -209,25 +209,25 @@ def _find_interaction_creature(direction_action: str | None) -> int | None:
     """Any creature (friendly, wild, or hostile) on the faced tile. Used so the
     player can examine/interact with anything adjacent, not just friendlies."""
     player_ent = first_player_entity()
-    if player_ent is None or not esper.has_component(player_ent, Position):
+    if player_ent is None or not ecs.has_component(player_ent, Position):
         return None
 
-    player_pos = esper.component_for_entity(player_ent, Position)
+    player_pos = ecs.component_for_entity(player_ent, Position)
     target_xy = _interaction_target_xy(direction_action, player_pos)
-    for ent, (pos, _npc) in esper.get_components(Position, NPC):
+    for ent, (pos, _npc) in ecs.get_components(Position, NPC):
         if (pos.x, pos.y) == target_xy:
             return ent
     return None
 
 
 def _disposition_of(ent: int) -> str:
-    if esper.has_component(ent, Player):
+    if ecs.has_component(ent, Player):
         return "You"
-    if esper.has_component(ent, Enemy):
+    if ecs.has_component(ent, Enemy):
         return "Hostile"
-    if esper.has_component(ent, Friendly):
+    if ecs.has_component(ent, Friendly):
         return "Friendly"
-    if esper.has_component(ent, Deer):
+    if ecs.has_component(ent, Deer):
         return "Wild animal"
     return "Neutral"
 
@@ -257,8 +257,8 @@ def _player_talk(player_ent: int, npc_ent: int) -> str:
     turn = clock.turn if clock is not None else 0
     _delta_player, delta_npc = interact(player_ent, npc_ent, turn)
     score = 0.0
-    if esper.has_component(player_ent, Relationships):
-        score = friendship(esper.component_for_entity(player_ent, Relationships), npc_ent)
+    if ecs.has_component(player_ent, Relationships):
+        score = friendship(ecs.component_for_entity(player_ent, Relationships), npc_ent)
     indicator = "++" if delta_npc > 0 else ("--" if delta_npc < 0 else "~")
     return f"{indicator} friendship now {int(score)} ({_friendship_label(score)})"
 
@@ -270,23 +270,23 @@ def _creature_status_lines(game_map: GameMap, ent: int) -> list[str]:
         f"Name: {entity_name(ent, fallback='Unknown')}",
         f"Disposition: {_disposition_of(ent)}",
     ]
-    if esper.has_component(ent, Personality):
-        traits = esper.component_for_entity(ent, Personality).traits
+    if ecs.has_component(ent, Personality):
+        traits = ecs.component_for_entity(ent, Personality).traits
         lines.append("Traits: " + (", ".join(traits) if traits else "None"))
         player_ent = first_player_entity()
-        if player_ent is not None and esper.has_component(ent, Relationships):
-            rel = esper.component_for_entity(ent, Relationships)
+        if player_ent is not None and ecs.has_component(ent, Relationships):
+            rel = ecs.component_for_entity(ent, Relationships)
             score = friendship(rel, player_ent)
             lines.append(f"Friendship: {int(score)} ({_friendship_label(score)})")
-    if esper.has_component(ent, Needs):
-        needs = esper.component_for_entity(ent, Needs)
+    if ecs.has_component(ent, Needs):
+        needs = ecs.component_for_entity(ent, Needs)
         lines.append(f"Hunger: {int(needs.hunger)}%")
         lines.append(f"Thirst: {int(needs.thirst)}%")
         lines.append(f"Tiredness: {int(needs.tiredness)}%")
 
     statuses: list[str] = []
-    if esper.has_component(ent, Position):
-        pos = esper.component_for_entity(ent, Position)
+    if ecs.has_component(ent, Position):
+        pos = ecs.component_for_entity(ent, Position)
         statuses = [status_label(name) for name in active_statuses(game_map, ent, pos)]
     lines.append("Status: " + (", ".join(statuses) if statuses else "Normal"))
     return lines
@@ -294,13 +294,13 @@ def _creature_status_lines(game_map: GameMap, ent: int) -> list[str]:
 
 def _find_interaction_corpse(direction_action: str | None) -> int | None:
     player_ent = first_player_entity()
-    if player_ent is None or not esper.has_component(player_ent, Position):
+    if player_ent is None or not ecs.has_component(player_ent, Position):
         return None
 
-    player_pos = esper.component_for_entity(player_ent, Position)
+    player_pos = ecs.component_for_entity(player_ent, Position)
     position_to_corpse: dict[tuple[int, int], int] = {
         (pos.x, pos.y): ent
-        for ent, (pos, _corpse) in esper.get_components(Position, Corpse)
+        for ent, (pos, _corpse) in ecs.get_components(Position, Corpse)
         if _entity_has_tradeable_items(ent)
     }
 
@@ -310,16 +310,16 @@ def _find_interaction_corpse(direction_action: str | None) -> int | None:
 
 def _npc_info_lines(game_map: GameMap, npc_ent: int) -> list[str]:
     dialogue_line = "..."
-    if esper.has_component(npc_ent, Dialogue):
-        dialogue_line = esper.component_for_entity(npc_ent, Dialogue).line
+    if ecs.has_component(npc_ent, Dialogue):
+        dialogue_line = ecs.component_for_entity(npc_ent, Dialogue).line
 
     inventory_count = 0
-    if esper.has_component(npc_ent, Inventory):
-        inventory_count = len(esper.component_for_entity(npc_ent, Inventory).items)
+    if ecs.has_component(npc_ent, Inventory):
+        inventory_count = len(ecs.component_for_entity(npc_ent, Inventory).items)
 
     equipped_count = 0
-    if esper.has_component(npc_ent, Equipment):
-        slots = esper.component_for_entity(npc_ent, Equipment).slots
+    if ecs.has_component(npc_ent, Equipment):
+        slots = ecs.component_for_entity(npc_ent, Equipment).slots
         equipped_count = sum(1 for item in slots.values() if item)
 
     # Name / Disposition / Needs / Status, then dialogue-specific detail.
@@ -340,13 +340,13 @@ class _TradeEntry:
 def _list_trade_entries(actor_ent: int) -> list[_TradeEntry]:
     entries: list[_TradeEntry] = []
 
-    if esper.has_component(actor_ent, Inventory):
-        items = esper.component_for_entity(actor_ent, Inventory).items
+    if ecs.has_component(actor_ent, Inventory):
+        items = ecs.component_for_entity(actor_ent, Inventory).items
         for idx, item_name in enumerate(items):
             entries.append(_TradeEntry(kind="inventory", item_name=item_name, item_index=idx))
 
-    if esper.has_component(actor_ent, Equipment):
-        slots = esper.component_for_entity(actor_ent, Equipment).slots
+    if ecs.has_component(actor_ent, Equipment):
+        slots = ecs.component_for_entity(actor_ent, Equipment).slots
         for slot_name in sorted(slots.keys()):
             equipped_item = slots.get(slot_name)
             if equipped_item:
@@ -357,9 +357,9 @@ def _list_trade_entries(actor_ent: int) -> list[_TradeEntry]:
 
 def _remove_trade_entry(actor_ent: int, entry: _TradeEntry) -> str | None:
     if entry.kind == "inventory":
-        if not esper.has_component(actor_ent, Inventory):
+        if not ecs.has_component(actor_ent, Inventory):
             return None
-        inventory = esper.component_for_entity(actor_ent, Inventory)
+        inventory = ecs.component_for_entity(actor_ent, Inventory)
         if entry.item_index is None:
             return None
         if entry.item_index < 0 or entry.item_index >= len(inventory.items):
@@ -367,9 +367,9 @@ def _remove_trade_entry(actor_ent: int, entry: _TradeEntry) -> str | None:
         return inventory.items.pop(entry.item_index)
 
     if entry.kind == "equipment":
-        if not esper.has_component(actor_ent, Equipment) or not entry.slot_name:
+        if not ecs.has_component(actor_ent, Equipment) or not entry.slot_name:
             return None
-        equipment = esper.component_for_entity(actor_ent, Equipment)
+        equipment = ecs.component_for_entity(actor_ent, Equipment)
         item = equipment.slots.get(entry.slot_name)
         if not item:
             return None
@@ -380,11 +380,11 @@ def _remove_trade_entry(actor_ent: int, entry: _TradeEntry) -> str | None:
 
 
 def _ensure_inventory(actor_ent: int) -> Inventory:
-    if esper.has_component(actor_ent, Inventory):
-        return esper.component_for_entity(actor_ent, Inventory)
+    if ecs.has_component(actor_ent, Inventory):
+        return ecs.component_for_entity(actor_ent, Inventory)
 
     inventory = Inventory(items=[])
-    esper.add_component(actor_ent, inventory)
+    ecs.add_component(actor_ent, inventory)
     return inventory
 
 
@@ -402,13 +402,13 @@ def _trade_item(source_ent: int, target_ent: int, entry: _TradeEntry) -> str:
 
 
 def _entity_has_tradeable_items(actor_ent: int) -> bool:
-    if esper.has_component(actor_ent, Inventory):
-        inventory = esper.component_for_entity(actor_ent, Inventory)
+    if ecs.has_component(actor_ent, Inventory):
+        inventory = ecs.component_for_entity(actor_ent, Inventory)
         if inventory.items:
             return True
 
-    if esper.has_component(actor_ent, Equipment):
-        slots = esper.component_for_entity(actor_ent, Equipment).slots
+    if ecs.has_component(actor_ent, Equipment):
+        slots = ecs.component_for_entity(actor_ent, Equipment).slots
         if any(item for item in slots.values()):
             return True
 
@@ -436,12 +436,12 @@ def _find_adjacent_feature(direction_action: str | None, component: type) -> int
     (the aimed direction), or ``None``. Used to interact with wells, stoves, and
     trees the same way corpses/NPCs are targeted."""
     player_ent = first_player_entity()
-    if player_ent is None or not esper.has_component(player_ent, Position):
+    if player_ent is None or not ecs.has_component(player_ent, Position):
         return None
 
-    player_pos = esper.component_for_entity(player_ent, Position)
+    player_pos = ecs.component_for_entity(player_ent, Position)
     target_xy = _interaction_target_xy(direction_action, player_pos)
-    for ent, (pos, _feature) in esper.get_components(Position, component):
+    for ent, (pos, _feature) in ecs.get_components(Position, component):
         if (pos.x, pos.y) == target_xy:
             return ent
     return None
@@ -450,12 +450,12 @@ def _find_adjacent_feature(direction_action: str | None, component: type) -> int
 def _chop_tree(tree_ent: int, player_ent: int) -> str:
     """Chop one load of wood off a tree. When the last load is taken the tree
     falls (its entity is removed, freeing the tile)."""
-    tree = esper.component_for_entity(tree_ent, Tree)
+    tree = ecs.component_for_entity(tree_ent, Tree)
     inventory = _ensure_inventory(player_ent)
     inventory.items.append(WOOD)
     tree.wood -= 1
     if tree.wood <= 0:
-        esper.delete_entity(tree_ent, immediate=True)
+        ecs.delete_entity(tree_ent, immediate=True)
         return "You fell the tree, gathering a last piece of wood."
     return "You chop a piece of wood from the tree."
 
@@ -471,10 +471,10 @@ def _harvest_bush(bush_ent: int, player_ent: int) -> str:
 
 def _drink_from_well(well_ent: int, player_ent: int) -> str:
     """Drink from a well, quenching thirst. Wells are a renewable source."""
-    if not esper.has_component(player_ent, Needs):
+    if not ecs.has_component(player_ent, Needs):
         return "The water is cool and clear."
 
-    needs = esper.component_for_entity(player_ent, Needs)
+    needs = ecs.component_for_entity(player_ent, Needs)
     if needs.thirst <= 0:
         return "You drink from the well, but you were not thirsty."
 
@@ -485,10 +485,10 @@ def _drink_from_well(well_ent: int, player_ent: int) -> str:
 def _cook_at_stove(stove_ent: int, player_ent: int) -> str:
     """Turn one Wood + one Raw Meat into a Cooked Meat at the stove. Needs both:
     wood fuels the fire, raw meat is the ingredient."""
-    if not esper.has_component(player_ent, Inventory):
+    if not ecs.has_component(player_ent, Inventory):
         return "You have nothing to cook."
 
-    inventory = esper.component_for_entity(player_ent, Inventory)
+    inventory = ecs.component_for_entity(player_ent, Inventory)
     raw_meat = next((item for item in inventory.items if is_raw_meat(item)), None)
 
     if raw_meat is None:
@@ -506,10 +506,10 @@ def _apply_consumable(player_ent: int, item_index: int) -> str | None:
     """Eat/drink the inventory item at ``item_index`` if it is consumable,
     removing it and reducing the matching need. Returns a message, or ``None``
     when the item is not food/drink (so the caller can fall back to equipping)."""
-    if not esper.has_component(player_ent, Inventory):
+    if not ecs.has_component(player_ent, Inventory):
         return None
 
-    inventory = esper.component_for_entity(player_ent, Inventory)
+    inventory = ecs.component_for_entity(player_ent, Inventory)
     if item_index < 0 or item_index >= len(inventory.items):
         return None
 
@@ -519,9 +519,9 @@ def _apply_consumable(player_ent: int, item_index: int) -> str | None:
     if hunger_value is None and thirst_value is None:
         return None
 
-    if not esper.has_component(player_ent, Needs):
-        esper.add_component(player_ent, Needs())
-    needs = esper.component_for_entity(player_ent, Needs)
+    if not ecs.has_component(player_ent, Needs):
+        ecs.add_component(player_ent, Needs())
+    needs = ecs.component_for_entity(player_ent, Needs)
 
     inventory.items.pop(item_index)
     if hunger_value is not None:
@@ -535,12 +535,12 @@ def _bed_near_player() -> int | None:
     """The nearest Bed on or beside the player's tile (so the sleep action can bed
     them down rather than pitching a camp), or ``None`` if none is adjacent."""
     player_ent = first_player_entity()
-    if player_ent is None or not esper.has_component(player_ent, Position):
+    if player_ent is None or not ecs.has_component(player_ent, Position):
         return None
-    ppos = esper.component_for_entity(player_ent, Position)
+    ppos = ecs.component_for_entity(player_ent, Position)
     best: int | None = None
     best_dist = 2
-    for ent, (pos, _bed) in esper.get_components(Position, Bed):
+    for ent, (pos, _bed) in ecs.get_components(Position, Bed):
         dist = max(abs(pos.x - ppos.x), abs(pos.y - ppos.y))
         if dist <= 1 and dist < best_dist:
             best, best_dist = ent, dist
@@ -583,7 +583,7 @@ def _place_buildable_at(
         return "You can't build on the edge of the world."
     if game_map.tile_at(tx, ty) != game_map.FLOOR:
         return "You can only build on open ground."
-    for _ent, (pos,) in esper.get_components(Position):
+    for _ent, (pos,) in ecs.get_components(Position):
         if (pos.x, pos.y) == (tx, ty):
             return "Something is in the way."
 
@@ -591,7 +591,7 @@ def _place_buildable_at(
     if item_name not in inventory.items:
         return f"You have no {item_name} to place."
     inventory.items.remove(item_name)
-    esper.create_entity(
+    ecs.create_entity(
         Position(tx, ty),
         Renderable(tile, fg=_BLUEPRINT_READY_BLUE),
         Name("Blueprint"),
@@ -609,9 +609,9 @@ def _work_blueprint(ghost_ent: int, player_ent: int, game_map: GameMap) -> tuple
     if it was the last piece). Building is labour, so a successful haul or raise
     **spends a turn** -- returns ``(message, took_turn)`` and only the no-op
     failures (nothing to build, or no wood to haul) come back free."""
-    if not esper.has_component(ghost_ent, Blueprint):
+    if not ecs.has_component(ghost_ent, Blueprint):
         return "There is nothing to build here.", False
-    bp = esper.component_for_entity(ghost_ent, Blueprint)
+    bp = ecs.component_for_entity(ghost_ent, Blueprint)
     if not bp.stocked:
         inventory = _ensure_inventory(player_ent)
         if WOOD not in inventory.items:
@@ -638,10 +638,10 @@ def _chebyshev_from_player(player_pos: Position, x: int, y: int) -> int:
 
 def _creature_at_xy(x: int, y: int) -> int | None:
     """The character (NPC or the player) standing on world cell (x, y)."""
-    for ent, (pos, _npc) in esper.get_components(Position, NPC):
+    for ent, (pos, _npc) in ecs.get_components(Position, NPC):
         if (pos.x, pos.y) == (x, y):
             return ent
-    for ent, (pos, _player) in esper.get_components(Position, Player):
+    for ent, (pos, _player) in ecs.get_components(Position, Player):
         if (pos.x, pos.y) == (x, y):
             return ent
     return None
@@ -650,7 +650,7 @@ def _creature_at_xy(x: int, y: int) -> int | None:
 def _renderable_at_xy(x: int, y: int, skip: int | None = None) -> int | None:
     """Any drawable entity on (x, y) other than ``skip`` (a tree, corpse, item,
     well, ...). Used to name whatever the look cursor rests on."""
-    for ent, (pos, _rend) in esper.get_components(Position, Renderable):
+    for ent, (pos, _rend) in ecs.get_components(Position, Renderable):
         if ent == skip:
             continue
         if (pos.x, pos.y) == (x, y):
@@ -673,16 +673,16 @@ def _look_available_actions(target_ent: int, dist: int) -> list[str]:
     """The interaction verbs the look cursor offers for ``target_ent`` at the
     given distance. Status is always offered; talking reaches a few tiles; trade
     and melee only work when standing right next to the target."""
-    if esper.has_component(target_ent, Player):
+    if ecs.has_component(target_ent, Player):
         return ["Status"]
 
     options: list[str] = []
-    if dist <= _LOOK_TALK_RANGE and esper.has_component(target_ent, Dialogue):
+    if dist <= _LOOK_TALK_RANGE and ecs.has_component(target_ent, Dialogue):
         options.append("Talk")
-    if dist <= _LOOK_TRADE_RANGE and esper.has_component(target_ent, Friendly):
+    if dist <= _LOOK_TRADE_RANGE and ecs.has_component(target_ent, Friendly):
         options.append("Trade")
     if dist <= _LOOK_MELEE_RANGE and (
-        esper.has_component(target_ent, Enemy) or esper.has_component(target_ent, Deer)
+        ecs.has_component(target_ent, Enemy) or ecs.has_component(target_ent, Deer)
     ):
         options.append("Attack")
     options.append("Status")
@@ -694,13 +694,13 @@ def _perform_look_attack(target_ent: int) -> None:
     processor's melee/death sfx so it feels like a normal attack, then let a turn
     pass so the world reacts."""
     name = entity_name(target_ent, fallback="the creature")
-    movement = esper.get_processor(MovementProcessor)
+    movement = ecs.get_processor(MovementProcessor)
     queue_message(f"You attack {name}.")
     if movement is not None and movement.on_melee_attack is not None:
         movement.on_melee_attack()
     slay_entity(target_ent)
     if movement is not None and movement.on_enemy_death is not None:
         movement.on_enemy_death()
-    esper.process(WAIT_ACTION)
+    ecs.process(WAIT_ACTION)
 
 

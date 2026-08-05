@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-import esper
+import ecs
 
 from components import Asleep, OnFire, Player, Position
 from regions import _UNBOUNDED
@@ -82,7 +82,7 @@ def active_effects(game_map, ent: int, pos: Position) -> list[str]:
     effects check the component; derived effects run their detector."""
     active: list[str] = []
     for defn in _EFFECTS.values():
-        if defn.component is not None and esper.has_component(ent, defn.component):
+        if defn.component is not None and ecs.has_component(ent, defn.component):
             active.append(defn.id)
         elif defn.detector is not None and defn.detector(game_map, ent, pos):
             active.append(defn.id)
@@ -94,8 +94,8 @@ def apply_effect(ent: int, effect_id: str) -> None:
     defn = _EFFECTS.get(effect_id)
     if defn is None:
         return
-    if defn.component is not None and not esper.has_component(ent, defn.component):
-        esper.add_component(ent, defn.component())
+    if defn.component is not None and not ecs.has_component(ent, defn.component):
+        ecs.add_component(ent, defn.component())
     if defn.on_apply is not None:
         defn.on_apply(ent)
 
@@ -104,13 +104,13 @@ def remove_effect(ent: int, effect_id: str) -> None:
     defn = _EFFECTS.get(effect_id)
     if defn is None:
         return
-    if defn.component is not None and esper.has_component(ent, defn.component):
-        esper.remove_component(ent, defn.component)
+    if defn.component is not None and ecs.has_component(ent, defn.component):
+        ecs.remove_component(ent, defn.component)
     if defn.on_remove is not None:
         defn.on_remove(ent)
 
 
-class EffectsProcessor(esper.Processor):
+class EffectsProcessor(ecs.Processor):
     """Ticks the ``on_tick`` of every component-marked effect once per turn *of the
     region the affected thing is standing in*.
 
@@ -166,7 +166,7 @@ class EffectsProcessor(esper.Processor):
         index = spatial.ensure(self.game_map)
         for defn in tickable:
             for ent in sorted(index.entities_in(region_id)):
-                if esper.entity_exists(ent) and esper.has_component(ent, defn.component):
+                if ecs.entity_exists(ent) and ecs.has_component(ent, defn.component):
                     defn.on_tick(ent)
 
     def process(self, action: str | None = None) -> None:
@@ -176,10 +176,10 @@ class EffectsProcessor(esper.Processor):
             if self._scheduler_driven:
                 # Every creature's effects tick with its own region; the player's
                 # tick here, because the player's turn *is* the turn.
-                for ent, _ in esper.get_components(defn.component, Player):
+                for ent, _ in ecs.get_components(defn.component, Player):
                     defn.on_tick(ent)
                 continue
-            for ent, _ in esper.get_components(defn.component):
+            for ent, _ in ecs.get_components(defn.component):
                 defn.on_tick(ent)
 
 

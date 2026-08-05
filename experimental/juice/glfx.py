@@ -123,8 +123,15 @@ def restart_on_the_card(renderer_name: str) -> None:
     os.execve(sys.executable, [sys.executable, *sys.argv], dict(os.environ))
 
 
-def open_gl_window(size: Tuple[int, int], caption: str = "juice workbench (GL)"):
-    """A window with a core 3.3 context. Returns the size actually granted."""
+def open_gl_window(size: Tuple[int, int], caption: str = "juice workbench (GL)",
+                   vsync: bool = False, resizable: bool = False):
+    """A window with a core 3.3 context. Returns the size actually granted.
+
+    `vsync` and `resizable` are properties of the window itself and so can only
+    be chosen here, when it is created -- which is why a bench that lets you
+    change them has to say "next time you start". The size can be changed later
+    through SDL without disturbing the context; these two cannot.
+    """
     import pygame
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
@@ -133,7 +140,13 @@ def open_gl_window(size: Tuple[int, int], caption: str = "juice workbench (GL)")
     pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
     pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 0)
     pygame.display.set_caption(caption)
-    pygame.display.set_mode(size, pygame.OPENGL | pygame.DOUBLEBUF)
+    flags = pygame.OPENGL | pygame.DOUBLEBUF | (pygame.RESIZABLE if resizable else 0)
+    try:
+        pygame.display.set_mode(size, flags, vsync=1 if vsync else 0)
+    except Exception:                                # pragma: no cover
+        # Some drivers refuse a vsync request outright rather than ignoring
+        # it. A window with the wrong swap interval beats no window.
+        pygame.display.set_mode(size, flags)
     return pygame.display.get_window_size()
 
 

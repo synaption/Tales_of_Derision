@@ -6,7 +6,7 @@
 Two halves, in the order they run:
 
 **The simulation**, with no Panda3D window and no GPU at all. Flight, the
-overheat latch, dashing, city collision, rooftop landings, ant and ally
+overheat latch, gliding, city collision, rooftop landings, ant and ally
 behaviour, projectile damage and determinism are all asserted against the
 dataclasses in :mod:`components`. This half is why :mod:`sim` is forbidden
 from importing anything from ``direct``.
@@ -278,46 +278,159 @@ def test_ground_recharge_is_much_faster_than_air() -> None:
     )
 
 
-def test_dash_costs_a_flat_charge_and_respects_its_cooldown() -> None:
-    sim = bare_sim()
-    energy = esper.component_for_entity(sim.player, Energy)
-    flight = esper.component_for_entity(sim.player, Flight)
-    vel = esper.component_for_entity(sim.player, Velocity)
-
-    step(sim, 1, dash=True, aim_yaw=0.0)
-    assert abs(energy.current - (100.0 - energy.cost_dash)) < 1.0, "dash should cost a flat charge"
-    assert vel.vec.y > flight.dash_speed * 0.9, f"dash gave {vel.vec.y:.1f} m/s forward"
-    assert flight.dash_cd > 0.0
-
-    # A second dash on the very next frame must be refused by the cooldown.
-    charged = energy.current
-    step(sim, 1, dash=True)
-    assert energy.current >= charged - 0.1, "the cooldown must block a second dash"
+def airborne_at(sim: Sim, height: float, speed_y: float = 0.0) -> None:
+    """Park the player at ``height`` with a given forward speed, in free fall."""
+    esper.component_for_entity(sim.player, Transform).pos = Vec3(0, 0, height)
+    esper.component_for_entity(sim.player, Velocity).vec = Vec3(0, speed_y, 0)
+    esper.component_for_entity(sim.player, Body).grounded = False
 
 
-def test_dash_is_blocked_while_overheated() -> None:
-    sim = bare_sim()
-    energy = esper.component_for_entity(sim.player, Energy)
-    vel = esper.component_for_entity(sim.player, Velocity)
-    energy.current = 0.0
-    energy.empty = True
+def test_glide_never_gains_height() -> None:
+    """The defining property: a glide slows a fall, it never reverses one.
 
-    step(sim, 1, dash=True)
-    assert math.hypot(vel.vec.x, vel.vec.y) < 1.0, "an overheated diver cannot dash"
+    This is what separates the glide from the hop it replaced. Entered at or
+    below zero vertical speed, altitude must be non-increasing on every single
+    frame -- there is no combination of inputs that turns the wings into lift.
+    """
+    for entry_speed in (0.0, -2.0, -12.0, -30.0):
+        sim = bare_sim()
+        airborne_at(sim, 90.0)
+        transform = esper.component_for_entity(sim.player, Transform)
+        velocity = esper.component_for_entity(sim.player, Velocity)
+        velocity.vec.z = entry_speed
+
+        previous = transform.pos.z
+        for _ in range(120):
+            step(sim, 1, glide=True, move_y=1.0, aim_yaw=0.0)
+            assert transform.pos.z <= previous + 1e-9, (
+                f"entering at {entry_speed:+.0f} m/s, the glide climbed "
+                f"{transform.pos.z - previous:.4f}m in one frame"
+            )
+            assert velocity.vec.z <= 1e-9, f"glide produced a climb rate of {velocity.vec.z:+.3f}"
+            previous = transform.pos.z
 
 
-def test_dash_keeps_its_speed_after_the_burst() -> None:
-    """The dash is an impulse: what it leaves behind is yours to spend."""
-    sim = bare_sim()
-    flight = esper.component_for_entity(sim.player, Flight)
-    vel = esper.component_for_entity(sim.player, Velocity)
+def test_glide_does_not_extend_a_climb() -> None:
+    """Held on the way up, the wings must not buy a single extra metre.
 
-    step(sim, 1, dash=True, aim_yaw=0.0)
-    step(sim, 12, thrust=True)  # ride it out, still airborne
-    speed = math.hypot(vel.vec.x, vel.vec.y)
-    assert speed > flight.air_max, (
-        f"post-dash speed {speed:.1f} should exceed the {flight.air_max} air cap"
+    The subtle version of the same rule. Softening gravity during an ascent
+    would stretch the arc out and let you float higher than you had momentum
+    for -- which is a hop wearing a glide's name. So the apex has to come out
+    identical whether or not shift was held on the way up.
+    """
+
+    def apex(glide: bool) -> float:
+        sim = bare_sim()
+        airborne_at(sim, 60.0)
+        transform = esper.component_for_entity(sim.player, Transform)
+        esper.component_for_entity(sim.player, Velocity).vec.z = 9.0
+        highest = transform.pos.z
+        for _ in range(90):
+            step(sim, 1, glide=glide)
+            highest = max(highest, transform.pos.z)
+        return highest
+
+    with_wings, without = apex(True), apex(False)
+    assert with_wings <= without + 1e-6, (
+        f"gliding upward reached {with_wings:.3f}m against {without:.3f}m coasting"
     )
+
+
+def test_glide_slows_the_fall() -> None:
+    """Wings out, she descends at roughly ``glide_fall`` instead of terminal."""
+    sim = bare_sim()
+    flight = esper.component_for_entity(sim.player, Flight)
+
+    airborne_at(sim, 200.0)
+    step(sim, 120)  # two seconds of plain falling
+    plain = 200.0 - esper.component_for_entity(sim.player, Transform).pos.z
+
+    sim = bare_sim()
+    airborne_at(sim, 200.0)
+    step(sim, 120, glide=True)
+    glided = 200.0 - esper.component_for_entity(sim.player, Transform).pos.z
+
+    assert glided < plain * 0.45, f"gliding fell {glided:.1f}m against {plain:.1f}m falling"
+    settled = -esper.component_for_entity(sim.player, Velocity).vec.z
+    assert abs(settled - flight.glide_fall) < 1.5, (
+        f"glide settled at {settled:.2f} m/s, expected about {flight.glide_fall}"
+    )
+
+
+def test_glide_keeps_horizontal_speed_and_covers_ground() -> None:
+    """The point of the glide: arrive with speed, keep it, go a long way."""
+    sim = bare_sim()
+    airborne_at(sim, 120.0, speed_y=17.0)
+    step(sim, 180)  # three seconds, wings in
+    coasted = esper.component_for_entity(sim.player, Transform).pos.y
+    coast_speed = esper.component_for_entity(sim.player, Velocity).vec.y
+
+    sim = bare_sim()
+    airborne_at(sim, 120.0, speed_y=17.0)
+    step(sim, 180, glide=True)
+    glided = esper.component_for_entity(sim.player, Transform).pos.y
+    glide_speed = esper.component_for_entity(sim.player, Velocity).vec.y
+
+    assert glide_speed > coast_speed * 2.0, (
+        f"glide bled speed nearly as fast as coasting ({glide_speed:.1f} vs {coast_speed:.1f})"
+    )
+    assert glide_speed > 14.0, f"three seconds of gliding lost {17.0 - glide_speed:.1f} m/s"
+    assert glided > coasted * 1.5, (
+        f"gliding covered {glided:.0f}m against {coasted:.0f}m coasting -- not much of a glide"
+    )
+
+
+def test_glide_is_cheap_but_not_free() -> None:
+    sim = bare_sim()
+    energy = esper.component_for_entity(sim.player, Energy)
+    airborne_at(sim, 150.0)
+
+    energy.current = 100.0
+    step(sim, 60, glide=True)
+    spent_gliding = 100.0 - energy.current
+
+    sim = bare_sim()
+    energy = esper.component_for_entity(sim.player, Energy)
+    airborne_at(sim, 150.0)
+    energy.current = 100.0
+    step(sim, 60, thrust=True)
+    spent_thrusting = 100.0 - energy.current
+
+    assert spent_gliding > 5.0, "the glide should not be free"
+    assert spent_gliding < spent_thrusting * 0.45, (
+        f"a glide costs {spent_gliding:.1f}/s against thrust at {spent_thrusting:.1f}/s"
+    )
+
+
+def test_glide_is_blocked_while_overheated_and_on_the_ground() -> None:
+    sim = bare_sim()
+    energy = esper.component_for_entity(sim.player, Energy)
+    flight = esper.component_for_entity(sim.player, Flight)
+
+    airborne_at(sim, 150.0)
+    energy.current, energy.empty = 0.0, True
+    step(sim, 90, glide=True)  # 1.5s: free fall covers ~25m, a glide about 7m
+    assert not flight.gliding, "an overheated diver has no wings"
+    fell = 150.0 - esper.component_for_entity(sim.player, Transform).pos.z
+    assert fell > 20.0, f"overheated, she should be falling properly, but fell {fell:.1f}m"
+
+    # And there is nothing to glide on with your feet on the tarmac.
+    sim = bare_sim()
+    flight = esper.component_for_entity(sim.player, Flight)
+    step(sim, 30, glide=True)
+    assert not flight.gliding, "gliding on the ground"
+    assert esper.component_for_entity(sim.player, Transform).pos.z == 0.0, "shift hopped"
+
+
+def test_thrust_beats_glide_when_both_are_held() -> None:
+    """Space and shift together should climb, not glide."""
+    sim = bare_sim()
+    flight = esper.component_for_entity(sim.player, Flight)
+    airborne_at(sim, 60.0)
+
+    step(sim, 30, thrust=True, glide=True)
+    assert flight.thrusting and not flight.gliding, "the glide must yield to the jets"
+    assert esper.component_for_entity(sim.player, Transform).pos.z > 60.0, "did not climb"
 
 
 def test_firing_the_lance_spends_flight_energy() -> None:
@@ -676,50 +789,50 @@ def render_tests() -> None:
     def shot() -> PNMImage:
         return pipeline.screenshot_image()
 
-    def place(pos: Vec3, yaw: float, pitch: float) -> None:
-        """Teleport the player and snap the camera, skipping the spring."""
-        esper.component_for_entity(sim.player, Transform).pos = Vec3(pos)
-        esper.component_for_entity(sim.player, Velocity).vec = Vec3(0, 0, 0)
-        esper.component_for_entity(sim.player, Body).grounded = pos.z <= 0.01
-        camera.position = pos + aim_vector(yaw, pitch) * -9.0 + Vec3(0, 0, 2.5)
+    def place(pos: Vec3, speed: Vec3 = Vec3(0, 0, 0)) -> None:
+        """Teleport the player and let the camera snap rather than fly over.
 
+        The camera's own spring already snaps past ``CAM_SNAP`` metres of
+        error, so this only has to clear the "have I started" flag for the
+        cases where the teleport is short.
+        """
+        esper.component_for_entity(sim.player, Transform).pos = Vec3(pos)
+        esper.component_for_entity(sim.player, Velocity).vec = Vec3(speed)
+        esper.component_for_entity(sim.player, Body).grounded = pos.z <= 0.01
+        camera._started = False
+
+    energy = esper.component_for_entity(sim.player, Energy)
     panels: list[tuple[str, PNMImage]] = []
 
     # 1. street level, with the squad and the first ants closing in
     draw(90, aim_yaw=0.0, aim_pitch=0.0)
-    place(Vec3(0, 0, 0), 0.0, -6.0)
+    place(Vec3(0, 0, 0))
     draw(20, aim_yaw=0.0, aim_pitch=-6.0)
     panels.append(("street", shot()))
 
-    # 2. in flight, over the rooftops
-    place(Vec3(-20, -40, 55), 28.0, -22.0)
-    draw(30, thrust=True, aim_yaw=28.0, aim_pitch=-22.0, move_y=1.0)
-    panels.append(("flight", shot()))
+    # 2. climbing out, jets lit
+    place(Vec3(-20, -40, 48))
+    draw(30, thrust=True, aim_yaw=28.0, aim_pitch=-16.0, move_y=1.0)
+    panels.append(("thrust", shot()))
 
-    # 3. the lance, fired at whatever is in front
-    draw(14, fire=True, aim_yaw=28.0, aim_pitch=-24.0, thrust=True)
+    # 3. gliding: wings out, descending slowly, keeping the speed she arrived
+    #    with. The wings sweep down a few degrees when the glide is engaged.
+    place(Vec3(-30, -70, 62), Vec3(6, 15, -3))
+    draw(45, glide=True, aim_yaw=22.0, aim_pitch=-20.0, move_y=1.0)
+    panels.append(("glide", shot()))
+
+    # 4. the lance, fired at whatever is in front
+    draw(14, fire=True, glide=True, aim_yaw=22.0, aim_pitch=-22.0)
     panels.append(("lance", shot()))
 
-    # 4. overheated: the HUD goes red and flight is locked out
-    energy = esper.component_for_entity(sim.player, Energy)
-    place(Vec3(10, 10, 0), 150.0, -4.0)
+    # 5. overheated: the HUD goes red and both flight and glide are locked out
+    place(Vec3(10, 10, 0))
     energy.current, energy.empty = 0.0, True
-    draw(4, aim_yaw=150.0, aim_pitch=-4.0, thrust=True)
+    draw(4, aim_yaw=150.0, aim_pitch=-4.0, thrust=True, glide=True)
     panels.append(("overheat", shot()))
 
-    # 5. a rooftop, looking down into the street
-    roof = None
-    for _ident, x0, y0, x1, y1, top in sim.grid.boxes:
-        if top > 30.0:
-            roof = Vec3((x0 + x1) * 0.5, (y0 + y1) * 0.5, top)
-            break
-    if roof is not None:
-        place(roof, 200.0, -30.0)
-        draw(20, aim_yaw=200.0, aim_pitch=-30.0)
-        panels.append(("rooftop", shot()))
-
     # 6. a swarm at street level, which is what the game mostly looks like
-    place(Vec3(0, 0, 0), 0.0, -4.0)
+    place(Vec3(0, 0, 0))
     energy.current, energy.empty = 100.0, False
     for index in range(14):
         angle = math.tau * index / 14.0
@@ -738,6 +851,8 @@ def render_tests() -> None:
     check("frames are not blank", lambda: _assert_varied(panels))
     check("scene graph tracks entity births", lambda: _assert_nodes(view, sim))
     check("dead entities release their nodes", lambda: _assert_release(view, sim, base))
+    check("the crosshair points where the lance goes", lambda: _assert_camera_aim(app, draw))
+    check("the camera stays out of the ground and walls", lambda: _assert_camera_clear(app, draw))
 
     # The sheet is written before the app-level tests, which restart the game
     # and throw the photographed world away.
@@ -843,6 +958,56 @@ def _assert_release(view, sim, base) -> None:
     assert ent not in view.nodes, "a deleted ant left its node behind"
 
 
+def _assert_camera_aim(app, draw) -> None:
+    """Screen centre must be the fire direction, at every aim angle.
+
+    The crosshair is drawn dead centre, so the camera's forward vector has to
+    equal :func:`sim.aim_vector` for the same angles -- otherwise the reticle
+    points somewhere the lance does not go, and the error grows with pitch.
+    An earlier version of this camera positioned itself from the aim and then
+    looked back at the player, which put the crosshair on her head; this is
+    the guard against that coming back.
+    """
+    for yaw, pitch in ((0.0, 0.0), (37.0, -28.0), (-120.0, 41.0), (200.0, -70.0), (95.0, 78.0)):
+        draw(3, aim_yaw=yaw, aim_pitch=pitch)
+        forward = app.camera.getQuat(app.render).getForward()
+        wanted = aim_vector(yaw, pitch)
+        error = math.degrees(
+            math.acos(max(-1.0, min(1.0, forward.dot(wanted))))
+        )
+        assert error < 0.05, (
+            f"at yaw {yaw} pitch {pitch} the camera looks {error:.2f} degrees "
+            f"off the shot direction"
+        )
+
+
+def _assert_camera_clear(app, draw) -> None:
+    """The boom must never end up underground or inside a tower.
+
+    Flies a lap of the city at rooftop height and at street level, checking
+    the camera's own position against the collision grid every frame.
+    """
+    sim = app.sim
+    offences = 0
+    worst = ""
+    for index in range(90):
+        yaw = index * 4.0
+        draw(1, aim_yaw=yaw, aim_pitch=-18.0, move_y=1.0, thrust=(index % 30 < 8))
+        position = app.camera.getPos(app.render)
+        if position.z < 0.2:
+            offences += 1
+            worst = f"z={position.z:.2f} underground"
+            continue
+        for _ident, x0, y0, x1, y1, top in sim.grid.query_aabb(
+            position.x, position.y, position.x, position.y
+        ):
+            if x0 <= position.x <= x1 and y0 <= position.y <= y1 and position.z < top - 0.5:
+                offences += 1
+                worst = f"{position.z:.1f}m inside a {top:.0f}m building"
+                break
+    assert offences == 0, f"the camera was buried on {offences} frames ({worst})"
+
+
 def _assert_input(app) -> None:
     """Held keys must reach the player's Intent through the real task loop.
 
@@ -933,9 +1098,13 @@ SIM_TESTS = (
     test_rise_speed_is_capped,
     test_overheat_latches_at_zero_and_only_clears_when_full,
     test_ground_recharge_is_much_faster_than_air,
-    test_dash_costs_a_flat_charge_and_respects_its_cooldown,
-    test_dash_is_blocked_while_overheated,
-    test_dash_keeps_its_speed_after_the_burst,
+    test_glide_never_gains_height,
+    test_glide_does_not_extend_a_climb,
+    test_glide_slows_the_fall,
+    test_glide_keeps_horizontal_speed_and_covers_ground,
+    test_glide_is_cheap_but_not_free,
+    test_glide_is_blocked_while_overheated_and_on_the_ground,
+    test_thrust_beats_glide_when_both_are_held,
     test_firing_the_lance_spends_flight_energy,
     test_walls_stop_you_but_let_you_slide,
     test_you_can_land_on_a_roof,

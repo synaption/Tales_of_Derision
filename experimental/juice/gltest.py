@@ -1054,6 +1054,370 @@ def test_a_ragdoll_moves_the_pixels_it_is_drawn_at():
 
 
 # ---------------------------------------------------------------------------
+# Thrown bombs
+# ---------------------------------------------------------------------------
+
+
+def test_a_thrown_bomb_arcs_out_lands_and_goes_off():
+    import math
+    import rogue_juice as rj
+    world, field = _corpses(kills=0, settle=0)
+    world.player.body.facing = (1, 0)
+    start = world.player.world_pos()
+    field.throw(world)
+    assert len(field.thrown) == 1, "nothing left the hand"
+    bomb = field.thrown[0]
+    peak, frames = 0.0, 0
+    while field.thrown and frames < 600:
+        _run(world, field, 1)
+        peak = max(peak, bomb.z)
+        frames += 1
+    assert peak > rj.TILE * 0.3, f"it never left the floor (peak {peak:.0f}px)"
+    assert frames < 600, "the fuse never ran out"
+    flew = math.hypot(bomb.x - start[0], bomb.y - start[1]) / rj.TILE
+    assert 1.5 < flew < 12.0, f"landed {flew:.1f} tiles away"
+    assert world.fx.shockwaves, "it went off without an explosion"
+
+
+def test_a_bomb_cannot_be_thrown_through_a_wall():
+    """The bomb goes through `_walls` -- the corpses' own wall pass -- so this
+    is really a test that the solver does not care what shape it is holding."""
+    import rogue_juice as rj
+    world, field = _corpses(kills=0, settle=0)
+    world.juice.params["bomb_throw"].value = 1400.0     # hardest possible throw
+    world.juice.params["bomb_fuse"].value = 4.0
+    for facing in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        world.player.body.facing = facing
+        field.throw(world)
+    for _ in range(400):
+        _run(world, field, 1)
+        for bomb in field.thrown:
+            assert not _in_a_wall(world, bomb), \
+                f"a bomb reached {bomb.x:.0f},{bomb.y:.0f}"
+
+
+def test_the_bomb_flies_with_the_ragdolls_switched_off():
+    """The explosion is worth having with the bodies nailed to the grid -- that
+    comparison is what the toggle is for -- so the fuse cannot be wired to it.
+    """
+    world, field = _corpses(kills=0, settle=0)
+    world.juice.toggles["ragdoll"].on = False
+    field.throw(world)
+    for _ in range(300):
+        _run(world, field, 1)
+        if not field.thrown:
+            break
+    assert not field.thrown, "the bomb froze when the ragdolls did"
+    assert world.fx.shockwaves, "no explosion"
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+#
+# The merge rules in `juicesettings.py` are the whole feature: a settings file
+# and a build never have to agree, because the bench grows a slider most times
+# anybody opens it. Every test here is one way they can disagree.
+
+
+def _tmp_settings():
+    import tempfile
+    import juicesettings
+    folder = tempfile.mkdtemp(prefix="juicebench-")
+    return juicesettings.Settings(os.path.join(folder, "settings.json"))
+
+
+def test_a_missing_settings_file_is_the_normal_first_run():
+    settings = _tmp_settings()
+    assert settings.load() is False
+    assert "default" in settings.note
+    import rogue_juice_gl as gl
+    juice = gl.gl_juice()
+    assert settings.apply_juice(juice) == 0, "it applied something from nothing"
+
+
+def test_settings_survive_a_round_trip():
+    import rogue_juice_gl as gl
+    settings = _tmp_settings()
+    juice = gl.gl_juice()
+    juice.toggles["bloom"].on = False
+    juice.params["rag_bounce"].value = 0.77
+    juice.choices["move_ease"].index = 2
+    settings.capture_juice(juice)
+    gl.Display(width=1600, height=900, frame_cap=144).store(settings)
+    assert settings.save(), settings.note
+
+    import juicesettings
+    fresh = juicesettings.Settings(settings.path)
+    assert fresh.load(), fresh.note
+    other = gl.gl_juice()
+    fresh.apply_juice(other)
+    assert other.toggles["bloom"].on is False
+    assert abs(other.params["rag_bounce"].value - 0.77) < 1e-6
+    assert other.choices["move_ease"].index == 2
+    display = gl.Display().load(fresh)
+    assert (display.width, display.height, display.frame_cap) == (1600, 900, 144)
+
+
+def test_a_setting_the_file_has_never_heard_of_keeps_its_code_default():
+    """Adding a slider must not need a migration, and must not reset the file.
+    This is the direction that happens every time anybody edits the bench."""
+    import json
+    import juicesettings
+    import rogue_juice_gl as gl
+    settings = _tmp_settings()
+    with open(settings.path, "w") as fh:
+        json.dump({"params": {"rag_bounce": 0.1}}, fh)
+    settings = juicesettings.Settings(settings.path)
+    settings.load()
+    juice = gl.gl_juice()
+    was = juice.params["rag_drag"].value
+    settings.apply_juice(juice)
+    assert abs(juice.params["rag_bounce"].value - 0.1) < 1e-6
+    assert juice.params["rag_drag"].value == was, "an absent key moved something"
+    assert juice.toggles["bloom"].on, "an absent toggle was switched off"
+
+
+def test_a_setting_this_build_has_never_heard_of_survives_being_saved():
+    """The other direction, and the one that silently destroys somebody's work:
+    open an older build, save, and the newer build's settings are gone."""
+    import json
+    import juicesettings
+    import rogue_juice_gl as gl
+    settings = _tmp_settings()
+    with open(settings.path, "w") as fh:
+        json.dump({"params": {"a_slider_from_the_future": 3.5},
+                   "a_whole_new_section": {"x": 1}}, fh)
+    settings = juicesettings.Settings(settings.path)
+    settings.load()
+    settings.capture_juice(gl.gl_juice())
+    assert settings.save(), settings.note
+    with open(settings.path) as fh:
+        kept = json.load(fh)
+    assert kept["params"]["a_slider_from_the_future"] == 3.5
+    assert kept["a_whole_new_section"] == {"x": 1}
+
+
+def test_one_bad_value_does_not_cost_the_whole_file():
+    import json
+    import juicesettings
+    import rogue_juice_gl as gl
+    settings = _tmp_settings()
+    with open(settings.path, "w") as fh:
+        json.dump({"params": {"rag_bounce": 99.0,       # past the slider's top
+                              "rag_drag": "banana",     # not a number
+                              "rag_size": 0.5},         # fine
+                   "toggles": {"bloom": "yes"},         # not a bool
+                   "choices": {"move_ease": "nope"}},   # not an option
+                  fh)
+    settings = juicesettings.Settings(settings.path)
+    settings.load()
+    juice = gl.gl_juice()
+    drag_was = juice.params["rag_drag"].value
+    settings.apply_juice(juice)
+    assert juice.params["rag_bounce"].value == juice.params["rag_bounce"].hi, \
+        "an out-of-range value was taken literally"
+    assert juice.params["rag_drag"].value == drag_was
+    assert juice.toggles["bloom"].on is True
+    assert juice.choices["move_ease"].index == 0
+    assert abs(juice.params["rag_size"].value - 0.5) < 1e-6, \
+        "the good value next door was thrown away with the bad ones"
+
+
+def test_an_unreadable_file_is_ignored_rather_than_fatal():
+    """A stray comma must not be a bench that will not start."""
+    import juicesettings
+    settings = _tmp_settings()
+    with open(settings.path, "w") as fh:
+        fh.write("{ not json at all")
+    settings = juicesettings.Settings(settings.path)
+    assert settings.load() is False
+    assert "unreadable" in settings.note
+
+
+def test_saving_makes_the_current_values_what_f3_returns_to():
+    """"Save as defaults" that F3 then undoes is not a save."""
+    import rogue_juice_gl as gl
+    settings = _tmp_settings()
+    juice = gl.gl_juice()
+    juice.params["rag_bounce"].value = 0.9
+    settings.capture_juice(juice)
+    juice.params["rag_bounce"].value = 0.1
+    settings.restore_defaults(juice)
+    assert abs(juice.params["rag_bounce"].value - 0.9) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# The escape menu
+# ---------------------------------------------------------------------------
+
+
+def _menu_bench():
+    """A renderer's menu wiring, pointed at a throwaway settings file.
+
+    The real one lives next to the checkout, and a test that saves over
+    somebody's tuned bench is a test that gets deleted.
+    """
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    ctx, target, _world, renderer = bench()
+    world = rj.World(gl.gl_juice(), None)
+    saved = (renderer.settings, renderer.display, renderer.menu)
+    renderer.settings = _tmp_settings()
+    renderer.display = gl.Display()
+    renderer.menu = gl.Menu()
+    return world, renderer, saved
+
+
+def test_escape_opens_the_menu_instead_of_quitting():
+    if not gl_available():
+        return
+    import pygame
+    import rogue_juice_gl as gl
+    world, renderer, saved = _menu_bench()
+    try:
+        event = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE)
+        assert gl.handle_event(event, world, renderer) is True, "it quit"
+        assert renderer.menu.open, "escape did not open the menu"
+        # And again closes it, rather than stacking.
+        assert gl.handle_event(event, world, renderer) is True
+        assert not renderer.menu.open
+    finally:
+        renderer.settings, renderer.display, renderer.menu = saved
+
+
+def test_the_menu_swallows_the_keys_behind_it():
+    """A modal that lets movement through is how you walk into a wall while
+    picking a resolution."""
+    if not gl_available():
+        return
+    import pygame
+    import rogue_juice_gl as gl
+    world, renderer, saved = _menu_bench()
+    try:
+        renderer.menu.show()
+        tile = world.player.tile
+        for key in (pygame.K_LEFT, pygame.K_SPACE, pygame.K_b, pygame.K_r):
+            gl.handle_event(pygame.event.Event(pygame.KEYDOWN, key=key),
+                            world, renderer)
+        assert world.player.tile == tile, "the player moved behind the menu"
+        assert not renderer.ragdolls.thrown, "a bomb was thrown behind the menu"
+    finally:
+        renderer.settings, renderer.display, renderer.menu = saved
+
+
+def test_every_menu_row_does_what_it_says():
+    if not gl_available():
+        return
+    import rogue_juice_gl as gl
+    world, renderer, saved = _menu_bench()
+    try:
+        menu, display = renderer.menu, renderer.display
+        menu.show()
+        assert [r[0] for r in menu.rows(display)] == \
+            ["resume", "options", "save", "quit"]
+        assert gl.menu_action("options", world, renderer) is True
+        assert menu.page == "options"
+        assert [r[0] for r in menu.rows(display)][-1] == "back"
+
+        cap = display.frame_cap
+        gl.menu_action("frame_cap:+1", world, renderer)
+        assert display.frame_cap != cap, "the frame cap did not move"
+        gl.menu_action("frame_cap:-1", world, renderer)
+        assert display.frame_cap == cap, "it did not come back"
+
+        vsync = display.vsync
+        gl.menu_action("vsync:+1", world, renderer)
+        assert display.vsync is not vsync
+        assert "restart" in menu.status, "vsync pretended to apply live"
+
+        gl.menu_action("back", world, renderer)
+        assert menu.page == "main"
+        assert gl.menu_action("quit", world, renderer) is False, "quit did not"
+        gl.menu_action("resume", world, renderer)
+        assert not menu.open
+    finally:
+        renderer.settings, renderer.display, renderer.menu = saved
+
+
+def test_the_save_row_writes_a_file_that_reads_back():
+    if not gl_available():
+        return
+    import juicesettings
+    import rogue_juice_gl as gl
+    world, renderer, saved = _menu_bench()
+    try:
+        world.juice.params["rag_bounce"].value = 0.61
+        world.juice.toggles["scanlines"].on = True
+        renderer.display.frame_cap = 144
+        renderer.menu.show()
+        gl.menu_action("save", world, renderer)
+        assert os.path.exists(renderer.settings.path), renderer.menu.status
+
+        fresh = juicesettings.Settings(renderer.settings.path)
+        assert fresh.load()
+        juice = gl.gl_juice()
+        fresh.apply_juice(juice)
+        assert abs(juice.params["rag_bounce"].value - 0.61) < 1e-6
+        assert juice.toggles["scanlines"].on is True
+        assert gl.Display().load(fresh).frame_cap == 144
+    finally:
+        renderer.settings, renderer.display, renderer.menu = saved
+
+
+def test_the_menu_is_drawn_over_the_frame():
+    if not gl_available():
+        return
+    import rogue_juice_gl as gl
+    world, renderer, saved = _menu_bench()
+    try:
+        plain = view_of(frame(world)).astype(np.int16)
+        renderer.menu.show()
+        renderer.ui_dirty = True
+        shown = view_of(frame(world)).astype(np.int16)
+        assert shown.mean() < plain.mean() - 3, "the frame was not dimmed"
+        delta = np.abs(shown - plain).max(axis=2)
+        assert (delta > 20).sum() > 5000, "no card was drawn"
+    finally:
+        renderer.menu.close()
+        renderer.settings, renderer.display, renderer.menu = saved
+        renderer.ui_dirty = True
+
+
+def test_the_bench_re_lays_itself_out_at_a_new_resolution():
+    """Resolution changes go through SDL rather than `set_mode`, so the context
+    survives and only the size-dependent buffers are rebuilt. If a global goes
+    out of step the panel lands on top of the arena, which is what the header
+    check below is really watching for."""
+    if not gl_available():
+        return
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    ctx, _target, _world, renderer = bench()
+    world = rj.World(gl.gl_juice(), None)
+    was = (gl.WIN_W, gl.WIN_H)
+    try:
+        assert renderer.resize(world, 1600, 900) is True
+        assert (gl.WIN_W, gl.WIN_H) == (rj.WIN_W, rj.WIN_H) == (1600, 900)
+        assert gl.VIEW_W == rj.VIEW_W == 1600 - rj.PANEL_W
+        target = ctx.simple_framebuffer((gl.WIN_W, gl.WIN_H), components=4)
+        old_target, renderer.target = renderer.target, target
+        target.viewport = (0, 0, gl.WIN_W, gl.WIN_H)
+        renderer.render(world, (0, 0))
+        raw = np.frombuffer(bytes(target.read(components=3)), dtype=np.uint8)
+        image = raw.reshape(gl.WIN_H, gl.WIN_W, 3)[::-1]
+        renderer.target = old_target
+        assert image[:, :gl.VIEW_W].std() > 6, "the world is a flat fill"
+        assert image[:40, gl.VIEW_W:].max() > 180, "the panel header is missing"
+
+        # And it refuses to shrink below something usable.
+        renderer.resize(world, 100, 100)
+        assert gl.VIEW_W >= gl.MIN_VIEW[0] and gl.VIEW_H >= gl.MIN_VIEW[1]
+    finally:
+        renderer.resize(world, *was)
+
+
+# ---------------------------------------------------------------------------
 # The bench is still the bench
 # ---------------------------------------------------------------------------
 
@@ -1072,7 +1436,12 @@ def test_the_gl_bench_keeps_every_software_control():
             f"{key} vanished in the GL build"
     for key in gl.DROP_CHOICES:
         assert key not in hard.choices
-    assert len(hard.toggles) == len(soft.toggles) + len(gl.GL_TOGGLES)
+    # A union rather than a sum: some of what the card does first, the software
+    # bench has since grown its own reading of -- `normals` is in both, with a
+    # blurb each describing how that build actually does it -- and the GL
+    # spec's job there is to replace the row, not to add a second one.
+    assert len(hard.toggles) == len(set(soft.toggles)
+                                    | {spec[0] for spec in gl.GL_TOGGLES})
 
 
 def test_the_sim_layer_is_untouched_by_the_renderer():

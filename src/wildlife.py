@@ -67,7 +67,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-import esper
+import ecs
 
 from components import Deer, Fish, NPC, Player, Position, Seaweed, Tree
 from game_map import GameMap
@@ -275,9 +275,9 @@ class WildlifeStocks:
         every turn to notice the moment somebody crosses a seam.
         """
         live: set[RegionId] = set()
-        for _ent, (pos, _p) in esper.get_components(Position, Player):
+        for _ent, (pos, _p) in ecs.get_components(Position, Player):
             live.add(region_at(self.game_map, pos.x, pos.y))
-        for _ent, (pos, _npc) in esper.get_components(Position, NPC):
+        for _ent, (pos, _npc) in ecs.get_components(Position, NPC):
             live.add(region_at(self.game_map, pos.x, pos.y))
         return live
 
@@ -334,8 +334,8 @@ class WildlifeStocks:
             members = sorted(index.of_kind(region_id, species.component))
             self.stock(region_id, species).count = len(members)
             for ent in members:
-                if esper.entity_exists(ent):
-                    esper.delete_entity(ent, immediate=True)
+                if ecs.entity_exists(ent):
+                    ecs.delete_entity(ent, immediate=True)
 
     # --- the day model ----------------------------------------------------
 
@@ -404,8 +404,8 @@ class WildlifeStocks:
         start = int(rng() * len(available))  # don't always eat the lowest ids
         for offset in range(min(units, len(available))):
             ent = available[(start + offset) % len(available)]
-            if esper.entity_exists(ent):
-                esper.delete_entity(ent, immediate=True)
+            if ecs.entity_exists(ent):
+                ecs.delete_entity(ent, immediate=True)
 
     def _apply(self, region_id: RegionId, species: Species, delta: int, rng) -> None:
         """Move a region's population by ``delta``, in whichever form it is kept."""
@@ -419,8 +419,8 @@ class WildlifeStocks:
         if delta < 0:
             members = sorted(index.of_kind(region_id, species.component))
             for ent in members[: -delta]:
-                if esper.entity_exists(ent):
-                    esper.delete_entity(ent, immediate=True)
+                if ecs.entity_exists(ent):
+                    ecs.delete_entity(ent, immediate=True)
         else:
             tiles = self.habitat(species, region_id)
             for _ in range(delta * 6):
@@ -436,7 +436,7 @@ class WildlifeStocks:
         stock.count = len(index.of_kind(region_id, species.component))
 
 
-class WildlifeProcessor(esper.Processor):
+class WildlifeProcessor(ecs.Processor):
     """Keeps residency honest every turn. Population is not its clock.
 
     Residency has to run **every turn**: the player crossing a seam must

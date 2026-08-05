@@ -1,6 +1,6 @@
 """The active/inactive split, enforced.
 
-The rule: ``esper.process(action)`` simulates the map tile the player is standing
+The rule: ``ecs.process(action)`` simulates the map tile the player is standing
 in and nothing else. Everywhere else moves only in the places allowed to move it
 -- the idle pump, region-entry catch-up, and sleep. These tests hold the turn path
 to that, so a future system that quietly scans the world (the thing that used to
@@ -9,7 +9,7 @@ a profile months later.
 """
 from __future__ import annotations
 
-import esper
+import ecs
 import pytest
 
 from components import Needs, NPC, Player, Position
@@ -29,29 +29,29 @@ pytestmark = pytest.mark.headless_renderer
 
 
 def _world(grid: int = 2) -> GameMap:
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     set_world_rng(0x7A1E5)
     width, height = archipelago_size(grid)
     game_map = GameMap(width, height, layout="islands")
     _setup_world(game_map, Position(width // 2, height // 2))
-    esper.add_processor(TimeProcessor(), priority=2)
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
+    ecs.add_processor(TimeProcessor(), priority=2)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
     npc_ai = NpcAiProcessor(
         game_map, max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT
     )
-    esper.add_processor(npc_ai, priority=0)
-    esper.add_processor(
+    ecs.add_processor(npc_ai, priority=0)
+    ecs.add_processor(
         FishAiProcessor(game_map, max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT),
         priority=0,
     )
     needs = NeedsProcessor(game_map)
-    esper.add_processor(needs, priority=0)
+    ecs.add_processor(needs, priority=0)
     effects = EffectsProcessor(game_map)
-    esper.add_processor(effects, priority=0)
-    esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
-    esper.add_processor(ReproductionProcessor(game_map), priority=0)
+    ecs.add_processor(effects, priority=0)
+    ecs.add_processor(TreeGrowthProcessor(game_map), priority=0)
+    ecs.add_processor(ReproductionProcessor(game_map), priority=0)
     # Wired the way game._register_processors wires it: needs and effects are steps
     # on the region scheduler, not per-turn world passes.
     needs.register_region_step(npc_ai.scheduler)
@@ -60,7 +60,7 @@ def _world(grid: int = 2) -> GameMap:
 
 
 def _player_region(game_map: GameMap):
-    for _ent, (pos, _p) in esper.get_components(Position, Player):
+    for _ent, (pos, _p) in ecs.get_components(Position, Player):
         return region_at(game_map, pos.x, pos.y)
     raise AssertionError("the world should have a player")
 
@@ -69,7 +69,7 @@ def _npc_positions(game_map: GameMap) -> dict[int, tuple[tuple[int, int], tuple[
     """entity -> (its region, its tile)."""
     return {
         ent: (region_at(game_map, pos.x, pos.y), (pos.x, pos.y))
-        for ent, (pos, _npc) in esper.get_components(Position, NPC)
+        for ent, (pos, _npc) in ecs.get_components(Position, NPC)
     }
 
 
@@ -79,7 +79,7 @@ def test_a_turn_moves_the_players_region_and_leaves_the_rest_still() -> None:
     before = _npc_positions(game_map)
 
     for _ in range(25):
-        esper.process("wait")
+        ecs.process("wait")
 
     after = _npc_positions(game_map)
     moved_here = 0
@@ -101,18 +101,18 @@ def test_a_turn_only_ticks_needs_in_the_players_region() -> None:
     active = _player_region(game_map)
     before = {
         ent: needs.hunger
-        for ent, (needs, pos) in esper.get_components(Needs, Position)
+        for ent, (needs, pos) in ecs.get_components(Needs, Position)
     }
     regions = {
         ent: region_at(game_map, pos.x, pos.y)
-        for ent, (_needs, pos) in esper.get_components(Needs, Position)
+        for ent, (_needs, pos) in ecs.get_components(Needs, Position)
     }
 
     for _ in range(25):
-        esper.process("wait")
+        ecs.process("wait")
 
     ticked_here = 0
-    for ent, (needs,) in esper.get_components(Needs):
+    for ent, (needs,) in ecs.get_components(Needs):
         if ent not in before:
             continue
         if regions[ent] == active:
@@ -128,11 +128,11 @@ def test_only_the_active_regions_clock_advances_on_a_turn() -> None:
     """The turn path advances one region's simulation cursor: the player's."""
     game_map = _world()
     active = _player_region(game_map)
-    npc_ai = esper.get_processor(NpcAiProcessor)
+    npc_ai = ecs.get_processor(NpcAiProcessor)
     before = dict(npc_ai.scheduler.region_turn)
 
     for _ in range(10):
-        esper.process("wait")
+        ecs.process("wait")
 
     after = npc_ai.scheduler.region_turn
     assert after[active] > before[active]
@@ -152,16 +152,16 @@ def test_a_caught_up_region_gets_as_hungry_as_the_turns_it_missed() -> None:
     game_map = _world()
     active = _player_region(game_map)
     for _ in range(30):
-        esper.process("wait")
+        ecs.process("wait")
 
     asleep_elsewhere = {
         ent: needs.hunger
-        for ent, (needs, pos) in esper.get_components(Needs, Position)
+        for ent, (needs, pos) in ecs.get_components(Needs, Position)
         if region_at(game_map, pos.x, pos.y) != active
     }
     assert asleep_elsewhere, "the world should have people on other islands"
 
-    npc_ai = esper.get_processor(NpcAiProcessor)
+    npc_ai = ecs.get_processor(NpcAiProcessor)
     target = max(npc_ai.scheduler.region_turn.values())
     for region_id, turn in list(npc_ai.scheduler.region_turn.items()):
         if turn < target:
@@ -169,7 +169,7 @@ def test_a_caught_up_region_gets_as_hungry_as_the_turns_it_missed() -> None:
 
     got_hungry = sum(
         1
-        for ent, (needs,) in esper.get_components(Needs)
+        for ent, (needs,) in ecs.get_components(Needs)
         if ent in asleep_elsewhere and needs.hunger > asleep_elsewhere[ent]
     )
     assert got_hungry, "catching a region up should charge it the hunger it missed"
@@ -181,8 +181,8 @@ def test_catch_up_is_where_a_sleeping_region_advances() -> None:
     game_map = _world()
     active = _player_region(game_map)
     for _ in range(10):
-        esper.process("wait")
-    npc_ai = esper.get_processor(NpcAiProcessor)
+        ecs.process("wait")
+    npc_ai = ecs.get_processor(NpcAiProcessor)
     target = max(npc_ai.scheduler.region_turn.values())
     sleeping = [r for r, t in npc_ai.scheduler.region_turn.items() if r != active and t < target]
     assert sleeping, "sleeping regions should have fallen behind"

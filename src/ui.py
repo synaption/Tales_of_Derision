@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import esper
+import ecs
 
 from action import BASE_ACTION_COST
 from components import (
@@ -167,9 +167,9 @@ def _draw_menu_shell(
     overlay_game: bool = False,
 ) -> tuple[int, int, int, int]:
     drew_game_background = False
-    if overlay_game and esper.get_processor(RenderProcessor) is not None:
+    if overlay_game and ecs.get_processor(RenderProcessor) is not None:
         # The game behind a menu is static, so render it once and reuse a
-        # snapshot for subsequent menu frames. Re-running esper.process() every
+        # snapshot for subsequent menu frames. Re-running ecs.process() every
         # keypress is the main cost that makes menu scrolling stutter audio on
         # web. The snapshot is invalidated by the game loop when play resumes.
         blit_backdrop = getattr(renderer, "blit_backdrop", None)
@@ -179,7 +179,7 @@ def _draw_menu_shell(
         if callable(blit_backdrop) and callable(has_backdrop) and has_backdrop():
             reused = blit_backdrop()
         if not reused:
-            esper.process(None)
+            ecs.process(None)
             if callable(capture_backdrop):
                 capture_backdrop()
         drew_game_background = True
@@ -594,10 +594,10 @@ def run_world_generation(renderer: Renderer, settle_turns: int) -> bool:
     the world without drawing the game. Returns False if the player quit."""
     # Build the static per-region caches now, behind this screen, so their one-off
     # cost never lands on a gameplay idle tick or the session's first rest.
-    flora = esper.get_processor(TreeGrowthProcessor)
+    flora = ecs.get_processor(TreeGrowthProcessor)
     if flora is not None:
         flora.warm_region_caches()
-    animals = esper.get_processor(WildlifeProcessor)
+    animals = ecs.get_processor(WildlifeProcessor)
     if animals is not None:
         animals.stocks.warm_region_caches()
     if settle_turns <= 0:
@@ -608,7 +608,7 @@ def run_world_generation(renderer: Renderer, settle_turns: int) -> bool:
     redraw_every = max(1, settle_turns // 60)
     _draw_generation_frame(renderer, 0.0)
     for i in range(settle_turns):
-        esper.process(WAIT_ACTION)
+        ecs.process(WAIT_ACTION)
         if i % redraw_every == 0 or i == settle_turns - 1:
             _draw_generation_frame(renderer, (i + 1) / settle_turns)
             if callable(poll) and poll() == "quit":
@@ -691,18 +691,18 @@ def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = 
     advances by every turn the sleep took, the player wakes with the needs those
     turns would have left them, and the catch-up below then makes every region
     live that span. What's gone is only the player's own 34-to-400 iterations of
-    ``esper.process``, each of which redrew the frame and re-ran every system to
+    ``ecs.process``, each of which redrew the frame and re-ran every system to
     apply arithmetic we can do in one line.
     """
     player_ent = first_player_entity()
     if player_ent is None:
         return
-    if not esper.has_component(player_ent, Needs):
-        esper.add_component(player_ent, Needs())
-    needs = esper.component_for_entity(player_ent, Needs)
+    if not ecs.has_component(player_ent, Needs):
+        ecs.add_component(player_ent, Needs())
+    needs = ecs.component_for_entity(player_ent, Needs)
     if needs.tiredness < _MIN_SLEEP_TIREDNESS:
         queue_message("You are not tired enough to sleep.")
-        esper.process(None)
+        ecs.process(None)
         return
 
     queue_message(
@@ -723,7 +723,7 @@ def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = 
         clock.turn += turns * BASE_ACTION_COST
         # The player's needs for that span are already paid (``settle_sleep``), so
         # the next turn must charge only the time after waking, not the night too.
-        needs_processor = esper.get_processor(NeedsProcessor)
+        needs_processor = ecs.get_processor(NeedsProcessor)
         if needs_processor is not None:
             needs_processor.resync_to(clock.turn)
     wake_up(player_ent, game_map)
@@ -745,8 +745,8 @@ def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = 
     if clock is not None:
         target_region_turn = clock.turn // BASE_ACTION_COST
         for name, processor in (
-            ("npc", esper.get_processor(NpcAiProcessor)),
-            ("fish", esper.get_processor(FishAiProcessor)),
+            ("npc", ecs.get_processor(NpcAiProcessor)),
+            ("fish", ecs.get_processor(FishAiProcessor)),
         ):
             if processor is not None:
                 scheduler = processor.scheduler
@@ -760,14 +760,14 @@ def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = 
             mark = time.monotonic()
     # Flora ages per day rather than per turn, and lags the same way; a sleep
     # brings every region's growth fully current too.
-    flora = esper.get_processor(TreeGrowthProcessor)
+    flora = ecs.get_processor(TreeGrowthProcessor)
     if flora is not None:
         flora.catch_up_all_flora()
     spans.append(("flora", time.monotonic() - mark))
     mark = time.monotonic()
     # Births lag per region the same way -- the world's babies due while you slept
     # are all delivered here rather than on some later keypress.
-    births = esper.get_processor(ReproductionProcessor)
+    births = ecs.get_processor(ReproductionProcessor)
     if births is not None:
         births.catch_up_all_births()
     spans.append(("births", time.monotonic() - mark))
@@ -775,13 +775,13 @@ def _sleep_player(renderer: Renderer, in_camp: bool, game_map: GameMap | None = 
     # Wild populations came with it: they ride the flora's day cursor, so
     # catch_up_all_flora above already grazed, bred and starved the night out.
 
-    esper.process(None)
+    ecs.process(None)
     spans.append(("draw", time.monotonic() - mark))
 
     total = time.monotonic() - started
     if total >= _SLOW_REST_SECONDS:
         detail = "  ".join(f"{name} {span * 1000:.0f}ms" for name, span in spans)
-        npcs = sum(1 for _e, _c in esper.get_components(NPC))
+        npcs = sum(1 for _e, _c in ecs.get_components(NPC))
         index = spatial.index_for(game_map) if game_map is not None else None
         held = len(index._region_of) if index is not None else 0
         rebuilds = index.rebuilds if index is not None else 0
@@ -794,19 +794,19 @@ def _place_from_inventory(renderer: Renderer, game_map: GameMap, item_name: str)
     """Prompt for a direction and build the selected piece on that adjacent tile.
     Any non-direction key cancels and keeps the item."""
     player_ent = first_player_entity()
-    if player_ent is None or not esper.has_component(player_ent, Position):
+    if player_ent is None or not ecs.has_component(player_ent, Position):
         return
     queue_message(f"Place the {item_name}: press a direction (Esc/other to cancel).")
-    esper.process(None)
+    ecs.process(None)
 
     action = _await_action(renderer)
-    player_pos = esper.component_for_entity(player_ent, Position)
+    player_pos = ecs.component_for_entity(player_ent, Position)
     target = _direction_target_xy(action, player_pos)
     if target is None:
         queue_message(f"You put the {item_name} away.")
     else:
         queue_message(_place_buildable_at(player_ent, game_map, item_name, target))
-    esper.process(None)
+    ecs.process(None)
 
 
 def _draw_trade_menu(renderer: Renderer, npc_ent: int) -> str:
@@ -963,7 +963,7 @@ def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
     message = "Enter: loot selected item  A/D: switch side  W/S: move"
 
     while True:
-        if not esper.entity_exists(corpse_ent):
+        if not ecs.entity_exists(corpse_ent):
             return "close"
 
         corpse_entries = _list_trade_entries(corpse_ent)
@@ -1114,7 +1114,7 @@ def _draw_loot_menu(renderer: Renderer, corpse_ent: int) -> str:
             if not _entity_has_tradeable_items(corpse_ent):
                 return "close"
 
-            if not esper.entity_exists(corpse_ent):
+            if not ecs.entity_exists(corpse_ent):
                 continue
 
 
@@ -1162,7 +1162,7 @@ def _look_info_line(
     dist = _chebyshev_from_player(player_pos, x, y)
     if creature_ent is not None:
         name = entity_name(creature_ent, fallback="someone")
-        if esper.has_component(creature_ent, Player):
+        if ecs.has_component(creature_ent, Player):
             return f"Look: {name} (you).   [Enter] status   [Esc/L] done"
         verbs = ", ".join(_look_available_actions(creature_ent, dist)).lower()
         return f"Look: {name} - {dist} away.   [Enter] {verbs}   [Esc/L] done"
@@ -1186,7 +1186,7 @@ def _draw_look_action_menu(
     selected = 0
     talk_line = ""
     while True:
-        if not esper.entity_exists(target_ent):
+        if not ecs.entity_exists(target_ent):
             return "close"
         name = entity_name(target_ent, fallback="Creature")
         menu_options = options + ["Leave"]
@@ -1223,8 +1223,8 @@ def _draw_look_action_menu(
             if choice == "Leave":
                 return "close"
             if choice == "Talk":
-                if esper.has_component(target_ent, Dialogue):
-                    line = esper.component_for_entity(target_ent, Dialogue).line
+                if ecs.has_component(target_ent, Dialogue):
+                    line = ecs.component_for_entity(target_ent, Dialogue).line
                     talk_line = f"{name}: \"{line}\""
                 else:
                     talk_line = f"{name} has nothing to say."
@@ -1253,9 +1253,9 @@ def _look_interact(renderer: Renderer, game_map: GameMap, x: int, y: int) -> str
     """Resolve an Enter press on the look cursor: interact with a creature there,
     loot an adjacent corpse, or just describe whatever the cursor rests on."""
     player_ent = first_player_entity()
-    if player_ent is None or not esper.has_component(player_ent, Position):
+    if player_ent is None or not ecs.has_component(player_ent, Position):
         return "close"
-    player_pos = esper.component_for_entity(player_ent, Position)
+    player_pos = ecs.component_for_entity(player_ent, Position)
     dist = _chebyshev_from_player(player_pos, x, y)
 
     creature_ent = _creature_at_xy(x, y)
@@ -1274,7 +1274,7 @@ def _look_interact(renderer: Renderer, game_map: GameMap, x: int, y: int) -> str
     if feature_ent is not None:
         if (
             dist <= 1
-            and esper.has_component(feature_ent, Corpse)
+            and ecs.has_component(feature_ent, Corpse)
             and _entity_has_tradeable_items(feature_ent)
         ):
             return _draw_loot_menu(renderer, feature_ent)
@@ -1305,12 +1305,12 @@ def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
     keys, and Enter interacts with whatever it rests on. Returns "quit" if the
     player quit the game while looking, otherwise "close"."""
     player_ent = first_player_entity()
-    if player_ent is None or not esper.has_component(player_ent, Position):
+    if player_ent is None or not ecs.has_component(player_ent, Position):
         return "close"
-    player_pos = esper.component_for_entity(player_ent, Position)
+    player_pos = ecs.component_for_entity(player_ent, Position)
     cursor_x, cursor_y = player_pos.x, player_pos.y
 
-    render = esper.get_processor(RenderProcessor)
+    render = ecs.get_processor(RenderProcessor)
 
     while True:
         # Keep the cursor inside the drawn viewport so it's always visible; on the
@@ -1332,7 +1332,7 @@ def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
             render.look_info = _look_info_line(
                 game_map, player_pos, cursor_x, cursor_y, visible, creature_ent
             )
-        esper.process(None)
+        ecs.process(None)
 
         action = _await_action(renderer)
         if action == "quit":
@@ -1358,7 +1358,7 @@ def _look_mode(renderer: Renderer, game_map: GameMap) -> str:
             continue
 
     _clear_look_overlay(render)
-    esper.process(None)
+    ecs.process(None)
     return "close"
 
 
@@ -1409,15 +1409,15 @@ def _draw_dialogue_menu(renderer: Renderer, game_map: GameMap, npc_ent: int) -> 
             if choice == "Leave":
                 return "close"
             if choice == "Talk":
-                if esper.has_component(npc_ent, Dialogue):
-                    line = esper.component_for_entity(npc_ent, Dialogue).line
+                if ecs.has_component(npc_ent, Dialogue):
+                    line = ecs.component_for_entity(npc_ent, Dialogue).line
                     talk_line = f"{npc_name}: \"{line}\""
                 else:
                     talk_line = f"{npc_name} has nothing to say."
                 # Chatting with a sentient villager builds friendship (Sims-like);
                 # show the outcome and refresh the info block's Friendship line.
                 player_ent = first_player_entity()
-                if player_ent is not None and esper.has_component(npc_ent, Personality):
+                if player_ent is not None and ecs.has_component(npc_ent, Personality):
                     outcome = _player_talk(player_ent, npc_ent)
                     talk_line = f"{talk_line}  [{outcome}]"
                     info_lines = _npc_info_lines(game_map, npc_ent)
@@ -1465,10 +1465,10 @@ def _render_inventory_body(
     inventory_items: list[str] = []
     equipment_slots = default_equipment_slots()
     if player_ent is not None:
-        if esper.has_component(player_ent, Inventory):
-            inventory_items = list(esper.component_for_entity(player_ent, Inventory).items)
-        if esper.has_component(player_ent, Equipment):
-            configured = esper.component_for_entity(player_ent, Equipment).slots
+        if ecs.has_component(player_ent, Inventory):
+            inventory_items = list(ecs.component_for_entity(player_ent, Inventory).items)
+        if ecs.has_component(player_ent, Equipment):
+            configured = ecs.component_for_entity(player_ent, Equipment).slots
             for slot_name in equipment_slots:
                 equipment_slots[slot_name] = configured.get(slot_name)
 
@@ -1568,10 +1568,10 @@ def _handle_inventory_input(action: str, state: _InventoryState) -> str | None:
     slot_count = 0
     item_count = 0
     if player_ent is not None:
-        if esper.has_component(player_ent, Equipment):
+        if ecs.has_component(player_ent, Equipment):
             slot_count = len(default_equipment_slots())
-        if esper.has_component(player_ent, Inventory):
-            item_count = len(esper.component_for_entity(player_ent, Inventory).items)
+        if ecs.has_component(player_ent, Inventory):
+            item_count = len(ecs.component_for_entity(player_ent, Inventory).items)
 
     if action == "move_left":
         state.selected_panel = "left"
@@ -1593,10 +1593,10 @@ def _handle_inventory_input(action: str, state: _InventoryState) -> str | None:
         return
 
     if action in {"menu_select", "confirm_action"} and player_ent is not None:
-        if not esper.has_component(player_ent, Inventory) or not esper.has_component(player_ent, Equipment):
+        if not ecs.has_component(player_ent, Inventory) or not ecs.has_component(player_ent, Equipment):
             return None
-        inventory = esper.component_for_entity(player_ent, Inventory)
-        equipment = esper.component_for_entity(player_ent, Equipment)
+        inventory = ecs.component_for_entity(player_ent, Inventory)
+        equipment = ecs.component_for_entity(player_ent, Equipment)
 
         if state.selected_panel == "right":
             if not inventory.items:
@@ -1642,8 +1642,8 @@ def _render_crafting_body(
     """Draw the Crafting tab: your Wood on hand and the buildable recipes."""
     player_ent = first_player_entity()
     wood_count = 0
-    if player_ent is not None and esper.has_component(player_ent, Inventory):
-        wood_count = esper.component_for_entity(player_ent, Inventory).items.count(WOOD)
+    if player_ent is not None and ecs.has_component(player_ent, Inventory):
+        wood_count = ecs.component_for_entity(player_ent, Inventory).items.count(WOOD)
 
     _draw_ui_text(renderer, x + 3, content_y, state.message, _MENU_MUTED_COLOR, width - 6)
     _draw_ui_text(renderer, x + 3, content_y + 1, f"Wood in pack: {wood_count}", _MENU_TEXT_COLOR, width - 6)

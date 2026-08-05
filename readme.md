@@ -1,7 +1,7 @@
 # Tales of Derision
 
 A turn-based, procedurally-generated roguelike **world simulation** in Python
-(pygame-ce + [esper](https://github.com/benmoran56/esper) ECS). A living island of
+(pygame-ce + a small built-in ECS). A living island of
 villagers, wildlife, and monsters that eat, drink, sleep, forage, cook, build
 houses, form families, and reproduce — all while the whole map keeps simulating
 around you, seed-deterministic from top to bottom.

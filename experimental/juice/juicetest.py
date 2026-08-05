@@ -804,6 +804,67 @@ def test_unjuiced_kill_removes_immediately():
     assert dummy not in world.entities
 
 
+def _spawned(count):
+    """A world built with the enemy slider at `count`, and its monsters.
+
+    The training dummy is filtered out: it is scenery with hit points, it is
+    spawned by a separate branch, and counting it would make every assertion
+    below off by one for no reason anybody would remember.
+    """
+    import rogue_juice as rj
+    juice = rj.Juice()
+    juice.params["spawn_count"].value = float(count)
+    world = rj.World(juice)
+    return world, [e for e in world.entities
+                   if e is not world.player and not e.invincible]
+
+
+def test_the_enemy_slider_decides_how_many_spawn():
+    import rogue_juice as rj
+    for asked in (0, 1, 5, len(rj.MONSTERS), 17, 40, 48):
+        world, mobs = _spawned(asked)
+        assert len(mobs) == asked, f"asked for {asked}, got {len(mobs)}"
+
+
+def test_every_spawn_gets_its_own_free_tile():
+    """Two monsters on one tile is a fight the sim cannot describe: they are
+    each other's `entity_at`, and walking into the pair hits whichever was
+    listed first."""
+    world, mobs = _spawned(40)
+    tiles = [e.tile for e in mobs]
+    assert len(set(tiles)) == len(tiles), "two monsters on one tile"
+    for e in mobs:
+        assert not world.blocked(*e.tile), f"{e.name} spawned inside a wall"
+        assert e.tile != world.player.tile, "a monster spawned on the player"
+
+
+def test_the_default_arena_is_the_arena_it_always_was():
+    """The slider must not disturb the hand-placed roster it defaults to. Those
+    nine positions were chosen so most approaches to the middle have a corner
+    in them, and a scatter that happens to include them is not the same thing.
+    """
+    import rogue_juice as rj
+    world, mobs = _spawned(len(rj.MONSTERS))
+    assert [e.name for e in mobs] == [m[1] for m in rj.MONSTERS]
+    assert [e.tile for e in mobs] == [(m[5], m[6]) for m in rj.MONSTERS]
+
+
+def test_the_same_slider_position_gives_the_same_arena():
+    """Seeded hash, not `random` -- the rule the whole bench runs on. Two runs
+    at the same setting have to be comparable or the bench measures nothing."""
+    first = [(e.name, e.tile) for e in _spawned(30)[1]]
+    again = [(e.name, e.tile) for e in _spawned(30)[1]]
+    assert first == again
+
+
+def test_a_bigger_roster_repeats_the_cast_rather_than_inventing_one():
+    import rogue_juice as rj
+    _world_, mobs = _spawned(30)
+    known = {m[1] for m in rj.MONSTERS}
+    assert {e.name for e in mobs} <= known, "a creature nobody wrote"
+    assert len({e.name for e in mobs}) == len(known), "the extras are all one kind"
+
+
 def test_nothing_moves_at_all_with_the_juice_off():
     """The A/B switch has to reach *everything*.
 
@@ -955,6 +1016,222 @@ def test_intensity_zero_leaves_the_body_alone():
         world.update(1 / 60)
         peak = max(peak, abs(world.player.body.oy))
     assert peak < 0.02, f"hop still lifted {peak:.3f} tiles at zero intensity"
+
+
+# ---------------------------------------------------------------------------
+# The light pass
+# ---------------------------------------------------------------------------
+#
+# Lighting is the one effect in the bench whose result is not a number on a
+# body -- it is what a *pixel* ended up being -- so it is tested by drawing a
+# frame under the dummy driver and reading the floor back. That is still
+# headless, and it is the only way to catch a shadow that falls the wrong side
+# of its caster, which is a bug that looks entirely reasonable in the source.
+
+
+def _lit_frame(player, sample, *, spawn=0.0, toggles=(), lights=(), place=(),
+               **params):
+    """Draw one frame lit by the player's own light. Returns (rj, renderer, at).
+
+    The player carries a light, so putting them somewhere and looking at a
+    floor tile is the whole apparatus: no torches are in reach of anywhere
+    tested here, and the ambient is turned off so what is left in the pixel is
+    the direct light and nothing else.
+
+    `lights` drops extra ones -- the sim's own hit lights -- at given tiles,
+    for the cases that need a light with no sprite standing on it. `place`
+    moves the spawned monsters, in order, onto tiles of your choosing, for the
+    cases that need something standing in the way of one.
+    """
+    import pygame
+
+    import rogue_juice as rj
+    pygame.init()
+    pygame.display.set_mode((rj.WIN_W, rj.WIN_H))
+    juice = rj.Juice()
+    juice.set_all(False)
+    juice.toggles["light"].on = True
+    for key in toggles:
+        juice.toggles[key].on = True
+    juice.params["spawn_count"].value = spawn
+    juice.params["light_ambient"].value = 0.0
+    for key, value in params.items():
+        juice.params[key].value = value
+    world = rj.World(juice)
+    world.player.body.tx, world.player.body.ty = float(player[0]), float(player[1])
+    for x, y in lights:
+        world.lights.append([(x + 0.5) * rj.TILE, (y + 0.5) * rj.TILE,
+                             1.0, 1.0, 1.0])
+    mobs = [e for e in world.entities if e is not world.player]
+    for e, (x, y) in zip(mobs, place):
+        e.body.tx, e.body.ty = float(x), float(y)
+    world.camera.snap((sample[0] + 0.5) * rj.TILE, (sample[1] + 0.5) * rj.TILE)
+    world.clamp_camera()
+    renderer = rj.Renderer()
+    renderer.draw_world(world)
+    at = renderer.to_view(world, (sample[0] + 0.5) * rj.TILE,
+                          (sample[1] + 0.5) * rj.TILE)
+    return rj, renderer, (int(at[0]), int(at[1]))
+
+
+def _brightness(renderer, at):
+    return sum(renderer.view.get_at(at)[:3])
+
+
+def _box_brightness(renderer, rect):
+    total = 0
+    for y in range(rect.top, rect.bottom, 2):
+        for x in range(rect.left, rect.right, 2):
+            total += sum(renderer.view.get_at((x, y))[:3])
+    return total
+
+
+def test_a_wall_puts_a_shadow_behind_itself():
+    """The pillar at (12, 7) between the light and the floor tile behind it.
+
+    Off, the light passes through masonry, which is what a light map with no
+    visibility term does and the reason a torch used to glow through a wall.
+    """
+    _rj, dark, at = _lit_frame((11, 7), (13, 7), wall_shadow_amt=1.0)
+    _rj, lit, _at = _lit_frame((11, 7), (13, 7), wall_shadow_amt=0.0)
+    assert _brightness(dark, at) < _brightness(lit, at) * 0.5, \
+        "the pillar did not shadow the tile directly behind it"
+
+
+def test_a_wall_only_shadows_its_own_side():
+    """The tile *between* the light and the wall is untouched.
+
+    The failure this catches is a shadow quad built from the wrong pair of
+    corners, which darkens the lit face of the wall and the floor in front of
+    it -- and looks quite convincing until you walk round the pillar.
+    """
+    _rj, dark, at = _lit_frame((10, 7), (11, 7), wall_shadow_amt=1.0)
+    _rj, lit, _at = _lit_frame((10, 7), (11, 7), wall_shadow_amt=0.0)
+    assert _brightness(dark, at) > _brightness(lit, at) * 0.9, \
+        "the tile in front of the pillar lost light to it"
+
+
+def test_a_body_throws_a_soft_shadow_away_from_the_light():
+    """The training dummy stands between the player and the tile behind it."""
+    tx, ty = 17, 10                                   # rj.DUMMY_POS
+    _rj, dark, at = _lit_frame((tx - 2, ty), (tx + 2, ty), npc_shadow_amt=1.0)
+    _rj, lit, _at = _lit_frame((tx - 2, ty), (tx + 2, ty), npc_shadow_amt=0.0)
+    assert _brightness(dark, at) < _brightness(lit, at) * 0.7, \
+        "a body between the light and the floor cast nothing"
+
+
+def test_body_shadows_do_not_fall_towards_the_light():
+    """Same dummy, sampled on the side the light is on."""
+    tx, ty = 17, 10
+    _rj, dark, at = _lit_frame((tx - 2, ty), (tx - 1, ty), npc_shadow_amt=1.0)
+    _rj, lit, _at = _lit_frame((tx - 2, ty), (tx - 1, ty), npc_shadow_amt=0.0)
+    assert _brightness(dark, at) > _brightness(lit, at) * 0.9, \
+        "the shadow fell between the caster and the light"
+
+
+def test_a_body_in_a_wall_shadow_does_not_brighten_it():
+    """Two things in the way of one light are darker than either, never lighter.
+
+    The bug this pins down: `draw.polygon` *replaces* the pixels it covers, so
+    a body's 55%-dark trapezoid drawn straight into the visibility mask stamped
+    itself over a wall's fully-dark wedge and cut a lighter, body-shaped hole
+    through it -- most visible exactly where it is least wanted, with a monster
+    standing between you and a pillar. Visibility terms multiply; the shader
+    says `wall_shadow * npc_shadow` and so does this now.
+    """
+    import rogue_juice as rj
+
+    def behind_the_pillar(body):
+        # The pillar at (12, 7), lit from (9, 7). A body at (11, 7) is between
+        # the light and the pillar, so its shadow lands inside the pillar's.
+        _rj, r, at = _lit_frame((9, 7), (13, 7), spawn=1.0,
+                                wall_shadow_amt=1.0, npc_shadow_amt=0.55,
+                                place=[body])
+        return _brightness(r, at)
+
+    assert behind_the_pillar((11, 7)) <= behind_the_pillar((11, 3)), \
+        "a body standing in a wall's shadow lit part of it back up"
+
+
+def test_one_body_shadow_does_not_rub_out_another():
+    """The same failure between two casters: the soft outer edge of one body's
+    shadow must not land on the dark core of the one next to it."""
+    def pair(second):
+        _rj, r, at = _lit_frame((9, 7), (12, 9), spawn=2.0, wall_shadow_amt=0.0,
+                                npc_shadow_amt=1.0, place=[(11, 8), second])
+        return _brightness(r, at)
+
+    alone = pair((3, 3))                  # the second body out of the way
+    together = pair((11, 9))              # and alongside the first
+    assert together <= alone, "the neighbour's penumbra erased the core shadow"
+
+
+def test_contrast_takes_the_ambient_away():
+    """At ten there is no ambient left, so an unlit corner is genuinely black
+    rather than merely dim -- which is the whole point of the slider."""
+    import rogue_juice as rj
+    corner = (rj.GRID_W - 3, rj.GRID_H - 3)
+    _rj, flat, at = _lit_frame((3, 3), corner, light_contrast=1.0,
+                               light_ambient=0.34)
+    _rj, hard, _at = _lit_frame((3, 3), corner, light_contrast=10.0,
+                                light_ambient=0.34)
+    assert _brightness(flat, at) > 30, "the test corner was never lit at all"
+    assert _brightness(hard, at) < 6, "contrast 10 left ambient light behind"
+
+
+def test_light_height_changes_the_shape_and_not_the_reach():
+    """A light on the floor has a hot spot a tile wide; one on the ceiling
+    spreads the same light out flat. Neither moves where the pool ends.
+
+    Sampled two tiles apart rather than one, because the floor is a
+    checkerboard of two shades and comparing across it would be measuring the
+    tiles instead of the light. The light is a hit flare rather than the
+    player's, so there is no sprite standing on the bright end of it.
+    """
+    def profile(height):
+        _rj, r, under = _lit_frame((3, 3), (20, 10), lights=[(20, 10)],
+                                   light_height=height)
+        _rj2, r2, out = _lit_frame((3, 3), (22, 10), lights=[(20, 10)],
+                                   light_height=height)
+        # Seven tiles straight down, which is past the radius and also the
+        # nearest direction with no torch of its own within reach.
+        _rj3, r3, past = _lit_frame((3, 3), (20, 17), lights=[(20, 10)],
+                                    light_height=height)
+        return (_brightness(r, under), _brightness(r2, out),
+                _brightness(r3, past))
+
+    low_peak, low_out, low_past = profile(2.0)
+    high_peak, high_out, high_past = profile(240.0)
+    assert low_out / low_peak < high_out / high_peak * 0.85, \
+        "dropping the light to the floor did not tighten the hot spot"
+    assert high_peak > low_peak, "a light overhead did not lift the pool"
+    for past in (low_past, high_past):
+        assert past < 6, "the light reached past its own radius"
+
+
+def test_lit_sprites_are_brighter_on_the_side_facing_the_light():
+    """The software reading of the card's normal-mapped sprites: whatever else
+    it does, the half of the body facing the torch has to come out brighter
+    than the half facing away, and by more than the light map alone manages."""
+    import pygame
+
+    tx, ty = 17, 10                                   # the dummy again
+    def halves(**flags):
+        rj, renderer, at = _lit_frame((tx - 2, ty), (tx, ty), toggles=flags.pop("on"),
+                                      **flags)
+        box = pygame.Rect(at[0] - rj.TILE // 2, at[1] - rj.TILE // 2,
+                          rj.TILE, rj.TILE)
+        left = _box_brightness(renderer, pygame.Rect(box.left, box.top,
+                                                     box.w // 2, box.h))
+        right = _box_brightness(renderer, pygame.Rect(box.centerx, box.top,
+                                                      box.w // 2, box.h))
+        return left, right
+
+    flat_l, flat_r = halves(on=(), npc_shadow_amt=0.0)
+    lit_l, lit_r = halves(on=("normals",), npc_shadow_amt=0.0)
+    assert lit_l - lit_r > flat_l - flat_r, \
+        "the rake did not favour the side the light is on"
+    assert lit_l > flat_l, "the lit side was not brightened at all"
 
 
 def test_every_key_binding_runs():

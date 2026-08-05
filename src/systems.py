@@ -1,7 +1,7 @@
 """ECS processors (systems).
 
-esper 3.x uses module-level state and esper.Processor subclasses whose
-process() receives whatever args are passed to esper.process().
+The built-in ECS uses module-level state and ``ecs.Processor`` subclasses whose
+``process()`` receives the arguments passed to ``ecs.process()``.
 """
 from collections import deque
 from collections.abc import Callable
@@ -10,7 +10,7 @@ from math import ceil
 import textwrap
 import time
 
-import esper
+import ecs
 
 from components import Actor, Age, Asleep, Bed, BerryBush, Blueprint, BlocksMovement, Camp, Chest, ConstructionSite, Corpse, Deer, Dialogue, Diet, Enemy, Equipment, Family, Fish, Friendly, Furniture, Gender, Home, Inventory, Mating, Meat, Name, Needs, NPC, Owned, Personality, Player, Position, Pregnant, Relationships, Renderable, Resident, Sapling, SeaSprout, Seaweed, Settled, Stove, Tree, Vision, WorldClock
 from game_map import GameMap, LAND_HEIGHT, LAND_WIDTH
@@ -101,7 +101,7 @@ def is_memorable_scenery(ent: int) -> bool:
     """Whether an entity is static enough to leave an imprint on a tile the
     player has explored but can no longer see. NPCs, the player, corpses and
     loot are never memorable (they return ``False``)."""
-    return any(esper.has_component(ent, comp) for comp in _MEMORABLE_SCENERY)
+    return any(ecs.has_component(ent, comp) for comp in _MEMORABLE_SCENERY)
 _TREE_GREEN = (58, 138, 66)
 _SAPLING_GREEN = (120, 176, 90)
 _BUSH_GREEN = (86, 140, 78)   # a bush that has been picked bare
@@ -114,9 +114,9 @@ _BUSH_GLYPH = "%"
 def _set_bush_appearance(ent: int, has_berries: bool) -> None:
     """Colour a berry bush by whether it's ripe: reddish with berries, plain
     green once picked. The glyph stays ``%``."""
-    if not esper.has_component(ent, Renderable):
+    if not ecs.has_component(ent, Renderable):
         return
-    rend = esper.component_for_entity(ent, Renderable)
+    rend = ecs.component_for_entity(ent, Renderable)
     rend.glyph = _BUSH_GLYPH
     rend.fg = _BERRY_RED if has_berries else _BUSH_GREEN
 
@@ -124,9 +124,9 @@ def _set_bush_appearance(ent: int, has_berries: bool) -> None:
 def pick_berries(bush_ent: int, clock: WorldClock | None) -> bool:
     """Take a bush's berries if it is ripe. Marks it bare and stamps the harvest
     time so the berries regrow 7 days later. Returns True if berries were taken."""
-    if not esper.has_component(bush_ent, BerryBush):
+    if not ecs.has_component(bush_ent, BerryBush):
         return False
-    bush = esper.component_for_entity(bush_ent, BerryBush)
+    bush = ecs.component_for_entity(bush_ent, BerryBush)
     if not bush.has_berries:
         return False
     bush.has_berries = False
@@ -164,7 +164,7 @@ status_label = effect_label                # status id -> human-readable label
 def player_is_animated(game_map: GameMap) -> bool:
     """True when the player has any active timed status, so the turn loop knows
     to keep re-rendering while idle for the animation to play."""
-    for ent, (pos, _player) in esper.get_components(Position, Player):
+    for ent, (pos, _player) in ecs.get_components(Position, Player):
         return bool(active_statuses(game_map, ent, pos))
     return False
 
@@ -190,7 +190,7 @@ _NIGHT_TINT = (12, 20, 54)
 def world_clock() -> WorldClock | None:
     """The singleton world clock, or ``None`` on maps that never created one
     (e.g. focused unit tests)."""
-    for _ent, (clock,) in esper.get_components(WorldClock):
+    for _ent, (clock,) in ecs.get_components(WorldClock):
         return clock
     return None
 
@@ -201,7 +201,7 @@ def _current_turn() -> int:
 
 
 def _player_entity() -> int | None:
-    for ent, (_player,) in esper.get_components(Player):
+    for ent, (_player,) in ecs.get_components(Player):
         return ent
     return None
 
@@ -341,9 +341,9 @@ _ADULT_AGE_YEARS = 17
 def age_years(ent: int, clock: WorldClock | None) -> float:
     """A person's age in years, from their ``Age.born_turn`` and the world clock.
     Returns 0.0 for a being with no ``Age`` or no clock."""
-    if clock is None or not esper.has_component(ent, Age):
+    if clock is None or not ecs.has_component(ent, Age):
         return 0.0
-    born = esper.component_for_entity(ent, Age).born_turn
+    born = ecs.component_for_entity(ent, Age).born_turn
     turns_per_year = _DAYS_PER_YEAR * max(1, clock.day_length)
     return max(0.0, (clock.turn - born) / turns_per_year)
 
@@ -372,7 +372,7 @@ def night_overlay_alpha(clock: WorldClock | None) -> int:
     return 0
 
 
-class TimeProcessor(esper.Processor):
+class TimeProcessor(ecs.Processor):
     """Advances the world clock one tick per real turn and announces the day's
     phase changes (``"Night falls."`` and friends) in the log."""
 
@@ -421,7 +421,7 @@ def _camp_at(x: int, y: int, game_map: GameMap | None = None) -> int | None:
             if pos.x == x and pos.y == y:
                 return ent
         return None
-    for ent, (pos, _camp) in esper.get_components(Position, Camp):
+    for ent, (pos, _camp) in ecs.get_components(Position, Camp):
         if (pos.x, pos.y) == (x, y):
             return ent
     return None
@@ -431,12 +431,12 @@ def go_to_sleep(ent: int, in_camp: bool, game_map: GameMap | None = None) -> Non
     """Put a character to sleep. Camping pitches a campfire on its tile (if one
     isn't already there); sleeping at home just marks it ``Asleep``. Pass the map
     so the "is one already here" check stays regional."""
-    if not esper.has_component(ent, Asleep):
-        esper.add_component(ent, Asleep(in_camp=in_camp))
-    if in_camp and esper.has_component(ent, Position):
-        pos = esper.component_for_entity(ent, Position)
+    if not ecs.has_component(ent, Asleep):
+        ecs.add_component(ent, Asleep(in_camp=in_camp))
+    if in_camp and ecs.has_component(ent, Position):
+        pos = ecs.component_for_entity(ent, Position)
         if _camp_at(pos.x, pos.y, game_map) is None:
-            esper.create_entity(
+            ecs.create_entity(
                 Position(pos.x, pos.y),
                 Renderable(_CAMP_GLYPH, fg=_CAMP_ORANGE),
                 Name("Camp"),
@@ -448,20 +448,20 @@ def wake_up(ent: int, game_map: GameMap | None = None) -> None:
     """Wake a sleeper: drop the ``Asleep`` tag, break any camp it pitched, and
     (for the player) log that it rose. Safe to call on an already-awake entity."""
     in_camp = False
-    if esper.has_component(ent, Asleep):
-        in_camp = esper.component_for_entity(ent, Asleep).in_camp
-        esper.remove_component(ent, Asleep)
+    if ecs.has_component(ent, Asleep):
+        in_camp = ecs.component_for_entity(ent, Asleep).in_camp
+        ecs.remove_component(ent, Asleep)
     # Anything that wakes a sleeper early -- being attacked, the player shaking it
     # -- cancels the rest of a compacted sleep. Leaving the receipt behind would
     # make an awake creature invisible to the per-turn systems for the remainder.
-    if esper.has_component(ent, Settled):
-        esper.remove_component(ent, Settled)
-    if in_camp and esper.has_component(ent, Position):
-        pos = esper.component_for_entity(ent, Position)
+    if ecs.has_component(ent, Settled):
+        ecs.remove_component(ent, Settled)
+    if in_camp and ecs.has_component(ent, Position):
+        pos = ecs.component_for_entity(ent, Position)
         camp_ent = _camp_at(pos.x, pos.y, game_map)
         if camp_ent is not None:
-            esper.delete_entity(camp_ent, immediate=True)
-    if esper.has_component(ent, Player):
+            ecs.delete_entity(camp_ent, immediate=True)
+    if ecs.has_component(ent, Player):
         _push_turn_event("You wake, feeling rested.")
 
 
@@ -496,7 +496,7 @@ def houses_for(game_map: GameMap, cache: dict) -> list[frozenset[tuple[int, int]
 def beds_by_position() -> dict[tuple[int, int], int]:
     """Map every bed's tile to its entity. Build once per turn and reuse for many
     ``_bed_in_interior`` lookups, rather than rescanning all beds per house."""
-    return {(pos.x, pos.y): ent for ent, (pos, _bed) in esper.get_components(Position, Bed)}
+    return {(pos.x, pos.y): ent for ent, (pos, _bed) in ecs.get_components(Position, Bed)}
 
 
 def _bed_in_interior(
@@ -512,7 +512,7 @@ def _bed_in_interior(
             if ent is not None:
                 return ent
         return None
-    for ent, (pos, _bed) in esper.get_components(Position, Bed):
+    for ent, (pos, _bed) in ecs.get_components(Position, Bed):
         if (pos.x, pos.y) in interior:
             return ent
     return None
@@ -521,9 +521,9 @@ def _bed_in_interior(
 def bed_owner(bed_ent: int) -> int | None:
     """The person who owns a bed (and thus the house), or ``None`` if it's
     unowned. An owner whose entity no longer exists is treated as unowned."""
-    if bed_ent is not None and esper.has_component(bed_ent, Owned):
-        owner = esper.component_for_entity(bed_ent, Owned).owner
-        if esper.entity_exists(owner):
+    if bed_ent is not None and ecs.has_component(bed_ent, Owned):
+        owner = ecs.component_for_entity(bed_ent, Owned).owner
+        if ecs.entity_exists(owner):
             return owner
     return None
 
@@ -537,12 +537,12 @@ _bed_of_owner: dict[int, int] = {}
 
 
 def set_bed_owner(bed_ent: int, owner: int) -> None:
-    if esper.has_component(bed_ent, Owned):
-        esper.component_for_entity(bed_ent, Owned).owner = owner
+    if ecs.has_component(bed_ent, Owned):
+        ecs.component_for_entity(bed_ent, Owned).owner = owner
     else:
-        esper.add_component(bed_ent, Owned(owner))
+        ecs.add_component(bed_ent, Owned(owner))
     # Chests are owned through this same call; only a bed is somebody's *home*.
-    if esper.has_component(bed_ent, Bed):
+    if ecs.has_component(bed_ent, Bed):
         _bed_of_owner[owner] = bed_ent
 
 
@@ -558,10 +558,10 @@ def owned_bed_of(ent: int) -> int | None:
     bed_ent = _bed_of_owner.get(ent)
     if bed_ent is not None:
         if (
-            esper.entity_exists(bed_ent)
-            and esper.has_component(bed_ent, Bed)
-            and esper.has_component(bed_ent, Owned)
-            and esper.component_for_entity(bed_ent, Owned).owner == ent
+            ecs.entity_exists(bed_ent)
+            and ecs.has_component(bed_ent, Bed)
+            and ecs.has_component(bed_ent, Owned)
+            and ecs.component_for_entity(bed_ent, Owned).owner == ent
         ):
             return bed_ent
         del _bed_of_owner[ent]  # the bed burned down, or changed hands
@@ -570,8 +570,8 @@ def owned_bed_of(ent: int) -> int | None:
     if population == _bed_owner_sweep_population:
         return None  # nothing has been claimed since the sweep: they own nothing
     _bed_of_owner.clear()
-    for owned_ent, (owned, _bed) in esper.get_components(Owned, Bed):
-        if esper.entity_exists(owned_ent):
+    for owned_ent, (owned, _bed) in ecs.get_components(Owned, Bed):
+        if ecs.entity_exists(owned_ent):
             _bed_of_owner[owned.owner] = owned_ent
     _bed_owner_sweep_population = population
     return _bed_of_owner.get(ent)
@@ -586,10 +586,10 @@ def house_is_owned(interior: frozenset[tuple[int, int]]) -> bool:
 def set_house_ownership(interior: frozenset[tuple[int, int]], owner: int) -> None:
     """Assign a house's ownable furnishings -- its bed and any chests -- to
     ``owner``, so trespassers get warned before using them."""
-    for ent, (pos, _bed) in esper.get_components(Position, Bed):
+    for ent, (pos, _bed) in ecs.get_components(Position, Bed):
         if (pos.x, pos.y) in interior:
             set_bed_owner(ent, owner)
-    for ent, (pos, _chest) in esper.get_components(Position, Chest):
+    for ent, (pos, _chest) in ecs.get_components(Position, Chest):
         if (pos.x, pos.y) in interior:
             set_bed_owner(ent, owner)
 
@@ -657,9 +657,9 @@ def furnish_house(
     if occupied is None:
         occupied = {
             (pos.x, pos.y)
-            for _ent, (pos, _blocks) in esper.get_components(Position, BlocksMovement)
+            for _ent, (pos, _blocks) in ecs.get_components(Position, BlocksMovement)
         }
-        occupied |= {(pos.x, pos.y) for _ent, (pos, _bed) in esper.get_components(Position, Bed)}
+        occupied |= {(pos.x, pos.y) for _ent, (pos, _bed) in ecs.get_components(Position, Bed)}
 
     def door_distance(tile: tuple[int, int]) -> int:
         if not door_adjacent:
@@ -674,7 +674,7 @@ def furnish_house(
 
     bed_tile = max(free, key=door_distance)
     bed_glyph, bed_color, bed_name, _bed_blocks, bed_extra = _FURNISHINGS[0]
-    esper.create_entity(Position(*bed_tile), Renderable(bed_glyph, fg=bed_color), Name(bed_name), *bed_extra())
+    ecs.create_entity(Position(*bed_tile), Renderable(bed_glyph, fg=bed_color), Name(bed_name), *bed_extra())
     occupied.add(bed_tile)
 
     # Try to place blocking furniture against the walls first (keeps the middle
@@ -705,7 +705,7 @@ def furnish_house(
         if blocks:
             components.append(BlocksMovement())
         components.extend(extra())
-        esper.create_entity(*components)
+        ecs.create_entity(*components)
         occupied.add(chosen)
 
     return bed_tile
@@ -769,9 +769,9 @@ def occupied_near(
         for nx in range(rx - 1, rx + 2):
             for kind in (Corpse, Sapling, Blueprint):
                 for ent in index.of_kind((nx, ny), kind):
-                    if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
+                    if not ecs.entity_exists(ent) or not ecs.has_component(ent, Position):
                         continue
-                    pos = esper.component_for_entity(ent, Position)
+                    pos = ecs.component_for_entity(ent, Position)
                     if abs(pos.x - cx) <= radius and abs(pos.y - cy) <= radius:
                         occupied.add((pos.x, pos.y))
     return occupied
@@ -860,7 +860,7 @@ def _spawn_blueprint(x: int, y: int, tile: str, site: int | None = None, stocked
     Ghosts carry no ``BlocksMovement`` -- workers and passers-by walk right
     through a proto-structure until its walls are actually raised. ``site`` links
     it to a cabin ``ConstructionSite`` (``None`` for a loose player-placed piece)."""
-    return esper.create_entity(
+    return ecs.create_entity(
         Position(x, y),
         Renderable(tile, fg=_BLUEPRINT_BLUE if stocked else _BLUEPRINT_BLUE_DIM),
         Name("Blueprint"),
@@ -870,11 +870,11 @@ def _spawn_blueprint(x: int, y: int, tile: str, site: int | None = None, stocked
 
 def _set_blueprint_stocked(ghost_ent: int, stocked: bool) -> None:
     """Flip a ghost between "needs materials" (dim) and "ready to raise" (bright)."""
-    if not esper.has_component(ghost_ent, Blueprint):
+    if not ecs.has_component(ghost_ent, Blueprint):
         return
-    esper.component_for_entity(ghost_ent, Blueprint).stocked = stocked
-    if esper.has_component(ghost_ent, Renderable):
-        rend = esper.component_for_entity(ghost_ent, Renderable)
+    ecs.component_for_entity(ghost_ent, Blueprint).stocked = stocked
+    if ecs.has_component(ghost_ent, Renderable):
+        rend = ecs.component_for_entity(ghost_ent, Renderable)
         rend.fg = _BLUEPRINT_BLUE if stocked else _BLUEPRINT_BLUE_DIM
 
 
@@ -895,9 +895,9 @@ def _obstructions_at(game_map: GameMap, x: int, y: int) -> list[int]:
     found: list[int] = []
     for comp in _OBSTRUCTION_COMPONENTS:
         for ent in sorted(index.of_kind(region, comp)):
-            if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
+            if not ecs.entity_exists(ent) or not ecs.has_component(ent, Position):
                 continue
-            pos = esper.component_for_entity(ent, Position)
+            pos = ecs.component_for_entity(ent, Position)
             if pos.x == x and pos.y == y:
                 found.append(ent)
     return found
@@ -909,10 +909,10 @@ def _clear_tile_obstructions(game_map: GameMap, x: int, y: int) -> None:
     for ent in _obstructions_at(game_map, x, y):
         # Guard entity_exists: a listed obstruction may have been eaten/cleared
         # earlier in this same building burst.
-        if esper.entity_exists(ent) and any(
-            esper.has_component(ent, comp) for comp in _OBSTRUCTION_COMPONENTS
+        if ecs.entity_exists(ent) and any(
+            ecs.has_component(ent, comp) for comp in _OBSTRUCTION_COMPONENTS
         ):
-            esper.delete_entity(ent, immediate=True)
+            ecs.delete_entity(ent, immediate=True)
 
 
 def create_construction_site(game_map: GameMap, origin: tuple[int, int]) -> int:
@@ -922,8 +922,8 @@ def create_construction_site(game_map: GameMap, origin: tuple[int, int]) -> int:
     them; the last piece furnishes the cabin (see ``raise_blueprint``)."""
     build, interior = _blueprint_tiles(game_map, origin[0], origin[1])
     bed = interior[0] if interior else origin
-    site_ent = esper.create_entity(ConstructionSite(interior=list(interior), bed=bed))
-    site = esper.component_for_entity(site_ent, ConstructionSite)
+    site_ent = ecs.create_entity(ConstructionSite(interior=list(interior), bed=bed))
+    site = ecs.component_for_entity(site_ent, ConstructionSite)
     for (x, y, tile) in build:
         site.pieces[(x, y)] = _spawn_blueprint(x, y, tile, site=site_ent)
     return site_ent
@@ -933,14 +933,14 @@ def _complete_site(game_map: GameMap, site_ent: int) -> None:
     """Finish a cabin whose every ghost has been raised: clear anything trapped
     inside, furnish it, and leave it **unowned** for the nearest homeless
     resident to claim (the founder no longer owns the labour)."""
-    if not esper.has_component(site_ent, ConstructionSite):
+    if not ecs.has_component(site_ent, ConstructionSite):
         return
-    site = esper.component_for_entity(site_ent, ConstructionSite)
+    site = ecs.component_for_entity(site_ent, ConstructionSite)
     interior = frozenset(site.interior)
     for (ix, iy) in interior:
         _clear_tile_obstructions(game_map, ix, iy)  # nothing gets trapped indoors
     furnish_house(game_map, interior)
-    esper.delete_entity(site_ent, immediate=True)
+    ecs.delete_entity(site_ent, immediate=True)
     _push_turn_event("A new cabin is finished.")
 
 
@@ -949,17 +949,17 @@ def raise_blueprint(game_map: GameMap, ghost_ent: int) -> bool:
     set the tile, delete the ghost, and -- if it was the last piece of a cabin
     ``ConstructionSite`` -- furnish the finished house. Public so the player and
     the NPC AI raise pieces the same way."""
-    if not esper.has_component(ghost_ent, Blueprint):
+    if not ecs.has_component(ghost_ent, Blueprint):
         return False
-    bp = esper.component_for_entity(ghost_ent, Blueprint)
-    pos = esper.component_for_entity(ghost_ent, Position)
+    bp = ecs.component_for_entity(ghost_ent, Blueprint)
+    pos = ecs.component_for_entity(ghost_ent, Position)
     x, y = pos.x, pos.y
     _clear_tile_obstructions(game_map, x, y)
     game_map.set_tile(x, y, bp.tile)
     site_ent = bp.site
-    esper.delete_entity(ghost_ent, immediate=True)
-    if site_ent is not None and esper.entity_exists(site_ent) and esper.has_component(site_ent, ConstructionSite):
-        site = esper.component_for_entity(site_ent, ConstructionSite)
+    ecs.delete_entity(ghost_ent, immediate=True)
+    if site_ent is not None and ecs.entity_exists(site_ent) and ecs.has_component(site_ent, ConstructionSite):
+        site = ecs.component_for_entity(site_ent, ConstructionSite)
         site.pieces.pop((x, y), None)
         if not site.pieces:
             _complete_site(game_map, site_ent)
@@ -1029,18 +1029,18 @@ def slay_entity(target_ent: int) -> int:
     corpse carries butcherable meat (named per creature via ``Meat``, falling
     back to generic Raw Meat) plus whatever the creature was carrying/wearing.
     """
-    pos = esper.component_for_entity(target_ent, Position)
+    pos = ecs.component_for_entity(target_ent, Position)
     target_name = "Unknown"
-    if esper.has_component(target_ent, Name):
-        target_name = esper.component_for_entity(target_ent, Name).value
+    if ecs.has_component(target_ent, Name):
+        target_name = ecs.component_for_entity(target_ent, Name).value
 
     meat_name = RAW_MEAT
-    if esper.has_component(target_ent, Meat):
-        meat_name = esper.component_for_entity(target_ent, Meat).name
+    if ecs.has_component(target_ent, Meat):
+        meat_name = ecs.component_for_entity(target_ent, Meat).name
 
     corpse_items: list[str] = [meat_name]
-    if esper.has_component(target_ent, Inventory):
-        corpse_items.extend(esper.component_for_entity(target_ent, Inventory).items)
+    if ecs.has_component(target_ent, Inventory):
+        corpse_items.extend(ecs.component_for_entity(target_ent, Inventory).items)
 
     corpse_components: list[object] = [
         Position(pos.x, pos.y),
@@ -1050,20 +1050,20 @@ def slay_entity(target_ent: int) -> int:
         Inventory(items=corpse_items),
     ]
 
-    if esper.has_component(target_ent, Equipment):
+    if ecs.has_component(target_ent, Equipment):
         looted_slots = {
             slot_name: item_name
-            for slot_name, item_name in esper.component_for_entity(target_ent, Equipment).slots.items()
+            for slot_name, item_name in ecs.component_for_entity(target_ent, Equipment).slots.items()
             if item_name
         }
         if looted_slots:
             corpse_components.append(Equipment(slots=looted_slots))
 
-    esper.delete_entity(target_ent, immediate=True)
-    return esper.create_entity(*corpse_components)
+    ecs.delete_entity(target_ent, immediate=True)
+    return ecs.create_entity(*corpse_components)
 
 
-class MovementProcessor(esper.Processor):
+class MovementProcessor(ecs.Processor):
     """Applies a movement action to every player-controlled entity."""
 
     def __init__(
@@ -1082,7 +1082,7 @@ class MovementProcessor(esper.Processor):
             return
         dx, dy = delta
 
-        for _ent, (pos, _player) in esper.get_components(Position, Player):
+        for _ent, (pos, _player) in ecs.get_components(Position, Player):
             nx, ny = pos.x + dx, pos.y + dy
             # Who is on the tile we're stepping onto. This used to build a dict of
             # every blocking entity in the world on every single keypress -- ~85k
@@ -1099,11 +1099,11 @@ class MovementProcessor(esper.Processor):
                     continue
 
                 target_name = "Unknown"
-                if esper.has_component(target_ent, Name):
-                    target_name = esper.component_for_entity(target_ent, Name).value
+                if ecs.has_component(target_ent, Name):
+                    target_name = ecs.component_for_entity(target_ent, Name).value
 
                 # Hostiles are fought; deer are wild game the player can hunt.
-                is_huntable = esper.has_component(target_ent, Enemy) or esper.has_component(
+                is_huntable = ecs.has_component(target_ent, Enemy) or ecs.has_component(
                     target_ent, Deer
                 )
                 if is_huntable:
@@ -1115,7 +1115,7 @@ class MovementProcessor(esper.Processor):
                         self.on_enemy_death()
                     continue
 
-                if esper.has_component(target_ent, Friendly):
+                if ecs.has_component(target_ent, Friendly):
                     _push_turn_event(f"{target_name} blocks your way. Press Enter to interact.")
                     continue
 
@@ -1304,10 +1304,10 @@ def friendship(rel: Relationships | None, other: int) -> float:
 
 
 def _relationships(ent: int) -> Relationships:
-    if esper.has_component(ent, Relationships):
-        return esper.component_for_entity(ent, Relationships)
+    if ecs.has_component(ent, Relationships):
+        return ecs.component_for_entity(ent, Relationships)
     rel = Relationships()
-    esper.add_component(ent, rel)
+    ecs.add_component(ent, rel)
     return rel
 
 
@@ -1459,8 +1459,8 @@ def _react(
 
 
 def _traits_of(ent: int) -> list[str]:
-    if esper.has_component(ent, Personality):
-        return esper.component_for_entity(ent, Personality).traits
+    if ecs.has_component(ent, Personality):
+        return ecs.component_for_entity(ent, Personality).traits
     return []
 
 
@@ -1487,10 +1487,10 @@ def interact(
     adjust_friendship(b, a, delta_b)
 
     for ent, other, rel, delta in ((a, b, rel_a, delta_a), (b, a, rel_b, delta_b)):
-        if esper.has_component(ent, Personality):
-            esper.component_for_entity(ent, Personality).last_social_turn = turn
-        if esper.has_component(ent, Position):
-            pos = esper.component_for_entity(ent, Position)
+        if ecs.has_component(ent, Personality):
+            ecs.component_for_entity(ent, Personality).last_social_turn = turn
+        if ecs.has_component(ent, Position):
+            pos = ecs.component_for_entity(ent, Position)
             indicator, indicator_color = _react(rel, other, delta, rng)
             spawn_speech_bubble(
                 pos.x, pos.y, gibberish(),
@@ -1503,18 +1503,18 @@ def interact(
 
 
 def _gender_of(ent: int) -> str | None:
-    if esper.has_component(ent, Gender):
-        return esper.component_for_entity(ent, Gender).value
+    if ecs.has_component(ent, Gender):
+        return ecs.component_for_entity(ent, Gender).value
     return None
 
 
 def _family(ent: int) -> Family:
     """The entity's ``Family`` component, created (with an empty surname) if it
     somehow lacks one -- so marriage can always record a spouse."""
-    if esper.has_component(ent, Family):
-        return esper.component_for_entity(ent, Family)
+    if ecs.has_component(ent, Family):
+        return ecs.component_for_entity(ent, Family)
     fam = Family(surname="")
-    esper.add_component(ent, fam)
+    ecs.add_component(ent, fam)
     return fam
 
 
@@ -1528,21 +1528,21 @@ def are_courtship_eligible(a: int, b: int, clock: WorldClock | None) -> bool:
     """Whether ``a`` and ``b`` could be a romantic couple at all: two different,
     living, adult, opposite-gender, friendly beings. Friendship level (lovers vs
     spouses) is checked separately by the callers."""
-    if a == b or not esper.entity_exists(a) or not esper.entity_exists(b):
+    if a == b or not ecs.entity_exists(a) or not ecs.entity_exists(b):
         return False
     if not (is_adult(a, clock) and is_adult(b, clock)):
         return False
     ga, gb = _gender_of(a), _gender_of(b)
     if ga is None or gb is None or ga == gb:
         return False
-    return esper.has_component(a, Friendly) and esper.has_component(b, Friendly)
+    return ecs.has_component(a, Friendly) and ecs.has_component(b, Friendly)
 
 
 def _mutual_friendship(a: int, b: int) -> float:
     """The weaker of the two friendship scores -- courtship needs both to feel it,
     so we gate on the lower direction."""
-    rel_a = esper.component_for_entity(a, Relationships) if esper.has_component(a, Relationships) else None
-    rel_b = esper.component_for_entity(b, Relationships) if esper.has_component(b, Relationships) else None
+    rel_a = ecs.component_for_entity(a, Relationships) if ecs.has_component(a, Relationships) else None
+    rel_b = ecs.component_for_entity(b, Relationships) if ecs.has_component(b, Relationships) else None
     return min(friendship(rel_a, b), friendship(rel_b, a))
 
 
@@ -1550,10 +1550,10 @@ def is_private(a: int, b: int, sentients: list[tuple[int, Position]]) -> bool:
     """True when no third person stands within ``_MATING_PRIVACY_RADIUS`` of either
     partner -- the couple is alone enough to be intimate. ``sentients`` is the
     per-turn snapshot of everyone with a ``Personality``."""
-    if not (esper.has_component(a, Position) and esper.has_component(b, Position)):
+    if not (ecs.has_component(a, Position) and ecs.has_component(b, Position)):
         return False
-    pa = esper.component_for_entity(a, Position)
-    pb = esper.component_for_entity(b, Position)
+    pa = ecs.component_for_entity(a, Position)
+    pb = ecs.component_for_entity(b, Position)
     for other, opos in sentients:
         if other == a or other == b:
             continue
@@ -1629,21 +1629,21 @@ def try_mate(
     _mating(woman).last_turn = turn
 
     for person in (man, woman):
-        if esper.has_component(person, Position):
-            pos = esper.component_for_entity(person, Position)
+        if ecs.has_component(person, Position):
+            pos = ecs.component_for_entity(person, Position)
             spawn_speech_bubble(pos.x, pos.y, _HEART, clock=bubble_clock)
     _push_turn_event(f"{_entity_display_name(a)} and {_entity_display_name(b)} slip away together.")
 
-    if rng() < _PREGNANCY_CHANCE and not esper.has_component(woman, Pregnant):
-        esper.add_component(woman, Pregnant(conceived_turn=turn, father=man))
+    if rng() < _PREGNANCY_CHANCE and not ecs.has_component(woman, Pregnant):
+        ecs.add_component(woman, Pregnant(conceived_turn=turn, father=man))
     return True
 
 
 def _mating(ent: int) -> Mating:
-    if esper.has_component(ent, Mating):
-        return esper.component_for_entity(ent, Mating)
+    if ecs.has_component(ent, Mating):
+        return ecs.component_for_entity(ent, Mating)
     m = Mating()
-    esper.add_component(ent, m)
+    ecs.add_component(ent, m)
     return m
 
 
@@ -1656,8 +1656,8 @@ def current_day_for_turn(turn: int, clock: WorldClock | None) -> int:
 
 
 def _entity_display_name(ent: int) -> str:
-    if esper.has_component(ent, Name):
-        return esper.component_for_entity(ent, Name).value
+    if ecs.has_component(ent, Name):
+        return ecs.component_for_entity(ent, Name).value
     return "Someone"
 
 
@@ -1665,8 +1665,8 @@ def _adopt_surname(ent: int, surname: str) -> None:
     """Give ``ent`` the family ``surname``, updating both its ``Family`` record and
     the surname shown in its display ``Name``."""
     _family(ent).surname = surname
-    if esper.has_component(ent, Name):
-        name = esper.component_for_entity(ent, Name)
+    if ecs.has_component(ent, Name):
+        name = ecs.component_for_entity(ent, Name)
         given = name.value.rsplit(" ", 1)[0] if " " in name.value else name.value
         name.value = f"{given} {surname}"
 
@@ -1675,8 +1675,8 @@ def _merge_homes(husband: int, wife: int) -> None:
     """Bring a newly-wed couple under one roof so they share a bed. Whoever already
     has a home hosts; if only one does, the other moves in; if neither, nothing to
     do yet (the housing system settles them later, spouse-aware)."""
-    h_home = esper.component_for_entity(husband, Home) if esper.has_component(husband, Home) else None
-    w_home = esper.component_for_entity(wife, Home) if esper.has_component(wife, Home) else None
+    h_home = ecs.component_for_entity(husband, Home) if ecs.has_component(husband, Home) else None
+    w_home = ecs.component_for_entity(wife, Home) if ecs.has_component(wife, Home) else None
     if h_home is not None:
         _set_home(wife, (h_home.x, h_home.y))
     elif w_home is not None:
@@ -1684,18 +1684,18 @@ def _merge_homes(husband: int, wife: int) -> None:
 
 
 def _set_home(ent: int, xy: tuple[int, int]) -> None:
-    if esper.has_component(ent, Home):
-        home = esper.component_for_entity(ent, Home)
+    if ecs.has_component(ent, Home):
+        home = ecs.component_for_entity(ent, Home)
         home.x, home.y = xy
     else:
-        esper.add_component(ent, Home(xy[0], xy[1]))
+        ecs.add_component(ent, Home(xy[0], xy[1]))
 
 
 
 
 
 
-class HousingProcessor(esper.Processor):
+class HousingProcessor(ecs.Processor):
     """Settles residents into homes. Houses belong to people: a resident who owns
     one is left alone. A resident who owns none **claims the nearest unowned
     house** it can reach (marking it as theirs); only if none is free does it
@@ -1743,7 +1743,7 @@ class HousingProcessor(esper.Processor):
             bed_ent = _bed_in_interior(interior, beds_by_pos)
             if bed_ent is None or bed_owner(bed_ent) is not None:
                 continue  # no bed, or already someone's house
-            bed_pos = esper.component_for_entity(bed_ent, Position)
+            bed_pos = ecs.component_for_entity(bed_ent, Position)
             unowned_houses.append((interior, (bed_pos.x, bed_pos.y)))
 
         for ent, _res in self._residents_in(active_region):
@@ -1756,7 +1756,7 @@ class HousingProcessor(esper.Processor):
             self._ensure_site_for(ent, sites)
 
     def _player_region(self) -> RegionId | None:
-        for _ent, (pos, _player) in esper.get_components(Position, Player):
+        for _ent, (pos, _player) in ecs.get_components(Position, Player):
             return region_at(self.game_map, pos.x, pos.y)
         return None
 
@@ -1766,7 +1766,7 @@ class HousingProcessor(esper.Processor):
 
     def _residents_in(self, active_region: RegionId | None):
         if active_region is None:  # whole-world mode (tests, headless tools)
-            yield from ((ent, res) for ent, (res,) in list(esper.get_components(Resident)))
+            yield from ((ent, res) for ent, (res,) in list(ecs.get_components(Resident)))
             return
         index = spatial.ensure(self.game_map)
         yield from ((ent, comps[0]) for ent, comps in list(index.components(active_region, Resident)))
@@ -1798,7 +1798,7 @@ class HousingProcessor(esper.Processor):
         if self._sites_population != population:
             buckets: dict[RegionId, list[tuple[int, ConstructionSite]]] = {}
             everything: list[tuple[int, ConstructionSite]] = []
-            for ent, (site,) in esper.get_components(ConstructionSite):
+            for ent, (site,) in ecs.get_components(ConstructionSite):
                 everything.append((ent, site))
                 if site.pieces:
                     region = region_at(self.game_map, *next(iter(site.pieces)))
@@ -1828,14 +1828,14 @@ class HousingProcessor(esper.Processor):
             designated partner) -- wait this turn and move in once it's ready.
         Returns False only when ``ent`` itself should go get the home, so exactly
         one spouse ever claims or builds."""
-        if not esper.has_component(ent, Family):
+        if not ecs.has_component(ent, Family):
             return False
-        spouse = esper.component_for_entity(ent, Family).spouse
-        if spouse is None or not esper.entity_exists(spouse):
+        spouse = ecs.component_for_entity(ent, Family).spouse
+        if spouse is None or not ecs.entity_exists(spouse):
             return False
 
-        if owned_bed_of(spouse) is not None and esper.has_component(spouse, Home):
-            home = esper.component_for_entity(spouse, Home)
+        if owned_bed_of(spouse) is not None and ecs.has_component(spouse, Home):
+            home = ecs.component_for_entity(spouse, Home)
             _set_home(ent, (home.x, home.y))
             return True
 
@@ -1853,7 +1853,7 @@ class HousingProcessor(esper.Processor):
         the shared ``unowned_houses`` list so no one else claims it this turn."""
         if not unowned_houses:
             return False
-        pos = esper.component_for_entity(ent, Position) if esper.has_component(ent, Position) else None
+        pos = ecs.component_for_entity(ent, Position) if ecs.has_component(ent, Position) else None
         if pos is not None:
             unowned_houses.sort(key=lambda c: _chebyshev((pos.x, pos.y), c[1]))
 
@@ -1864,11 +1864,11 @@ class HousingProcessor(esper.Processor):
             if pos is not None and (pos.x, pos.y) != bed_xy and not self.game_map.same_region((pos.x, pos.y), bed_xy):
                 continue
             set_house_ownership(interior, ent)  # bed + chests now belong to them
-            if esper.has_component(ent, Home):
-                home = esper.component_for_entity(ent, Home)
+            if ecs.has_component(ent, Home):
+                home = ecs.component_for_entity(ent, Home)
                 home.x, home.y = bed_xy
             else:
-                esper.add_component(ent, Home(bed_xy[0], bed_xy[1]))
+                ecs.add_component(ent, Home(bed_xy[0], bed_xy[1]))
             unowned_houses.pop(index)  # taken -- keep other settlers off it
             return True
         return False
@@ -1877,9 +1877,9 @@ class HousingProcessor(esper.Processor):
         """Make sure this homeless resident has a blueprint to work on. If one it
         can reach already exists, leave it -- the NPC AI will send the villager to
         help raise it. Otherwise stake out a fresh cabin site nearby."""
-        if not esper.has_component(ent, Position):
+        if not ecs.has_component(ent, Position):
             return
-        pos = esper.component_for_entity(ent, Position)
+        pos = ecs.component_for_entity(ent, Position)
         here = (pos.x, pos.y)
         for _site_ent, site in sites:
             if site.pieces and self._site_reachable(here, site):
@@ -1904,7 +1904,7 @@ class HousingProcessor(esper.Processor):
             return
         self._no_site.pop(ent, None)
         site_ent = create_construction_site(self.game_map, origin)
-        sites.append((site_ent, esper.component_for_entity(site_ent, ConstructionSite)))
+        sites.append((site_ent, ecs.component_for_entity(site_ent, ConstructionSite)))
         _push_turn_event("A villager stakes out a blueprint for a new cabin.")
 
     def _site_reachable(self, here: tuple[int, int], site: ConstructionSite) -> bool:
@@ -1967,11 +1967,11 @@ _PICKED_BUSHES: list[int] = []
 def reset_flora_queue() -> None:
     """Forget bushes picked in a previous world. Entity ids restart with each
     world, so a leftover id could alias an unrelated entity in the next one;
-    the test fixture clears this alongside esper's database."""
+    the test fixture clears this alongside ECS's database."""
     _PICKED_BUSHES.clear()
 
 
-class TreeGrowthProcessor(esper.Processor):
+class TreeGrowthProcessor(ecs.Processor):
     """Ages the flora one **day** at a time (it acts on the turn a new day
     begins, matching the per-day odds below).
 
@@ -2103,7 +2103,7 @@ class TreeGrowthProcessor(esper.Processor):
         self._advance_regions_flora(all_region_ids(self.game_map), day, clock)
 
     def _player_region(self) -> RegionId | None:
-        for _e, (pos, _p) in esper.get_components(Position, Player):
+        for _e, (pos, _p) in ecs.get_components(Position, Player):
             return region_at(self.game_map, pos.x, pos.y)
         return None
 
@@ -2295,7 +2295,7 @@ class TreeGrowthProcessor(esper.Processor):
         # twice; what is left for this scan is a bush made bare some other way.
         already = {ent for ents in berry_queue.values() for ent in ents}
         for ent in sorted(index.of_kind(region_id, BerryBush) - already):
-            bush = esper.component_for_entity(ent, BerryBush)
+            bush = ecs.component_for_entity(ent, BerryBush)
             if not bush.has_berries and bush.harvested_turn is not None:
                 self._file(
                     berry_queue,
@@ -2314,9 +2314,9 @@ class TreeGrowthProcessor(esper.Processor):
         clock, index = ctx["clock"], ctx["index"]
         picked, _PICKED_BUSHES[:] = list(_PICKED_BUSHES), []
         for ent in picked:
-            if not esper.entity_exists(ent) or not esper.has_component(ent, BerryBush):
+            if not ecs.entity_exists(ent) or not ecs.has_component(ent, BerryBush):
                 continue
-            bush = esper.component_for_entity(ent, BerryBush)
+            bush = ecs.component_for_entity(ent, BerryBush)
             if bush.has_berries or bush.harvested_turn is None:
                 continue  # already regrown (or never really picked)
             region_id = index.region_of(ent)
@@ -2350,7 +2350,7 @@ class TreeGrowthProcessor(esper.Processor):
         queue.clear()
         filed.clear()
         for ent in sorted(saplings):
-            sapling = esper.component_for_entity(ent, Sapling)
+            sapling = ecs.component_for_entity(ent, Sapling)
             self._file(
                 queue,
                 self._due_day(sapling.planted_turn, _DAYS_PER_YEAR, clock.day_length),
@@ -2358,7 +2358,7 @@ class TreeGrowthProcessor(esper.Processor):
             )
             filed.add(ent)
         for ent in sorted(sprouts):
-            sprout = esper.component_for_entity(ent, SeaSprout)
+            sprout = ecs.component_for_entity(ent, SeaSprout)
             self._file(
                 queue,
                 self._due_day(sprout.planted_turn, _SEAWEED_MATURE_DAYS, clock.day_length),
@@ -2377,51 +2377,51 @@ class TreeGrowthProcessor(esper.Processor):
         filed = self._filed_saplings.setdefault(region_id, set())
         for ent in due:
             filed.discard(ent)
-            if not esper.entity_exists(ent):
+            if not ecs.entity_exists(ent):
                 continue
             # Land and sea juveniles share this queue -- a deadline is a deadline
             # -- but carry different components so the two habitats stay countable
             # apart (see ``SeaSprout``).
-            if esper.has_component(ent, SeaSprout):
+            if ecs.has_component(ent, SeaSprout):
                 kind = "seaweed"
-            elif esper.has_component(ent, Sapling):
-                kind = esper.component_for_entity(ent, Sapling).kind
+            elif ecs.has_component(ent, Sapling):
+                kind = ecs.component_for_entity(ent, Sapling).kind
             else:
                 continue
-            pos = esper.component_for_entity(ent, Position)
+            pos = ecs.component_for_entity(ent, Position)
             if (pos.x, pos.y) in blockers:
                 # Something stands on it -- try again tomorrow rather than turn
                 # into a wall of wood under whoever is there.
                 self._file(queue, day + 1, ent)
                 filed.add(ent)
                 continue
-            esper.remove_component(ent, SeaSprout if kind == "seaweed" else Sapling)
+            ecs.remove_component(ent, SeaSprout if kind == "seaweed" else Sapling)
             if kind == "bush":
-                esper.add_component(ent, BlocksMovement())
-                esper.add_component(ent, BerryBush())
+                ecs.add_component(ent, BlocksMovement())
+                ecs.add_component(ent, BerryBush())
                 _set_bush_appearance(ent, True)
-                if esper.has_component(ent, Name):
-                    esper.component_for_entity(ent, Name).value = "Berry Bush"
+                if ecs.has_component(ent, Name):
+                    ecs.component_for_entity(ent, Name).value = "Berry Bush"
             elif kind == "seaweed":
                 # Seaweed is the one flora that doesn't block: fish swim over it,
                 # which is how they graze it.
-                esper.add_component(ent, Seaweed())
-                if esper.has_component(ent, Renderable):
-                    rend = esper.component_for_entity(ent, Renderable)
+                ecs.add_component(ent, Seaweed())
+                if ecs.has_component(ent, Renderable):
+                    rend = ecs.component_for_entity(ent, Renderable)
                     rend.glyph = '"'
                     rend.fg = _SEAWEED_GREEN
                     rend.bg = _WATER_BLUE
-                if esper.has_component(ent, Name):
-                    esper.component_for_entity(ent, Name).value = "Seaweed"
+                if ecs.has_component(ent, Name):
+                    ecs.component_for_entity(ent, Name).value = "Seaweed"
             else:
-                esper.add_component(ent, BlocksMovement())
-                esper.add_component(ent, Tree())
-                if esper.has_component(ent, Renderable):
-                    rend = esper.component_for_entity(ent, Renderable)
+                ecs.add_component(ent, BlocksMovement())
+                ecs.add_component(ent, Tree())
+                if ecs.has_component(ent, Renderable):
+                    rend = ecs.component_for_entity(ent, Renderable)
                     rend.glyph = "T"
                     rend.fg = _TREE_GREEN
-                if esper.has_component(ent, Name):
-                    esper.component_for_entity(ent, Name).value = "Tree"
+                if ecs.has_component(ent, Name):
+                    ecs.component_for_entity(ent, Name).value = "Tree"
             # It was a seedling and is now a grown plant of some kind: the index
             # buckets it by what it is, so it has to be told.
             spatial.reclassify(ent)
@@ -2446,17 +2446,17 @@ class TreeGrowthProcessor(esper.Processor):
             ordered = sorted(population)  # snapshot: we are about to delete from it
             for i in doomed:
                 ent = ordered[i]
-                if esper.entity_exists(ent):
-                    esper.delete_entity(ent, immediate=True)
+                if ecs.entity_exists(ent):
+                    ecs.delete_entity(ent, immediate=True)
 
     def _regrow_berries(self, region_id: RegionId, day: int, ctx: dict) -> None:
         """Ripen the bushes whose seven days are up today. Only bushes that were
         actually picked are ever on the queue, so a region full of ripe bushes
         costs nothing."""
         for ent in self._pop_due(self._berry_due.setdefault(region_id, {}), day):
-            if not esper.entity_exists(ent) or not esper.has_component(ent, BerryBush):
+            if not ecs.entity_exists(ent) or not ecs.has_component(ent, BerryBush):
                 continue
-            bush = esper.component_for_entity(ent, BerryBush)
+            bush = ecs.component_for_entity(ent, BerryBush)
             if bush.has_berries:
                 continue  # picked, regrown and picked again? the later filing wins
             bush.has_berries = True
@@ -2543,7 +2543,7 @@ class TreeGrowthProcessor(esper.Processor):
                 kind, glyph, name = "tree", "t", "Sapling"
             else:
                 kind, glyph, name = "bush", ",", "Bush Seedling"
-            ent = esper.create_entity(
+            ent = ecs.create_entity(
                 Position(x, y),
                 Renderable(glyph, fg=_SAPLING_GREEN),
                 Name(name),
@@ -2654,7 +2654,7 @@ class TreeGrowthProcessor(esper.Processor):
             if index.rooted_at(x, y) is not None:
                 continue  # something already grows there; fish swim over, so that
                           # is the only thing an open-sea tile can be taken by
-            ent = esper.create_entity(
+            ent = ecs.create_entity(
                 Position(x, y),
                 Renderable("'", fg=_SEAWEED_SPROUT_GREEN, bg=_WATER_BLUE),
                 Name("Seaweed Sprout"),
@@ -2674,7 +2674,7 @@ _VILLAGER_GLYPH = "v"
 _BABY_SKIN = (222, 184, 156)
 
 
-class ReproductionProcessor(esper.Processor):
+class ReproductionProcessor(ecs.Processor):
     """Delivers babies. Once a day (a cheap day-boundary pass, like the flora)
     it checks every pregnant woman: when the gestation period has elapsed a child
     is born beside her -- named by the onymancer, sharing the family surname, and
@@ -2725,7 +2725,7 @@ class ReproductionProcessor(esper.Processor):
     def _player_region(self) -> RegionId | None:
         if self.game_map is None:
             return None
-        for _ent, (pos, _player) in esper.get_components(Position, Player):
+        for _ent, (pos, _player) in ecs.get_components(Position, Player):
             return region_at(self.game_map, pos.x, pos.y)
         return None
 
@@ -2761,7 +2761,7 @@ class ReproductionProcessor(esper.Processor):
         for mother, pregnant in self._pregnancies(region_id):
             if clock.turn - pregnant.conceived_turn < term:
                 continue
-            esper.remove_component(mother, Pregnant)
+            ecs.remove_component(mother, Pregnant)
             self._give_birth(mother, pregnant.father, clock)
 
     def _pregnancies(self, region_id: RegionId | None):
@@ -2772,16 +2772,16 @@ class ReproductionProcessor(esper.Processor):
         """
         if region_id is None or self.game_map is None:
             yield from (
-                (ent, comps[0]) for ent, comps in list(esper.get_components(Pregnant))
+                (ent, comps[0]) for ent, comps in list(ecs.get_components(Pregnant))
             )
             return
         index = spatial.ensure(self.game_map)
         for ent in sorted(index.of_kind(region_id, Personality)):
-            if esper.entity_exists(ent) and esper.has_component(ent, Pregnant):
-                yield ent, esper.component_for_entity(ent, Pregnant)
+            if ecs.entity_exists(ent) and ecs.has_component(ent, Pregnant):
+                yield ent, ecs.component_for_entity(ent, Pregnant)
 
     def _give_birth(self, mother: int, father: int, clock: WorldClock) -> None:
-        if not esper.entity_exists(mother):
+        if not ecs.entity_exists(mother):
             return
         birth_xy = self._birth_tile(mother)
         surname = _family(mother).surname or _surname_of(_entity_display_name(mother))
@@ -2791,7 +2791,7 @@ class ReproductionProcessor(esper.Processor):
 
         repro_rng = world_rng().stream("repro")
         traits = repro_rng.sample(list(_TRAITS), k=repro_rng.randint(1, 2))
-        baby = esper.create_entity(
+        baby = ecs.create_entity(
             Position(*birth_xy),
             Renderable(_VILLAGER_GLYPH, fg=_BABY_SKIN),
             Name(full),
@@ -2813,12 +2813,12 @@ class ReproductionProcessor(esper.Processor):
         # Record the child on both parents (siblings are derived from shared
         # parents, so nothing else to link).
         for parent in (father, mother):
-            if esper.entity_exists(parent):
+            if ecs.entity_exists(parent):
                 _family(parent).children.append(baby)
 
         # The baby lives with its mother.
-        if esper.has_component(mother, Home):
-            home = esper.component_for_entity(mother, Home)
+        if ecs.has_component(mother, Home):
+            home = ecs.component_for_entity(mother, Home)
             _set_home(baby, (home.x, home.y))
 
         _push_turn_event(
@@ -2832,11 +2832,11 @@ class ReproductionProcessor(esper.Processor):
     def _birth_tile(self, mother: int) -> tuple[int, int]:
         """The mother's own tile if we can't do better; otherwise a free adjacent
         tile so the newborn doesn't share a cell (it blocks movement)."""
-        if not esper.has_component(mother, Position):
+        if not ecs.has_component(mother, Position):
             return (0, 0)
-        mpos = esper.component_for_entity(mother, Position)
+        mpos = ecs.component_for_entity(mother, Position)
         occupied = {
-            (pos.x, pos.y) for _e, (pos, _b) in esper.get_components(Position, BlocksMovement)
+            (pos.x, pos.y) for _e, (pos, _b) in ecs.get_components(Position, BlocksMovement)
         }
         for nx, ny in _neighbours_8(mpos.x, mpos.y):
             if (nx, ny) not in occupied:
@@ -2918,7 +2918,7 @@ def _crossed_warning(
     return None
 
 
-class NeedsProcessor(esper.Processor):
+class NeedsProcessor(ecs.Processor):
     """Advances hunger/thirst/tiredness by the *time elapsed* since the last turn.
 
     Needs are a function of world time, not action count: a turn that consumed 200
@@ -2926,7 +2926,7 @@ class NeedsProcessor(esper.Processor):
     proportionally hungrier. The per-turn rates on ``Needs`` are defined per
     ``BASE_ACTION_COST`` TU, so a baseline turn accrues exactly the old amount.
 
-    Menu refreshes call ``esper.process(None)``; those must not starve the player,
+    Menu refreshes call ``ecs.process(None)``; those must not starve the player,
     so the tick is gated on a turn-advancing action.
     """
 
@@ -3022,15 +3022,15 @@ class NeedsProcessor(esper.Processor):
         )
         woke: list[int] = []
         for ent, (needs,) in spatial.ensure(self.game_map).components(region_id, Needs):
-            if esper.has_component(ent, Player):
+            if ecs.has_component(ent, Player):
                 continue
-            if esper.has_component(ent, Settled):
+            if ecs.has_component(ent, Settled):
                 if self._burn_settled_turns(ent, turns):
                     woke.append(ent)
                 continue
             needs.hunger = min(needs.max_value, needs.hunger + needs.hunger_rate * turns)
             needs.thirst = min(needs.max_value, needs.thirst + needs.thirst_rate * turns)
-            if esper.has_component(ent, Asleep):
+            if ecs.has_component(ent, Asleep):
                 needs.tiredness = max(0.0, needs.tiredness - _SLEEP_RECOVERY * turns)
                 if needs.tiredness <= 0.0:
                     woke.append(ent)
@@ -3047,12 +3047,12 @@ class NeedsProcessor(esper.Processor):
     def _burn_settled_turns(ent: int, turns: int) -> bool:
         """Consume ``turns`` region-turns of a compacted activity at once. Returns
         True when that used the receipt up and the entity was asleep."""
-        settled = esper.component_for_entity(ent, Settled)
+        settled = ecs.component_for_entity(ent, Settled)
         settled.turns -= turns
         if settled.turns > 0:
             return False
-        esper.remove_component(ent, Settled)
-        return esper.has_component(ent, Asleep)
+        ecs.remove_component(ent, Settled)
+        return ecs.has_component(ent, Asleep)
 
     @staticmethod
     def _burn_settled_turn(ent: int) -> bool:
@@ -3068,7 +3068,7 @@ class NeedsProcessor(esper.Processor):
         prev_hunger = needs.hunger
         prev_thirst = needs.thirst
         prev_tiredness = needs.tiredness
-        asleep = esper.has_component(ent, Asleep)
+        asleep = ecs.has_component(ent, Asleep)
         rested = False
 
         # Hunger and thirst creep up whether awake or asleep.
@@ -3085,7 +3085,7 @@ class NeedsProcessor(esper.Processor):
 
         # Every creature accumulates needs, but only the player's are surfaced as
         # log warnings -- a hungry goblin shouldn't print "You are starving!".
-        if esper.has_component(ent, Player):
+        if ecs.has_component(ent, Player):
             hunger_msg = _crossed_warning(prev_hunger, needs.hunger, _HUNGER_WARNINGS)
             if hunger_msg is not None:
                 _push_turn_event(hunger_msg)
@@ -3104,7 +3104,7 @@ class NeedsProcessor(esper.Processor):
     def _player_region(self) -> RegionId | None:
         if self.game_map is None:
             return None
-        for _ent, (pos, _player) in esper.get_components(Position, Player):
+        for _ent, (pos, _player) in ecs.get_components(Position, Player):
             return region_at(self.game_map, pos.x, pos.y)
         return None
 
@@ -3117,11 +3117,11 @@ class NeedsProcessor(esper.Processor):
         which is what those tests assert.
         """
         if self._scheduler_driven:
-            for ent, (needs, _player) in esper.get_components(Needs, Player):
+            for ent, (needs, _player) in ecs.get_components(Needs, Player):
                 yield ent, needs
             return
         if self.game_map is None or active_region is None:
-            yield from ((ent, needs) for ent, (needs,) in esper.get_components(Needs))
+            yield from ((ent, needs) for ent, (needs,) in ecs.get_components(Needs))
             return
         for ent, (needs,) in spatial.ensure(self.game_map).components(active_region, Needs):
             yield ent, needs
@@ -3159,7 +3159,7 @@ class NeedsProcessor(esper.Processor):
         for ent, needs in self._ticking_entities(self._player_region()):
             # Same receipt as the region pass: turns a compacted activity already
             # applied must not be applied again by the whole-world tick either.
-            if esper.has_component(ent, Settled):
+            if ecs.has_component(ent, Settled):
                 if self._burn_settled_turn(ent):
                     woke.append(ent)
                 continue

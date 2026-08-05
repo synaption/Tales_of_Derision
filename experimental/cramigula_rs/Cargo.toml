@@ -1,0 +1,83 @@
+[package]
+name = "cramigula"
+version = "0.1.0"
+edition = "2021"
+description = "EDF flight-class movement and a PlayStation 1 renderer, on Bevy."
+publish = false
+# There are two binaries; `cargo run` with no `--bin` should give you the game
+# rather than an error listing them.
+default-run = "cramigula"
+
+[lib]
+name = "cramigula"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cramigula"
+path = "src/main.rs"
+required-features = ["render"]
+
+[[bin]]
+name = "contactsheet"
+path = "src/bin/contactsheet.rs"
+required-features = ["render"]
+
+[features]
+default = ["render"]
+# Everything that can draw. Off, and `bevy_render` is not merely unused --
+# it is absent from the dependency graph, so `cargo test --no-default-features`
+# cannot open a window however hard it tries.
+render = ["dep:bevy"]
+
+# The dependency list is the architecture, so it is worth reading.
+#
+# `sim`, `components`, `spatial`, `worldgen` and `rng` use ONLY the four small
+# crates below -- no `bevy_render`, no `bevy_pbr`, no `bevy_window`. They
+# physically cannot open a window, which is what makes the headless tests in
+# `tests/` instant and windowless rather than merely well-behaved.
+#
+# The full `bevy` facade is used by `main.rs`, `render.rs`, `ps1.rs`, `hud.rs`
+# and `models.rs`, and by nothing else. Cargo unifies the versions, so
+# `bevy_ecs::component::Component` and `bevy::prelude::Component` are the same
+# type -- the split costs nothing at runtime and buys a compiler-enforced seam.
+[dependencies]
+bevy_ecs = "0.18"
+bevy_math = "0.18"
+bevy_app = "0.18"
+bevy_platform = "0.18"
+
+[dependencies.bevy]
+version = "0.18"
+optional = true
+default-features = false
+features = [
+    "std",
+    "multi_threaded",
+    "bevy_asset",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_sprite",
+    "bevy_window",
+    "bevy_winit",
+    "bevy_ui",
+    # Layout and drawing are separate features in 0.18. `bevy_ui` alone gives
+    # a HUD that computes its geometry perfectly and never appears.
+    "bevy_ui_render",
+    "bevy_text",
+    "default_font",
+    "bevy_log",
+    # X11 only. WSLg speaks it, and `wayland` needs libwayland's headers at
+    # build time, which is a system package this crate should not require.
+    "x11",
+    "png",
+]
+
+[profile.dev]
+opt-level = 1
+
+# Bevy is unusable in a debug build without this; the dependencies are
+# compiled once and never edited, so there is no iteration cost to paying for
+# optimisation in them.
+[profile.dev.package."*"]
+opt-level = 3

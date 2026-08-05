@@ -3,7 +3,7 @@ the trait-driven friendship math, partner preference, the NPC social drive, the
 speech-bubble store, and the player's Talk action."""
 from __future__ import annotations
 
-import esper
+import ecs
 import pytest
 
 from components import (
@@ -36,7 +36,7 @@ pytestmark = pytest.mark.unrendered
 
 
 def _make_being(x: int, y: int, traits: list[str]) -> int:
-    return esper.create_entity(
+    return ecs.create_entity(
         Position(x, y),
         NPC(),
         Friendly(),
@@ -56,11 +56,11 @@ def test_interaction_delta_sign_follows_warmth() -> None:
 
 
 def test_adjust_friendship_clamps_and_creates_component() -> None:
-    ent = esper.create_entity(Position(1, 1))
-    other = esper.create_entity(Position(2, 2))
+    ent = ecs.create_entity(Position(1, 1))
+    other = ecs.create_entity(Position(2, 2))
 
     assert adjust_friendship(ent, other, 200.0) == 100.0  # clamped high
-    assert esper.has_component(ent, Relationships)  # created on demand
+    assert ecs.has_component(ent, Relationships)  # created on demand
     assert adjust_friendship(ent, other, -300.0) == -100.0  # clamped low
 
 
@@ -73,13 +73,13 @@ def test_pick_social_partner_prefers_a_friend_over_a_nearer_stranger() -> None:
     friend = _make_being(9, 5, ["Kind"])       # distance 4, but already liked
     stranger = _make_being(7, 5, ["Kind"])     # distance 2, unknown
 
-    esper.component_for_entity(chooser, Relationships).scores[friend] = 40.0
+    ecs.component_for_entity(chooser, Relationships).scores[friend] = 40.0
 
     proc = NpcAiProcessor(game_map)
-    sentients = [(friend, esper.component_for_entity(friend, Position)),
-                 (stranger, esper.component_for_entity(stranger, Position))]
+    sentients = [(friend, ecs.component_for_entity(friend, Position)),
+                 (stranger, ecs.component_for_entity(stranger, Position))]
     chosen = proc._pick_social_partner(
-        chooser, esper.component_for_entity(chooser, Position), sentients
+        chooser, ecs.component_for_entity(chooser, Position), sentients
     )
     assert chosen is not None
     assert chosen[0] == friend
@@ -96,8 +96,8 @@ def test_adjacent_villagers_interact_and_pop_bubbles() -> None:
 
     NpcAiProcessor(game_map).process(WAIT_ACTION)
 
-    assert esper.component_for_entity(a, Relationships).scores.get(b, 0.0) > 0
-    assert esper.component_for_entity(b, Relationships).scores.get(a, 0.0) > 0
+    assert ecs.component_for_entity(a, Relationships).scores.get(b, 0.0) > 0
+    assert ecs.component_for_entity(b, Relationships).scores.get(a, 0.0) > 0
     # One interaction pops a bubble above each participant.
     assert len(active_bubbles()) == 2
 
@@ -110,10 +110,10 @@ def test_social_cooldown_blocks_immediate_repeat() -> None:
 
     proc = NpcAiProcessor(game_map)
     proc.process(WAIT_ACTION)
-    score_after_first = esper.component_for_entity(a, Relationships).scores[b]
+    score_after_first = ecs.component_for_entity(a, Relationships).scores[b]
 
     proc.process(WAIT_ACTION)  # same turn -> both still on cooldown
-    assert esper.component_for_entity(a, Relationships).scores[b] == score_after_first
+    assert ecs.component_for_entity(a, Relationships).scores[b] == score_after_first
 
 
 # --- Speech bubbles ---------------------------------------------------------
@@ -200,11 +200,11 @@ def test_react_can_surface_a_mild_indicator_mid_conversation() -> None:
 
 def test_player_talk_builds_friendship() -> None:
     systems._SPEECH_BUBBLES.clear()
-    player = esper.create_entity(Position(5, 5), Player())
+    player = ecs.create_entity(Position(5, 5), Player())
     villager = _make_being(5, 6, ["Kind"])
 
     outcome = _player_talk(player, villager)
 
     assert isinstance(outcome, str) and outcome != ""
-    rel = esper.component_for_entity(player, Relationships)
+    rel = ecs.component_for_entity(player, Relationships)
     assert friendship(rel, villager) > 0

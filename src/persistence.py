@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import shutil
 
-import esper
+import ecs
 
 from components import Player, Position
 from game_map import GameMap
@@ -174,6 +174,6 @@ def load_game(
 
 
 def first_player_position() -> Position | None:
-    for _ent, (pos, _player) in esper.get_components(Position, Player):
+    for _ent, (pos, _player) in ecs.get_components(Position, Player):
         return pos
     return None

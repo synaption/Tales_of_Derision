@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import esper
+import ecs
 import pytest
 
 from components import BlocksMovement, Corpse, Dialogue, Enemy, Equipment, Friendly, Inventory, NPC, Name, Player, Position, Renderable, Vision
@@ -16,12 +16,12 @@ def _setup_world(width: int = 10, height: int = 6) -> tuple[GameMap, FakeRendere
     game_map = GameMap(width, height)
     renderer = FakeRenderer()
 
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(NpcAiProcessor(game_map), priority=0)
-    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(NpcAiProcessor(game_map), priority=0)
+    ecs.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
     player_pos = Position(width // 2, height // 2)
-    esper.create_entity(
+    ecs.create_entity(
         player_pos,
         Renderable("@"),
         Name("You"),
@@ -31,7 +31,7 @@ def _setup_world(width: int = 10, height: int = 6) -> tuple[GameMap, FakeRendere
         Inventory(items=["Bandage"]),
         Equipment(slots={"main hand": "Rusty Sword"}),
     )
-    esper.create_entity(
+    ecs.create_entity(
         Position(player_pos.x + 1, player_pos.y),
         Renderable("g"),
         Name("Goblin"),
@@ -49,7 +49,7 @@ def _setup_world(width: int = 10, height: int = 6) -> tuple[GameMap, FakeRendere
 def test_initial_tick_renders_map_player_and_status_line() -> None:
     game_map, renderer, player_pos = _setup_world()
 
-    esper.process(None)
+    ecs.process(None)
 
     assert renderer.present_calls == 1
     assert renderer.glyphs[(0, 0)] == game_map.WALL
@@ -71,16 +71,16 @@ def test_nearby_section_is_dynamic_and_log_starts_after_items() -> None:
     game_map = GameMap(30, 14)
     renderer = FakeRenderer()
 
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
     player_pos = Position(15, 7)
-    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player())
-    esper.create_entity(Position(16, 7), Renderable("g"), Name("Goblin"))
-    esper.create_entity(Position(14, 7), Renderable("o"), Name("Orc"))
-    esper.create_entity(Position(15, 8), Renderable("r"), Name("Rat"))
+    ecs.create_entity(player_pos, Renderable("@"), Name("You"), Player())
+    ecs.create_entity(Position(16, 7), Renderable("g"), Name("Goblin"))
+    ecs.create_entity(Position(14, 7), Renderable("o"), Name("Orc"))
+    ecs.create_entity(Position(15, 8), Renderable("r"), Name("Rat"))
 
-    esper.process(None)
+    ecs.process(None)
 
     sidebar_x = next(x for x, _y, text in renderer.text if text == "[NEARBY]")
     nearby_header_y = next(y for x, y, text in renderer.text if x == sidebar_x and text == "[NEARBY]")
@@ -99,7 +99,7 @@ def test_move_action_updates_position_and_rendered_player_location() -> None:
     _game_map, renderer, player_pos = _setup_world()
 
     start = (player_pos.x, player_pos.y)
-    esper.process("move_left")
+    ecs.process("move_left")
 
     assert (player_pos.x, player_pos.y) == (start[0] - 1, start[1])
     assert renderer.glyphs[(player_pos.x, player_pos.y)] == "@"
@@ -109,8 +109,8 @@ def test_blocked_movement_adds_log_event() -> None:
     _game_map, renderer, player_pos = _setup_world(width=8, height=20)
 
     player_pos.x = 1
-    esper.process(None)
-    esper.process("move_left")
+    ecs.process(None)
+    ecs.process("move_left")
 
     assert any("You bump into a" in text for _x, _y, text in renderer.text)
 
@@ -121,7 +121,7 @@ def test_player_does_not_move_through_wall() -> None:
     player_pos.x = 1
     start = (player_pos.x, player_pos.y)
 
-    esper.process("move_left")
+    ecs.process("move_left")
 
     assert (player_pos.x, player_pos.y) == start
 
@@ -130,16 +130,16 @@ def test_visible_npc_sighting_logs_once_even_when_not_adjacent() -> None:
     game_map = GameMap(12, 20)
     renderer = FakeRenderer()
 
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
     player_pos = Position(5, 10)
-    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
-    esper.create_entity(Position(8, 10), Renderable("r"), Name("Rat"), NPC(), Enemy(), BlocksMovement())
+    ecs.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    ecs.create_entity(Position(8, 10), Renderable("r"), Name("Rat"), NPC(), Enemy(), BlocksMovement())
 
-    esper.process(None)
-    esper.process("move_left")
-    esper.process("move_right")
+    ecs.process(None)
+    ecs.process("move_left")
+    ecs.process("move_right")
 
     notice_count = sum(1 for _x, _y, text in renderer.text if "You notice Rat" in text)
     assert notice_count == 1
@@ -149,18 +149,18 @@ def test_npc_moves_toward_player_when_in_sight() -> None:
     game_map = GameMap(16, 10)
     renderer = FakeRenderer()
 
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(NpcAiProcessor(game_map), priority=0)
-    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(NpcAiProcessor(game_map), priority=0)
+    ecs.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
     player_pos = Position(10, 5)
     npc_pos = Position(4, 5)
 
-    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
-    esper.create_entity(npc_pos, Renderable("g"), Name("Goblin"), NPC(), Enemy(), Vision(10), BlocksMovement())
+    ecs.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    ecs.create_entity(npc_pos, Renderable("g"), Name("Goblin"), NPC(), Enemy(), Vision(10), BlocksMovement())
 
     start = (npc_pos.x, npc_pos.y)
-    esper.process("move_right")
+    ecs.process("move_right")
 
     assert (npc_pos.x, npc_pos.y) != start
     assert npc_pos.x > start[0]
@@ -170,13 +170,13 @@ def test_player_attacks_enemy_on_collision() -> None:
     game_map = GameMap(12, 8)
     renderer = FakeRenderer()
 
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(NpcAiProcessor(game_map), priority=0)
-    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(NpcAiProcessor(game_map), priority=0)
+    ecs.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
     player_pos = Position(5, 4)
     enemy_pos = Position(6, 4)
-    enemy_ent = esper.create_entity(
+    enemy_ent = ecs.create_entity(
         enemy_pos,
         Renderable("g"),
         Name("Goblin"),
@@ -187,26 +187,26 @@ def test_player_attacks_enemy_on_collision() -> None:
         Inventory(items=["Copper Coin"]),
         Equipment(slots={"main hand": "Jagged Dagger"}),
     )
-    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    ecs.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
 
-    esper.process("move_right")
+    ecs.process("move_right")
 
     corpses = [
         (pos, name)
-        for _ent, (pos, _corpse, name) in esper.get_components(Position, Corpse, Name)
+        for _ent, (pos, _corpse, name) in ecs.get_components(Position, Corpse, Name)
     ]
 
     assert (player_pos.x, player_pos.y) == (5, 4)
-    assert not esper.entity_exists(enemy_ent)
+    assert not ecs.entity_exists(enemy_ent)
     assert len(corpses) == 1
     assert (corpses[0][0].x, corpses[0][0].y) == (6, 4)
     assert corpses[0][1].value == "Corpse of Goblin"
     assert any(text == "You attack Goblin." for _x, _y, text in renderer.text)
 
-    corpse_ent = next(ent for ent, (_corpse,) in esper.get_components(Corpse))
-    corpse_renderable = esper.component_for_entity(corpse_ent, Renderable)
-    corpse_inventory = esper.component_for_entity(corpse_ent, Inventory)
-    corpse_equipment = esper.component_for_entity(corpse_ent, Equipment)
+    corpse_ent = next(ent for ent, (_corpse,) in ecs.get_components(Corpse))
+    corpse_renderable = ecs.component_for_entity(corpse_ent, Renderable)
+    corpse_inventory = ecs.component_for_entity(corpse_ent, Inventory)
+    corpse_equipment = ecs.component_for_entity(corpse_ent, Equipment)
     assert corpse_renderable.glyph == "x"
     # A corpse always yields butcherable Raw Meat on top of carried loot.
     assert corpse_inventory.items == ["Raw Meat", "Copper Coin"]
@@ -217,13 +217,13 @@ def test_player_bumps_friendly_and_gets_interaction_prompt() -> None:
     game_map = GameMap(12, 8)
     renderer = FakeRenderer()
 
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(NpcAiProcessor(game_map), priority=0)
-    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(NpcAiProcessor(game_map), priority=0)
+    ecs.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
     player_pos = Position(5, 4)
-    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
-    esper.create_entity(
+    ecs.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(10), BlocksMovement())
+    ecs.create_entity(
         Position(6, 4),
         Renderable("v"),
         Name("Friendly Villager"),
@@ -233,8 +233,8 @@ def test_player_bumps_friendly_and_gets_interaction_prompt() -> None:
         BlocksMovement(),
     )
 
-    esper.process(None)
-    esper.process("move_right")
+    ecs.process(None)
+    ecs.process("move_right")
 
     assert (player_pos.x, player_pos.y) == (5, 4)
     assert any("blocks your way" in text for _x, _y, text in renderer.text)
@@ -246,12 +246,12 @@ def test_all_characters_have_inventory_and_equipment_components() -> None:
 
     actor_ents = {
         ent
-        for ent, (_pos, _name) in esper.get_components(Position, Name)
-        if esper.has_component(ent, Player) or esper.has_component(ent, NPC)
+        for ent, (_pos, _name) in ecs.get_components(Position, Name)
+        if ecs.has_component(ent, Player) or ecs.has_component(ent, NPC)
     }
 
-    with_inventory = {ent for ent, (_inv,) in esper.get_components(Inventory)}
-    with_equipment = {ent for ent, (_equip,) in esper.get_components(Equipment)}
+    with_inventory = {ent for ent, (_inv,) in ecs.get_components(Inventory)}
+    with_equipment = {ent for ent, (_equip,) in ecs.get_components(Equipment)}
 
     assert actor_ents
     assert actor_ents.issubset(with_inventory)

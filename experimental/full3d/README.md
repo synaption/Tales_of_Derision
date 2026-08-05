@@ -6,45 +6,86 @@
 
 ```
 python3 experimental/full3d/cramigula.py
-python3 experimental/full3d/headlesstest.py                # 40 tests, no window
+python3 experimental/full3d/headlesstest.py                # 46 tests, no window
 python3 experimental/full3d/headlesstest.py --no-render    # sim only, no GL
 ```
 
 Needs `panda3d` and `esper`.
 
+There is a Rust + Bevy port of this in [`../cramigula_rs`](../cramigula_rs),
+with the same numbers and the same look. Its README covers what the change of
+engine changed and what it did not.
+
 ---
 
 ## The movement system
 
-The Wing Diver is one meter with three straws in it. Flight, dashing and the
+The Wing Diver is one meter with three straws in it. Flight, gliding and the
 lance all drink from the same 100 points, and the whole class is the
 arithmetic of not running out.
 
 | Rule | Number | Why it is the number |
 | --- | --- | --- |
 | Thrust drain | 26/s | ~3.8s of continuous flight from full |
-| Dash | 18 flat | Five dashes, or one dash and two seconds of air |
+| Glide drain | 7/s | Altitude is expensive; distance is not |
 | Lance | 12/shot | A shot from the air is altitude you chose not to buy |
 | Ground recharge | 45/s | Landing is always the right answer, eventually |
-| Air recharge | 12/s | Gliding recovers something, but not enough |
+| Air recharge | 12/s | Coasting recovers something, but not enough |
 | Overheat penalty | x0.55 | And it does not release until the bar is **full** |
 
 Thrust is an *acceleration*, not an assignment to `vel.z`. That single choice
 is most of the feel: a tap gives a hop, a hold gives a climb, and a diver who
 has been falling for a second has to pay that momentum back before she rises.
-The dash is an impulse rather than a state, so the speed it leaves behind is
-yours to keep -- dash, then thrust, and you hold more speed than air control
-alone could give you, because the soft cap only stops you *accelerating* past
-it.
+
+The glide is the other half, and the two prices are what make the class play.
+With the wings out the descent settles near 4.5 m/s and the horizontal drag
+drops by a factor of eighteen, so the speed you arrived with is speed you
+keep. At 7 a second against the thrust's 26, the way across the city is one
+hard burn upward and then a long flat descent — not a jetpack held down the
+whole way.
+
+**A glide never gains height.** Not from a fall, and not from a climb either:
+gravity is only softened while already descending, so holding glide on the way
+up reaches exactly the same apex as not holding it. Softening gravity during an
+ascent would stretch the arc and let you float higher than you had momentum
+for, which is a hop wearing a glide's name. Two tests guard that
+(`test_glide_never_gains_height`, `test_glide_does_not_extend_a_climb`).
 
 The overheat is the interesting rule. Touching exactly zero latches
-`Energy.empty`: no flight, no dash, and a recharge at 55% that does not release
-until the meter is completely full. Landing with 1% left costs you a moment.
-Landing with 0% costs you the fight. Everything else about playing the class is
-downstream of learning to always leave yourself one dash.
+`Energy.empty`: no flight, no glide, and a recharge at 55% that does not
+release until the meter is completely full. Landing with 1% left costs you a
+moment. Landing with 0% costs you the fight — you are a slow soldier with no
+gun until it fills. Everything else about playing the class is downstream of
+learning to always leave yourself the glide home.
 
-All of it is `FlightProcessor` in [sim.py](sim.py), about eighty lines, and
+All of it is `FlightProcessor` in [sim.py](sim.py), about a hundred lines, and
 `headlesstest.py` asserts every row of that table.
+
+## The camera
+
+Third-person, on a spring, behind and to the right. The one thing that matters:
+**it looks along the aim, never at the player.**
+
+The obvious chase camera positions itself from the aim and then `lookAt`s the
+character — and the moment you pitch, screen centre is her head rather than the
+direction the lance travels. The crosshair then lies about where the shot goes,
+by more the harder you are aiming, and the gun feels broken in a way that is
+very hard to blame on the camera.
+
+So orientation comes straight from the aim angles and nothing else. Panda's HPR
+forward vector for `(yaw, pitch, 0)` is exactly `sim.aim_vector`, so screen
+centre *is* the fire direction by construction. Position is then fully
+decoupled: the boom can be yanked out of a wall, lifted off the tarmac or
+snapped across the map on a restart without the reticle ever drifting off the
+shot. The player is kept from behind the crosshair by offsetting the boom right
+and up, not by aiming somewhere she is not.
+
+The boom retracts out of walls fast (26 m/s) and extends back out slow (7 m/s),
+because a camera that springs back at the rate it went in lurches every time
+you skim a building. The "crosshair points where the lance goes" test checks
+the camera's forward vector against `aim_vector` at five aim angles, including
+two past 70 degrees of pitch, and the "stays out of the ground and walls" test
+flies a lap of the city checking the boom against the collision grid.
 
 ## The PlayStation look
 
@@ -91,7 +132,7 @@ was anyway.
 | [models.py](models.py) | Procedural geometry |
 | [render.py](render.py) | Three processors that read the sim and never write it |
 | [cramigula.py](cramigula.py) | Window, input, one task |
-| [headlesstest.py](headlesstest.py) | 40 tests and a contact sheet |
+| [headlesstest.py](headlesstest.py) | 46 tests and a contact sheet |
 
 The seam that matters: `sim.py` imports `esper`, `math` and
 `panda3d.core.Vec3`, and nothing else. It never touches a `NodePath` and cannot
@@ -116,10 +157,10 @@ fly.
 
 | | |
 | --- | --- |
-| Mouse | Aim. The camera follows the aim, not the velocity |
+| Mouse | Aim. Screen centre is exactly where the lance goes |
 | W A S D | Move, relative to where you are looking |
 | Space (hold) | Thrust |
-| Shift | Boost dash |
+| Shift (hold) | Glide -- wings out: the fall slows and the speed keeps |
 | Left mouse | Fire the lance |
 | R | Restart with a fresh city |
 | F1 | Toggle the vertex snapping |
@@ -130,8 +171,8 @@ fly.
 `headlesstest.py` opens no window. The simulation half runs with no GL context
 at all; the renderer half uses `window-type offscreen`, so nothing appears on
 the desktop even while the shaders are being exercised. It writes
-`cramigula_headless.png`, a six-panel contact sheet -- street level, in flight,
-firing, overheated, a rooftop, a swarm -- so the art can be eyeballed without
+`cramigula_headless.png`, a six-panel contact sheet -- street level, climbing,
+gliding, firing, overheated, a swarm -- so the art can be eyeballed without
 launching the game.
 
 The renderer tests earn their keep. The reason the PS1 shader is visibly a

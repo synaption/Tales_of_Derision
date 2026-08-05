@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import esper
+import ecs
 import pytest
 
 from components import Enemy, NPC, Player, Position
@@ -52,11 +52,11 @@ def test_small_maps_stay_a_plain_walled_room() -> None:
 def test_movement_processor_moves_player_without_renderer() -> None:
     game_map = GameMap(10, 6)
     player_pos = Position(3, 3)
-    esper.create_entity(player_pos, Player())
-    esper.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.create_entity(player_pos, Player())
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
 
-    esper.process("move_right")
-    esper.process("move_up")
+    ecs.process("move_right")
+    ecs.process("move_up")
 
     assert (player_pos.x, player_pos.y) == (4, 2)
 
@@ -64,10 +64,10 @@ def test_movement_processor_moves_player_without_renderer() -> None:
 def test_movement_processor_supports_diagonal_player_move() -> None:
     game_map = GameMap(10, 10)
     player_pos = Position(3, 3)
-    esper.create_entity(player_pos, Player())
-    esper.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.create_entity(player_pos, Player())
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
 
-    esper.process("move_down_right")
+    ecs.process("move_down_right")
 
     assert (player_pos.x, player_pos.y) == (4, 4)
 
@@ -80,13 +80,13 @@ def test_npc_ai_can_move_diagonally_toward_player() -> None:
     player_pos = Position(12, 12)
     npc_pos = Position(6, 6)
 
-    esper.create_entity(player_pos, Player(), BlocksMovement(), Vision(12))
-    esper.create_entity(npc_pos, NPC(), Enemy(), BlocksMovement(), Vision(12))
+    ecs.create_entity(player_pos, Player(), BlocksMovement(), Vision(12))
+    ecs.create_entity(npc_pos, NPC(), Enemy(), BlocksMovement(), Vision(12))
 
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(NpcAiProcessor(game_map), priority=0)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(NpcAiProcessor(game_map), priority=0)
 
-    esper.process("move_down_right")
+    ecs.process("move_down_right")
 
     assert (npc_pos.x, npc_pos.y) == (7, 7)
 
@@ -268,7 +268,7 @@ def test_setup_world_rat_flood_spawns_rat_on_every_walkable_tile() -> None:
 
     rat_positions = {
         (pos.x, pos.y)
-        for _ent, (pos, _npc, _enemy) in esper.get_components(Position, NPC, Enemy)
+        for _ent, (pos, _npc, _enemy) in ecs.get_components(Position, NPC, Enemy)
         if (pos.x, pos.y) != (player_pos.x, player_pos.y)
     }
 

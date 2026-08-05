@@ -31,8 +31,9 @@ The effects, grouped as they are in the panel:
                lag, look-ahead and gamepad rumble
     world      particles, damage numbers, shockwaves, a floor ripple, blood
                decals and ambient sway
-    screen     screen flash, vignette, RGB split, bloom, lighting, sprite
-               outlines, heat haze, and the pixel-snapping mode
+    screen     screen flash, vignette, RGB split, bloom, lighting with cast
+               shadows, lit sprites, outlines, heat haze, and the
+               pixel-snapping mode
     feel       input buffering and turn pacing -- juice with no pixels in it,
                and the two that matter most
     sound      layered impacts with pre-rendered pitch variation, and ducking
@@ -372,7 +373,14 @@ TOGGLE_SPECS = [
     ("light", "lighting", "screen",
      "A light map multiplied over the frame, with a light at every torch and "
      "one on each hit. The flash lights the room instead of only the victim. "
-     "Off by default: it is a look, not a piece of feel.", False),
+     "Walls block it and bodies cast into it -- see the four sliders under "
+     "this row. Off by default: it is a look, not a piece of feel.", False),
+    ("normals", "lit sprites", "screen",
+     "Rake the light across each creature instead of only dimming it: a warm "
+     "band on the side facing the nearest light and a cool one opposite. The "
+     "card generates real normals from the sprite's own silhouette; this is "
+     "the two-blit software reading of the same idea, and at 32px it is most "
+     "of what those normals were buying. Needs the lighting on."),
     ("outline", "sprite outlines", "screen",
      "The silhouette blitted four times behind the sprite. Lifts creatures off "
      "a busy floor for four extra blits each."),
@@ -492,6 +500,13 @@ PARAM_SPECS = [
     ("rumble_str", "rumble strength", "camera", 1.0, 0.0, 1.0,
      "Scales both motors. Needs a pad plugged in.", "{:.2f}"),
 
+    ("spawn_count", "enemies spawned", "world", float(len(MONSTERS)), 0.0, 48.0,
+     "How many monsters a reset puts on the floor. The first nine are the "
+     "hand-placed roster -- one of each, at spots picked so most approaches "
+     "have a corner in them -- and past that the cast repeats onto scattered "
+     "free tiles. Takes effect on the next reset (r), because respawning the "
+     "room under a fight in progress is not a thing a slider should do.",
+     "{:.0f}"),
     ("part_count", "particles per hit", "world", 12.0, 0.0, 60.0,
      "Sparks in the contact burst, before the tier multiplies it.", "{:.0f}"),
     ("part_speed", "particle speed", "world", 430.0, 40.0, 1200.0,
@@ -530,6 +545,31 @@ PARAM_SPECS = [
      "How much of the light map is *added* as well as multiplied. Multiply "
      "alone can only darken, so on a near-black floor a torch would light "
      "nothing; this is the half that puts brightness back.", "{:.2f}"),
+    ("light_height", "light height", "screen", 82.0, 2.0, 240.0,
+     "How far the lights float above the floor plane, in pixels. Low is a "
+     "torch held at the floor: a hot spot a tile wide that falls away hard, "
+     "and a dimmer room around it. High is a lamp on the ceiling, which "
+     "flattens the pool out and lifts everything in it. It is the shape of the "
+     "falloff and not its reach -- the radius slider still says how far the "
+     "light goes.", "{:.0f}"),
+    ("light_contrast", "light / dark contrast", "screen", 1.0, 0.0, 10.0,
+     "Difference between lit and shadowed areas. Zero flattens the lighting; "
+     "one is natural; ten removes ambient light completely, making areas "
+     "outside direct light pitch black. Below one it also fades the cast "
+     "shadows out, because a flat room should not have hard ones in it.",
+     "{:.2f}"),
+    ("wall_shadow_amt", "wall shadow amount", "screen", 1.0, 0.0, 1.0,
+     "Opacity of the shadows walls throw. One makes masonry a real occluder -- "
+     "a pillar between you and a torch puts a wedge of dark across the floor "
+     "and the wedge swings as you walk. Zero lets light pass through walls, "
+     "which is what every light map without a visibility pass does.", "{:.2f}"),
+    ("npc_shadow_amt", "NPC shadow amount", "screen", 0.55, 0.0, 1.0,
+     "Opacity of the soft shadows monsters and the dummy throw, independent of "
+     "the wall shadows. Deliberately soft and deliberately weak: a hard body "
+     "shadow at this sprite size reads as a second creature.", "{:.2f}"),
+    ("normal_depth", "sprite light depth", "screen", 1.0, 0.0, 2.0,
+     "How hard the raking light is pushed across a creature. Past about 1.5 "
+     "they stop being lit and start being two-tone.", "{:.2f}"),
     ("outline_alpha", "outline strength", "screen", 0.75, 0.0, 1.0,
      "Opacity of the silhouette behind each sprite.", "{:.2f}"),
     ("haze_amt", "haze amount", "screen", 2.2, 0.0, 10.0,
@@ -831,7 +871,7 @@ class World:
 
         px, py = self.player.tile
         self.entities = [self.player]
-        for kind, name, color, hp, weight, x, y in MONSTERS:
+        for kind, name, color, hp, weight, x, y in self.spawn_list():
             if (x, y) == (px, py) or self.blocked(x, y):
                 continue
             self.entities.append(Entity(kind, x, y, color, name, hp=hp,
@@ -858,6 +898,41 @@ class World:
             self.camera.snap(cx, cy)
             self.clamp_camera()
         self.say("walk into something to hit it", ACCENT)
+
+    def spawn_list(self):
+        """The roster a reset should use, at whatever length the slider asks.
+
+        Up to nine it is the hand-placed roster, unchanged and in order, which
+        is what keeps the default arena exactly the arena it always was: one of
+        each creature, at spots chosen so most approaches to the middle have a
+        corner in them. Past nine the cast repeats onto free tiles, so the
+        slider can put forty bodies in the room to watch a system under load
+        without anybody having to place them.
+
+        The extra tiles are picked by a seeded hash rather than `random`, for
+        the same reason nothing else in the bench uses one: the same slider
+        position has to give the same arena every time, or two runs cannot be
+        compared. Free tiles are sorted by that hash, which is a shuffle that
+        happens to be reproducible -- and taking them in order means every
+        extra spawn lands somewhere distinct with no rejection loop to run dry.
+        """
+        want = max(0, int(round(self.juice.p("spawn_count"))))
+        if want <= len(MONSTERS):
+            return MONSTERS[:want]
+
+        px, py = self.player.tile
+        taken = {(px, py), DUMMY_POS} | {(m[5], m[6]) for m in MONSTERS}
+        free = [(x, y)
+                for y in range(1, GRID_H - 1) for x in range(1, GRID_W - 1)
+                if not self.blocked(x, y) and (x, y) not in taken]
+        free.sort(key=lambda t: hash01(t[0] * GRID_H + t[1], 977))
+
+        roster = list(MONSTERS)
+        for i in range(min(want - len(MONSTERS), len(free))):
+            kind, name, color, hp, weight, _x, _y = MONSTERS[i % len(MONSTERS)]
+            x, y = free[i]
+            roster.append((kind, name, color, hp, weight, x, y))
+        return roster
 
     def clamp_camera(self):
         """Keep the viewport inside the map, centring on any axis too small.
@@ -1567,34 +1642,38 @@ class Renderer:
             f.set_bold(bold)
             return f
 
+        #: What the footer lists when the mouse is not over a row. An attribute
+        #: rather than the constant directly, because the GL bench has keys
+        #: this one does not (a menu on escape, a bomb on B) and a shared
+        #: module constant edited at import would put them in both.
+        self.help_lines = HELP_LINES
+
         self.font_tile = load(int(TILE * 0.82), bold=True)
         self.font_ui = load(12)
         self.font_ui_b = load(12, bold=True)
         self.font_big = load(18, bold=True)
         self.font_num = load(18, bold=True)
 
-        self.view = pygame.Surface((VIEW_W, VIEW_H)).convert()
-        self.overlay = pygame.Surface((VIEW_W, VIEW_H), pygame.SRCALPHA)
-        self.scratch = pygame.Surface((VIEW_W, VIEW_H), pygame.SRCALPHA)
-        # Preallocated channel buffers for the RGB split. Copying a full view
-        # is over a megabyte of allocation, and doing that twice a frame while
-        # the effect is running is most of what it used to cost.
-        self.split_r = pygame.Surface((VIEW_W, VIEW_H)).convert()
-        self.split_b = pygame.Surface((VIEW_W, VIEW_H)).convert()
-        # Bloom works at an eighth resolution: the downscale *is* the blur, and
-        # at 100x75 the two smoothscales are cheap enough to leave on.
-        self.bloom_small = pygame.Surface((VIEW_W // 8, VIEW_H // 8)).convert()
-        self.bloom_big = pygame.Surface((VIEW_W, VIEW_H)).convert()
-        # The light map is built at half resolution and scaled up. Light is the
-        # lowest-frequency thing in the frame -- a gradient over five tiles has
-        # nothing in it that a 400x300 buffer cannot hold -- so building it at
-        # full size was paying four times over for detail that does not exist.
-        # Halving it took the pass from 4.9ms to under 2.
-        self.light_small = pygame.Surface((VIEW_W // 2, VIEW_H // 2)).convert()
-        self.lightmap = pygame.Surface((VIEW_W, VIEW_H)).convert()
-        self.light_blob = self._make_light(int(TILE * 14))
+        self.resize()
+        #: (size, height, gain) -> the radial falloff for one light. Three
+        #: numbers rather than one because the *shape* of a light is a slider
+        #: now and not a constant, so a blob cannot simply be scaled.
         self._light_cache: dict = {}
-        self.vignette = self._make_vignette()
+        #: (size, x, y, amount) -> the wall shadows for one light. Torches do
+        #: not move, so theirs are built once and blitted for the rest of the
+        #: session; only the light the player carries is rebuilt as it walks.
+        self._wall_cache: dict = {}
+        #: size -> a scratch surface to assemble one light's visibility in,
+        #: and a second for the body shadows that get multiplied into it.
+        self._mask: dict = {}
+        self._shade: dict = {}
+        #: The rake gradient, one per quantised light direction.
+        self._ramp_cache: dict = {}
+        #: (sprite surface, screen x, screen y, world x, world y) for every
+        #: body drawn this frame, so the sprite lighting can run *after* the
+        #: light map has been multiplied over the frame. Lighting a sprite
+        #: before the multiply would only get it darkened again.
+        self._lit: list = []
         self.sheet = tiles.SpriteSheet(TILE)
         self._floor = None          # baked on first draw; the arena is static
         self._shadow = self._make_shadow()
@@ -1610,6 +1689,37 @@ class Renderer:
         # budget -- and a bench that hid that would be teaching the wrong
         # lesson. Toggle one and watch the number move.
         self.frame_ms = 0.0
+
+    def resize(self):
+        """(Re)allocate every buffer whose size is the *view's* size.
+
+        Its own method because the GL bench can change the window at runtime,
+        and rebuilding the whole renderer to do it would reload five fonts and
+        re-bake the vignette for a resize the user is still dragging. The fonts
+        and the baked art do not care how big the window is; these do.
+        """
+        self.view = pygame.Surface((VIEW_W, VIEW_H)).convert()
+        self.overlay = pygame.Surface((VIEW_W, VIEW_H), pygame.SRCALPHA)
+        self.scratch = pygame.Surface((VIEW_W, VIEW_H), pygame.SRCALPHA)
+        # Preallocated channel buffers for the RGB split. Copying a full view
+        # is over a megabyte of allocation, and doing that twice a frame while
+        # the effect is running is most of what it used to cost.
+        self.split_r = pygame.Surface((VIEW_W, VIEW_H)).convert()
+        self.split_b = pygame.Surface((VIEW_W, VIEW_H)).convert()
+        # Bloom works at an eighth resolution: the downscale *is* the blur, and
+        # at 100x75 the two smoothscales are cheap enough to leave on.
+        self.bloom_small = pygame.Surface((max(1, VIEW_W // 8),
+                                           max(1, VIEW_H // 8))).convert()
+        self.bloom_big = pygame.Surface((VIEW_W, VIEW_H)).convert()
+        # The light map is built at half resolution and scaled up. Light is the
+        # lowest-frequency thing in the frame -- a gradient over five tiles has
+        # nothing in it that a 400x300 buffer cannot hold -- so building it at
+        # full size was paying four times over for detail that does not exist.
+        # Halving it took the pass from 4.9ms to under 2.
+        self.light_small = pygame.Surface((max(1, VIEW_W // 2),
+                                           max(1, VIEW_H // 2))).convert()
+        self.lightmap = pygame.Surface((VIEW_W, VIEW_H)).convert()
+        self.vignette = self._make_vignette()
 
     # -- prebuilt surfaces -------------------------------------------------
     def _make_vignette(self):
@@ -1649,23 +1759,219 @@ class Renderer:
             pygame.draw.ellipse(surf, (0, 0, 0, int(26 * (1.0 - t) + 12)), rect)
         return surf
 
-    def _make_light(self, size: int):
+    @staticmethod
+    def _cached(store: dict, key):
+        """A cache read that also marks the entry as the freshest.
+
+        Least-recently-used and not "clear it when it gets big", because what
+        gets big is the light the *player* is carrying -- a new key every time
+        they take a step -- and a cache that throws everything out to make room
+        for it would rebuild all four static torches every few frames to store
+        one walking light that is never asked for twice.
+        """
+        hit = store.pop(key, None)
+        if hit is not None:
+            store[key] = hit                 # back to the young end
+        return hit
+
+    @staticmethod
+    def _keep(store: dict, key, value, limit: int):
+        store[key] = value
+        while len(store) > limit:
+            del store[next(iter(store))]     # the oldest untouched entry
+        return value
+
+    def _light_blob(self, size: int, height: float, gain: float):
         """A warm radial falloff as an *additive* RGB surface.
 
         Additive rather than alpha-blended so overlapping lights brighten each
         other, which is what light does and what a stack of alpha circles
         conspicuously fails to do.
+
+        The falloff is two terms, and the second one is what `light height`
+        buys. A light is a point floating above the floor plane, so the floor
+        under it is hit square on and the floor a few tiles away is hit at a
+        glance: the cosine of that angle is `h / hypot(distance, h)`, which is
+        a term the card gets for free out of a dot product and this has to bake
+        into the gradient instead. Drop the light to the floor and the hot spot
+        collapses to a tile across with the rest of the room dimmer behind it;
+        lift it to the ceiling and it flattens out into the plain squared
+        falloff the bench used to have, with everything under it brighter.
+        Same reach either way -- the radius slider owns that.
+
+        Cached on all three numbers because two of them are sliders. The blob
+        is a few dozen concentric circles, which is cheap enough to rebuild
+        while one is being dragged and far too expensive to rebuild per frame.
         """
+        key = (size, int(height / 4.0), int(gain * 20.0))
+        hit = self._cached(self._light_cache, key)
+        if hit is not None:
+            return hit
         surf = pygame.Surface((size, size)).convert()
         surf.fill((0, 0, 0))
         r = size // 2
+        h = max(1.0, height)
         for i in range(r, 0, -2):
-            t = 1.0 - i / r
-            # Squared falloff, warmed towards the middle.
-            v = t ** 2.2
+            t = i / r                       # 1 at the rim, 0 in the middle
+            # `size` is the light's radius in *world* pixels: the map is built
+            # at half resolution, so one blob pixel is two of them.
+            atten = (1.0 - t) ** 2
+            rake = h / math.hypot(t * size, h)
+            v = clamp(atten * (0.45 + 0.55 * rake) * gain)
             pygame.draw.circle(surf, (int(232 * v), int(206 * v), int(160 * v)),
                                (r, r), i)
         surf.set_colorkey(None)
+        return self._keep(self._light_cache, key, surf, 10)
+
+    def _scratch(self, store: dict, size: int):
+        """A reusable surface one light's visibility is assembled in.
+
+        Kept one per size rather than one in total, because the three kinds of
+        light in the room are three different radii and a single scratch would
+        be reallocated three times a frame -- which is the allocation the
+        half-resolution map exists to avoid.
+        """
+        hit = self._cached(store, size)
+        if hit is None:
+            hit = self._keep(store, size,
+                             pygame.Surface((size, size)).convert(), 4)
+        return hit
+
+    def _wall_shadows(self, world: World, wx: float, wy: float, size: int,
+                      amount: float):
+        """White where this light reaches, dark where masonry is in the way.
+
+        The card asks the question per fragment: march sixty-four steps towards
+        the light and see if a wall cell was crossed. There is no marching a
+        pixel here, so the question is turned round and answered per *wall*
+        instead -- the shadow a box throws is the quad between its two
+        silhouette corners and those corners projected away from the light,
+        which is one polygon fill for a shape a ray march would have paid four
+        hundred thousand samples for.
+
+        Two details are worth the lines:
+
+        * the light's own tile never occludes, or a torch mounted on a pillar
+          would put the pillar between itself and the room;
+        * wall tiles are painted back in afterwards, because a wall the light
+          can see is lit whatever is behind it. Without that, the far side of a
+          pillar goes to a flat silhouette and the room reads as a hole.
+
+        Built in the light's own space -- offsets from the light, halved -- so
+        it does not depend on where the camera happens to be, which is what
+        makes it cacheable for the torches at all.
+        """
+        key = (size, round(wx), round(wy), int(amount * 32))
+        hit = self._cached(self._wall_cache, key)
+        if hit is not None:
+            return hit
+
+        surf = pygame.Surface((size, size)).convert()
+        surf.fill((255, 255, 255))
+        reach = float(size)                  # the light's radius, world pixels
+        half = size * 0.5
+        level = (int(255 * (1.0 - clamp(amount))),) * 3
+        far = reach * 2.2                    # past the rim, so no shadow ends
+        ltx, lty = int(wx // TILE), int(wy // TILE)
+
+        def local(px, py):
+            return ((px - wx) * 0.5 + half, (py - wy) * 0.5 + half)
+
+        lit_walls = []
+        x0 = max(0, int((wx - reach) // TILE))
+        x1 = min(GRID_W - 1, int((wx + reach) // TILE))
+        y0 = max(0, int((wy - reach) // TILE))
+        y1 = min(GRID_H - 1, int((wy + reach) // TILE))
+        for ty in range(y0, y1 + 1):
+            row = world.grid[ty]
+            for tx in range(x0, x1 + 1):
+                if not row[tx] or (tx, ty) == (ltx, lty):
+                    continue
+                left, top = tx * TILE, ty * TILE
+                cx, cy = left + TILE * 0.5, top + TILE * 0.5
+                lx, ly = local(left, top)
+                lit_walls.append(pygame.Rect(math.floor(lx), math.floor(ly),
+                                             TILE // 2 + 1, TILE // 2 + 1))
+                if math.hypot(cx - wx, cy - wy) > reach + TILE:
+                    continue
+                # The two corners furthest apart in angle *as seen from the
+                # light* are the silhouette. Angles are taken relative to the
+                # tile's own bearing so the comparison cannot straddle the
+                # wrap at pi and pick the wrong pair.
+                base = math.atan2(cy - wy, cx - wx)
+                lo = hi = None
+                for px, py in ((left, top), (left + TILE, top),
+                               (left + TILE, top + TILE), (left, top + TILE)):
+                    a = (math.atan2(py - wy, px - wx) - base + math.pi) \
+                        % (2.0 * math.pi) - math.pi
+                    if lo is None or a < lo[0]:
+                        lo = (a, px, py)
+                    if hi is None or a > hi[0]:
+                        hi = (a, px, py)
+                quad = []
+                for _a, px, py in (lo, hi):
+                    away = math.hypot(px - wx, py - wy) or 1.0
+                    quad.append((px, py))                       # the corner
+                    quad.append((px + (px - wx) / away * far,   # and its ray
+                                 py + (py - wy) / away * far))
+                near_a, far_a, near_b, far_b = quad
+                pygame.draw.polygon(surf, level, [local(*near_a), local(*far_a),
+                                                  local(*far_b), local(*near_b)])
+        for rect in lit_walls:
+            surf.fill((255, 255, 255), rect)
+        return self._keep(self._wall_cache, key, surf, 10)
+
+    def _cast_shadows(self, wx: float, wy: float, size: int, casters,
+                      amount: float):
+        """The soft shadows the bodies in the room throw away from one light.
+
+        Returned as its own layer rather than drawn straight into the light's
+        visibility, and that is not tidiness -- a `draw` call *replaces* the
+        pixels it covers, so a body standing in front of a wall used to stamp
+        its 55%-dark trapezoid over the wall's fully-dark wedge and cut a
+        lighter body-shaped hole through it. Visibility terms multiply: the
+        shader says `wall_shadow * npc_shadow` and this layer is the second
+        half of that product, blended in with `BLEND_RGB_MULT`.
+
+        Three nested trapezoids rather than a blur: a body shadow at this size
+        is a smudge a couple of tiles long, and the eye reads three steps of
+        penumbra as a soft edge quite happily -- especially after the whole
+        light map is scaled up from half resolution, which softens it again for
+        nothing. A real blur would cost more than every other light in the room
+        put together. The layers are drawn widest first across *every* caster
+        before the next one starts, for the same reason the layer exists at
+        all: one body's soft outer edge must never land on another body's core.
+
+        Returns None when nothing is in reach, so the caller can skip a blit.
+        """
+        reach = float(size)
+        half = size * 0.5
+        near = [(cx, cy, rad, dx / d, dy / d, reach - d + TILE)
+                for cx, cy, rad in casters
+                for dx, dy, d in ((cx - wx, cy - wy,
+                                   math.hypot(cx - wx, cy - wy)),)
+                if 1e-3 < d <= reach]
+        if not near:
+            return None
+        surf = self._scratch(self._shade, size)
+        surf.fill((255, 255, 255))
+        for spread, weight in ((2.1, 0.34), (1.5, 0.66), (1.0, 1.0)):
+            level = (int(255 * (1.0 - clamp(amount * weight))),) * 3
+            for cx, cy, rad, ux, uy, length in near:
+                px, py = -uy, ux
+                # `length` only reaches as far as the light still carries:
+                # past the rim there is nothing left to take away.
+                edge, far_edge = rad * spread, rad * spread * 1.8
+                pts = ((cx + px * edge, cy + py * edge),
+                       (cx - px * edge, cy - py * edge),
+                       (cx - px * far_edge + ux * length,
+                        cy - py * far_edge + uy * length),
+                       (cx + px * far_edge + ux * length,
+                        cy + py * far_edge + uy * length))
+                pygame.draw.polygon(
+                    surf, level,
+                    [((x - wx) * 0.5 + half, (y - wy) * 0.5 + half)
+                     for x, y in pts])
         return surf
 
     # -- helpers ----------------------------------------------------------
@@ -1736,6 +2042,7 @@ class Renderer:
     def draw_world(self, world: World):
         j = world.juice
         self.view.fill(BG)
+        self._lit.clear()
         self.draw_floor(world)
         if j.on("decals"):
             self.draw_decals(world)
@@ -1745,6 +2052,8 @@ class Renderer:
         self.draw_entities(world)
         if j.on("light"):
             self.apply_light(world)
+            if j.on("normals"):
+                self.apply_sprite_light(world)
         if j.on("haze"):
             self.draw_haze(world)
         self.draw_slashes(world)
@@ -1893,46 +2202,110 @@ class Renderer:
                 pygame.draw.ellipse(self.view, (255, 228, 150), flame.inflate(-3, -5))
 
     def torch_lights(self, world: World):
-        """(x, y, strength) in world pixels for everything that gives off light."""
-        out = [(world.player.world_pos()[0], world.player.world_pos()[1], 1.0)]
-        for kind, wx, wy, _ in world.props:
-            if kind == "torch":
-                out.append((wx, wy, 0.85))
+        """(x, y, radius, strength) in world pixels for everything that lights.
+
+        A radius per light rather than one for all of them: a torch is a
+        smaller light than the one the player carries and the flare a blow
+        raises is a bigger one, and the ratios are the same three the GL bench
+        uses so the two rooms light the same way.
+        """
+        j = world.juice
+        radius = j.p("light_radius") * TILE
+        px, py = world.player.world_pos()
+        out = [(px, py, radius, 1.0)]
+        t = world.elapsed
+        for kind, wx, wy, phase in world.props:
+            if kind != "torch":
+                continue
+            # A torch that is perfectly steady is a lamp. Two sines at
+            # unrelated rates keep it from looking like a pulse.
+            f = (0.86 + 0.09 * math.sin(t * 7.3 + phase)
+                 + 0.05 * math.sin(t * 17.1 + phase * 2.0))
+            out.append((wx, wy, radius * 0.85, f))
         for x, y, s, life, maxl in world.lights:
-            out.append((x, y, s * (life / maxl)))
+            out.append((x, y, radius * 1.1, s * (life / maxl)))
         return out
 
     def apply_light(self, world: World):
         """Multiply the frame by a light map built from additive blobs.
 
-        No shaders, so this is the software cousin: an ambient grey, a warm
-        radial gradient added at every light, and one multiply over the view.
-        Three full-frame operations, and the result does the thing that matters
-        -- a hit *lights the room* rather than only whitening the sprite it
-        landed on.
+        No shaders, so this is the software cousin of the GL bench's lighting:
+        an ambient grey, a warm radial gradient added at every light, and one
+        multiply over the view. What the card does per fragment is done here
+        per *occluder* instead -- one polygon per wall and three per body, into
+        the light's own little surface, before the gradient is multiplied
+        through it. The arithmetic that decides how the room ends up looking is
+        the same in both:
+
+        * `light height` shapes the falloff (`_light_blob`),
+        * `contrast` takes the ambient down and the direct light up, and fades
+          the shadows out below one,
+        * `wall shadow` and `NPC shadow` are the two visibility terms.
+
+        The bill is a handful of small polygon fills plus the three full-frame
+        operations the pass always cost. Everything static -- which is every
+        torch in the room -- comes out of a cache and costs one blit.
         """
         j = world.juice
-        amb = int(255 * clamp(j.p("light_ambient")))
+        # From the authored ambient at contrast 1 to no ambient at all at 10,
+        # linearly, so the last part of the slider stays useful instead of
+        # approaching black without ever arriving.
+        contrast = max(j.p("light_contrast"), 0.01)
+        ambient_scale = 1.0 - clamp((contrast - 1.0) / 9.0)
+        gain = lerp(0.65, 1.35, clamp(contrast * 0.5))
+        height = max(2.0, j.p("light_height"))
+        # Under one, the shadows fade out with everything else: a room with no
+        # contrast in it should not have hard-edged shadows lying around.
+        shadow_mix = min(contrast, 1.0)
+        wall_amt = clamp(j.p("wall_shadow_amt")) * shadow_mix
+        npc_amt = clamp(j.p("npc_shadow_amt")) * shadow_mix
+
+        amb = int(255 * clamp(j.p("light_ambient") * ambient_scale))
         self.light_small.fill((amb, amb, amb))
-        # Quantised to eight pixels and cached, because the radius comes off a
-        # slider and rescaling a 450px gradient every frame costs more than the
-        # whole rest of the light pass.
-        size = int(j.p("light_radius") * TILE) // 8 * 8      # half res, so *1
-        if size < 8:
-            return
-        blob = self._light_cache.get(size)
-        if blob is None:
-            blob = pygame.transform.smoothscale(self.light_blob, (size, size))
-            self._light_cache = {size: blob}      # only ever one live radius
-        half = size * 0.5
-        for wx, wy, strength in self.torch_lights(world):
+
+        casters = []
+        if npc_amt > 0.01:
+            # The player carries the principal light, so only the other bodies
+            # cast: a creature standing on its own light source would spend the
+            # whole game inside its own shadow.
+            for e in world.entities[1:]:
+                if e.dying:
+                    continue
+                x, y = e.world_pos()
+                casters.append((x, y, TILE * 0.32))
+
+        for wx, wy, radius, strength in self.torch_lights(world):
+            # Quantised to eight pixels, because the radius comes off a slider
+            # and a gradient rebuilt every frame costs more than the whole rest
+            # of the light pass.
+            size = int(radius) // 8 * 8                  # half res, so *1
+            if size < 8 or strength <= 0.01:
+                continue
             sx, sy = self.to_view(world, wx, wy)
             sx, sy = sx * 0.5, sy * 0.5
+            half = size * 0.5
             if not (-size < sx < VIEW_W * 0.5 + size and -size < sy < VIEW_H * 0.5 + size):
                 continue
+            blob = self._light_blob(size, height, gain)
             img = blob
+            shadowed = wall_amt > 0.01 or (casters and npc_amt > 0.01)
+            if shadowed:
+                img = self._scratch(self._mask, size)
+                if wall_amt > 0.01:
+                    img.blit(self._wall_shadows(world, wx, wy, size, wall_amt),
+                             (0, 0))
+                else:
+                    img.fill((255, 255, 255))
+                if casters and npc_amt > 0.01:
+                    # Multiplied in, not drawn in: two things in the way of the
+                    # same light are darker than either, never lighter.
+                    shade = self._cast_shadows(wx, wy, size, casters, npc_amt)
+                    if shade is not None:
+                        img.blit(shade, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
+                img.blit(blob, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
             if strength < 0.97:
-                img = blob.copy()
+                if not shadowed:
+                    img = blob.copy()
                 img.fill((int(255 * clamp(strength)),) * 3,
                          special_flags=pygame.BLEND_RGB_MULT)
             self.light_small.blit(img, (int(sx - half), int(sy - half)),
@@ -1952,6 +2325,111 @@ class Renderer:
             k = int(255 * warm)
             self.lightmap.fill((k, k, k), special_flags=pygame.BLEND_RGB_MULT)
             self.view.blit(self.lightmap, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+    def _rake_ramp(self, bucket: int):
+        """A one-sided gradient pointing at a light, as an alpha mask.
+
+        Sixteen of these, built once each and stretched to whatever size a
+        sprite happens to be this frame. The card generates a normal per texel
+        out of the sprite's blurred alpha and takes a dot product with the
+        light; at 32 pixels what that actually produces is a bright band down
+        the side facing the light, falling off to nothing across the middle,
+        and this is that band with the derivation left out.
+        """
+        hit = self._ramp_cache.get(bucket)
+        if hit is not None:
+            return hit
+        n = 64
+        surf = pygame.Surface((n, n), pygame.SRCALPHA)
+        surf.fill((255, 255, 255, 0))
+        ang = bucket * (2.0 * math.pi / 16.0)
+        ux, uy = math.cos(ang), math.sin(ang)
+        px, py = -uy, ux
+        c = n * 0.5
+        bands = 14
+        for i in range(bands):
+            t0, t1 = i / bands, (i + 1) / bands
+            a = int(255 * ((t0 + t1) * 0.5) ** 1.35)
+            d0, d1 = t0 * c * 1.5, t1 * c * 1.5
+            quad = []
+            for d, side in ((d0, 1), (d0, -1), (d1, -1), (d1, 1)):
+                quad.append((c + ux * d + px * side * n,
+                             c + uy * d + py * side * n))
+            pygame.draw.polygon(surf, (255, 255, 255, a), quad)
+        self._ramp_cache[bucket] = surf
+        return surf
+
+    @staticmethod
+    def _rake_at(lights, wx: float, wy: float, height: float):
+        """Which way the light comes from at a point, and how much of it.
+
+        The sum of every light that reaches, weighted by its falloff and by how
+        far it is *sideways*: a torch directly overhead has no direction to
+        rake from, which is the same `light height` term the floor gradient
+        uses and the reason raising the lights flattens the creatures too.
+        """
+        ax = ay = total = 0.0
+        for lx, ly, radius, strength in lights:
+            dx, dy = lx - wx, ly - wy
+            d = math.hypot(dx, dy)
+            if d < 1e-3 or d > radius:
+                continue
+            weight = (1.0 - d / radius) ** 2 * strength * (d / math.hypot(d, height))
+            ax += dx / d * weight
+            ay += dy / d * weight
+            total += weight
+        m = math.hypot(ax, ay)
+        if total <= 1e-4 or m <= 1e-6:
+            return 0.0, 0.0, 0.0
+        return ax / m, ay / m, clamp(total)
+
+    def apply_sprite_light(self, world: World):
+        """Rake the light across every body drawn this frame.
+
+        Runs *after* the light map has been multiplied over the view, and that
+        ordering is the whole trick: the multiply is what puts a creature in a
+        dark corner into the dark, and this is what says which side of it the
+        torch is on. Done in the other order the highlight would simply be
+        dimmed along with everything else.
+
+        Two blits a body -- a warm one on the lit side, a cool one on the
+        other -- both shaped by the sprite's own alpha, so nothing lands off
+        the silhouette and no per-pixel work happens anywhere.
+        """
+        j = world.juice
+        depth = clamp(j.p("normal_depth") * j.intensity, 0.0, 2.0)
+        if depth <= 0.02 or not self._lit:
+            return
+        lights = self.torch_lights(world)
+        height = max(2.0, j.p("light_height"))
+        for img, sx, sy, wx, wy in self._lit:
+            ux, uy, amt = self._rake_at(lights, wx, wy, height)
+            if amt <= 0.02:
+                continue
+            k = clamp(amt * depth)
+            bucket = int(round(math.atan2(uy, ux) / (2.0 * math.pi) * 16.0)) % 16
+            size = img.get_size()
+            rect = img.get_rect(center=(int(sx), int(sy)))
+
+            lit = img.copy()
+            lit.fill((int(104 * k), int(88 * k), int(62 * k)),
+                     special_flags=pygame.BLEND_RGB_ADD)
+            lit.blit(pygame.transform.scale(self._rake_ramp(bucket), size),
+                     (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+            self.view.blit(lit, rect)
+
+            # The far side, cooled rather than blackened: a silhouette that
+            # goes to black at this size reads as a hole in the floor, which is
+            # the same reason the card's shading is half-lambert.
+            shade = 1.0 - clamp(k * 0.45)
+            dark = img.copy()
+            dark.fill((int(255 * shade), int(255 * min(1.0, shade * 1.04)),
+                       int(255 * min(1.0, shade * 1.14)), 255),
+                      special_flags=pygame.BLEND_RGBA_MULT)
+            dark.blit(pygame.transform.scale(self._rake_ramp((bucket + 8) % 16),
+                                             size),
+                      (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+            self.view.blit(dark, rect)
 
     def apply_bloom(self, world: World):
         """Downscale, threshold, upscale, add. Pygame's answer to a glow shader.
@@ -2183,6 +2661,12 @@ class Renderer:
         else:
             self._blit_at(img, sx, sy, mode,
                           b.alpha if mode == "subpixel" else 1.0)
+        # Kept for the sprite lighting, which cannot run until the light map
+        # has been multiplied over the frame. Solid bodies only: a corpse on
+        # its way out is already fading, and a rim light on something
+        # disappearing reads as it coming back.
+        if b.alpha > 0.99 and world.juice.on("light") and world.juice.on("normals"):
+            self._lit.append((img, sx, sy, wx, wy))
 
     def draw_bars(self, world: World):
         """Health bars, after the light pass so a dark corner does not hide them.
@@ -2487,7 +2971,7 @@ class Renderer:
                 screen.blit(self.font_ui.render(line, True, DIM), (x0 + 14, ty))
                 ty += 13
         else:
-            for line in HELP_LINES:
+            for line in self.help_lines:
                 if line:
                     screen.blit(self.font_ui.render(line, True, DIM), (x0 + 14, ty))
                 ty += 13

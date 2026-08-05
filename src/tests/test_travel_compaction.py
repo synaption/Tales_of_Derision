@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import itertools
 
-import esper
+import ecs
 import pytest
 
 from action import BASE_ACTION_COST
@@ -43,17 +43,17 @@ def _world() -> GameMap:
     """A 3x1 region grid of open floor: wide enough that a creature can stand well
     beyond the full-sim box, which is what every map in the real game looks like
     and no single-region test map ever does."""
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     game_map = GameMap(360, 60)
-    esper.create_entity(WorldClock(turn=0))
-    esper.create_entity(Position(2, 30), Player())
+    ecs.create_entity(WorldClock(turn=0))
+    ecs.create_entity(Position(2, 30), Player())
     return game_map
 
 
 def _npc_at(x: int, y: int) -> tuple[int, Position]:
     pos = Position(x, y)
-    return esper.create_entity(pos, NPC()), pos
+    return ecs.create_entity(pos, NPC()), pos
 
 
 def _processor(game_map: GameMap) -> NpcAiProcessor:
@@ -85,7 +85,7 @@ def test_the_walk_is_billed_as_the_time_it_took() -> None:
 
     # The turn it was decided in pays for the first tile the ordinary way; the
     # other eleven are charged here, leaving the traveller that far in arrears.
-    assert esper.component_for_entity(ent, Actor).energy == -11 * BASE_ACTION_COST
+    assert ecs.component_for_entity(ent, Actor).energy == -11 * BASE_ACTION_COST
 
 
 def test_a_long_trek_is_walked_in_capped_legs() -> None:
@@ -110,7 +110,7 @@ def test_a_walk_stops_on_the_threshold_of_the_watched_world() -> None:
     rest of the approach is walked a tile at a time like anything else on screen."""
     game_map = _world()
     player_xy = (100, 30)
-    for _ent, (pos, _p) in esper.get_components(Position, Player):
+    for _ent, (pos, _p) in ecs.get_components(Position, Player):
         pos.x, pos.y = player_xy
     start_x = player_xy[0] + _FULL_SIM_HALF_W + 20
     ent, pos = _npc_at(start_x, 30)
@@ -137,8 +137,8 @@ def test_an_npc_the_player_can_see_still_walks_one_tile_at_a_time() -> None:
     proc._step_toward(ent, pos, (32, 30), {})
 
     assert (pos.x, pos.y) == (21, 30)
-    assert not esper.has_component(ent, Actor) or (
-        esper.component_for_entity(ent, Actor).energy == 0.0
+    assert not ecs.has_component(ent, Actor) or (
+        ecs.component_for_entity(ent, Actor).energy == 0.0
     ), "an on-screen step is charged by the turn loop, not billed ahead"
 
 

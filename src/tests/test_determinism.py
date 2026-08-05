@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
-import esper
+import ecs
 import pytest
 
 import ai
@@ -73,7 +73,7 @@ def test_new_seed_produces_ints() -> None:
 def _worldgen_snapshot() -> list[tuple[str, int, int]]:
     return sorted(
         (name.value, pos.x, pos.y)
-        for _ent, (pos, name) in esper.get_components(Position, Name)
+        for _ent, (pos, name) in ecs.get_components(Position, Name)
     )
 
 
@@ -82,7 +82,7 @@ def test_worldgen_is_reproducible_for_a_seed() -> None:
     _setup_world(GameMap(60, 30), Position(30, 15))
     first = _worldgen_snapshot()
 
-    esper.clear_database()
+    ecs.clear_database()
 
     set_world_rng(0xABCDEF)
     _setup_world(GameMap(60, 30), Position(30, 15))
@@ -97,7 +97,7 @@ def test_worldgen_varies_by_seed() -> None:
     _setup_world(GameMap(60, 30), Position(30, 15))
     first = _worldgen_snapshot()
 
-    esper.clear_database()
+    ecs.clear_database()
 
     set_world_rng(2)
     _setup_world(GameMap(60, 30), Position(30, 15))

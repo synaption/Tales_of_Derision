@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import replace
 from math import ceil
 
-import esper
+import ecs
 
 from components import (
     Actor, Asleep, BerryBush, BlocksMovement, Blueprint, Corpse, Deer, Diet, DriveProfile,
@@ -136,7 +136,7 @@ _COMPACTED_ACTIVITY_TURNS = 8
 _COMPACTED_SLEEP_TURNS = 120
 
 
-class NpcAiProcessor(esper.Processor):
+class NpcAiProcessor(ecs.Processor):
     """Drives NPC behaviour each turn.
 
     Priority order per creature:
@@ -252,7 +252,7 @@ class NpcAiProcessor(esper.Processor):
         return shore
 
     def _find_player_position(self) -> tuple[int, int] | None:
-        for _ent, (pos, _player) in esper.get_components(Position, Player):
+        for _ent, (pos, _player) in ecs.get_components(Position, Player):
             return (pos.x, pos.y)
         return None
 
@@ -796,14 +796,14 @@ class NpcAiProcessor(esper.Processor):
     ) -> bool:
         """Strip one wood off the tree at ``xy``; delete it once it's bare.
         Returns False if it has already gone (the goal map can be a turn stale)."""
-        if tree_ent is None or not esper.entity_exists(tree_ent):
+        if tree_ent is None or not ecs.entity_exists(tree_ent):
             return False
-        if not esper.has_component(tree_ent, Tree):
+        if not ecs.has_component(tree_ent, Tree):
             return False
-        tree = esper.component_for_entity(tree_ent, Tree)
+        tree = ecs.component_for_entity(tree_ent, Tree)
         tree.wood -= 1
         if tree.wood <= 0:
-            esper.delete_entity(tree_ent, immediate=True)
+            ecs.delete_entity(tree_ent, immediate=True)
             occupied.pop(xy, None)
         return True
 
@@ -831,7 +831,7 @@ class NpcAiProcessor(esper.Processor):
         )
         if target_xy is None:
             return acted
-        if target_ent is None or not esper.entity_exists(target_ent):
+        if target_ent is None or not ecs.entity_exists(target_ent):
             return False  # the map named a bush that has gone; the key already moved
         if pick_berries(target_ent, clock):
             needs.hunger = max(0.0, needs.hunger - _GRAZE_RESTORE)
@@ -858,7 +858,7 @@ class NpcAiProcessor(esper.Processor):
         candidates.extend(
             (xy, "prey", prey_ent)
             for xy, prey_ent in prey
-            if prey_ent != ent and esper.entity_exists(prey_ent)
+            if prey_ent != ent and ecs.entity_exists(prey_ent)
         )
         if not candidates:
             return False
@@ -884,9 +884,9 @@ class NpcAiProcessor(esper.Processor):
         return self._step_toward(ent, pos, target_xy, occupied)
 
     def _eat_from_corpse(self, corpse_ent: int, needs: Needs) -> None:
-        if not esper.has_component(corpse_ent, Inventory):
+        if not ecs.has_component(corpse_ent, Inventory):
             return
-        inventory = esper.component_for_entity(corpse_ent, Inventory)
+        inventory = ecs.component_for_entity(corpse_ent, Inventory)
         for index, item in enumerate(inventory.items):
             if is_raw_meat(item) or is_cooked_meat(item):
                 inventory.items.pop(index)
@@ -897,9 +897,9 @@ class NpcAiProcessor(esper.Processor):
         """A hungry creature eats a *prepared* item it is carrying (cooked meat,
         bread, ...) before foraging. Raw meat is skipped -- meat must be cooked
         first. Returns True if it ate."""
-        if not esper.has_component(ent, Inventory):
+        if not ecs.has_component(ent, Inventory):
             return False
-        inventory = esper.component_for_entity(ent, Inventory)
+        inventory = ecs.component_for_entity(ent, Inventory)
         for index, item in enumerate(inventory.items):
             if is_raw_meat(item):
                 continue
@@ -934,7 +934,7 @@ class NpcAiProcessor(esper.Processor):
         candidates.extend(
             (xy, "prey", prey_ent)
             for xy, prey_ent in prey
-            if prey_ent != ent and esper.entity_exists(prey_ent)
+            if prey_ent != ent and ecs.entity_exists(prey_ent)
         )
         if not candidates:
             return False
@@ -954,9 +954,9 @@ class NpcAiProcessor(esper.Processor):
         return self._step_toward(ent, pos, target_xy, occupied)
 
     def _take_meat_from_corpse(self, corpse_ent: int, inventory: Inventory) -> None:
-        if not esper.has_component(corpse_ent, Inventory):
+        if not ecs.has_component(corpse_ent, Inventory):
             return
-        corpse_inventory = esper.component_for_entity(corpse_ent, Inventory)
+        corpse_inventory = ecs.component_for_entity(corpse_ent, Inventory)
         for index, item in enumerate(corpse_inventory.items):
             if is_raw_meat(item):
                 corpse_inventory.items.pop(index)
@@ -1021,10 +1021,10 @@ class NpcAiProcessor(esper.Processor):
         stoves: list[tuple[tuple[int, int], int]],
         occupied: dict[tuple[int, int], int],
     ) -> bool:
-        if not esper.has_component(ent, Inventory):
+        if not ecs.has_component(ent, Inventory):
             return False
-        inventory = esper.component_for_entity(ent, Inventory)
-        needs = esper.component_for_entity(ent, Needs) if esper.has_component(ent, Needs) else None
+        inventory = ecs.component_for_entity(ent, Inventory)
+        needs = ecs.component_for_entity(ent, Needs) if ecs.has_component(ent, Needs) else None
         has_raw = any(is_raw_meat(item) for item in inventory.items)
         if not has_raw:
             if self._forage_meat(ent, pos, inventory, prey, corpses, occupied):
@@ -1046,8 +1046,8 @@ class NpcAiProcessor(esper.Processor):
         home) camp where they stand. Lying down out of sight sleeps the whole
         rest through at once (``_bed_down``)."""
         home = None
-        if esper.has_component(ent, Home):
-            home = esper.component_for_entity(ent, Home)
+        if ecs.has_component(ent, Home):
+            home = ecs.component_for_entity(ent, Home)
 
         if home is None:
             return self._bed_down(ent, pos, needs, in_camp=True)
@@ -1085,23 +1085,23 @@ class NpcAiProcessor(esper.Processor):
         if self._compactable((pos.x, pos.y)):
             turns = min(_COMPACTED_SLEEP_TURNS, sleep_turns_needed(needs))
             settle_sleep(needs, turns)
-            esper.add_component(ent, Settled(activity="sleep", turns=turns))
+            ecs.add_component(ent, Settled(activity="sleep", turns=turns))
         return True
 
     def _ensure_inventory(self, ent: int) -> Inventory:
-        if esper.has_component(ent, Inventory):
-            return esper.component_for_entity(ent, Inventory)
+        if ecs.has_component(ent, Inventory):
+            return ecs.component_for_entity(ent, Inventory)
         inventory = Inventory(items=[])
-        esper.add_component(ent, inventory)
+        ecs.add_component(ent, inventory)
         return inventory
 
     def _actor_of(self, ent: int) -> Actor:
         """This NPC's action-economy bookkeeping (its per-region-turn energy),
         created on first use so creatures don't need one at spawn."""
-        if esper.has_component(ent, Actor):
-            return esper.component_for_entity(ent, Actor)
+        if ecs.has_component(ent, Actor):
+            return ecs.component_for_entity(ent, Actor)
         actor = Actor()
-        esper.add_component(ent, actor)
+        ecs.add_component(ent, actor)
         return actor
 
     def _compactable(self, xy: tuple[int, int]) -> bool:
@@ -1159,7 +1159,7 @@ class NpcAiProcessor(esper.Processor):
         """True when raising a home is this NPC's job right now: a resident that
         owns no bed. Such a villager pitches in on the nearest blueprint -- its
         own staked-out cabin or a neighbour's -- so building is shared labour."""
-        return esper.has_component(ent, Resident) and owned_bed_of(ent) is None
+        return ecs.has_component(ent, Resident) and owned_bed_of(ent) is None
 
     def _reachable_ghosts(self, pos: Position) -> list[tuple[int, tuple[int, int], Blueprint]]:
         """Every blueprint ghost in the same walkable region as ``pos`` -- the
@@ -1324,8 +1324,8 @@ class NpcAiProcessor(esper.Processor):
         occupied: dict[tuple[int, int], int],
     ) -> bool:
         vision_radius = 8
-        if esper.has_component(ent, Vision):
-            vision_radius = esper.component_for_entity(ent, Vision).radius
+        if ecs.has_component(ent, Vision):
+            vision_radius = ecs.component_for_entity(ent, Vision).radius
         if _chebyshev((pos.x, pos.y), player_xy) > vision_radius:
             return False
         if not self.game_map.has_line_of_sight((pos.x, pos.y), player_xy):
@@ -1352,14 +1352,14 @@ class NpcAiProcessor(esper.Processor):
         being it can see, weighted so higher current friendship wins over a
         slightly closer stranger. Returns ``(entity, position)`` or ``None``."""
         rel = (
-            esper.component_for_entity(ent, Relationships)
-            if esper.has_component(ent, Relationships)
+            ecs.component_for_entity(ent, Relationships)
+            if ecs.has_component(ent, Relationships)
             else None
         )
         best: tuple[int, Position] | None = None
         best_score: float | None = None
         for other, other_pos in sentients:
-            if other == ent or esper.has_component(other, Asleep):
+            if other == ent or ecs.has_component(other, Asleep):
                 continue
             dist = _chebyshev((pos.x, pos.y), (other_pos.x, other_pos.y))
             if dist > _SOCIAL_SIGHT:
@@ -1392,7 +1392,7 @@ class NpcAiProcessor(esper.Processor):
         ``turn``/``clock`` are an as-of turn number and clock during a region
         catch-up burst, not necessarily the true "now" -- see ``_forage_berries``.
         """
-        personality = esper.component_for_entity(ent, Personality)
+        personality = ecs.component_for_entity(ent, Personality)
         if turn - personality.last_social_turn < _SOCIAL_COOLDOWN:
             return False
 
@@ -1419,14 +1419,14 @@ class NpcAiProcessor(esper.Processor):
 
     @staticmethod
     def _has_meat(ent: int) -> bool:
-        if not esper.has_component(ent, Inventory):
+        if not ecs.has_component(ent, Inventory):
             return False
-        items = esper.component_for_entity(ent, Inventory).items
+        items = ecs.component_for_entity(ent, Inventory).items
         return any(is_raw_meat(item) or is_cooked_meat(item) for item in items)
 
     @staticmethod
     def _has_berries(ent: int) -> bool:
-        return esper.component_for_entity(ent, BerryBush).has_berries
+        return ecs.component_for_entity(ent, BerryBush).has_berries
 
     def _widen(
         self,
@@ -1452,9 +1452,9 @@ class NpcAiProcessor(esper.Processor):
             for nx in range(cx - 1, cx + 2):
                 own_region = (nx, ny) == region_id
                 for ent in sorted(index.of_kind((nx, ny), kind)):
-                    if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
+                    if not ecs.entity_exists(ent) or not ecs.has_component(ent, Position):
                         continue
-                    pos = esper.component_for_entity(ent, Position)
+                    pos = ecs.component_for_entity(ent, Position)
                     if not own_region and not in_region_with_margin(
                         game_map, region_id, pos.x, pos.y, margin
                     ):
@@ -1466,17 +1466,17 @@ class NpcAiProcessor(esper.Processor):
 
     def _widen_components(self, region_id: RegionId, kind: type):
         """``(entity, (Position, kind))`` for a region and its neighbours -- the
-        regional form of ``esper.get_components(Position, kind)``."""
+        regional form of ``ecs.get_components(Position, kind)``."""
         index = self._index()
         cx, cy = region_id
         for ny in range(cy - 1, cy + 2):
             for nx in range(cx - 1, cx + 2):
                 for ent in sorted(index.of_kind((nx, ny), kind)):
-                    if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
+                    if not ecs.entity_exists(ent) or not ecs.has_component(ent, Position):
                         continue
                     yield ent, (
-                        esper.component_for_entity(ent, Position),
-                        esper.component_for_entity(ent, kind),
+                        ecs.component_for_entity(ent, Position),
+                        ecs.component_for_entity(ent, kind),
                     )
 
     def _static_region_items(self, region_id: RegionId) -> tuple[list, list, list]:
@@ -1582,16 +1582,16 @@ class NpcAiProcessor(esper.Processor):
         index = self._index()
         limit = _UNBOUNDED
         for ent in index.of_kind(region_id, NPC):
-            if not esper.entity_exists(ent):
+            if not ecs.entity_exists(ent):
                 continue
-            if esper.has_component(ent, Asleep):
-                if not esper.has_component(ent, Settled):
+            if ecs.has_component(ent, Asleep):
+                if not ecs.has_component(ent, Settled):
                     return 0
-                wait = esper.component_for_entity(ent, Settled).turns
+                wait = ecs.component_for_entity(ent, Settled).turns
             else:
                 energy = (
-                    esper.component_for_entity(ent, Actor).energy
-                    if esper.has_component(ent, Actor)
+                    ecs.component_for_entity(ent, Actor).energy
+                    if ecs.has_component(ent, Actor)
                     else 0.0
                 )
                 # It acts on the turn its granted energy first covers an action.
@@ -1613,7 +1613,7 @@ class NpcAiProcessor(esper.Processor):
         several times over.
         """
         for ent in self._index().of_kind(region_id, NPC):
-            if not esper.entity_exists(ent) or esper.has_component(ent, Asleep):
+            if not ecs.entity_exists(ent) or ecs.has_component(ent, Asleep):
                 continue
             self._actor_of(ent).energy += turns * BASE_ACTION_COST
 
@@ -1657,15 +1657,15 @@ class NpcAiProcessor(esper.Processor):
         # stale, and it is a single bucket lookup.
         index = self._index()
         acting = [
-            (ent, esper.component_for_entity(ent, Position))
+            (ent, ecs.component_for_entity(ent, Position))
             for ent in sorted(index.of_kind(region_id, NPC))
-            if esper.entity_exists(ent) and esper.has_component(ent, Position)
+            if ecs.entity_exists(ent) and ecs.has_component(ent, Position)
         ]
         for ent, pos in acting:
-            if not esper.entity_exists(ent):
+            if not ecs.entity_exists(ent):
                 continue
             # Sleepers skip their turn; NeedsProcessor recovers and wakes them.
-            if esper.has_component(ent, Asleep):
+            if ecs.has_component(ent, Asleep):
                 continue
 
             # Anti-oscillation guard: forbid an immediate one-tile reversal back
@@ -1704,7 +1704,7 @@ class NpcAiProcessor(esper.Processor):
                     )
                     actor.energy -= cost
                     acted += 1
-                    if not esper.entity_exists(ent):
+                    if not ecs.entity_exists(ent):
                         break
             finally:
                 if guard is not None and occupied.get(guard) == _OSC_GUARD:
@@ -1712,16 +1712,16 @@ class NpcAiProcessor(esper.Processor):
                 self._prev_turn_pos[ent] = start_xy
 
     def _drive_factor(self, ent: int, drive_id: str) -> float:
-        if not esper.has_component(ent, DriveProfile):
+        if not ecs.has_component(ent, DriveProfile):
             return 1.0
-        return float(esper.component_for_entity(ent, DriveProfile).drives.get(drive_id, 1.0))
+        return float(ecs.component_for_entity(ent, DriveProfile).drives.get(drive_id, 1.0))
 
     def _has_inventory_food(self, ent: int) -> bool:
-        if not esper.has_component(ent, Inventory):
+        if not ecs.has_component(ent, Inventory):
             return False
         return any(
             not is_raw_meat(item) and hunger_restored(item) is not None
-            for item in esper.component_for_entity(ent, Inventory).items
+            for item in ecs.component_for_entity(ent, Inventory).items
         )
 
     def _trigger_passes(self, ent: int, trigger: tuple, ctx: dict) -> bool:
@@ -1755,11 +1755,11 @@ class NpcAiProcessor(esper.Processor):
         if name == "should_build":
             return self._should_build(ent)
         if name == "can_socialize":
-            return esper.has_component(ent, Personality) and esper.has_component(ent, Friendly)
+            return ecs.has_component(ent, Personality) and ecs.has_component(ent, Friendly)
         if name == "has_player":
             return ctx["player_xy"] is not None
         if name == "is_enemy":
-            return esper.has_component(ent, Enemy)
+            return ecs.has_component(ent, Enemy)
         raise KeyError(f"unknown AI trigger {name!r}")
 
     def _score_drive(self, ent: int, drive: DriveDef, ctx: dict) -> tuple[float | None, dict]:
@@ -1839,8 +1839,8 @@ class NpcAiProcessor(esper.Processor):
         new branch here.
         """
         trees, prey, corpses, stoves, bushes, sentients = diet_buckets
-        needs = esper.component_for_entity(ent, Needs) if esper.has_component(ent, Needs) else None
-        diet_kind = esper.component_for_entity(ent, Diet).kind if esper.has_component(ent, Diet) else None
+        needs = ecs.component_for_entity(ent, Needs) if ecs.has_component(ent, Needs) else None
+        diet_kind = ecs.component_for_entity(ent, Diet).kind if ecs.has_component(ent, Diet) else None
         ctx = {
             "needs": needs, "diet_kind": diet_kind, "trees": trees, "prey": prey,
             "corpses": corpses, "stoves": stoves, "bushes": bushes,
@@ -1857,7 +1857,7 @@ class NpcAiProcessor(esper.Processor):
 
         # A recycled entity id must never inherit a previous world's cached route
         # or widened buckets (both hold entity ids / live Position refs).
-        world = esper.current_world
+        world = ecs.current_world
         if world != self._trip_cache_world:
             self._trip_cache.clear()
             self._static_region_cache.clear()
@@ -1899,7 +1899,7 @@ class NpcAiProcessor(esper.Processor):
             )
 
 
-class FishAiProcessor(esper.Processor):
+class FishAiProcessor(ecs.Processor):
     """Swims the fish each turn. A fish is the aquatic mirror of a grazing deer:
     when hungry it eats seaweed it is next to, otherwise it drifts toward the
     nearest seaweed it can see, and failing that mills about at random.
@@ -1953,7 +1953,7 @@ class FishAiProcessor(esper.Processor):
         population = spatial.component_population(Fish)
         if self._fish_tiles is None or self._fish_population != population:
             self._fish_tiles = {}
-            for ent, (pos, _f) in esper.get_components(Position, Fish):
+            for ent, (pos, _f) in ecs.get_components(Position, Fish):
                 self._fish_tiles[(pos.x, pos.y)] = ent
             self._fish_population = population
         return self._fish_tiles
@@ -1962,9 +1962,9 @@ class FishAiProcessor(esper.Processor):
         """The fish swimming in one region, straight from the index."""
         index = spatial.ensure(self.game_map)
         return [
-            (ent, esper.component_for_entity(ent, Position))
+            (ent, ecs.component_for_entity(ent, Position))
             for ent in sorted(index.of_kind(region_id, Fish))
-            if esper.entity_exists(ent) and esper.has_component(ent, Position)
+            if ecs.entity_exists(ent) and ecs.has_component(ent, Position)
         ]
 
     def _region_seaweed(self, region_id: RegionId) -> list:
@@ -1979,9 +1979,9 @@ class FishAiProcessor(esper.Processor):
         fronds = [
             ((pos.x, pos.y), ent)
             for ent, pos in (
-                (e, esper.component_for_entity(e, Position))
+                (e, ecs.component_for_entity(e, Position))
                 for e in sorted(index.of_kind(region_id, Seaweed))
-                if esper.entity_exists(e) and esper.has_component(e, Position)
+                if ecs.entity_exists(e) and ecs.has_component(e, Position)
             )
         ]
         self._seaweed_by_region[region_id] = (version, fronds)
@@ -2014,7 +2014,7 @@ class FishAiProcessor(esper.Processor):
             return
 
         player_region = None
-        for _ent, (pos, _player) in esper.get_components(Position, Player):
+        for _ent, (pos, _player) in ecs.get_components(Position, Player):
             player_region = self.scheduler.region_at(pos.x, pos.y)
             break
 
@@ -2052,11 +2052,11 @@ class FishAiProcessor(esper.Processor):
         """Swim one area's fish for a single step against that area's seaweed."""
         seaweed_at = {xy: sw_ent for xy, sw_ent in seaweed}
         for ent, pos in fish:
-            if not esper.entity_exists(ent):
+            if not ecs.entity_exists(ent):
                 continue
             needs = (
-                esper.component_for_entity(ent, Needs)
-                if esper.has_component(ent, Needs)
+                ecs.component_for_entity(ent, Needs)
+                if ecs.has_component(ent, Needs)
                 else None
             )
             hungry = needs is not None and needs.hunger >= _FORAGE_THRESHOLD
@@ -2131,11 +2131,11 @@ class FishAiProcessor(esper.Processor):
         occupied: dict[tuple[int, int], int],
     ) -> None:
         needs.hunger = max(0.0, needs.hunger - _FISH_GRAZE_RESTORE)
-        if esper.entity_exists(sw_ent) and esper.has_component(sw_ent, Seaweed):
-            frond = esper.component_for_entity(sw_ent, Seaweed)
+        if ecs.entity_exists(sw_ent) and ecs.has_component(sw_ent, Seaweed):
+            frond = ecs.component_for_entity(sw_ent, Seaweed)
             frond.food -= 1
             if frond.food <= 0:
-                esper.delete_entity(sw_ent, immediate=True)  # eaten bare
+                ecs.delete_entity(sw_ent, immediate=True)  # eaten bare
                 seaweed_at.pop(xy, None)
 
     def _move(

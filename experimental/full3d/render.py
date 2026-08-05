@@ -42,11 +42,21 @@ from components import (
     Velocity,
     Weapon,
 )
-from sim import ARENA, Sim, aim_vector, clamp
+from sim import ARENA, Sim, aim_vector, clamp, heading_vectors
 
-# How much of the gap between the camera's current and wanted position is
-# closed per second. High enough to keep up with a dash, low enough to lag.
-CAM_STIFFNESS = 9.0
+# Camera. The boom sits behind the player along her aim, offset to one side
+# and slightly up so she does not stand in front of the crosshair.
+CAM_STIFFNESS = 14.0  # e-folds per second for the position spring
+CAM_SNAP = 30.0  # metres of error that mean "teleported", so do not lerp
+CAM_BOOM = 7.4  # metres behind the focus at rest
+CAM_BOOM_SPEED = 0.085  # extra metres per m/s of horizontal speed
+CAM_BOOM_EXTRA = 3.6  # cap on that extra
+CAM_SHOULDER = 0.85  # metres right of the aim line
+CAM_LIFT = 0.42  # metres above it
+CAM_FOCUS_Z = 1.30  # height up the body the boom pivots about
+CAM_CLEARANCE = 0.55  # keep this far off the ground and off walls
+CAM_PULL_IN = 26.0  # metres/sec the boom retracts out of a wall
+CAM_PUSH_OUT = 7.0  # metres/sec it is allowed back out again
 
 # Largest polygon, in metres, allowed on a wall or a rooftop. Bounds how badly
 # the affine texture mapping can swim -- see :func:`models.build_ground`.
@@ -192,6 +202,7 @@ class RenderProcessor(esper.Processor):
 
     def __init__(self, view: SceneView) -> None:
         self.view = view
+        self._flicker = 0  # frame counter for the jet flame's wobble
 
     def process(self, dt: float) -> None:
         view = self.view
@@ -271,32 +282,54 @@ class RenderProcessor(esper.Processor):
             if not limb.isEmpty():
                 limb.setP(models.swing(gait.phase, gait.amplitude, offset))
 
-    @staticmethod
-    def _thruster(node: NodePath, flight: Flight, ent: int) -> None:
-        """Flare the jets when they are lit, and hide them when they are not."""
+    def _thruster(self, node: NodePath, flight: Flight, ent: int) -> None:
+        """Show what the jetpack is doing: burning, gliding, or neither.
+
+        The wings sweep down and forward on a glide. It is a few degrees, but
+        it is the only feedback that the glide is engaged other than the rate
+        the ground is arriving at, and that one is easy to miss.
+        """
         flame = node.find("**/thruster")
-        if flame.isEmpty():
-            return
-        if flight.dash_timer > 0.0:
-            flame.setScale(1.5, 1.5, 2.4)
-        elif flight.thrusting:
-            wobble = 0.85 + 0.3 * math.sin(flight.dash_cd * 90.0 + ent)
-            flame.setScale(1.0, 1.0, wobble)
-        else:
-            flame.setScale(0.001)
+        if not flame.isEmpty():
+            if flight.thrusting:
+                self._flicker += 1
+                flame.setScale(1.0, 1.0, 0.85 + 0.3 * math.sin(self._flicker * 0.9 + ent))
+            elif flight.gliding:
+                flame.setScale(0.45, 0.45, 0.35)  # pilot light: the wings are powered
+            else:
+                flame.setScale(0.001)
+
+        wings = node.find("**/wings")
+        if not wings.isEmpty():
+            wings.setP(-14.0 if flight.gliding else 0.0)
 
 
 class CameraProcessor(esper.Processor):
-    """A chase camera on a spring, that will not let a building block the shot.
+    """A chase camera that looks *along* the aim, not at the player.
 
-    The boom points backward along the player's *aim*, not their velocity, so
-    strafing and dashing sideways keep the camera facing where the lance will
-    go -- which is what EDF does and what makes the class aimable at speed.
+    That distinction is the whole design. An obvious-looking chase camera puts
+    itself behind the player and then ``lookAt``s her -- and the moment you
+    pitch, the centre of the screen is her head rather than the direction the
+    lance travels. The crosshair then lies about where the shot goes, by more
+    the harder you are aiming, which makes the gun feel broken in a way that
+    is very hard to attribute to the camera.
+
+    So the orientation here is set directly from the aim angles and nothing
+    else. Panda's HPR forward vector for ``(yaw, pitch, 0)`` is exactly
+    :func:`sim.aim_vector`, so screen centre *is* the fire direction, by
+    construction. The camera is then free to be shoved anywhere -- pulled out
+    of a wall, lifted off the tarmac -- without the crosshair ever drifting
+    off the shot, because position and orientation are fully decoupled.
+
+    The player is kept out from behind the crosshair by offsetting the boom
+    to the right and up, rather than by aiming somewhere she is not.
     """
 
     def __init__(self, view: SceneView) -> None:
         self.view = view
         self.position = Vec3(0, -10, 6)
+        self.boom = CAM_BOOM  # smoothed, so wall collisions do not snap
+        self._started = False
 
     def process(self, dt: float) -> None:
         sim = self.view.sim
@@ -308,50 +341,70 @@ class CameraProcessor(esper.Processor):
         intent = esper.component_for_entity(sim.player, Intent)
         vel = esper.component_for_entity(sim.player, Velocity)
 
-        focus = transform.pos + Vec3(0, 0, 1.45)
+        focus = transform.pos + Vec3(0, 0, CAM_FOCUS_Z)
+        direction = aim_vector(intent.aim_yaw, intent.aim_pitch)
+        _fx, _fy, right_x, right_y = heading_vectors(intent.aim_yaw)
+        right = Vec3(right_x, right_y, 0.0)
+        up = right.cross(direction)  # camera-relative up, so the offsets roll with the pitch
+        up.normalize()
+
         speed = math.hypot(vel.vec.x, vel.vec.y)
-        boom = 7.0 + clamp(speed * 0.11, 0.0, 3.5)
+        wanted_boom = CAM_BOOM + clamp(speed * CAM_BOOM_SPEED, 0.0, CAM_BOOM_EXTRA)
+        wanted_boom = min(wanted_boom, self._clear_distance(focus, direction, wanted_boom))
 
-        direction = aim_vector(intent.aim_yaw, clamp(intent.aim_pitch, -55.0, 55.0))
-        wanted = focus - direction * boom + Vec3(0, 0, 1.15)
-        wanted.z = max(wanted.z, 0.9)  # never dip below the tarmac
+        # Retract fast, extend slow. A camera that springs back out of a wall
+        # at the same rate it went in reads as a lurch every time you skim one.
+        rate = CAM_PULL_IN if wanted_boom < self.boom else CAM_PUSH_OUT
+        self.boom += clamp(wanted_boom - self.boom, -rate * dt, rate * dt)
 
-        blend = clamp(CAM_STIFFNESS * dt, 0.0, 1.0)
-        self.position += (wanted - self.position) * blend
-        self.position = self._unblock(focus, self.position)
+        wanted = focus - direction * self.boom + right * CAM_SHOULDER + up * CAM_LIFT
+        floor = self.view.sim.ground_height(wanted.x, wanted.y) + CAM_CLEARANCE
+        wanted.z = max(wanted.z, floor)
+
+        if not self._started or (wanted - self.position).length() > CAM_SNAP:
+            # First frame, or the player was teleported (a restart, a test
+            # harness). Springing across the map takes a visible second.
+            self.position = Vec3(wanted)
+            self._started = True
+        else:
+            self.position += (wanted - self.position) * (1.0 - math.exp(-CAM_STIFFNESS * dt))
 
         base.camera.setPos(self.position)
-        base.camera.lookAt(focus)
+        base.camera.setHpr(intent.aim_yaw, intent.aim_pitch, 0.0)
 
-    def _unblock(self, focus: Vec3, position: Vec3) -> Vec3:
-        """Pull the camera in until the line back to the player is clear.
+    def _clear_distance(self, focus: Vec3, direction: Vec3, wanted: float) -> float:
+        """How far back the boom can reach before it is inside something.
 
-        Marches the boom in eight steps and stops at the first sample inside a
-        building. Crude, but the alternative is a swept-sphere test against the
-        collision grid for a camera that is already smoothed to within a metre.
+        Marches out from the player in half-metre steps and stops at the first
+        sample inside a building or under the street. Half a metre is finer
+        than the camera's own smoothing, so the result never quantises
+        visibly, and the march is over a handful of grid cells.
         """
         grid = self.view.sim.grid
-        offset = position - focus
-        length = offset.length()
-        if length < 1e-4:
-            return position
-        step = offset / length
-        clear = length
-        for i in range(1, 9):
-            distance = length * i / 8.0
-            sample = focus + step * distance
+        steps = max(2, int(wanted / 0.5))
+        clear = wanted
+        for index in range(1, steps + 1):
+            distance = wanted * index / steps
+            sample = focus - direction * distance
+            if sample.z < CAM_CLEARANCE:
+                clear = distance
+                break
+            pad = CAM_CLEARANCE
             blocked = False
             for _ident, x0, y0, x1, y1, top in grid.query_aabb(
-                sample.x - 0.4, sample.y - 0.4, sample.x + 0.4, sample.y + 0.4
+                sample.x - pad, sample.y - pad, sample.x + pad, sample.y + pad
             ):
-                if x0 - 0.4 <= sample.x <= x1 + 0.4 and y0 - 0.4 <= sample.y <= y1 + 0.4:
-                    if sample.z <= top + 0.4:
-                        blocked = True
-                        break
+                if (
+                    x0 - pad <= sample.x <= x1 + pad
+                    and y0 - pad <= sample.y <= y1 + pad
+                    and sample.z <= top + pad
+                ):
+                    blocked = True
+                    break
             if blocked:
-                clear = max(1.8, distance - length / 8.0)
+                clear = max(1.5, distance - wanted / steps)
                 break
-        return focus + step * clear
+        return clear
 
 
 class HudProcessor(esper.Processor):

@@ -1,8 +1,8 @@
 # Systems
 
-Systems (esper calls them **processors**) hold all behaviour. Each subclasses
-`esper.Processor` and implements `process(*args)`, receiving whatever was passed to
-`esper.process(...)`. Most live in [src/systems.py](../src/systems.py) alongside a
+Systems (called **processors** here) hold all behaviour. Each subclasses
+`ecs.Processor` and implements `process(*args)`, receiving whatever was passed to
+`ecs.process(...)`. Most live in [src/systems.py](../src/systems.py) alongside a
 large set of free **helper functions** the processors and turn loop share; the two
 largest were split into siblings — `RenderProcessor` into
 [src/render.py](../src/render.py) and `NpcAiProcessor`/`FishAiProcessor` into
@@ -219,10 +219,10 @@ call. They'll become the modules of the future `systems/` package:
 
 ## Adding a system
 
-1. Subclass `esper.Processor` and implement `process(self, action=None)`.
+1. Subclass `ecs.Processor` and implement `process(self, action=None)`.
 2. Register it in `game.py` with a `priority` placing it correctly relative to
    Time (2), Movement (1), and Render (0).
-3. Query the components it needs with `esper.get_components(...)`; gate time-advancing
+3. Query the components it needs with `ecs.get_components(...)`; gate time-advancing
    work on `action in _TURN_ACTIONS`.
 
 For a new *creature/item/effect*, you usually **don't** add a system — you add a

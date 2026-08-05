@@ -3,8 +3,8 @@
 ## ECS in one paragraph
 
 Entity-Component-System splits the game into three parts: **entities** are just ids,
-**components** are plain data attached to entities, and **systems** (esper calls them
-*processors*) hold all the behaviour. The player isn't a `Player` class with position
+**components** are plain data attached to entities, and **systems** (called
+*processors* in this project) hold all the behaviour. The player isn't a `Player` class with position
 + rendering + movement baked in; it's an entity that *has* a `Position`, a
 `Renderable`, and a `Player` tag, and separate systems read those components and do
 work. **Behaviour composes by adding components, not by subclassing** — a creature is
@@ -12,19 +12,21 @@ a carnivore because it has `Diet("carnivore")`, a resident because it has `Resid
 prey because it has `Deer`. This is what lets content scale: see
 [Content & Mods](Content-and-Mods.md).
 
-## esper 3.x model
+## Built-in ECS model
 
-esper 3.x keeps ECS state in **module-level** globals rather than a `World` object.
+The small ECS in [src/ecs.py](../src/ecs.py) keeps the active world's state in
+module-level stores. Named world contexts provide isolation for tests and future
+scenes without requiring an external framework or a `World` argument everywhere.
 
 | Call | Purpose |
 |------|---------|
-| `esper.create_entity(*components)` | Make an entity from components |
-| `esper.add_processor(proc, priority=0)` | Register a system; higher priority runs first |
-| `esper.get_components(A, B)` | Iterate `(entity, (a, b))` for entities having both |
-| `esper.component_for_entity(ent, A)` | Fetch one component off one entity |
-| `esper.has_component(ent, A)` | Membership test |
-| `esper.add_component` / `remove_component` / `delete_entity` | Mutate the database |
-| `esper.process(*args)` | Run every processor's `process(*args)` in priority order |
+| `ecs.create_entity(*components)` | Make an entity from components |
+| `ecs.add_processor(proc, priority=0)` | Register a system; higher priority runs first |
+| `ecs.get_components(A, B)` | Iterate `(entity, (a, b))` for entities having both |
+| `ecs.component_for_entity(ent, A)` | Fetch one component off one entity |
+| `ecs.has_component(ent, A)` | Membership test |
+| `ecs.add_component` / `remove_component` / `delete_entity` | Mutate the database |
+| `ecs.process(*args)` | Run every processor's `process(*args)` in priority order |
 
 ## Layer DAG (imports only point down)
 
@@ -48,7 +50,7 @@ are re-exported through it (import them via `systems`).
 ## The turn loop
 
 The game is turn-based: it waits for actionable input, runs the systems once, and
-repeats. A single call to `esper.process(action)` runs **every** processor in
+repeats. A single call to `ecs.process(action)` runs **every** processor in
 priority order, so one keypress advances time, AI, needs, and the frame together.
 
 Processor registration and priorities (`game.py`, high runs first):
@@ -66,10 +68,10 @@ Processor registration and priorities (`game.py`, high runs first):
 | 0 | `RenderProcessor` | Draw the frame **last** |
 
 Time-advancing systems only tick on a real action (a move or `WAIT_ACTION`); menu
-refreshes call `esper.process(None)`, which advances nothing. Move-before-draw (and
+refreshes call `ecs.process(None)`, which advances nothing. Move-before-draw (and
 Time-before-everything) means a keypress is reflected in the same frame.
 
-The loop also does the work a bare `esper.process` can't: it resolves held-direction
+The loop also does the work a bare `ecs.process` can't: it resolves held-direction
 keys into a single action, routes UI actions (menus, look mode, interactions) to
 their handlers, and — when the player is idle or only a status animation is playing —
 spends the spare time paying down background region-simulation debt
@@ -80,7 +82,7 @@ spends the spare time paying down background region-simulation debt
 1. `PygameRenderer.poll_action()` reads pygame events and emits an abstract action
    string (`move_left`, `menu_select`, `confirm_action`, `sleep`, `look`, …).
 2. `game.py` handles UI-state actions (inventory/pause/options/dialogue/look/
-   interactions) and routes gameplay actions into `esper.process(...)`.
+   interactions) and routes gameplay actions into `ecs.process(...)`.
 3. `TimeProcessor` advances the clock; `MovementProcessor` moves the player (or bumps
    an adjacent creature into a melee attack); the AI/needs/flora/reproduction systems
    simulate the world.
@@ -91,7 +93,7 @@ spends the spare time paying down background region-simulation debt
 
 Because the renderer is an interface, tests substitute a fake (see
 [src/tests/fakes.py](../src/tests/fakes.py)): register it with `RenderProcessor`, call
-`esper.process("move_up")`, and assert on the recorded draw calls or the player's
+`ecs.process("move_up")`, and assert on the recorded draw calls or the player's
 `Position`. No live window required. The whole survival/social/housing/reproduction
 sim is driven and asserted this way — 236 tests in ~1s.
 

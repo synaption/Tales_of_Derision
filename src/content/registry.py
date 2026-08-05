@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-import esper
+import ecs
 
 from components import Name, Position, Renderable
 from content.kits import build_kit
@@ -117,4 +117,4 @@ def build_components(prefab_id: str, x: int, y: int, **overrides) -> list:
 
 def spawn(prefab_id: str, x: int, y: int, **overrides) -> int:
     """Create an entity from ``prefab_id`` at ``(x, y)`` and return its id."""
-    return esper.create_entity(*build_components(prefab_id, x, y, **overrides))
+    return ecs.create_entity(*build_components(prefab_id, x, y, **overrides))

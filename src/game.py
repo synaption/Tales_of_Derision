@@ -15,7 +15,7 @@ from pathlib import Path
 import sys
 import time
 
-import esper
+import ecs
 
 from action import BASE_ACTION_COST
 from components import Bed, BerryBush, Blueprint, Chest, Friendly, Player, Position, Stove, Tree, Well
@@ -168,7 +168,7 @@ def _idle_pump_budget(idle_ticks: int) -> float:
 def _player_region_for_processors(player_xy: Position | tuple[int, int] | None) -> tuple[int, int] | None:
     if player_xy is None:
         return None
-    processor = esper.get_processor(NpcAiProcessor) or esper.get_processor(FishAiProcessor)
+    processor = ecs.get_processor(NpcAiProcessor) or ecs.get_processor(FishAiProcessor)
     if processor is None:
         return None
     if isinstance(player_xy, Position):
@@ -200,7 +200,7 @@ def _catch_up_entered_region_cooperatively(renderer: Renderer, region_id: tuple[
     islands that was ~80% of the entire stall spent on thousands of frames nobody
     could see, and it grew with the debt. Progress feedback only needs to arrive
     at a watchable rate; the simulation is unaffected either way, because
-    ``esper.process(None)`` is render-only.
+    ``ecs.process(None)`` is render-only.
     """
     if region_id is None:
         return
@@ -209,7 +209,7 @@ def _catch_up_entered_region_cooperatively(renderer: Renderer, region_id: tuple[
         return
     processors = [
         processor
-        for processor in (esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor))
+        for processor in (ecs.get_processor(NpcAiProcessor), ecs.get_processor(FishAiProcessor))
         if processor is not None
     ]
     if not processors:
@@ -230,7 +230,7 @@ def _catch_up_entered_region_cooperatively(renderer: Renderer, region_id: tuple[
         now = time.monotonic()
         if now - last_frame >= _CATCHUP_FRAME_SECONDS:
             last_frame = now
-            esper.process(None)
+            ecs.process(None)
 
 
 # Slices for spending a turn's leftover beat on background simulation. The slice
@@ -244,7 +244,7 @@ def catch_up_whole_world(on_progress: Callable[[float], None] | None = None) -> 
     """Bring every region -- not just the player's -- current with the clock.
 
     Used at the end of world generation. The settle turns run through
-    ``esper.process``, which by design simulates only the region the player
+    ``ecs.process``, which by design simulates only the region the player
     stands in, so a hundred-island world walks out of the loading screen with
     every other region a hundred and fifty turns in arrears. That debt is not
     free: it is paid later, all at once, the first time something demands a
@@ -260,7 +260,7 @@ def catch_up_whole_world(on_progress: Callable[[float], None] | None = None) -> 
     schedulers = [
         processor.scheduler
         for processor in (
-            esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor)
+            ecs.get_processor(NpcAiProcessor), ecs.get_processor(FishAiProcessor)
         )
         if processor is not None
     ]
@@ -270,7 +270,7 @@ def catch_up_whole_world(on_progress: Callable[[float], None] | None = None) -> 
             scheduler.catch_up_region(region_id, target_turn)
             if on_progress is not None and done % 8 == 0:
                 on_progress((index + done / max(1, len(regions))) / (len(schedulers) + 1))
-    flora = esper.get_processor(TreeGrowthProcessor)
+    flora = ecs.get_processor(TreeGrowthProcessor)
     if flora is not None:
         flora.catch_up_all_flora()
     if on_progress is not None:
@@ -285,11 +285,11 @@ def _pump_background_regions(budget_seconds: float) -> None:
     if clock is None:
         return
     player_xy: tuple[int, int] | None = None
-    for _ent, (pos, _p) in esper.get_components(Position, Player):
+    for _ent, (pos, _p) in ecs.get_components(Position, Player):
         player_xy = (pos.x, pos.y)
         break
     for processor_type in (NpcAiProcessor, FishAiProcessor):
-        processor = esper.get_processor(processor_type)
+        processor = ecs.get_processor(processor_type)
         if processor is None:
             continue
         player_region = (
@@ -303,12 +303,12 @@ def _pump_background_regions(budget_seconds: float) -> None:
             budget_seconds, player_region, target_region_turn, time.monotonic
         )
     # Flora growth lags the same way and is paid down in the same spare cycles.
-    flora = esper.get_processor(TreeGrowthProcessor)
+    flora = ecs.get_processor(TreeGrowthProcessor)
     if flora is not None:
         flora.pump_flora(budget_seconds, player_xy, time.monotonic)
     # So do births: a baby due in a region the player isn't standing in arrives
     # here, in spare time, instead of on the keypress that crossed the day line.
-    births = esper.get_processor(ReproductionProcessor)
+    births = ecs.get_processor(ReproductionProcessor)
     if births is not None:
         births.pump_births(player_xy)
     # Wild populations need no pump of their own: they ride the flora's
@@ -444,7 +444,7 @@ class GameSession:
         the budget the longer the player goes without acting."""
         if self._idle_is_animated:
             _pump_background_regions(_IDLE_PUMP_BASE_BUDGET)
-            esper.process(None)  # keep the status animation cycling
+            ecs.process(None)  # keep the status animation cycling
             return
         self._idle_ticks += 1
         _pump_background_regions(_idle_pump_budget(self._idle_ticks))
@@ -494,7 +494,7 @@ class GameSession:
 
     def redraw(self) -> None:
         """Refresh the frame without advancing the world."""
-        esper.process(None)
+        ecs.process(None)
 
     def take_turn(self, action: str, draw: bool = True) -> None:
         """Run the systems for one player action, then cooperatively settle a
@@ -508,11 +508,11 @@ class GameSession:
         looks uneven. The deferred frame still describes *this* turn; the
         RenderProcessor holds on to the action it skipped.
         """
-        render_processor = None if draw else esper.get_processor(RenderProcessor)
+        render_processor = None if draw else ecs.get_processor(RenderProcessor)
         if render_processor is not None:
             render_processor.defer_frame = True
         try:
-            esper.process(action)
+            ecs.process(action)
         finally:
             if render_processor is not None:
                 # Region catch-up below draws interim frames on purpose, so the
@@ -564,7 +564,7 @@ class GameSession:
         creature = _find_interaction_creature(faced)
         if creature is not None:
             self._held_directions.clear()
-            if esper.has_component(creature, Friendly):
+            if ecs.has_component(creature, Friendly):
                 # Friendlies: full dialogue (which shows their status).
                 choice = _draw_dialogue_menu(self.renderer, self.game_map, creature)
             else:
@@ -661,7 +661,7 @@ class GameSession:
 
 def _register_processors(game_map: GameMap, combat_sfx: CombatSfxPlayer) -> None:
     """Install the simulation systems, in the order one turn runs them."""
-    esper.add_processor(
+    ecs.add_processor(
         MovementProcessor(
             game_map,
             on_melee_attack=combat_sfx.play_melee_attack,
@@ -671,33 +671,33 @@ def _register_processors(game_map: GameMap, combat_sfx: CombatSfxPlayer) -> None
     )
     # TimeProcessor runs first (priority above movement) so the clock is
     # current before needs/AI read the time of day this turn.
-    esper.add_processor(TimeProcessor(), priority=2)
+    ecs.add_processor(TimeProcessor(), priority=2)
     # Housing runs before the AI so a villager that just claimed a home
     # can start heading there this turn.
-    esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
+    ecs.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
     npc_ai = NpcAiProcessor(
         game_map, max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT
     )
-    esper.add_processor(npc_ai, priority=0)
-    esper.add_processor(
+    ecs.add_processor(npc_ai, priority=0)
+    ecs.add_processor(
         FishAiProcessor(game_map, max_entry_catchup_advances=ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT),
         priority=0,
     )
     needs = NeedsProcessor(game_map)
-    esper.add_processor(needs, priority=0)
+    ecs.add_processor(needs, priority=0)
     # Ticks registered status effects (fire, poison, ...). A no-op until an
     # effect declares behaviour; the seam lives in content.effects.
     effects = EffectsProcessor(game_map)
-    esper.add_processor(effects, priority=0)
+    ecs.add_processor(effects, priority=0)
     flora = TreeGrowthProcessor(game_map)
-    esper.add_processor(flora, priority=0)
-    esper.add_processor(ReproductionProcessor(game_map), priority=0)
+    ecs.add_processor(flora, priority=0)
+    ecs.add_processor(ReproductionProcessor(game_map), priority=0)
     # Wild populations. The processor itself only keeps residency in step each
     # turn; the population model rides the flora's day cursor, because animals
     # eat plants and the two must advance together (see register_on).
     animals = WildlifeProcessor(game_map)
     animals.register_on(flora)
-    esper.add_processor(animals, priority=0)
+    ecs.add_processor(animals, priority=0)
 
     # Needs and status effects belong to a *region's* turn, not the world's: they
     # are registered as steps on the region scheduler, so they run wherever that
@@ -777,9 +777,9 @@ def game_session(args: argparse.Namespace) -> Iterator[GameSession | None]:
                 # here, while the loading screen is still up and it is free.
                 catch_up_whole_world(on_progress=lambda done: draw_settling_frame(renderer, done))
 
-            esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+            ecs.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
-            esper.process()  # initial frame
+            ecs.process()  # initial frame
             if args.screenshot is not None:
                 _capture_frame_screenshot(renderer, args.screenshot)
                 yield None

@@ -24,7 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, "src"))
 
-import esper  # noqa: E402
+import ecs  # noqa: E402
 
 from components import Position  # noqa: E402
 from config import ACTIVE_REGION_CATCHUP_STEPS_PER_INPUT, MAP_HEIGHT, MAP_WIDTH  # noqa: E402
@@ -53,31 +53,31 @@ class _NullRenderer(Renderer):
 
 
 def build(flood: bool, render: bool, active_cap: int | None = None) -> GameMap:
-    esper.clear_database()
+    ecs.clear_database()
     set_world_rng(0x7A1E5)
     game_map = GameMap(MAP_WIDTH, MAP_HEIGHT)
     player = Position(MAP_WIDTH // 2, MAP_HEIGHT // 2)
     count = _setup_world(game_map, player, rat_flood=flood)
-    esper.add_processor(TimeProcessor(), priority=2)
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
-    esper.add_processor(
+    ecs.add_processor(TimeProcessor(), priority=2)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
+    ecs.add_processor(
         NpcAiProcessor(game_map, max_entry_catchup_advances=active_cap), priority=0
     )
-    esper.add_processor(
+    ecs.add_processor(
         FishAiProcessor(game_map, max_entry_catchup_advances=active_cap), priority=0
     )
-    esper.add_processor(NeedsProcessor(game_map), priority=0)
-    esper.add_processor(EffectsProcessor(), priority=0)
+    ecs.add_processor(NeedsProcessor(game_map), priority=0)
+    ecs.add_processor(EffectsProcessor(), priority=0)
     flora = TreeGrowthProcessor(game_map)
-    esper.add_processor(flora, priority=0)
-    esper.add_processor(ReproductionProcessor(), priority=0)
+    ecs.add_processor(flora, priority=0)
+    ecs.add_processor(ReproductionProcessor(), priority=0)
     animals = WildlifeProcessor(game_map)
     animals.register_on(flora)
-    esper.add_processor(animals, priority=0)
+    ecs.add_processor(animals, priority=0)
     if render:
-        esper.add_processor(RenderProcessor(_NullRenderer(), game_map), priority=0)
-    npcs = sum(1 for _e, _c in esper.get_components(Position))
+        ecs.add_processor(RenderProcessor(_NullRenderer(), game_map), priority=0)
+    npcs = sum(1 for _e, _c in ecs.get_components(Position))
     print(f"world built: {count if flood else 'scripted'} spawn return, {npcs} positioned entities")
     return game_map
 
@@ -87,7 +87,7 @@ def run(turns: int) -> None:
     # catch-up bursts -- the realistic worst case).
     moves = ["move_right", "move_down"]
     for i in range(turns):
-        esper.process(moves[i % len(moves)])
+        ecs.process(moves[i % len(moves)])
 
 
 def main() -> None:

@@ -16,7 +16,7 @@ import textwrap
 import time
 from collections.abc import Callable
 
-import esper
+import ecs
 
 from components import Corpse, Enemy, Friendly, NPC, Name, Needs, Player, Position, Renderable, Vision
 from game_map import GameMap
@@ -32,7 +32,7 @@ from systems import (
 )
 
 
-class RenderProcessor(esper.Processor):
+class RenderProcessor(ecs.Processor):
     """Draws the map, then all Renderable entities on top of it."""
 
     def __init__(self, renderer: Renderer, game_map: GameMap):
@@ -214,10 +214,10 @@ class RenderProcessor(esper.Processor):
         remain dynamic ECS queries; static scenery is looked up by visible tile.
         """
         by_xy: dict[tuple[int, int], list[tuple[int, Renderable]]] = {}
-        for ent, (pos, rend) in esper.get_components(Position, Renderable):
+        for ent, (pos, rend) in ecs.get_components(Position, Renderable):
             if ent == player_ent:
                 continue
-            if esper.has_component(ent, NPC) or esper.has_component(ent, Corpse):
+            if ecs.has_component(ent, NPC) or ecs.has_component(ent, Corpse):
                 continue
             by_xy.setdefault((pos.x, pos.y), []).append((ent, rend))
         self._static_renderables_by_xy = by_xy
@@ -236,7 +236,7 @@ class RenderProcessor(esper.Processor):
                 continue
             live_entries: list[tuple[int, Renderable]] = []
             for ent, rend in entries:
-                if not esper.entity_exists(ent):
+                if not ecs.entity_exists(ent):
                     continue
                 live_entries.append((ent, rend))
                 out.append((ent, Position(xy[0], xy[1]), rend))
@@ -247,24 +247,24 @@ class RenderProcessor(esper.Processor):
                 else:
                     self._static_renderables_by_xy.pop(xy, None)
 
-        for ent, (pos, rend, _npc) in esper.get_components(Position, Renderable, NPC):
+        for ent, (pos, rend, _npc) in ecs.get_components(Position, Renderable, NPC):
             if ent in seen or (pos.x, pos.y) not in self._visible_tiles:
                 continue
             out.append((ent, pos, rend))
             seen.add(ent)
 
-        for ent, (pos, rend, _corpse) in esper.get_components(Position, Renderable, Corpse):
+        for ent, (pos, rend, _corpse) in ecs.get_components(Position, Renderable, Corpse):
             if ent in seen or (pos.x, pos.y) not in self._visible_tiles:
                 continue
             out.append((ent, pos, rend))
             seen.add(ent)
 
-        if player_ent is not None and esper.entity_exists(player_ent):
-            if esper.has_component(player_ent, Position) and esper.has_component(player_ent, Renderable):
+        if player_ent is not None and ecs.entity_exists(player_ent):
+            if ecs.has_component(player_ent, Position) and ecs.has_component(player_ent, Renderable):
                 out.append((
                     player_ent,
-                    esper.component_for_entity(player_ent, Position),
-                    esper.component_for_entity(player_ent, Renderable),
+                    ecs.component_for_entity(player_ent, Position),
+                    ecs.component_for_entity(player_ent, Renderable),
                 ))
         return out
 
@@ -274,7 +274,7 @@ class RenderProcessor(esper.Processor):
     ) -> list[_NearbyEntry]:
         nearby: list[_NearbyEntry] = []
 
-        for ent, (pos, rend) in esper.get_components(Position, Renderable):
+        for ent, (pos, rend) in ecs.get_components(Position, Renderable):
             if pos.x == player_pos.x and pos.y == player_pos.y:
                 continue
             if (pos.x, pos.y) not in self._visible_tiles:
@@ -287,13 +287,13 @@ class RenderProcessor(esper.Processor):
 
             arrow = self._direction_arrow(player_pos, pos)
             name = "Unknown"
-            if esper.has_component(ent, Name):
-                name = esper.component_for_entity(ent, Name).value
+            if ecs.has_component(ent, Name):
+                name = ecs.component_for_entity(ent, Name).value
 
             classification = "default"
-            if esper.has_component(ent, Friendly):
+            if ecs.has_component(ent, Friendly):
                 classification = "friendly"
-            elif esper.has_component(ent, Enemy):
+            elif ecs.has_component(ent, Enemy):
                 classification = "enemy"
 
             nearby.append(
@@ -318,8 +318,8 @@ class RenderProcessor(esper.Processor):
             return set()
 
         radius = max(self.game_map.width // 2, self.game_map.height // 2)
-        if player_ent is not None and esper.has_component(player_ent, Vision):
-            radius = esper.component_for_entity(player_ent, Vision).radius
+        if player_ent is not None and ecs.has_component(player_ent, Vision):
+            radius = ecs.component_for_entity(player_ent, Vision).radius
 
         # Clip the scan (and thus visibility) to the current section: other
         # sections are simulated but never drawn.
@@ -718,7 +718,7 @@ class RenderProcessor(esper.Processor):
     ) -> list[tuple[int, str, str, str, int, int, int, int]]:
         visible: list[tuple[int, str, str, str, int, int, int, int]] = []
 
-        for ent, (pos, rend, _npc) in esper.get_components(Position, Renderable, NPC):
+        for ent, (pos, rend, _npc) in ecs.get_components(Position, Renderable, NPC):
             if (pos.x, pos.y) == (player_pos.x, player_pos.y):
                 continue
             if (pos.x, pos.y) not in self._visible_tiles:
@@ -728,8 +728,8 @@ class RenderProcessor(esper.Processor):
             dy = pos.y - player_pos.y
             arrow = self._direction_arrow(player_pos, pos)
             name = "Unknown"
-            if esper.has_component(ent, Name):
-                name = esper.component_for_entity(ent, Name).value
+            if ecs.has_component(ent, Name):
+                name = ecs.component_for_entity(ent, Name).value
 
             visible.append((ent, rend.glyph, arrow, name, abs(dx) + abs(dy), max(abs(dx), abs(dy)), pos.x, pos.y))
 
@@ -1136,7 +1136,7 @@ class RenderProcessor(esper.Processor):
         # that hurt once the ocean added a couple thousand fish/seaweed.
         player_pos: Position | None = None
         player_ent: int | None = None
-        for ent, (pos, _player) in esper.get_components(Position, Player):
+        for ent, (pos, _player) in ecs.get_components(Position, Player):
             player_pos = pos
             player_ent = ent
             break
@@ -1200,11 +1200,11 @@ class RenderProcessor(esper.Processor):
                 continue
 
             # Avoid component lookups for the thousands of off-screen renderables
-            # on the archipelago. The old order asked esper whether every tree,
+            # on the archipelago. The old order asked ECS whether every tree,
             # bush, fish and villager was an NPC/friendly/enemy before checking
             # visibility, which made walking stutter even though only a viewport's
             # worth of entities can ever be drawn.
-            is_character = is_player or esper.has_component(ent, NPC)
+            is_character = is_player or ecs.has_component(ent, NPC)
 
             if visible and is_memorable_scenery(ent):
                 seen_scenery[(pos.x, pos.y)] = (rend.glyph, "default", rend.fg, rend.bg)
@@ -1214,9 +1214,9 @@ class RenderProcessor(esper.Processor):
                 continue
 
             classification = "default"
-            if is_player or esper.has_component(ent, Friendly):
+            if is_player or ecs.has_component(ent, Friendly):
                 classification = "friendly"
-            elif esper.has_component(ent, Enemy):
+            elif ecs.has_component(ent, Enemy):
                 classification = "enemy"
 
             if is_character:
@@ -1229,8 +1229,8 @@ class RenderProcessor(esper.Processor):
                 dy = pos.y - player_pos.y
                 arrow = self._direction_arrow(player_pos, pos)
                 name = "Unknown"
-                if esper.has_component(ent, Name):
-                    name = esper.component_for_entity(ent, Name).value
+                if ecs.has_component(ent, Name):
+                    name = ecs.component_for_entity(ent, Name).value
                 mdist = abs(dx) + abs(dy)
                 cdist = max(abs(dx), abs(dy))
                 if is_character:
@@ -1348,8 +1348,8 @@ class RenderProcessor(esper.Processor):
         draw_text_clipped = getattr(r, "draw_text_clipped", None)
         time_text = f"{format_datetime(clock)}  "
         needs_text = ""
-        if player_ent is not None and esper.has_component(player_ent, Needs):
-            needs = esper.component_for_entity(player_ent, Needs)
+        if player_ent is not None and ecs.has_component(player_ent, Needs):
+            needs = ecs.component_for_entity(player_ent, Needs)
             needs_text = (
                 f"Hunger {int(needs.hunger)}%  Thirst {int(needs.thirst)}%  "
                 f"Tired {int(needs.tiredness)}%    "

@@ -94,9 +94,9 @@ capability. This page groups them by domain; the file is the source of truth.
 ## Adding a component
 
 1. Add a `@dataclass` to [src/components.py](../src/components.py).
-2. Attach it at creation (`esper.create_entity(...)`, or a [prefab](Content-and-Mods.md))
-   or later with `esper.add_component(ent, MyComponent(...))`.
-3. Query it from a system via `esper.get_components(MyComponent, ...)`.
+2. Attach it at creation (`ecs.create_entity(...)`, or a [prefab](Content-and-Mods.md))
+   or later with `ecs.add_component(ent, MyComponent(...))`.
+3. Query it from a system via `ecs.get_components(MyComponent, ...)`.
 
 Because behaviour is keyed off component presence, most new content needs **no new
 component** — it reuses the ones above (a new predator is just another entity with

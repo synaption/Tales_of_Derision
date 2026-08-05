@@ -14,21 +14,26 @@ separate modules and only meet here:
 **Controls**
 
 ===============  =========================================================
-Mouse            aim; the camera follows the aim, not the velocity
+Mouse            aim; the screen centre is exactly where the lance goes
 W A S D          move, relative to where you are looking
 Space (hold)     thrust -- drains energy continuously while held
-Shift            boost dash -- a flat energy charge for a fixed burst
+Shift (hold)     glide -- wings out: the fall slows and the speed keeps
 Left mouse       fire the lance -- costs energy too, so it costs altitude
 R                restart with a fresh city
 F1               toggle the vertex snapping, to see what it is doing
 Escape           release the mouse; again to quit
 ===============  =========================================================
 
-The whole class is one meter. Flight, dashing and shooting all drink from it,
+The whole class is one meter. Flight, gliding and shooting all drink from it,
 it only refills quickly with your feet on the ground, and if you let it hit
 exactly zero it locks out and refills at half speed until it is completely
 full. Everything interesting about playing a Wing Diver is the arithmetic of
 not letting that happen.
+
+The glide is what makes the arithmetic work. Thrust costs 26 a second and
+gliding costs 7, and a glide never gains a millimetre of height -- so the way
+to cross the city is one hard burn upward followed by a long flat descent,
+not a jetpack held down the whole way.
 """
 
 from __future__ import annotations
@@ -205,7 +210,7 @@ class Cramigula(ShowBase):
         intent.move_x = (1.0 if keys.get("d") else 0.0) - (1.0 if keys.get("a") else 0.0)
         intent.move_y = (1.0 if keys.get("w") else 0.0) - (1.0 if keys.get("s") else 0.0)
         intent.thrust = bool(keys.get("space"))
-        intent.dash = bool(keys.get("shift"))
+        intent.glide = bool(keys.get("shift"))
         intent.fire = bool(keys.get("mouse1")) or bool(keys.get("control"))
 
     # -- the loop ----------------------------------------------------------

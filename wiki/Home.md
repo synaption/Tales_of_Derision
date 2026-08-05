@@ -9,7 +9,7 @@ This wiki is the concrete reference.
 
 ## Status
 
-- ✅ esper ECS (3.x, module-level API); renderer decoupled behind an interface for
+- ✅ Small built-in ECS (module-level API); renderer decoupled behind an interface for
   headless tests
 - ✅ Time-based **action economy** (turn order by completion time) + deterministic
   scheduler

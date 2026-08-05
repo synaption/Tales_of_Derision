@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 import itertools
 
-import esper
+import ecs
 import pytest
 
 from action import BASE_ACTION_COST, action_cost, action_weight, actor_speed
@@ -28,17 +28,17 @@ def _expired_wall_clock():
 
 
 def test_actor_without_attributes_is_baseline_speed() -> None:
-    ent = esper.create_entity()
+    ent = ecs.create_entity()
     assert actor_speed(ent) == 1.0
 
 
 def test_average_dexterity_is_baseline_speed() -> None:
-    ent = esper.create_entity(Attributes(dexterity=10))
+    ent = ecs.create_entity(Attributes(dexterity=10))
     assert actor_speed(ent) == 1.0
 
 
 def test_baseline_action_costs_exactly_base_cost() -> None:
-    ent = esper.create_entity(Attributes(dexterity=10))
+    ent = ecs.create_entity(Attributes(dexterity=10))
     assert action_cost(ent, "move_up") == BASE_ACTION_COST
     assert action_cost(ent, "wait") == BASE_ACTION_COST
     # Unknown/None actions still fall back to the unit weight.
@@ -46,19 +46,19 @@ def test_baseline_action_costs_exactly_base_cost() -> None:
 
 
 def test_higher_dexterity_acts_faster_costs_less() -> None:
-    quick = esper.create_entity(Attributes(dexterity=20))
+    quick = ecs.create_entity(Attributes(dexterity=20))
     assert actor_speed(quick) > 1.0
     assert action_cost(quick, "move_up") < BASE_ACTION_COST
 
 
 def test_lower_dexterity_acts_slower_costs_more() -> None:
-    slow = esper.create_entity(Attributes(dexterity=5))
+    slow = ecs.create_entity(Attributes(dexterity=5))
     assert actor_speed(slow) < 1.0
     assert action_cost(slow, "move_up") > BASE_ACTION_COST
 
 
 def test_speed_has_a_floor_so_cost_stays_positive() -> None:
-    clumsy = esper.create_entity(Attributes(dexterity=-1000))
+    clumsy = ecs.create_entity(Attributes(dexterity=-1000))
     assert actor_speed(clumsy) >= 0.1
     assert action_cost(clumsy, "move_up") >= 1
 
@@ -71,8 +71,8 @@ def test_action_weight_defaults_to_one() -> None:
 # --- End-to-end: the clock advances by the player's action cost -------------
 
 def test_baseline_player_advances_clock_by_base_cost_per_action() -> None:
-    esper.create_entity(WorldClock(turn=0))
-    esper.create_entity(Player(), Attributes(dexterity=10))
+    ecs.create_entity(WorldClock(turn=0))
+    ecs.create_entity(Player(), Attributes(dexterity=10))
     time_proc = TimeProcessor()
 
     for _ in range(5):
@@ -83,8 +83,8 @@ def test_baseline_player_advances_clock_by_base_cost_per_action() -> None:
 
 
 def test_quicker_player_consumes_less_world_time_per_action() -> None:
-    esper.create_entity(WorldClock(turn=0))
-    esper.create_entity(Player(), Attributes(dexterity=25))
+    ecs.create_entity(WorldClock(turn=0))
+    ecs.create_entity(Player(), Attributes(dexterity=25))
 
     TimeProcessor().process("move_up")
 
@@ -93,9 +93,9 @@ def test_quicker_player_consumes_less_world_time_per_action() -> None:
 
 
 def test_baseline_needs_accrue_one_rate_per_baseline_turn() -> None:
-    esper.create_entity(WorldClock(turn=0))
-    esper.create_entity(Player(), Attributes(dexterity=10))
-    ent = esper.create_entity(Needs(hunger=0.0, hunger_rate=1.0))
+    ecs.create_entity(WorldClock(turn=0))
+    ecs.create_entity(Player(), Attributes(dexterity=10))
+    ent = ecs.create_entity(Needs(hunger=0.0, hunger_rate=1.0))
 
     time_proc = TimeProcessor()
     needs_proc = NeedsProcessor()
@@ -106,17 +106,17 @@ def test_baseline_needs_accrue_one_rate_per_baseline_turn() -> None:
 
     # Needs are time-based, but a baseline turn accrues exactly the old per-turn
     # amount, so the switch is invisible at baseline speed.
-    assert esper.component_for_entity(ent, Needs).hunger == pytest.approx(turns * 1.0)
+    assert ecs.component_for_entity(ent, Needs).hunger == pytest.approx(turns * 1.0)
 
 
 # --- Per-NPC speed: dexterity buys extra actions per region-turn ------------
 
 def test_quicker_npc_acts_more_often_than_a_baseline_npc() -> None:
-    esper.create_entity(WorldClock(turn=0))
+    ecs.create_entity(WorldClock(turn=0))
     game_map = GameMap(40, 20)
-    esper.create_entity(Position(20, 10), Player())  # anchors the live region
-    baseline = esper.create_entity(Position(5, 5), NPC())
-    quick = esper.create_entity(Position(6, 6), NPC(), Attributes(dexterity=30))
+    ecs.create_entity(Position(20, 10), Player())  # anchors the live region
+    baseline = ecs.create_entity(Position(5, 5), NPC())
+    quick = ecs.create_entity(Position(6, 6), NPC(), Attributes(dexterity=30))
 
     processor = NpcAiProcessor(game_map, wall_clock=_expired_wall_clock())
 

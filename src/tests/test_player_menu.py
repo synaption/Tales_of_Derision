@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 
-import esper
+import ecs
 import pytest
 
 from components import BlocksMovement, Equipment, Inventory, Name, Player, Position, Renderable
@@ -27,7 +27,7 @@ class ScriptedRenderer(FakeRenderer):
 
 
 def _player(items: list[str] | None = None, main_hand: str | None = None) -> int:
-    return esper.create_entity(
+    return ecs.create_entity(
         Position(5, 5),
         Renderable("@"),
         Name("You"),
@@ -71,7 +71,7 @@ def test_inventory_actions_work_inside_the_menu_tab() -> None:
     player = _player(items=["Rusty Sword"], main_hand=None)
     # Move to the items panel, equip the sword, then close.
     _run(["move_right", "menu_select", "open_pause_menu"], start_tab="inventory")
-    equipment = esper.component_for_entity(player, Equipment)
-    inventory = esper.component_for_entity(player, Inventory)
+    equipment = ecs.component_for_entity(player, Equipment)
+    inventory = ecs.component_for_entity(player, Inventory)
     assert equipment.slots["main hand"] == "Rusty Sword"
     assert inventory.items == []

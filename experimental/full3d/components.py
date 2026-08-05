@@ -76,7 +76,7 @@ class Transform:
     pos: Vec3 = field(default_factory=Vec3)
     heading: float = 0.0  # degrees, 0 = +Y, increasing counter-clockwise
     pitch: float = 0.0  # degrees, positive = nose up
-    roll: float = 0.0  # degrees, cosmetic bank while dashing
+    roll: float = 0.0  # degrees, cosmetic bank while airborne
 
 
 @dataclass
@@ -127,20 +127,24 @@ class Gait:
 
 @dataclass
 class Energy:
-    """The Wing Diver's single resource: flight, dashes and shots all drink it.
+    """The Wing Diver's single resource: flight, gliding and shots all drink it.
 
     The rule that gives the class its character is the *overheat*: run the
-    meter to exactly zero and ``empty`` latches, flight and dashing are locked
+    meter to exactly zero and ``empty`` latches, flight and gliding are locked
     out entirely, and the recharge runs at a fraction of normal speed until
     the meter is completely full again. Landing with 1% left recovers in a
     moment; landing with 0% is a punishment.
+
+    Note how cheap the glide is next to the thrust. That ratio is the economy
+    of the class: climbing is expensive and covering ground is not, so the
+    efficient way anywhere is one hard burn followed by a long flat glide.
     """
 
     maximum: float = 100.0
     current: float = 100.0
 
     drain_thrust: float = 26.0  # per second of held thrust
-    cost_dash: float = 18.0  # per dash, flat
+    drain_glide: float = 7.0  # per second with the wings out
     regen_ground: float = 45.0  # per second, feet down, not thrusting
     regen_air: float = 12.0  # per second, airborne, not thrusting
     empty_penalty: float = 0.55  # regen multiplier while overheated
@@ -169,29 +173,35 @@ class Energy:
 
 @dataclass
 class Flight:
-    """Tuning and state for jetpack movement.
+    """Tuning and state for jetpack movement: thrust up, or glide across.
 
     Thrust is an acceleration rather than a set-velocity so that momentum
     carries across a thrust tap, which is what makes EDF flight feel like
     swimming rather than like an elevator.
+
+    The glide is the other half. With the wings out the descent is capped near
+    ``glide_fall`` and the horizontal drag drops by most of an order of
+    magnitude, so whatever speed you arrived with is speed you keep. It never
+    adds height -- it only stops you losing it, which is what separates a
+    glide from a hop.
     """
 
     thrust_accel: float = 34.0
     rise_max: float = 14.0
     air_accel: float = 26.0
     air_max: float = 18.0
-    glide_drag: float = 0.9  # horizontal damping per second, airborne
+    air_drag: float = 0.9  # horizontal damping per second, wings in
     fall_max: float = 30.0
 
-    dash_speed: float = 34.0
-    dash_time: float = 0.18
-    dash_cooldown: float = 0.45
+    glide_fall: float = 4.5  # terminal descent with the wings out
+    glide_bite: float = 6.0  # how fast a hard fall is eased back to that
+    glide_drag: float = 0.05  # horizontal damping per second, wings out
+    glide_accel: float = 15.0  # air control while gliding: committed to a line
+    glide_gravity: float = 0.2  # gravity multiplier while the wings are out
 
     # live state
     thrusting: bool = False
-    dash_timer: float = 0.0  # >0 while the dash impulse is being held
-    dash_cd: float = 0.0
-    dash_dir: Vec3 = field(default_factory=Vec3)
+    gliding: bool = False
 
 
 @dataclass
@@ -219,12 +229,12 @@ class Intent:
     aim_yaw: float = 0.0
     aim_pitch: float = 0.0
     thrust: bool = False
-    dash: bool = False
+    glide: bool = False
     fire: bool = False
 
     def clear(self) -> None:
         self.move_x = self.move_y = 0.0
-        self.thrust = self.dash = self.fire = False
+        self.thrust = self.glide = self.fire = False
 
 
 # --------------------------------------------------------------------------

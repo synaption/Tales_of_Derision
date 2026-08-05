@@ -2,7 +2,7 @@
 ties it wires onto the starting villagers."""
 from __future__ import annotations
 
-import esper
+import ecs
 import pytest
 
 from components import Family, Gender, Name, Personality
@@ -71,8 +71,8 @@ def test_monogender_none_draws_without_error() -> None:
 
 def _villager_families() -> list[tuple[int, Family]]:
     return [
-        (ent, esper.component_for_entity(ent, Family))
-        for ent, (_pers, fam) in esper.get_components(Personality, Family)
+        (ent, ecs.component_for_entity(ent, Family))
+        for ent, (_pers, fam) in ecs.get_components(Personality, Family)
     ]
 
 
@@ -81,9 +81,9 @@ def test_setup_world_gives_every_villager_a_name_gender_and_family() -> None:
     villagers = _villager_families()
     assert villagers  # some spawned
     for ent, _fam in villagers:
-        assert esper.has_component(ent, Name)
-        assert esper.has_component(ent, Gender)
-        gender = esper.component_for_entity(ent, Gender)
+        assert ecs.has_component(ent, Name)
+        assert ecs.has_component(ent, Gender)
+        gender = ecs.component_for_entity(ent, Gender)
         assert gender.value in ("male", "female")
 
 
@@ -92,7 +92,7 @@ def test_spouse_links_are_reciprocal() -> None:
     spouses = [(ent, fam) for ent, fam in _villager_families() if fam.spouse is not None]
     assert spouses  # at least one couple
     for ent, fam in spouses:
-        partner_fam = esper.component_for_entity(fam.spouse, Family)
+        partner_fam = ecs.component_for_entity(fam.spouse, Family)
         assert partner_fam.spouse == ent
         # Spouses share the household surname.
         assert partner_fam.surname == fam.surname
@@ -105,6 +105,6 @@ def test_parent_and_child_links_are_reciprocal_and_share_a_surname() -> None:
     for child, fam in children:
         assert len(fam.parents) == 2
         for parent in fam.parents:
-            parent_fam = esper.component_for_entity(parent, Family)
+            parent_fam = ecs.component_for_entity(parent, Family)
             assert child in parent_fam.children
             assert parent_fam.surname == fam.surname

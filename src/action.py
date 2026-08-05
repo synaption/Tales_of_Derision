@@ -12,7 +12,7 @@ action weights) behaves exactly like the old lockstep model -- one action per
 """
 from __future__ import annotations
 
-import esper
+import ecs
 
 from components import Attributes
 
@@ -41,9 +41,9 @@ def action_weight(action: str | None) -> float:
 def actor_speed(ent: int) -> float:
     """How fast ``ent`` acts, as a multiplier on the base rate. Average dexterity
     (10) is 1.0; higher is faster. Entities without ``Attributes`` act at baseline."""
-    if not esper.has_component(ent, Attributes):
+    if not ecs.has_component(ent, Attributes):
         return 1.0
-    dexterity = esper.component_for_entity(ent, Attributes).dexterity
+    dexterity = ecs.component_for_entity(ent, Attributes).dexterity
     return max(_MIN_SPEED, 1.0 + (dexterity - 10) * SPEED_PER_DEXTERITY)
 
 

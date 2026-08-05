@@ -247,7 +247,7 @@ class PygameRenderer(Renderer):
         self._last_mouse_activity_ms = 0
         self._mouse_hide_delay_ms = 2400
         # Cached game-scene snapshot reused as a static menu backdrop (see
-        # capture_backdrop). Avoids a full esper.process() render per menu frame.
+        # capture_backdrop). Avoids a full ecs.process() render per menu frame.
         self._backdrop_snapshot = None
         # Cached fully-drawn map; walking blits regions of it instead of
         # re-drawing every visible tile (see capture_map_surface).

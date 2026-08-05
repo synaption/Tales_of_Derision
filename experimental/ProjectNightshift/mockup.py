@@ -1,18 +1,23 @@
 """Playable prototype for Project Nightshift.
 
 Draws with the MSX-UnDeadPeopleEdition CP437 sheet on a low-resolution internal
-surface, and runs the Phase 1 core underneath it: a seeded room-and-corridor
-generator, raycast field of view with tile memory, the energy scheduler, and
-enemies that chase down a flow field.
+surface, and runs the core underneath it: one persistent three-storey mansion
+generated from a seed, raycast field of view with tile memory, the energy
+scheduler, enemies that chase down a flow field, stance and cover, and a
+key/fixture dependency chain you have to backtrack through to escape.
+
+The mansion is generated once and never regenerates. Stairs move you between
+storeys; doors you opened, enemies you put down, and puzzles you solved all stay
+that way.
 
     python mockup.py                 # play; window auto-fits the desktop
     python mockup.py --cell 24       # 960x600, between the 16px 1x and 2x rungs
     python mockup.py --seed 18421    # fixed seed
     python mockup.py --out shot.png  # headless screenshot
 
-Keys: WASD/arrows move (bump to attack, bump a door to open it), shift+dir
-sprint, space wait, F fire, R reload, Q first aid, N new level, F1 debug,
-Escape quit.
+Keys: WASD/arrows move (bump to attack, open a door, or finish a downed enemy),
+shift+dir sprint, C crouch, E interact, space wait, F fire, R reload, Q first
+aid, ? controls, F1 debug, N new mansion, Escape quit.
 """
 
 from __future__ import annotations
@@ -46,7 +51,9 @@ DIVIDER_X = 26
 PANEL_X, PANEL_W = 27, 13
 LOG_Y = 22
 
-LEVEL_W, LEVEL_H = 56, 38
+FLOOR_W, FLOOR_H = 56, 38
+STOREYS = ("CELLAR", "GROUND", "UPPER")
+GROUND = 1               # the storey you start on and escape from
 
 # --- palette ---------------------------------------------------------------
 # Desaturated, slightly sick. Everything else is this multiplied by light.
@@ -55,30 +62,40 @@ UI_DIM = (104, 116, 100)
 UI_TEXT = (172, 188, 156)
 UI_HOT = (198, 78, 56)
 UI_WARM = (196, 172, 116)
+OTHER_STOREY = (58, 74, 96)   # cold blue: something on a floor that isn't yours
 
 # --- tiles -----------------------------------------------------------------
 # char -> (cp437 glyph, colour, walkable, opaque)
 TILES = {
-    "#": ("█", (114, 106, 94), False, True),      # wall
+    "#": ("█", (114, 106, 94), False, True),    # wall
     ".": (".", (96, 92, 90), True, False),      # floorboards
     ",": ("░", (88, 78, 62), True, False),      # debris
     '"': ("░", (132, 58, 52), True, False),     # carpet
-    "=": ("≡", (150, 110, 62), False, False),   # furniture
+    "=": ("≡", (150, 110, 62), False, False),   # furniture -- low cover
+    "H": ("▀", (146, 132, 104), False, False),  # railing -- low cover, see over
+    "O": (" ", (0, 0, 0), False, False),        # open shaft down to the storey below
     "T": ("Φ", (150, 146, 132), False, True),   # statue
     "+": ("+", (158, 116, 62), False, True),    # closed door
     "'": ("'", (128, 98, 56), True, False),     # open door
+    "L": ("╬", (176, 96, 72), False, True),     # locked door
     "*": ("☼", (236, 194, 112), True, False),   # candle
     "%": ("%", (124, 28, 30), True, False),     # gore
-    "<": ("<", (172, 172, 182), True, False),   # entrance
+    "<": ("<", (172, 172, 182), True, False),   # stairs up
     ">": (">", (172, 172, 182), True, False),   # stairs down
+    "Ω": ("Ω", (150, 180, 190), False, False),  # fixture: fuse box / safe
+    "∩": ("∩", (214, 196, 150), True, False),   # the front door -- the way out
 }
+
+LOW_COVER = ("=", "H")   # crouch behind these
 
 # char -> (cp437 glyph, colour, display name)
 ITEMS = {
     "!": ("!", (198, 62, 58), "FIRST AID"),
     "/": ("/", (150, 152, 160), "CROWBAR"),
-    "&": ("¶", (190, 180, 150), "NOTE"),
+    "&": ("¶", (190, 180, 150), "CODE NOTE"),
     "k": ("§", (204, 172, 80), "BRASS KEY"),
+    "i": ("§", (188, 196, 210), "IRON KEY"),
+    "f": ("♣", (196, 156, 96), "FUSE"),
     "a": ("=", (188, 160, 96), "AMMO BOX"),
 }
 
@@ -91,14 +108,18 @@ LIGHT_LEVELS = 7
 
 # --- action costs (README table) -------------------------------------------
 COST_WAIT = 50
+COST_STANCE = 25
 COST_MOVE = 100
+COST_CROUCH_MOVE = 125
 COST_SPRINT = 150
 COST_DOOR = 75
 COST_PICKUP = 50
 COST_FIRE = 100
 COST_MELEE = 100
+COST_FINISH = 150
 COST_RELOAD = 125
 COST_HEAL = 150
+COST_INTERACT = 100
 
 BAYER = [
     [0, 8, 2, 10],
@@ -109,7 +130,7 @@ BAYER = [
 
 # Python's cp437 codec maps 0x00-0x1F to C0 controls, so the graphical glyphs
 # that live down there need their indices spelled out.
-LOW_GLYPHS = {"☼": 15, "¶": 20, "§": 21, "↑": 24, "→": 26, "▲": 30}
+LOW_GLYPHS = {"☼": 15, "¶": 20, "§": 21, "♣": 5, "↑": 24, "→": 26, "▲": 30}
 
 
 # ---------------------------------------------------------------------------
@@ -181,15 +202,25 @@ class Actor:
     max_hp: int
     energy_gain: int
     damage: tuple[int, int]
+    accuracy: float = 0.0
     sense: int = 0
+    rises: bool = False      # goes down instead of dying, and gets back up
     energy: int = 0
     aware: bool = False
     target: tuple[int, int] | None = None
     patience: int = 0
+    downed: bool = False
+    rise_in: int = 0
+    dead: bool = False
 
     @property
     def alive(self) -> bool:
-        return self.hp > 0
+        return not self.dead
+
+    @property
+    def acting(self) -> bool:
+        """On its feet and able to take a turn."""
+        return not self.dead and not self.downed
 
     @property
     def max_energy(self) -> int:
@@ -208,22 +239,24 @@ class Actor:
 
 
 def make_player(x: int, y: int) -> Actor:
-    return Actor("@", (244, 238, 214), "YOU", x, y, 100, 100, 100, (8, 14))
+    return Actor("@", (244, 238, 214), "YOU", x, y, 100, 100, 100, (7, 13))
 
 
 ENEMY_KINDS = {
-    "z": dict(glyph="z", colour=(132, 152, 92), name="SHAMBLER",
-              hp=30, energy_gain=60, damage=(6, 12), sense=7),
-    "d": dict(glyph="d", colour=(152, 112, 72), name="HOUND",
-              hp=18, energy_gain=140, damage=(4, 8), sense=9),
+    # Shamblers do not die; they go down and get back up unless finished.
+    "z": dict(glyph="z", colour=(132, 152, 92), name="SHAMBLER", hp=62,
+              energy_gain=60, damage=(7, 13), accuracy=0.70, sense=7, rises=True),
+    "d": dict(glyph="d", colour=(152, 112, 72), name="HOUND", hp=34,
+              # 140 outran a sprint, which made contact with a hound unbreakable.
+              energy_gain=120, damage=(5, 11), accuracy=0.78, sense=9, rises=False),
 }
 
 
 def make_enemy(kind: str, x: int, y: int) -> Actor:
     spec = ENEMY_KINDS[kind]
     return Actor(spec["glyph"], spec["colour"], spec["name"], x, y,
-                 spec["hp"], spec["hp"], spec["energy_gain"],
-                 spec["damage"], spec["sense"])
+                 spec["hp"], spec["hp"], spec["energy_gain"], spec["damage"],
+                 spec["accuracy"], spec["sense"], spec["rises"])
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +272,10 @@ class Room:
     @property
     def centre(self) -> tuple[int, int]:
         return self.x + self.w // 2, self.y + self.h // 2
+
+    @property
+    def area(self) -> int:
+        return self.w * self.h
 
     def cells(self):
         for y in range(self.y, self.y + self.h):
@@ -259,11 +296,14 @@ class Room:
             yield self.x + self.w, y
 
 
-class Level:
-    def __init__(self, rng: random.Random, floor: int) -> None:
+class Floor:
+    """One storey. Generated once, then mutated in place for the whole run."""
+
+    def __init__(self, rng: random.Random, depth: int) -> None:
         self.rng = rng
-        self.floor = floor
-        self.tiles = [["#"] * LEVEL_W for _ in range(LEVEL_H)]
+        self.depth = depth
+        self.name = STOREYS[depth]
+        self.tiles = [["#"] * FLOOR_W for _ in range(FLOOR_H)]
         self.items: dict[tuple[int, int], str] = {}
         self.rooms: list[Room] = []
         self.enemies: list[Actor] = []
@@ -272,10 +312,6 @@ class Level:
         self.flow: dict[tuple[int, int], int] = {}
         self._carve()
         self._decorate()
-        self.player = make_player(*self.rooms[0].centre)
-        self._populate()
-        self.candles = [(x, y) for y in range(LEVEL_H) for x in range(LEVEL_W)
-                        if self.tiles[y][x] == "*"]
 
     # -- terrain ------------------------------------------------------------
     def _carve(self) -> None:
@@ -284,7 +320,7 @@ class Level:
             if len(self.rooms) >= 14:
                 break
             w, h = rng.randint(5, 11), rng.randint(4, 8)
-            x, y = rng.randint(2, LEVEL_W - w - 3), rng.randint(2, LEVEL_H - h - 3)
+            x, y = rng.randint(2, FLOOR_W - w - 3), rng.randint(2, FLOOR_H - h - 3)
             room = Room(x, y, w, h)
             if any(room.overlaps(other) for other in self.rooms):
                 continue
@@ -298,7 +334,7 @@ class Level:
         for previous, room in zip(self.rooms, self.rooms[1:]):
             ax, ay = previous.centre
             bx, by = room.centre
-            if self.rng.random() < 0.5:
+            if rng.random() < 0.5:
                 legs = [(ax, bx, ay, True), (ay, by, bx, False)]
             else:
                 legs = [(ay, by, ax, False), (ax, bx, by, True)]
@@ -326,10 +362,10 @@ class Level:
                 self.tiles[cell[1]][cell[0]] = "."
 
         for x, y in doors:
-            self.tiles[y][x] = "+" if self.rng.random() < 0.65 else "'"
+            self.tiles[y][x] = "+" if rng.random() < 0.65 else "'"
 
     def _is_doorway(self, x: int, y: int) -> bool:
-        if not (0 < x < LEVEL_W - 1 and 0 < y < LEVEL_H - 1):
+        if not (0 < x < FLOOR_W - 1 and 0 < y < FLOOR_H - 1):
             return False
         open_h = self.tiles[y][x - 1] != "#" and self.tiles[y][x + 1] != "#"
         open_v = self.tiles[y - 1][x] != "#" and self.tiles[y + 1][x] != "#"
@@ -347,13 +383,13 @@ class Level:
                     if abs(x - cx) <= room.w // 4 and abs(y - cy) <= room.h // 4:
                         self.tiles[y][x] = '"'
             elif role == "study":
-                for _ in range(rng.randint(2, 5)):
-                    x, y = rng.randint(room.x, room.x + room.w - 1), rng.randint(room.y, room.y + room.h - 1)
+                for _ in range(rng.randint(3, 6)):
+                    x, y = self._spot(room)
                     if self.tiles[y][x] == ".":
                         self.tiles[y][x] = "="
             elif role == "storage":
                 for _ in range(rng.randint(4, 10)):
-                    x, y = rng.randint(room.x, room.x + room.w - 1), rng.randint(room.y, room.y + room.h - 1)
+                    x, y = self._spot(room)
                     if self.tiles[y][x] == ".":
                         self.tiles[y][x] = ","
             elif role == "gallery":
@@ -363,53 +399,33 @@ class Level:
 
             if index and rng.random() < 0.4:
                 for _ in range(8):
-                    x, y = rng.randint(room.x, room.x + room.w - 1), rng.randint(room.y, room.y + room.h - 1)
+                    x, y = self._spot(room)
                     if self.tiles[y][x] == ".":
                         self.tiles[y][x] = "*"
                         break
 
-    def _populate(self) -> None:
-        rng = self.rng
-        start = self.rooms[0]
-        self.tiles[start.centre[1]][start.centre[0]] = "<"
+    def _spot(self, room: Room) -> tuple[int, int]:
+        return (self.rng.randint(room.x, room.x + room.w - 1),
+                self.rng.randint(room.y, room.y + room.h - 1))
 
-        far = max(self.rooms[1:], key=lambda r: math.dist(r.centre, start.centre))
-        self.tiles[far.centre[1]][far.centre[0]] = ">"
-        self.exit = far.centre
-
-        pool = "!!/&kaa" if self.floor > 1 else "!!!/&ka"
-        for glyph in pool:
-            cell = self._free_cell(exclude_room=None)
-            if cell:
-                self.items[cell] = glyph
-
-        for _ in range(len(self.rooms) // 2 + self.floor):
-            cell = self._free_cell(exclude_room=start)
-            if cell:
-                kind = "d" if rng.random() < 0.35 else "z"
-                self.enemies.append(make_enemy(kind, *cell))
-
-        for _ in range(rng.randint(3, 8)):
-            cell = self._free_cell(exclude_room=start)
-            if cell and self.tiles[cell[1]][cell[0]] == ".":
-                self.tiles[cell[1]][cell[0]] = "%"
-
-    def _free_cell(self, exclude_room: Room | None) -> tuple[int, int] | None:
-        rooms = [r for r in self.rooms if r is not exclude_room]
-        for _ in range(200):
-            room = self.rng.choice(rooms)
-            x = self.rng.randint(room.x, room.x + room.w - 1)
-            y = self.rng.randint(room.y, room.y + room.h - 1)
-            if self.tiles[y][x] not in (".", ",", '"'):
+    def free_cell(self, exclude: set[tuple[int, int]] | None = None,
+                  within: set[tuple[int, int]] | None = None) -> tuple[int, int] | None:
+        exclude = exclude or set()
+        for _ in range(400):
+            room = self.rng.choice(self.rooms)
+            cell = self._spot(room)
+            if self.tiles[cell[1]][cell[0]] not in (".", ",", '"'):
                 continue
-            if (x, y) in self.items or self.actor_at(x, y):
+            if cell in self.items or cell in exclude or self.actor_at(*cell):
                 continue
-            return x, y
+            if within is not None and cell not in within:
+                continue
+            return cell
         return None
 
     # -- queries ------------------------------------------------------------
     def in_bounds(self, x: int, y: int) -> bool:
-        return 0 <= x < LEVEL_W and 0 <= y < LEVEL_H
+        return 0 <= x < FLOOR_W and 0 <= y < FLOOR_H
 
     def walkable(self, x: int, y: int) -> bool:
         return self.in_bounds(x, y) and TILES[self.tiles[y][x]][2]
@@ -421,10 +437,8 @@ class Level:
     def opaque(self, x: int, y: int) -> bool:
         return not self.in_bounds(x, y) or TILES[self.tiles[y][x]][3]
 
-    def connected(self) -> bool:
-        """Every room centre and the exit must be reachable from the entrance."""
-        flow = compute_flow(self, limit=LEVEL_W * LEVEL_H)
-        return all(room.centre in flow for room in self.rooms) and self.exit in flow
+    def is_cover(self, x: int, y: int) -> bool:
+        return self.in_bounds(x, y) and self.tiles[y][x] in LOW_COVER
 
     def actor_at(self, x: int, y: int) -> Actor | None:
         for enemy in self.enemies:
@@ -432,14 +446,256 @@ class Level:
                 return enemy
         return None
 
-    def actors(self) -> list[Actor]:
-        return [self.player, *[e for e in self.enemies if e.alive]]
+    def reachable(self, origin: tuple[int, int], blocked: set[tuple[int, int]] | None = None,
+                  unlocked: bool = False) -> set[tuple[int, int]]:
+        """Flood fill over pathable tiles.
+
+        `blocked` treats cells as walls; `unlocked` models carrying the iron key,
+        since opening a locked door turns it into floor you can walk through.
+        """
+        blocked = blocked or set()
+
+        def passable(x: int, y: int) -> bool:
+            if (x, y) in blocked:
+                return False
+            if self.pathable(x, y):
+                return True
+            return unlocked and self.in_bounds(x, y) and self.tiles[y][x] == "L"
+
+        seen = {origin}
+        queue = deque([origin])
+        while queue:
+            cell = queue.popleft()
+            for n in neighbours(cell):
+                if n not in seen and passable(*n):
+                    seen.add(n)
+                    queue.append(n)
+        return seen
+
+
+def neighbours(cell: tuple[int, int]):
+    x, y = cell
+    return ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1))
+
+
+# ---------------------------------------------------------------------------
+# the mansion: one persistent world, generated once
+# ---------------------------------------------------------------------------
+@dataclass
+class Fixture:
+    """An interactable that gates progress. Solved once, stays solved."""
+    kind: str
+    depth: int
+    x: int
+    y: int
+    needs_item: str | None = None
+    needs_flags: tuple[str, ...] = ()
+    grants_item: str | None = None
+    grants_flag: str | None = None
+    blurb: str = ""
+    solved: bool = False
+
+
+class Mansion:
+    def __init__(self, rng: random.Random) -> None:
+        self.rng = rng
+        self.floors = [Floor(rng, depth) for depth in range(len(STOREYS))]
+        self.stairs: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+        self.fixtures: list[Fixture] = []
+        self.atrium: Room | None = None
+        self.start = self.floors[GROUND].rooms[0].centre
+        self._link_stairs()
+        self._cut_atrium()
+        self._place_progression()
+        self._populate()
+
+    def floor(self, depth: int) -> Floor | None:
+        return self.floors[depth] if 0 <= depth < len(self.floors) else None
+
+    # -- vertical links -----------------------------------------------------
+    def _link_stairs(self) -> None:
+        ground = self.floors[GROUND]
+        for other, glyph_here, glyph_there in ((GROUND - 1, ">", "<"), (GROUND + 1, "<", ">")):
+            here = ground.free_cell(exclude={self.start})
+            there = self.floors[other].free_cell()
+            if here is None or there is None:
+                continue
+            ground.tiles[here[1]][here[0]] = glyph_here
+            self.floors[other].tiles[there[1]][there[0]] = glyph_there
+            self.stairs[(GROUND, *here)] = (other, *there)
+            self.stairs[(other, *there)] = (GROUND, *here)
+
+    def _cut_atrium(self) -> None:
+        """Open the biggest ground-floor room up to the storey above.
+
+        The upper storey gets a hole ringed by railings; standing at the rail you
+        look down into the room below, and from below you can see who is up there.
+        """
+        ground, upper = self.floors[GROUND], self.floors[GROUND + 1]
+        room = max(ground.rooms, key=lambda r: r.area)
+        if room.w < 6 or room.h < 5:
+            return
+        hole = Room(room.x + 1, room.y + 1, room.w - 2, room.h - 2)
+
+        for x, y in hole.cells():
+            upper.tiles[y][x] = "O"
+        for x, y in hole.ring():
+            if not upper.in_bounds(x, y):
+                continue
+            # Walkway around the drop, with a rail on the inward edge.
+            upper.tiles[y][x] = "H"
+        for x, y in Room(hole.x - 2, hole.y - 2, hole.w + 4, hole.h + 4).ring():
+            if upper.in_bounds(x, y) and upper.tiles[y][x] == "#":
+                upper.tiles[y][x] = "."
+        # Clear the ground-floor room so the drop looks onto open space.
+        for x, y in hole.cells():
+            if ground.tiles[y][x] in ("=", "T"):
+                ground.tiles[y][x] = "."
+        self.atrium = hole
+
+    # -- progression --------------------------------------------------------
+    def _place_progression(self) -> None:
+        """Author the dependency chain, then place items so it is solvable.
+
+        cellar: BRASS KEY + CODE NOTE (both loose)
+          -> upper: safe wants CODE NOTE, grants IRON KEY and the SEAL flag
+          -> upper: IRON KEY opens a locked wing holding the FUSE
+          -> cellar: fuse box wants FUSE, grants the POWER flag
+          -> ground: the front door wants POWER and SEAL
+        """
+        cellar, ground, upper = self.floors
+        cellar_start = self._stair_cell(GROUND - 1)
+        upper_start = self._stair_cell(GROUND + 1)
+
+        # The fuse sits behind a door we lock; everything needed to reach the key
+        # has to live outside that door, so gate first and place afterwards.
+        # The sealed set has to be computed before the tile becomes "L", since a
+        # locked door is not pathable and would hide the region it seals.
+        sealed = self._lock_a_door(upper, upper_start)
+        open_upper = upper.reachable(upper_start)
+
+        spot = next((c for c in sorted(sealed) if upper.tiles[c[1]][c[0]] == "."), None)
+        if spot is None:                              # no lockable door found
+            spot = upper.free_cell(within=open_upper)
+        if spot:
+            upper.items[spot] = "f"
+
+        for glyph in ("k", "&"):
+            cell = cellar.free_cell()
+            if cell:
+                cellar.items[cell] = glyph
+
+        safe = upper.free_cell(within=open_upper)
+        if safe:
+            upper.tiles[safe[1]][safe[0]] = "Ω"
+            self.fixtures.append(Fixture(
+                "SAFE", GROUND + 1, *safe, needs_item="CODE NOTE",
+                grants_item="IRON KEY", grants_flag="SEAL",
+                blurb="a wall safe, dial worn smooth"))
+
+        box = cellar.free_cell()
+        if box:
+            cellar.tiles[box[1]][box[0]] = "Ω"
+            self.fixtures.append(Fixture(
+                "FUSEBOX", GROUND - 1, *box, needs_item="FUSE",
+                grants_flag="POWER", blurb="the fuse box, one socket empty"))
+
+        exit_cell = ground.free_cell(exclude={self.start})
+        if exit_cell:
+            ground.tiles[exit_cell[1]][exit_cell[0]] = "∩"
+            self.fixtures.append(Fixture(
+                "FRONTDOOR", GROUND, *exit_cell, needs_flags=("POWER", "SEAL"),
+                blurb="the front door, dead bolts and a dead keypad"))
+
+    def _stair_cell(self, depth: int) -> tuple[int, int]:
+        for (d, x, y) in self.stairs:
+            if d == depth:
+                return (x, y)
+        return self.floors[depth].rooms[0].centre
+
+    def _lock_a_door(self, floor: Floor, origin: tuple[int, int]) -> set[tuple[int, int]]:
+        """Lock a door that seals off a worthwhile chunk, and return what it seals."""
+        doors = [(x, y) for y in range(FLOOR_H) for x in range(FLOOR_W)
+                 if floor.tiles[y][x] in ("+", "'")]
+        self.rng.shuffle(doors)
+        whole = floor.reachable(origin)
+        for door in doors:
+            if door == origin:
+                continue
+            outside = floor.reachable(origin, blocked={door})
+            sealed = whole - outside - {door}
+            if 10 <= len(sealed) <= len(whole) // 2:
+                floor.tiles[door[1]][door[0]] = "L"
+                return sealed
+        return set()
+
+    def _populate(self) -> None:
+        rng = self.rng
+        for depth, floor in enumerate(self.floors):
+            # A mansion you re-cross a dozen times cannot be packed: at 25 the
+            # walk itself outpaced every medkit in the building.
+            count = 3 + depth + rng.randint(0, 2)
+            for _ in range(count):
+                cell = floor.free_cell(exclude={self.start})
+                if cell is None or (depth == GROUND and math.dist(cell, self.start) < 9):
+                    continue
+                floor.enemies.append(make_enemy("d" if rng.random() < 0.3 else "z", *cell))
+            for _ in range(rng.randint(4, 9)):
+                cell = floor.free_cell()
+                if cell and floor.tiles[cell[1]][cell[0]] == ".":
+                    floor.tiles[cell[1]][cell[0]] = "%"
+            for glyph in "!!!/aa" + ("!" if depth != GROUND else ""):
+                cell = floor.free_cell()
+                if cell:
+                    floor.items[cell] = glyph
+
+    def solvable(self) -> bool:
+        """Walk the dependency chain by reachability. A seed that fails is thrown away.
+
+        Existence is not enough -- an item can generate inside a pocket the
+        corridors never reached, so every step is checked against a flood fill
+        from where the player actually is when they need it.
+        """
+        cellar, ground, upper = self.floors
+        if {f.kind for f in self.fixtures} != {"SAFE", "FUSEBOX", "FRONTDOOR"}:
+            return False
+
+        def usable(cell: tuple[int, int], region: set[tuple[int, int]]) -> bool:
+            # Fixtures are solid; you work them from an adjacent tile.
+            return cell in region or any(n in region for n in neighbours(cell))
+
+        ground_open = ground.reachable(self.start)
+        landings = [(x, y) for (depth, x, y) in self.stairs if depth == GROUND]
+        if len(landings) != 2 or any(cell not in ground_open for cell in landings):
+            return False
+
+        cellar_open = cellar.reachable(self._stair_cell(GROUND - 1))
+        for glyph in ("k", "&"):
+            cell = next((c for c, g in cellar.items.items() if g == glyph), None)
+            if cell is None or cell not in cellar_open:
+                return False
+
+        upper_start = self._stair_cell(GROUND + 1)
+        upper_open = upper.reachable(upper_start)
+        upper_all = upper.reachable(upper_start, unlocked=True)
+
+        safe = next(f for f in self.fixtures if f.kind == "SAFE")
+        if not usable((safe.x, safe.y), upper_open):
+            return False                       # the safe grants the key; it cannot be behind it
+
+        fuse = next((c for c, g in upper.items.items() if g == "f"), None)
+        if fuse is None or fuse not in upper_all:
+            return False
+
+        box = next(f for f in self.fixtures if f.kind == "FUSEBOX")
+        door = next(f for f in self.fixtures if f.kind == "FRONTDOOR")
+        return usable((box.x, box.y), cellar_open) and (door.x, door.y) in ground_open
 
 
 # ---------------------------------------------------------------------------
 # field of view and flow field
 # ---------------------------------------------------------------------------
-def compute_fov(level: Level, ox: int, oy: int, radius: int) -> set[tuple[int, int]]:
+def compute_fov(floor: Floor, ox: int, oy: int, radius: int) -> set[tuple[int, int]]:
     """Raycast FOV. Coarse, but the viewport is small and it only runs on a turn."""
     visible = {(ox, oy)}
     for index in range(540):
@@ -450,29 +706,28 @@ def compute_fov(level: Level, ox: int, oy: int, radius: int) -> set[tuple[int, i
             x += dx
             y += dy
             tx, ty = int(x), int(y)
-            if not level.in_bounds(tx, ty) or math.dist((tx, ty), (ox, oy)) > radius:
+            if not floor.in_bounds(tx, ty) or math.dist((tx, ty), (ox, oy)) > radius:
                 break
             visible.add((tx, ty))
-            if level.opaque(tx, ty):
+            if floor.opaque(tx, ty):
                 break
     return visible
 
 
-def compute_flow(level: Level, limit: int = 22) -> dict[tuple[int, int], int]:
+def compute_flow(floor: Floor, origin: tuple[int, int], limit: int = 22) -> dict[tuple[int, int], int]:
     """Breadth-first distance field to the player; enemies just walk downhill."""
-    origin = (level.player.x, level.player.y)
     flow = {origin: 0}
     queue = deque([origin])
     while queue:
-        x, y = queue.popleft()
-        distance = flow[(x, y)]
+        cell = queue.popleft()
+        distance = flow[cell]
         if distance >= limit:
             continue
-        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-            if (nx, ny) in flow or not level.pathable(nx, ny):
+        for n in neighbours(cell):
+            if n in flow or not floor.pathable(*n):
                 continue
-            flow[(nx, ny)] = distance + 1
-            queue.append((nx, ny))
+            flow[n] = distance + 1
+            queue.append(n)
     return flow
 
 
@@ -483,20 +738,23 @@ def compute_flow(level: Level, limit: int = 22) -> dict[tuple[int, int], int]:
 class World:
     seed: int
     rng: random.Random
-    level: Level
-    floor: int = 1
+    mansion: Mansion
+    player: Actor
+    depth: int = GROUND
     turn: int = 0
     noise: int = 0
+    crouched: bool = False
     ammo: int = 6
-    ammo_reserve: int = 12
-    inventory: dict[str, int] = field(default_factory=lambda: {"FIRST AID": 1})
+    ammo_reserve: int = 10
+    flags: set[str] = field(default_factory=set)
+    inventory: dict[str, int] = field(default_factory=lambda: {"FIRST AID": 2})
     messages: list[tuple[str, tuple[int, int, int]]] = field(default_factory=list)
     dead: bool = False
-    descended: bool = False
+    escaped: bool = False
 
     @property
-    def player(self) -> Actor:
-        return self.level.player
+    def level(self) -> Floor:
+        return self.mansion.floors[self.depth]
 
     def log(self, text: str, colour=UI_TEXT) -> None:
         self.messages.append((text.upper(), colour))
@@ -505,40 +763,129 @@ class World:
     def carried(self) -> int:
         return sum(self.inventory.values())
 
+    def take(self, name: str) -> None:
+        self.inventory[name] = self.inventory.get(name, 0) + 1
 
-def new_world(seed: int, floor: int = 1) -> World:
-    rng = random.Random(seed + floor * 977)
-    for _ in range(16):
-        level = Level(rng, floor)
-        if level.connected():
+    def drop(self, name: str) -> None:
+        if self.inventory.get(name):
+            self.inventory[name] -= 1
+            if not self.inventory[name]:
+                del self.inventory[name]
+
+    def fixture_at(self, depth: int, x: int, y: int) -> Fixture | None:
+        for fixture in self.mansion.fixtures:
+            if (fixture.depth, fixture.x, fixture.y) == (depth, x, y):
+                return fixture
+        return None
+
+
+def new_world(seed: int) -> World:
+    rng = random.Random(seed)
+    for _ in range(12):
+        mansion = Mansion(rng)
+        if mansion.solvable():
             break
     else:
-        raise RuntimeError(f"seed {seed} floor {floor}: no valid layout in 16 attempts")
-    world = World(seed=seed, rng=rng, level=level, floor=floor)
-    world.log("the door locks behind you.", UI_DIM)
+        raise RuntimeError(f"seed {seed}: could not lay out a solvable mansion")
+    world = World(seed=seed, rng=rng, mansion=mansion,
+                  player=make_player(*mansion.start))
+    world.log("the door locks behind you. ? for controls.", UI_DIM)
     refresh_senses(world)
     return world
 
 
 def refresh_senses(world: World) -> None:
-    level = world.level
-    level.visible = compute_fov(level, level.player.x, level.player.y, SIGHT_RADIUS)
-    level.explored |= level.visible
-    level.flow = compute_flow(level)
+    floor = world.level
+    player = world.player
+    floor.visible = compute_fov(floor, player.x, player.y, SIGHT_RADIUS)
+    floor.explored |= floor.visible
+    floor.flow = compute_flow(floor, (player.x, player.y))
+
+
+# ---------------------------------------------------------------------------
+# stance and cover
+# ---------------------------------------------------------------------------
+def behind_cover(floor: Floor, x: int, y: int) -> bool:
+    return any(floor.is_cover(*n) for n in neighbours((x, y)))
+
+
+def player_concealed(world: World) -> bool:
+    """Crouched and tucked against something low: hard to see, hard to hit."""
+    return world.crouched and behind_cover(world.level, world.player.x, world.player.y)
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def ranged_chance(world: World, target: Actor) -> float:
+    distance = math.dist((target.x, target.y), (world.player.x, world.player.y))
+    chance = 0.86 - 0.055 * max(0.0, distance - 2.0)
+    if world.crouched:
+        chance += 0.12                                   # braced
+    if behind_cover(world.level, target.x, target.y):
+        chance -= 0.22
+    if target.downed:
+        chance += 0.20
+    return clamp(chance, 0.15, 0.95)
+
+
+def melee_chance(world: World, target: Actor) -> float:
+    if target.downed:
+        return 1.0
+    chance = 0.74
+    if target.name == "HOUND":
+        chance -= 0.16                                   # fast and low
+    if world.crouched:
+        chance -= 0.12                                   # awkward swing
+    return clamp(chance, 0.2, 0.95)
+
+
+def enemy_chance(world: World, enemy: Actor) -> float:
+    chance = enemy.accuracy
+    if player_concealed(world):
+        chance -= 0.26
+    elif world.crouched:
+        chance -= 0.10
+    return clamp(chance, 0.15, 0.95)
+
+
+def sense_radius(world: World, enemy: Actor) -> float:
+    if player_concealed(world):
+        return enemy.sense * 0.45
+    if world.crouched:
+        return enemy.sense * 0.7
+    return float(enemy.sense)
 
 
 # ---------------------------------------------------------------------------
 # actions
 # ---------------------------------------------------------------------------
+def stain(floor: Floor, x: int, y: int) -> None:
+    """Leave gore, but only on plain floor.
+
+    Painting it over whatever was there deleted staircases, fixtures and doors
+    when something died on one, which could strand a run permanently.
+    """
+    if floor.tiles[y][x] in (".", ",", '"'):
+        floor.tiles[y][x] = "%"
+
+
 def damage_roll(actor: Actor, rng: random.Random) -> int:
     return rng.randint(*actor.damage)
 
 
-def alert(world: World, radius: int) -> None:
-    """A noise pulls every enemy in radius toward the player's position."""
+def make_noise(world: World, loudness: int, radius: int) -> None:
+    """Sound off, pulling nearby enemies toward you.
+
+    Loudness is the current volume, not a running total -- accumulating it pinned
+    the meter at maximum after a dozen ordinary steps, so walking read as loud as
+    gunfire and the HUD gauge told you nothing.
+    """
+    world.noise = max(world.noise, loudness)
     player = world.player
     for enemy in world.level.enemies:
-        if enemy.alive and math.dist((enemy.x, enemy.y), (player.x, player.y)) <= radius:
+        if enemy.acting and math.dist((enemy.x, enemy.y), (player.x, player.y)) <= radius:
             enemy.aware = True
             enemy.target = (player.x, player.y)
             enemy.patience = 12
@@ -546,12 +893,31 @@ def alert(world: World, radius: int) -> None:
 
 def tick(world: World) -> None:
     """Hand out energy until somebody can act, then let the enemies spend it."""
-    for actor in world.level.actors():
-        actor.gain()
+    world.player.gain()
+    for enemy in world.level.enemies:
+        if enemy.acting:
+            enemy.gain()
+        elif enemy.downed and not enemy.dead:
+            enemy.rise_in -= 1
+            if enemy.rise_in <= 0:
+                rise(world, enemy)
     world.turn += 1
-    if world.turn % 4 == 0 and world.noise > 0:
+    if world.turn % 2 == 0 and world.noise > 0:
         world.noise -= 1
     resolve_enemies(world)
+
+
+def rise(world: World, enemy: Actor) -> None:
+    enemy.downed = False
+    enemy.hp = max(1, int(enemy.max_hp * 0.4))
+    enemy.energy = 0
+    enemy.aware = True
+    enemy.target = (world.player.x, world.player.y)
+    enemy.patience = 12
+    if (enemy.x, enemy.y) in world.level.visible:
+        world.log(f"the {enemy.name.lower()} gets back up.", UI_HOT)
+    else:
+        world.log("something drags itself upright.", UI_DIM)
 
 
 def perform(world: World, cost: int, action) -> None:
@@ -575,47 +941,69 @@ def perform(world: World, cost: int, action) -> None:
 
 
 def try_move(world: World, dx: int, dy: int, sprint: bool = False) -> None:
-    level = world.level
-    player = level.player
+    floor = world.level
+    player = world.player
     tx, ty = player.x + dx, player.y + dy
 
-    target = level.actor_at(tx, ty)
+    target = floor.actor_at(tx, ty)
     if target is not None:
-        perform(world, COST_MELEE, lambda: melee(world, target))
+        if target.downed:
+            perform(world, COST_FINISH, lambda: finish(world, target))
+        else:
+            perform(world, COST_MELEE, lambda: melee(world, target))
         return
 
-    if level.in_bounds(tx, ty) and level.tiles[ty][tx] == "+":
+    if floor.in_bounds(tx, ty) and floor.tiles[ty][tx] == "+":
         perform(world, COST_DOOR, lambda: open_door(world, tx, ty))
         return
 
-    if not level.walkable(tx, ty):
+    if floor.in_bounds(tx, ty) and floor.tiles[ty][tx] == "L":
+        perform(world, COST_DOOR, lambda: unlock_door(world, tx, ty))
         return
 
+    if not floor.walkable(tx, ty):
+        if floor.is_cover(tx, ty) and not world.crouched:
+            world.log("too high to climb. crouch to use it as cover.", UI_DIM)
+        return
+
+    if sprint and world.crouched:
+        world.log("you cannot sprint from a crouch.", UI_DIM)
+        return
+
+    cost = COST_SPRINT if sprint else (COST_CROUCH_MOVE if world.crouched else COST_MOVE)
     steps = 2 if sprint else 1
-    cost = COST_SPRINT if sprint else COST_MOVE
     perform(world, cost, lambda: walk(world, dx, dy, steps, sprint))
 
 
 def walk(world: World, dx: int, dy: int, steps: int, sprint: bool) -> None:
-    level = world.level
-    player = level.player
+    floor = world.level
+    player = world.player
     for _ in range(steps):
         tx, ty = player.x + dx, player.y + dy
-        if not level.walkable(tx, ty) or level.actor_at(tx, ty):
+        if not floor.walkable(tx, ty) or floor.actor_at(tx, ty):
             break
         player.x, player.y = tx, ty
     if sprint:
-        world.noise = min(10, world.noise + 3)
-        alert(world, 9)
+        make_noise(world, 6, 9)
+    elif not world.crouched:
+        make_noise(world, 2, 3)
     pick_up(world)
-    if (player.x, player.y) == level.exit:
-        world.descended = True
+
+
+def toggle_crouch(world: World) -> None:
+    world.crouched = not world.crouched
+    if world.crouched:
+        cover = behind_cover(world.level, world.player.x, world.player.y)
+        world.log("you drop into a crouch." + (" good cover here." if cover else ""),
+                  UI_WARM if cover else UI_DIM)
+    else:
+        world.log("you straighten up.", UI_DIM)
 
 
 def pick_up(world: World) -> None:
-    level = world.level
-    cell = (level.player.x, level.player.y)
-    glyph = level.items.get(cell)
+    floor = world.level
+    cell = (world.player.x, world.player.y)
+    glyph = floor.items.get(cell)
     if glyph is None:
         return
     name = ITEMS[glyph][2]
@@ -624,59 +1012,82 @@ def pick_up(world: World) -> None:
         return
 
     # Stooping costs on top of the move that carried you here.
-    level.player.energy = max(0, level.player.energy - COST_PICKUP)
-    del level.items[cell]
+    world.player.energy = max(0, world.player.energy - COST_PICKUP)
+    del floor.items[cell]
     if glyph == "a":
-        world.ammo_reserve += 6
-        world.log("you pocket six rounds.", UI_WARM)
+        world.ammo_reserve += 4
+        world.log("you pocket four rounds.", UI_WARM)
     else:
-        world.inventory[name] = world.inventory.get(name, 0) + 1
+        world.take(name)
         world.log(f"picked up {name.lower()}.", UI_WARM)
 
 
 def open_door(world: World, x: int, y: int) -> None:
     world.level.tiles[y][x] = "'"
-    world.noise = min(10, world.noise + 1)
-    alert(world, 5)
+    make_noise(world, 4, 6)
     world.log("the hinges shriek.", UI_DIM)
 
 
-def melee(world: World, target: Actor) -> None:
-    weapon = "CROWBAR" if world.inventory.get("CROWBAR") else "fists"
-    bonus = 6 if weapon == "CROWBAR" else 0
-    target.hp -= damage_roll(world.player, world.rng) + bonus
-    world.noise = min(10, world.noise + 2)
-    alert(world, 6)
-    if target.alive:
-        world.log(f"you strike the {target.name.lower()}.", UI_TEXT)
+def unlock_door(world: World, x: int, y: int) -> None:
+    if world.inventory.get("IRON KEY"):
+        world.level.tiles[y][x] = "'"
+        world.log("the iron key turns. the wing is open.", UI_WARM)
     else:
-        world.log(f"the {target.name.lower()} comes apart.", UI_WARM)
-        world.level.tiles[target.y][target.x] = "%"
+        world.log("locked. a heavy iron keyway.", UI_HOT)
+
+
+def melee(world: World, target: Actor) -> None:
+    weapon = "CROWBAR" if world.inventory.get("CROWBAR") else None
+    make_noise(world, 5, 6)
+    if world.rng.random() >= melee_chance(world, target):
+        world.log(f"you swing wide of the {target.name.lower()}.", UI_DIM)
+        return
+    bonus = 7 if weapon else 0
+    target.hp -= damage_roll(world.player, world.rng) + bonus
+    resolve_damage(world, target, "you strike the")
+
+
+def finish(world: World, target: Actor) -> None:
+    target.dead = True
+    target.downed = False
+    stain(world.level, target.x, target.y)
+    make_noise(world, 5, 6)
+    world.log(f"you finish the {target.name.lower()}. it stays down.", UI_WARM)
+
+
+def resolve_damage(world: World, target: Actor, verb: str) -> None:
+    if target.hp > 0:
+        world.log(f"{verb} {target.name.lower()}.", UI_TEXT)
+        return
+    if target.rises:
+        target.downed = True
+        target.hp = 0
+        target.rise_in = world.rng.randint(18, 34)
+        world.log(f"the {target.name.lower()} goes down. it is not finished.", UI_WARM)
+    else:
+        target.dead = True
+        stain(world.level, target.x, target.y)
+        world.log(f"the {target.name.lower()} drops.", UI_WARM)
 
 
 def fire(world: World) -> None:
-    level = world.level
+    floor = world.level
     if world.ammo <= 0:
         world.log("the hammer falls on an empty chamber.", UI_HOT)
         return
-    visible = [e for e in level.enemies
-               if e.alive and (e.x, e.y) in level.visible]
-    if not visible:
-        world.log("you fire into the dark. nothing.", UI_DIM)
-        world.ammo -= 1
-        world.noise = 10
-        alert(world, 16)
-        return
-    target = min(visible, key=lambda e: math.dist((e.x, e.y), (level.player.x, level.player.y)))
     world.ammo -= 1
-    target.hp -= world.rng.randint(22, 34)
-    world.noise = 10
-    alert(world, 16)
-    if target.alive:
-        world.log(f"the {target.name.lower()} staggers.", UI_TEXT)
-    else:
-        world.log(f"the {target.name.lower()} drops.", UI_WARM)
-        level.tiles[target.y][target.x] = "%"
+    make_noise(world, 10, 16)
+
+    targets = [e for e in floor.enemies if e.alive and (e.x, e.y) in floor.visible]
+    if not targets:
+        world.log("you fire into the dark. nothing.", UI_DIM)
+        return
+    target = min(targets, key=lambda e: math.dist((e.x, e.y), (world.player.x, world.player.y)))
+    if world.rng.random() >= ranged_chance(world, target):
+        world.log(f"the shot goes wide. plaster and dust.", UI_DIM)
+        return
+    target.hp -= world.rng.randint(15, 26)
+    resolve_damage(world, target, "the round tears into the")
 
 
 def reload_weapon(world: World) -> None:
@@ -696,12 +1107,71 @@ def use_first_aid(world: World) -> None:
     if not world.inventory.get("FIRST AID"):
         world.log("nothing to bind the wound with.", UI_HOT)
         return
-    world.inventory["FIRST AID"] -= 1
-    if not world.inventory["FIRST AID"]:
-        del world.inventory["FIRST AID"]
-    player = world.player
-    player.hp = min(player.max_hp, player.hp + 32)
+    world.drop("FIRST AID")
+    world.player.hp = min(world.player.max_hp, world.player.hp + 40)
     world.log("you bind the wound. it holds.", UI_WARM)
+
+
+def interact(world: World) -> None:
+    """Stairs, fixtures, the way out -- whatever is under your feet."""
+    floor = world.level
+    player = world.player
+    here = floor.tiles[player.y][player.x]
+
+    link = world.mansion.stairs.get((world.depth, player.x, player.y))
+    if link is not None:
+        world.depth, player.x, player.y = link
+        world.log(f"you take the stairs. {world.level.name.lower()}.", UI_WARM)
+        return
+
+    fixture = world.fixture_at(world.depth, player.x, player.y)
+    if fixture is None:
+        for cell in neighbours((player.x, player.y)):
+            fixture = world.fixture_at(world.depth, *cell)
+            if fixture:
+                break
+    if fixture is not None:
+        solve(world, fixture)
+        return
+
+    # Shutting a door behind you is the one way to break contact: the pursuer
+    # has to spend 75 shouldering it open again, which is your head start.
+    for cx, cy in neighbours((player.x, player.y)):
+        if floor.in_bounds(cx, cy) and floor.tiles[cy][cx] == "'" and not floor.actor_at(cx, cy):
+            floor.tiles[cy][cx] = "+"
+            make_noise(world, 3, 4)
+            world.log("you pull the door shut.", UI_WARM)
+            return
+    world.log("nothing here to work with.", UI_DIM)
+
+
+def solve(world: World, fixture: Fixture) -> None:
+    if fixture.solved:
+        world.log("already dealt with.", UI_DIM)
+        return
+    missing = [f for f in fixture.needs_flags if f not in world.flags]
+    if missing:
+        world.log(f"{fixture.blurb}. still dead: {', '.join(missing).lower()}.", UI_HOT)
+        return
+    if fixture.needs_item and not world.inventory.get(fixture.needs_item):
+        world.log(f"{fixture.blurb}. you need the {fixture.needs_item.lower()}.", UI_HOT)
+        return
+
+    fixture.solved = True
+    if fixture.needs_item:
+        world.drop(fixture.needs_item)
+    if fixture.grants_item:
+        world.take(fixture.grants_item)
+    if fixture.grants_flag:
+        world.flags.add(fixture.grants_flag)
+
+    if fixture.kind == "FRONTDOOR":
+        world.escaped = True
+        world.log("the bolts draw back. you are out.", UI_WARM)
+    elif fixture.kind == "SAFE":
+        world.log("the safe opens. an iron key, and a name you know.", UI_WARM)
+    else:
+        world.log("the fuse seats. somewhere, the house wakes up.", UI_WARM)
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +1180,7 @@ def use_first_aid(world: World) -> None:
 def resolve_enemies(world: World) -> None:
     for enemy in world.level.enemies:
         guard = 0
-        while enemy.alive and not world.dead and enemy_turn(world, enemy):
+        while enemy.acting and not world.dead and enemy_turn(world, enemy):
             guard += 1
             if guard > 8:
                 break
@@ -722,13 +1192,14 @@ def enemy_turn(world: World, enemy: Actor) -> bool:
     Banking rather than burning the surplus on a wait is what makes speed mean
     anything: a shambler gaining 60 has to sit out a tick to afford a 100 move.
     """
-    level = world.level
-    player = level.player
+    floor = world.level
+    player = world.player
     here = (enemy.x, enemy.y)
     distance = math.dist(here, (player.x, player.y))
 
-    # Player FOV doubles as the enemy's: if you can see it, it can see you.
-    if here in level.visible and distance <= enemy.sense:
+    # Player FOV doubles as the enemy's: if you can see it, it can see you --
+    # unless you are low and tucked in, which is what crouching buys.
+    if here in floor.visible and distance <= sense_radius(world, enemy):
         enemy.aware = True
         enemy.target = (player.x, player.y)
         enemy.patience = 12
@@ -737,6 +1208,9 @@ def enemy_turn(world: World, enemy: Actor) -> bool:
         if not enemy.can_afford(COST_MELEE):
             return False
         enemy.spend(COST_MELEE)
+        if world.rng.random() >= enemy_chance(world, enemy):
+            world.log(f"the {enemy.name.lower()} lunges and misses.", UI_DIM)
+            return True
         player.hp -= damage_roll(enemy, world.rng)
         world.log(f"the {enemy.name.lower()} tears into you.", UI_HOT)
         if player.hp <= 0:
@@ -747,35 +1221,35 @@ def enemy_turn(world: World, enemy: Actor) -> bool:
     if enemy.aware:
         # Downhill on the flow field when the player is reachable, otherwise
         # grope toward the last known position.
-        current = level.flow.get(here)
+        current = floor.flow.get(here)
         if current is not None:
-            options = [(level.flow.get(n, 999), n) for n in neighbours(here)
-                       if level.pathable(*n) and not level.actor_at(*n)]
+            options = [(floor.flow.get(n, 999), n) for n in neighbours(here)
+                       if floor.pathable(*n) and not floor.actor_at(*n)]
             options = [o for o in options if o[0] < current]
             if options:
                 step = min(options)[1]
         if step is None and enemy.target:
-            step = grope(level, here, enemy.target)
+            step = grope(floor, here, enemy.target)
     elif world.rng.random() < 0.6:
         step = world.rng.choice(list(neighbours(here)))
 
-    if step is None or level.actor_at(*step) or step == (player.x, player.y):
+    if step is None or floor.actor_at(*step) or step == (player.x, player.y):
         if not enemy.can_afford(COST_WAIT):
             return False
         enemy.spend(COST_WAIT)
         return True
 
-    if level.tiles[step[1]][step[0]] == "+":
+    if floor.tiles[step[1]][step[0]] == "+":
         # Doors are a delay for the enemy, not a wall -- and they stay open.
         if not enemy.can_afford(COST_DOOR):
             return False
         enemy.spend(COST_DOOR)
-        level.tiles[step[1]][step[0]] = "'"
-        if step in level.visible:
+        floor.tiles[step[1]][step[0]] = "'"
+        if step in floor.visible:
             world.log(f"the {enemy.name.lower()} shoulders a door open.", UI_HOT)
         else:
             world.log("a door swings open somewhere.", UI_DIM)
-    elif level.walkable(*step):
+    elif floor.walkable(*step):
         if not enemy.can_afford(COST_MOVE):
             return False
         enemy.spend(COST_MOVE)
@@ -793,15 +1267,10 @@ def enemy_turn(world: World, enemy: Actor) -> bool:
     return True
 
 
-def neighbours(cell: tuple[int, int]):
-    x, y = cell
-    return ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1))
-
-
-def grope(level: Level, here: tuple[int, int], target: tuple[int, int]):
+def grope(floor: Floor, here: tuple[int, int], target: tuple[int, int]):
     best = None
     for option in neighbours(here):
-        if not level.walkable(*option) or level.actor_at(*option):
+        if not floor.walkable(*option) or floor.actor_at(*option):
             continue
         score = math.dist(option, target)
         if best is None or score < best[0]:
@@ -816,15 +1285,24 @@ def scale_colour(colour, amount: float):
     return tuple(min(255, max(0, int(channel * amount))) for channel in colour)
 
 
-def light_at(level: Level, x: int, y: int, flicker: float) -> float:
-    player = level.player
+def light_at(world: World, x: int, y: int, flicker: float) -> float:
+    player = world.player
     total = 1.0 - (math.dist((x, y), (player.x, player.y)) / (LANTERN_RADIUS * flicker)) ** 1.15
     total = max(0.0, total)
-    for cx, cy in level.candles:
+    for cx, cy in candles(world.level):
         distance = math.dist((x, y), (cx, cy))
         if distance < CANDLE_RADIUS:
             total += 0.7 * (1.0 - distance / CANDLE_RADIUS)
     return min(1.0, total)
+
+
+def candles(floor: Floor) -> list[tuple[int, int]]:
+    cached = getattr(floor, "_candles", None)
+    if cached is None:
+        cached = [(x, y) for y in range(FLOOR_H) for x in range(FLOOR_W)
+                  if floor.tiles[y][x] == "*"]
+        floor._candles = cached
+    return cached
 
 
 def dither(value: float, x: int, y: int) -> float:
@@ -833,49 +1311,10 @@ def dither(value: float, x: int, y: int) -> float:
     return min(1.0, math.floor(value * LIGHT_LEVELS + threshold) / LIGHT_LEVELS)
 
 
-def camera(level: Level) -> tuple[int, int]:
-    cx = max(0, min(level.player.x - VIEW_W // 2, LEVEL_W - VIEW_W))
-    cy = max(0, min(level.player.y - VIEW_H // 2, LEVEL_H - VIEW_H))
+def camera(world: World) -> tuple[int, int]:
+    cx = max(0, min(world.player.x - VIEW_W // 2, FLOOR_W - VIEW_W))
+    cy = max(0, min(world.player.y - VIEW_H // 2, FLOOR_H - VIEW_H))
     return cx, cy
-
-
-def draw_map(surface, font: Font, world: World, flicker: float, debug: bool) -> None:
-    level = world.level
-    ox, oy = camera(level)
-    for sy in range(VIEW_H):
-        for sx in range(VIEW_W):
-            x, y = ox + sx, oy + sy
-            if (x, y) not in level.explored:
-                continue
-
-            seen = (x, y) in level.visible
-            lit = max(light_at(level, x, y, flicker), AMBIENT) if seen else 0.0
-            level_value = dither(lit if seen else MEMORY_LEVEL, x, y)
-            if level_value <= 0.0:
-                continue
-
-            glyph, colour, _, _ = TILES[level.tiles[y][x]]
-            if (x, y) in level.items and seen:
-                glyph, colour, _ = ITEMS[level.items[(x, y)]]
-
-            colour = shade(colour, lit)
-            font.blit(surface, glyph, MAP_X + sx, MAP_Y + sy, scale_colour(colour, level_value))
-
-    for actor in level.actors():
-        if (actor.x, actor.y) not in level.visible:
-            continue
-        sx, sy = actor.x - ox, actor.y - oy
-        if not (0 <= sx < VIEW_W and 0 <= sy < VIEW_H):
-            continue
-        lit = light_at(level, actor.x, actor.y, flicker)
-        level_value = dither(max(lit, 0.45), actor.x, actor.y)
-        colour = actor.colour
-        if lit < 0.25 and actor is not level.player:
-            # Outside the lantern things read as silhouettes, not sprites.
-            colour = (int(colour[0] * 0.85), int(colour[1] * 0.6), int(colour[2] * 0.7))
-        font.blit(surface, actor.glyph, MAP_X + sx, MAP_Y + sy, scale_colour(colour, level_value))
-        if debug and actor.aware:
-            font.blit(surface, "!", MAP_X + sx, MAP_Y + sy - 1, UI_HOT)
 
 
 def shade(colour, lit: float):
@@ -887,13 +1326,78 @@ def shade(colour, lit: float):
                  for c, tint in zip(colour, (255, 226, 186)))
 
 
+def draw_map(surface, font: Font, world: World, flicker: float, debug: bool) -> None:
+    floor = world.level
+    below = world.mansion.floor(world.depth - 1)
+    above = world.mansion.floor(world.depth + 1)
+    ox, oy = camera(world)
+
+    for sy in range(VIEW_H):
+        for sx in range(VIEW_W):
+            x, y = ox + sx, oy + sy
+            if (x, y) not in floor.explored:
+                continue
+            seen = (x, y) in floor.visible
+
+            if floor.tiles[y][x] == "O":
+                if seen and below is not None:
+                    draw_through(surface, font, below, x, y, MAP_X + sx, MAP_Y + sy)
+                continue
+
+            lit = max(light_at(world, x, y, flicker), AMBIENT) if seen else 0.0
+            level_value = dither(lit if seen else MEMORY_LEVEL, x, y)
+            if level_value <= 0.0:
+                continue
+
+            glyph, colour, _, _ = TILES[floor.tiles[y][x]]
+            if (x, y) in floor.items and seen:
+                glyph, colour, _ = ITEMS[floor.items[(x, y)]]
+            colour = shade(colour, lit)
+            font.blit(surface, glyph, MAP_X + sx, MAP_Y + sy, scale_colour(colour, level_value))
+
+            # Standing under the atrium you can see who is on the balcony.
+            if seen and above is not None and above.tiles[y][x] == "O":
+                overhead = above.actor_at(x, y)
+                if overhead and overhead.alive:
+                    font.blit(surface, overhead.glyph, MAP_X + sx, MAP_Y + sy, OTHER_STOREY)
+
+    for actor in [*floor.enemies, world.player]:
+        if not actor.alive or (actor.x, actor.y) not in floor.visible:
+            continue
+        sx, sy = actor.x - ox, actor.y - oy
+        if not (0 <= sx < VIEW_W and 0 <= sy < VIEW_H):
+            continue
+        lit = light_at(world, actor.x, actor.y, flicker)
+        level_value = dither(max(lit, 0.45), actor.x, actor.y)
+        glyph, colour = actor.glyph, actor.colour
+        if actor.downed:
+            glyph, colour = "%", (128, 46, 44)
+        elif lit < 0.25 and actor is not world.player:
+            # Outside the lantern things read as silhouettes, not sprites.
+            colour = (int(colour[0] * 0.85), int(colour[1] * 0.6), int(colour[2] * 0.7))
+        font.blit(surface, glyph, MAP_X + sx, MAP_Y + sy, scale_colour(colour, level_value))
+        if debug and actor.aware and actor.acting:
+            font.blit(surface, "!", MAP_X + sx, MAP_Y + sy - 1, UI_HOT)
+
+
+def draw_through(surface, font: Font, below: Floor, x: int, y: int, sx: int, sy: int) -> None:
+    """Look down a shaft: the storey underneath, cold and flattened."""
+    glyph, _, _, _ = TILES[below.tiles[y][x]]
+    if below.tiles[y][x] == "O":
+        return
+    font.blit(surface, glyph, sx, sy, scale_colour(OTHER_STOREY, 0.75))
+    actor = below.actor_at(x, y)
+    if actor and actor.alive:
+        font.blit(surface, actor.glyph if not actor.downed else "%", sx, sy, OTHER_STOREY)
+
+
 def bar(value: int, maximum: int, width: int = 10) -> str:
     filled = max(0, min(width, int(round(width * value / maximum))))
     return "█" * filled + "░" * (width - filled)
 
 
 def threat_level(world: World) -> tuple[str, tuple[int, int, int]]:
-    aware = sum(1 for e in world.level.enemies if e.alive and e.aware)
+    aware = sum(1 for e in world.level.enemies if e.acting and e.aware)
     if aware >= 3:
         return "HIGH", UI_HOT
     if aware:
@@ -903,7 +1407,7 @@ def threat_level(world: World) -> tuple[str, tuple[int, int, int]]:
 
 def draw_hud(surface, font: Font, world: World, tick_count: int, debug: bool) -> None:
     player = world.player
-    font.text(surface, "NIGHTSHIFT".ljust(14) + f"MANSION {world.floor}F", 0, 0, UI_DIM)
+    font.text(surface, "NIGHTSHIFT".ljust(14) + world.level.name, 0, 0, UI_DIM)
     font.text(surface, f"SEED {world.seed}"[:PANEL_W], PANEL_X, 0, UI_DIM)
 
     for y in range(0, LOG_Y - 1):
@@ -913,6 +1417,7 @@ def draw_hud(surface, font: Font, world: World, tick_count: int, debug: bool) ->
 
     rule = "─" * PANEL_W
     threat, threat_colour = threat_level(world)
+    cover = player_concealed(world)
     panel: list[tuple[str, tuple[int, int, int]]] = [
         ("   STATUS", UI_TEXT),
         (rule, UI_DIM),
@@ -921,20 +1426,20 @@ def draw_hud(surface, font: Font, world: World, tick_count: int, debug: bool) ->
         (f"EN {bar(player.energy, player.max_energy)}", (120, 174, 168)),
         (f"{player.energy:>7}/{player.max_energy}", UI_TEXT),
         (rule, UI_DIM),
-        (") REVOLVER", UI_DIM),
-        (f"  AMMO  {world.ammo}/ 6", UI_WARM if world.ammo else UI_HOT),
-        (f"  RESERVE  {world.ammo_reserve:>2}", UI_TEXT),
+        (f"STANCE {'CROUCH' if world.crouched else ' STAND'}",
+         UI_WARM if world.crouched else UI_DIM),
+        (f"COVER  {'HIDDEN' if cover else '  OPEN'}", UI_WARM if cover else UI_DIM),
+        (rule, UI_DIM),
+        (f")  AMMO  {world.ammo}/ 6", UI_WARM if world.ammo else UI_HOT),
+        (f"   SPARE  {world.ammo_reserve:>3}", UI_TEXT),
         (rule, UI_DIM),
         (f"CARRY    {world.carried()}/8", UI_DIM),
     ]
-    for name, count in list(world.inventory.items())[:5]:
-        # Count goes in front: a trailing "x2" is what gets clipped at 13 columns.
+    for name, count in list(world.inventory.items())[:4]:
         prefix = f"{count}x" if count > 1 else "-"
         panel.append((f"{prefix} {name}"[:PANEL_W], UI_TEXT))
     panel.append((rule, UI_DIM))
-    panel.append((f"NOISE  {bar(world.noise, 10, 5)}", UI_TEXT))
     panel.append((f"THREAT {threat:>6}", threat_colour))
-    panel.append((f"TURN {world.turn:>8}", UI_DIM))
 
     for offset, (line, colour) in enumerate(panel[:LOG_Y - 2]):
         font.text(surface, line[:PANEL_W], PANEL_X, MAP_Y + offset, colour)
@@ -943,34 +1448,39 @@ def draw_hud(surface, font: Font, world: World, tick_count: int, debug: bool) ->
         font.text(surface, f"> {line}"[:COLS], 0, LOG_Y + offset, colour)
 
     if debug:
-        awake = sum(1 for e in world.level.enemies if e.alive and e.aware)
-        alive = sum(1 for e in world.level.enemies if e.alive)
-        footer = f"ROOMS {len(world.level.rooms)}  LIVE {alive}  AWAKE {awake}  FLOW {len(world.level.flow)}"
+        floor = world.level
+        up = sum(1 for e in floor.enemies if e.acting)
+        down = sum(1 for e in floor.enemies if e.downed and not e.dead)
+        footer = f"UP {up}  DOWN {down}  TURN {world.turn}  FLOW {len(floor.flow)}"
     else:
-        footer = "MOVE 100  SPRINT 150  FIRE 100  ? KEYS"
+        power = "ON" if "POWER" in world.flags else "--"
+        seal = "ON" if "SEAL" in world.flags else "--"
+        footer = f"NOISE {bar(world.noise, 10, 5)}  POWER {power}  SEAL {seal}  ? KEYS"
     font.text(surface, footer[:COLS], 0, LOG_Y + 2, UI_DIM)
 
     if world.dead:
-        banner(surface, font, "YOU DIED", "N FOR A NEW SEED", tick_count)
-    elif world.descended:
-        banner(surface, font, "STAIRS DOWN", "SPACE TO DESCEND", tick_count)
+        banner(surface, font, "YOU DIED", "N FOR A NEW MANSION", tick_count)
+    elif world.escaped:
+        banner(surface, font, "YOU ARE OUT", f"{world.turn} TURNS", tick_count)
 
 
 HELP_LINES = [
     ("WASD / ARROWS", "MOVE 100"),
     ("  + SHIFT", "SPRINT 150"),
+    ("C  CROUCH", "25"),
     ("BUMP ENEMY", "ATTACK 100"),
+    ("BUMP DOWNED", "FINISH 150"),
     ("BUMP DOOR", "OPEN 75"),
-    ("SPACE", "WAIT 50"),
-    ("F  FIRE REVOLVER", "100"),
+    ("E  INTERACT", "100"),
+    ("F  FIRE", "100"),
     ("R  RELOAD", "125"),
     ("Q  FIRST AID", "150"),
-    (None, None),
-    ("N", "NEW LEVEL"),
+    ("N", "NEW MANSION"),
     ("F1", "DEBUG OVERLAY"),
-    ("?", "THIS LIST"),
     ("ESC", "QUIT"),
 ]
+# 13 entries + title + 2 rules + 2 notes = 18 lines, which is exactly VIEW_H - 2.
+# Anything more gets silently clipped by draw_help.
 
 
 def draw_help(surface, font: Font) -> None:
@@ -978,7 +1488,7 @@ def draw_help(surface, font: Font) -> None:
     body = [f"{left:<{inner - len(right)}}{right}" if left else "─" * inner
             for left, right in HELP_LINES]
     body = ["CONTROLS", "─" * inner, *body, "─" * inner,
-            "ENERGY BUYS ACTIONS.", "TIME PASSES TO AFFORD."]
+            "CROUCH BY COVER TO HIDE.", "E ALSO SHUTS DOORS."]
 
     body = body[:VIEW_H - 2]          # never overflow the viewport
     height = len(body) + 2
@@ -996,8 +1506,8 @@ def draw_help(surface, font: Font) -> None:
 
 def banner(surface, font: Font, title: str, hint: str, tick_count: int) -> None:
     y = MAP_Y + VIEW_H // 2 - 1
-    x = (VIEW_W - len(title)) // 2
-    font.text(surface, title, x, y, UI_HOT if (tick_count // 20) % 2 == 0 else UI_WARM)
+    font.text(surface, title, (VIEW_W - len(title)) // 2, y,
+              UI_HOT if (tick_count // 20) % 2 == 0 else UI_WARM)
     font.text(surface, hint, (VIEW_W - len(hint)) // 2, y + 2, UI_DIM)
 
 
@@ -1095,23 +1605,18 @@ def is_help_key(event) -> bool:
 
 def handle_key(world: World, event) -> World:
     if event.key == pygame.K_n:
-        return new_world(world.rng.randrange(10**5), 1)
+        return new_world(world.rng.randrange(10**5))
 
-    if world.dead:
+    if world.dead or world.escaped:
         return world
-
-    if world.descended and event.key == pygame.K_SPACE:
-        following = new_world(world.seed, world.floor + 1)
-        following.ammo, following.ammo_reserve = world.ammo, world.ammo_reserve
-        following.inventory = dict(world.inventory)
-        following.player.hp = world.player.hp
-        following.log("deeper. the air is colder.", UI_DIM)
-        return following
 
     if event.key in DIRECTIONS:
         dx, dy = DIRECTIONS[event.key]
-        sprint = bool(event.mod & pygame.KMOD_SHIFT)
-        try_move(world, dx, dy, sprint)
+        try_move(world, dx, dy, bool(event.mod & pygame.KMOD_SHIFT))
+    elif event.key == pygame.K_c:
+        perform(world, COST_STANCE, lambda: toggle_crouch(world))
+    elif event.key == pygame.K_e:
+        perform(world, COST_INTERACT, lambda: interact(world))
     elif event.key == pygame.K_SPACE:
         perform(world, COST_WAIT, lambda: None)
     elif event.key == pygame.K_f:
@@ -1158,7 +1663,7 @@ def main() -> None:
     grain = make_grain((COLS * CELL, ROWS * CELL), random.Random(seed))
 
     if args.out:
-        frame = render_frame(font, internal, scanlines, vignette, grain, world, 12, False)
+        frame = render_frame(font, internal, scanlines, vignette, grain, world, 12)
         pygame.image.save(frame, str(args.out))
         pygame.quit()
         print(f"wrote {args.out} (seed {seed})")

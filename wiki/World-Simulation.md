@@ -206,7 +206,7 @@ built on ([Roadmap](Roadmap.md)).
   and it grew with the debt: stepping into the next region cost 0.72 s after 100
   turns of play (250 frames) and 1.66 s after 300 (450 frames). Pacing the progress
   frames at `_CATCHUP_FRAME_SECONDS` (0.1 s) makes those 0.14 s / 2 frames and
-  0.24 s / 3 frames. `esper.process(None)` is render-only, so the simulation is
+  0.24 s / 3 frames. `ecs.process(None)` is render-only, so the simulation is
   identical either way.
 - Catch-up cost concentrates on **region entry** (entering a lagging region replays
   every missed turn at once) — this is where pathfinding cost shows up. Kept in check

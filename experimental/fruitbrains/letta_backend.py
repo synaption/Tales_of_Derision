@@ -327,6 +327,28 @@ class LettaBackend:
                 return _learnt(entry.get("value") or "")
         return ""
 
+    def remembers(self, villager: str) -> str:
+        """One line for the panel: what they know about you, or how far back.
+
+        A model that writes to its memory blocks gives us facts to show.  One
+        that never calls a tool -- qwen2.5, the default -- still has every past
+        conversation on the server, so say *that* rather than leaving the line
+        reading as if nothing persisted.
+        """
+        facts = self.memory(villager)
+        if facts:
+            return facts
+        agent_id = self._agents.get(villager)
+        if not agent_id:
+            return ""
+        history = get_json(f"{self.url}/v1/agents/{agent_id}/messages?limit=200",
+                           MEMORY_TIMEOUT, self.token)
+        turns = sum(1 for m in history or []
+                    if isinstance(m, dict) and m.get("message_type") == "user_message")
+        if not turns:
+            return ""
+        return f"{turns} thing{'' if turns == 1 else 's'} you have said before"
+
     # -- talking --------------------------------------------------------------
 
     def converse(self, villager: str, persona: str, mood: str, player: str,

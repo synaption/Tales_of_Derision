@@ -63,3 +63,16 @@ src/data/saves/*.json
 # build outputs
 *.exe
 *.pyc
+
+# Workbench test snapshots, rewritten on every run
+experimental/fantacy_maps/rogue_headless.png
+experimental/juice/juice_headless.png
+experimental/juice/juice_gl_headless.png
+experimental/fruitbrains/fruitbrains_headless.png
+experimental/full3d/cramigula_headless.png
+experimental/cramigula_rs/cramigula_contactsheet.png
+
+# Whoever's bench it is, those are their sliders -- written by the GL bench's
+# escape menu and meaningless on anybody else's monitor.
+experimental/juice/juice_settings.json
+experimental/juice/.juice_settings.*

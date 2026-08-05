@@ -8,7 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
-import esper
+import ecs
 import pytest
 
 from components import (
@@ -60,9 +60,9 @@ def test_build_components_assembles_a_cave_rat() -> None:
 
 def test_spawn_creates_a_live_entity() -> None:
     ent = spawn("deer", 3, 4)
-    assert esper.has_component(ent, Position)
-    assert esper.component_for_entity(ent, Diet).kind == "herbivore"
-    assert esper.component_for_entity(ent, Meat).name == "Deer Meat"
+    assert ecs.has_component(ent, Position)
+    assert ecs.component_for_entity(ent, Diet).kind == "herbivore"
+    assert ecs.component_for_entity(ent, Meat).name == "Deer Meat"
 
 
 def test_fish_prefab_is_not_an_npc_and_never_thirsts() -> None:
@@ -95,8 +95,8 @@ def test_register_factory_prefab_python_path() -> None:
 
     register_prefab(imp, prefab_id="imp")
     ent = spawn("imp", 9, 9)
-    assert esper.component_for_entity(ent, Name).value == "Imp"
-    assert esper.has_component(ent, Enemy)
+    assert ecs.component_for_entity(ent, Name).value == "Imp"
+    assert ecs.has_component(ent, Enemy)
 
 
 # --- Kits -------------------------------------------------------------------
@@ -124,23 +124,23 @@ class _FakeMap:
 
 
 def test_on_fire_is_a_component_effect() -> None:
-    ent = esper.create_entity(Position(2, 2), Renderable("@"))
+    ent = ecs.create_entity(Position(2, 2), Renderable("@"))
     apply_effect(ent, "on_fire")
-    assert esper.has_component(ent, OnFire)
+    assert ecs.has_component(ent, OnFire)
     assert active_effects(_FakeMap(set()), ent, Position(2, 2)) == ["on_fire"]
     remove_effect(ent, "on_fire")
-    assert not esper.has_component(ent, OnFire)
+    assert not ecs.has_component(ent, OnFire)
 
 
 def test_swimming_is_a_derived_effect() -> None:
-    ent = esper.create_entity(Position(4, 4), Renderable("@"))
+    ent = ecs.create_entity(Position(4, 4), Renderable("@"))
     game_map = _FakeMap({(4, 4)})
     assert active_effects(game_map, ent, Position(4, 4)) == ["swimming"]
     assert active_effects(game_map, ent, Position(0, 0)) == []
 
 
 def test_effects_stack_in_registration_order() -> None:
-    ent = esper.create_entity(Position(4, 4), Renderable("@"))
+    ent = ecs.create_entity(Position(4, 4), Renderable("@"))
     apply_effect(ent, "on_fire")
     order = active_effects(_FakeMap({(4, 4)}), ent, Position(4, 4))
     assert order == ["swimming", "on_fire"]  # swimming registered before on_fire
@@ -157,7 +157,7 @@ def test_effects_processor_ticks_component_effects() -> None:
     register_effect(EffectDef("_test_burn", glyph="b", seconds=0.1, label="Burn",
                               component=OnFire, on_tick=ticked.append))
     try:
-        ent = esper.create_entity(Position(1, 1), OnFire())
+        ent = ecs.create_entity(Position(1, 1), OnFire())
         EffectsProcessor().process("move_up")
         assert ticked == [ent]
         ticked.clear()
@@ -212,8 +212,8 @@ def test_json_prefab_composes_from_kits_and_spawns() -> None:
     })
     register_prefab(defn)
     ent = spawn("dire_rat", 2, 2)
-    assert esper.component_for_entity(ent, Meat).name == "Dire Rat Meat"
-    assert esper.component_for_entity(ent, Renderable).fg == (150, 60, 60)
+    assert ecs.component_for_entity(ent, Meat).name == "Dire Rat Meat"
+    assert ecs.component_for_entity(ent, Renderable).fg == (150, 60, 60)
 
 
 # --- Determinism gate over the content (simulation) modules -----------------

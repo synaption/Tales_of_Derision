@@ -91,20 +91,44 @@ who they are and a `human` block for what they've worked out about you.  Tell
 Peach you keep bees and she still knows next week.
 
 What persists is the conversation itself, held by the agent -- quit, restart,
-come back tomorrow, and Peach still knows about the bees.  The chat panel shows
-her `human` block next to her name, so what she has written down is on screen
-rather than in a log.
+come back tomorrow, and Peach still knows about the bees.  The chat panel says
+so next to her name: the facts she has written down if her model writes any,
+otherwise how far back the two of you go (`remembers: 9 things you have said
+before`).
 
 **Verified against Letta 0.16.8 with `qwen2.5:7b`**, and one caveat came out of
-it: the agents are given Letta's base tools, including core-memory writes, but
-whether they *use* them depends on the model.  Ollama's OpenAI-compatible
-endpoint returns no native tool calls for qwen2.5 (`tool_calls: null`, even with
-tools in the request), so a villager talks well and remembers the conversation
-but rarely edits its own memory block -- and when it tries, it writes
-`memory_insert(...)` as dialogue.  That never reaches the screen: `spoken()`
-strips tool-call syntax and fails the turn rather than have a villager read JSON
-at you.  A model with working tool calls gets the self-editing memory too; the
-lever is `FRUITBRAINS_MODEL`.
+it: agents get `memory_insert` and `memory_replace`, but whether they *use* them
+is a property of the model, not of the plumbing.  qwen2.5:7b calls tools
+correctly when asked to (native `tool_calls` on both Ollama endpoints) and still
+never writes to its memory blocks -- across six turns it made zero tool calls,
+and told point-blank to "write this down" it replies "I'll remember that!" and
+records nothing.  Deciding to reach for a tool unprompted is an agentic skill
+small models lack; see the [model note](#which-model-for-letta).
+
+When such a model *is* nudged into writing memory, it tends to emit
+`memory_insert(...)` as dialogue instead of a real call.  That never reaches the
+screen: `spoken()` strips tool-call syntax and fails the turn rather than have a
+villager read JSON at you.
+
+### Which model for Letta
+
+Conversation memory works with any model -- it is server-side and needs no tool
+calls.  Self-editing memory blocks need a model that *chooses* to call tools:
+
+| model | writes memory? | as a neighbour |
+| --- | --- | --- |
+| `llama3.1:8b` | **yes** -- verified `memory_insert`/`memory_replace` every turn | flat; recites facts back at you |
+| `qwen2.5:7b` | no -- zero tool calls in six turns | warm, curious, asks after your bees |
+| `qwen3:14b` | untested; the obvious next try on a 16 GB card | -- |
+| Pi-sized (≤3 B) | no | conversation memory only -- use the plain Ollama backend |
+
+It is a straight trade, and **the town runs on qwen2.5** -- the whole
+[ladder](#model-sizing) is qwen2.5, and being good company matters more here
+than filing notes.  Every villager still remembers every conversation; that
+lives on the server and needs no tools at all.  Swap in llama3.1 for a session
+if you want to watch the blocks fill up:
+
+    FRUITBRAINS_MODEL=llama3.1:8b python3 fruitbrains.py --letta
 
 Letta is the agent layer, not the model: it runs inference through the same
 local Ollama and the same [model ladder](#model-sizing), plus a small embedding
@@ -116,14 +140,23 @@ never shut down.
 Letta's server keeps its state in Postgres, so the docker image (which brings
 one) is the path that works with nothing else installed:
 
-    docker run -d -p 8283:8283 --add-host=host.docker.internal:host-gateway \
-      -e OLLAMA_BASE_URL=http://host.docker.internal:11434 letta/letta:latest
+    docker run -d --name fruitbrains-letta --network host \
+      --restart unless-stopped \
+      -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+      -v ~/.letta/pgdata:/var/lib/postgresql/data letta/letta:latest
     python3 fruitbrains.py --letta          # finds it on :8283 and leaves it alone
 
-Ollama binds `127.0.0.1` by default, which the container cannot reach, and the
-symptom is Letta listing no models at all -- so it needs
-`OLLAMA_HOST=0.0.0.0 ollama serve` (or any address the container can get to).
-Startup says so if the handle it wants isn't on offer.
+`--network host` is doing real work: Ollama binds `127.0.0.1`, so a bridged
+container cannot reach it, and the symptom is not a connection error but Letta
+listing *no models at all*.  Sharing the host's network sidesteps that without
+having to re-bind Ollama.  The volume is what makes the villagers durable --
+their memories live in Letta's Postgres, not in this repo, so pointing that
+somewhere temporary means a town that forgets every reboot.
+
+`--letta` needs the server up *first*: without one, the game refuses to open a
+window and prints how to start it (exit 2).  That is the same rule as the model
+itself -- a villager who has quietly lost their memory is worse than a game
+that will not start.
 
     pip install letta                       # the game starts this one itself, but
     LETTA_PG_URI=postgresql://...           # only with a Postgres to point at

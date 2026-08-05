@@ -8,7 +8,7 @@ the day model actually responds to how much there is to eat.
 """
 from __future__ import annotations
 
-import esper
+import ecs
 import pytest
 
 from components import Name, Position, Renderable, Seaweed, Tree
@@ -100,7 +100,7 @@ def test_seeding_adopts_world_gen_animals_and_stocks_them_down() -> None:
     stocks = _stocks(game_map, species)
     region = _only_region(game_map)
     for i in range(7):
-        esper.create_entity(Position(2 + i, 3), Renderable("f"), Name("Minnow"), Seaweed())
+        ecs.create_entity(Position(2 + i, 3), Renderable("f"), Name("Minnow"), Seaweed())
 
     stocks.seed_from_world()
 
@@ -119,7 +119,7 @@ def _place_food(game_map: GameMap, count: int) -> None:
                 return
             if game_map.tiles[y][x] != game_map.FLOOR:
                 continue
-            esper.create_entity(Position(x, y), Renderable("T"), Name("Tree"), Tree())
+            ecs.create_entity(Position(x, y), Renderable("T"), Name("Tree"), Tree())
             placed += 1
 
 
@@ -212,7 +212,7 @@ def test_a_region_with_no_animals_costs_nothing_and_stays_empty() -> None:
 def _run_days(days: list[int], start: int = 30) -> int:
     """Advance one region over ``days`` (in the given order) and report the
     population. Used to prove the answer doesn't depend on the order."""
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     set_world_rng(4242)
     game_map = GameMap(40, 20)
@@ -236,7 +236,7 @@ def test_a_days_outcome_does_not_depend_on_when_it_was_simulated() -> None:
     day 7 whether it was caught up in one burst or a day at a time -- which is
     what lets the idle pump advance however many regions its budget allows.
     """
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     set_world_rng(99)
     game_map = GameMap(40, 20)
@@ -270,7 +270,7 @@ def test_a_days_outcome_does_not_depend_on_when_it_was_simulated() -> None:
 def _ocean_world():
     from worldgen import _setup_world
 
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     wildlife.detach()
     set_world_rng(0x7A1E5)
@@ -365,7 +365,7 @@ def test_the_population_model_rides_the_floras_day_cursor() -> None:
 
     game_map = GameMap(40, 20)
     clock = WorldClock(turn=0, day_length=10)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     flora = TreeGrowthProcessor(game_map, rng=lambda: 1.0)
     animals = wildlife.WildlifeProcessor(game_map)
     animals.register_on(flora)

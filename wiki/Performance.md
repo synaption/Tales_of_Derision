@@ -38,7 +38,7 @@ assume walls don't change mid-session).
 
 ## Simulation budget (per turn)
 
-The lever is the synchronous per-turn `esper.process()` spike. **Profile the real
+The lever is the synchronous per-turn `ecs.process()` spike. **Profile the real
 workload, not intuition** — a cProfile of a cross-region walk with a headless renderer
 (so the map-surface build doesn't mask sim cost) is the trustworthy signal.
 Whole-turn A/B timings are confounded because A*'s tie-break changes NPC routes and
@@ -174,7 +174,7 @@ The daily flora pass (`TreeGrowthProcessor`) was the last system whose cost was 
 by how much world there is rather than by how much of it changed. Per region per
 day it rolled once for every one of ~7200 outdoor ground tiles, once for every
 ocean tile, and once for every plant, and it rebuilt a whole-world snapshot (five
-`esper.get_components` sweeps over ~85 000 entities, plus a set of every occupied
+`ecs.get_components` sweeps over ~85 000 entities, plus a set of every occupied
 tile in the world) for each elapsed day. All of that to plant roughly one sapling.
 
 Nothing about the *rules* required any of it. A per-tile chance over N tiles is a
@@ -321,7 +321,7 @@ Two things worth knowing:
 
 ### Strict active/inactive partitioning
 
-`esper.process(action)` simulates the region the player stands in and nothing else.
+`ecs.process(action)` simulates the region the player stands in and nothing else.
 Everywhere else advances only where the design allows it to: `simulate_idle`'s
 background pump, `_catch_up_entered_region_cooperatively` on region entry, and sleep.
 `src/tests/test_active_region_partition.py` holds the turn path to that rule.
@@ -349,7 +349,7 @@ hungrier — an NPC has no slow actions, only region-turns.
   anticipates it; see [Action Economy](Action-Economy.md)).
 - **Regional entity index** — *done* (`src/spatial.py`): every positioned entity
   bucketed by simulation region and by kind, built once at worldgen and maintained
-  incrementally (three movement hooks; creation and deletion are noticed from esper's
+  incrementally (three movement hooks; creation and deletion are noticed from the ECS's
   own id counter, so no call site has to remember). Systems ask for a region's
   entities instead of the world's. Measured over 300 turns after a 150-turn settle,
   at 9 islands: `MovementProcessor` 1.63 → 0.02 ms/turn, `NeedsProcessor` 0.15 → 0.03,

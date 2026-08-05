@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import itertools
 
-import esper
+import ecs
 import pytest
 
 from dataclasses import replace
@@ -163,29 +163,29 @@ def test_next_turn_for_advances_by_at_least_one_without_a_moving_clock() -> None
 
 def test_npc_outside_the_players_region_does_not_act_until_caught_up() -> None:
     game_map = GameMap(240, 60)
-    esper.create_entity(Position(10, 30), Player())
-    npc = esper.create_entity(Position(200, 30), NPC(), Needs(hunger=90.0), Diet("herbivore"))
-    esper.create_entity(Position(201, 30), Tree(wood=5))
+    ecs.create_entity(Position(10, 30), Player())
+    npc = ecs.create_entity(Position(200, 30), NPC(), Needs(hunger=90.0), Diet("herbivore"))
+    ecs.create_entity(Position(201, 30), Tree(wood=5))
 
     processor = NpcAiProcessor(game_map, wall_clock=_no_background_pump())
     processor.process("wait")
 
-    pos = esper.component_for_entity(npc, Position)
-    needs = esper.component_for_entity(npc, Needs)
+    pos = ecs.component_for_entity(npc, Position)
+    needs = ecs.component_for_entity(npc, Needs)
     assert (pos.x, pos.y) == (200, 30)  # hasn't acted -- its region never ran
     assert needs.hunger == 90.0
 
     far_region = processor.scheduler.region_at(200, 30)
     processor.scheduler.catch_up_region(far_region, processor.scheduler.region_turn[far_region] + 1)
 
-    needs = esper.component_for_entity(npc, Needs)
+    needs = ecs.component_for_entity(npc, Needs)
     assert needs.hunger < 90.0  # grazed once its own region was actually run
 
 
 def test_entering_a_new_region_replays_every_missed_turn_at_once() -> None:
-    esper.create_entity(WorldClock(turn=0, day_length=240))
+    ecs.create_entity(WorldClock(turn=0, day_length=240))
     game_map = GameMap(240, 60)
-    player = esper.create_entity(Position(10, 30), Player())
+    player = ecs.create_entity(Position(10, 30), Player())
 
     processor = NpcAiProcessor(game_map, wall_clock=_no_background_pump())
     region_a = processor.scheduler.region_at(10, 30)
@@ -201,7 +201,7 @@ def test_entering_a_new_region_replays_every_missed_turn_at_once() -> None:
 
     # The player walks into region B -- it must come up fully to date in this
     # one call, not a bounded burst.
-    player_pos = esper.component_for_entity(player, Position)
+    player_pos = ecs.component_for_entity(player, Position)
     player_pos.x, player_pos.y = 200, 30
     clock.turn = 6 * BASE_ACTION_COST
     processor.process("wait")
@@ -211,14 +211,14 @@ def test_entering_a_new_region_replays_every_missed_turn_at_once() -> None:
 
 def test_npc_near_a_region_seam_still_reaches_a_resource_just_across_it() -> None:
     game_map = GameMap(240, 60)
-    esper.create_entity(Position(10, 30), Player())  # same region as the NPC below
-    npc = esper.create_entity(Position(119, 30), NPC(), Needs(hunger=90.0), Diet("herbivore"))
-    esper.create_entity(Position(125, 30), Tree(wood=5))  # 6 tiles into the next region
+    ecs.create_entity(Position(10, 30), Player())  # same region as the NPC below
+    npc = ecs.create_entity(Position(119, 30), NPC(), Needs(hunger=90.0), Diet("herbivore"))
+    ecs.create_entity(Position(125, 30), Tree(wood=5))  # 6 tiles into the next region
 
     processor = NpcAiProcessor(game_map)
     processor.process("wait")
 
-    pos = esper.component_for_entity(npc, Position)
+    pos = ecs.component_for_entity(npc, Position)
     # Stepped toward the tree despite it sitting in a different simulation
     # region -- without the border margin this tree would be invisible and
     # the NPC would never move.
@@ -227,43 +227,43 @@ def test_npc_near_a_region_seam_still_reaches_a_resource_just_across_it() -> Non
 
 def test_live_needs_processor_ticks_only_the_players_region() -> None:
     game_map = GameMap(240, 60)
-    player = esper.create_entity(Position(10, 30), Player(), Needs(hunger=0.0, thirst=0.0))
-    near_npc = esper.create_entity(Position(20, 30), NPC(), Needs(hunger=10.0, thirst=10.0))
-    far_npc = esper.create_entity(Position(200, 30), NPC(), Needs(hunger=20.0, thirst=20.0))
+    player = ecs.create_entity(Position(10, 30), Player(), Needs(hunger=0.0, thirst=0.0))
+    near_npc = ecs.create_entity(Position(20, 30), NPC(), Needs(hunger=10.0, thirst=10.0))
+    far_npc = ecs.create_entity(Position(200, 30), NPC(), Needs(hunger=20.0, thirst=20.0))
 
     NeedsProcessor(game_map).process("wait")
 
-    assert esper.component_for_entity(player, Needs).hunger > 0.0
-    assert esper.component_for_entity(near_npc, Needs).hunger > 10.0
-    assert esper.component_for_entity(far_npc, Needs).hunger == 20.0
-    assert esper.component_for_entity(far_npc, Needs).thirst == 20.0
+    assert ecs.component_for_entity(player, Needs).hunger > 0.0
+    assert ecs.component_for_entity(near_npc, Needs).hunger > 10.0
+    assert ecs.component_for_entity(far_npc, Needs).hunger == 20.0
+    assert ecs.component_for_entity(far_npc, Needs).thirst == 20.0
 
 
 def test_default_needs_processor_keeps_whole_world_semantics() -> None:
     game_map = GameMap(240, 60)
-    esper.create_entity(Position(10, 30), Player(), Needs(hunger=0.0, thirst=0.0))
-    far_npc = esper.create_entity(Position(200, 30), NPC(), Needs(hunger=20.0, thirst=20.0))
+    ecs.create_entity(Position(10, 30), Player(), Needs(hunger=0.0, thirst=0.0))
+    far_npc = ecs.create_entity(Position(200, 30), NPC(), Needs(hunger=20.0, thirst=20.0))
 
     NeedsProcessor().process("wait")
 
     assert region_at(game_map, 200, 30) == (1, 0)
-    assert esper.component_for_entity(far_npc, Needs).hunger > 20.0
-    assert esper.component_for_entity(far_npc, Needs).thirst > 20.0
+    assert ecs.component_for_entity(far_npc, Needs).hunger > 20.0
+    assert ecs.component_for_entity(far_npc, Needs).thirst > 20.0
 
 
 def test_sleep_catches_up_every_region_not_just_the_players() -> None:
     """Mirrors what ``main._sleep_player`` does after waking: call
     ``catch_up_all`` on every region-aware processor's scheduler."""
-    esper.create_entity(WorldClock(turn=0, day_length=240))
+    ecs.create_entity(WorldClock(turn=0, day_length=240))
     game_map = GameMap(240, 60)
-    esper.create_entity(Position(10, 30), Player())
-    npc = esper.create_entity(Position(200, 30), NPC(), Needs(hunger=90.0), Diet("herbivore"))
-    esper.create_entity(Position(201, 30), Tree(wood=5))
+    ecs.create_entity(Position(10, 30), Player())
+    npc = ecs.create_entity(Position(200, 30), NPC(), Needs(hunger=90.0), Diet("herbivore"))
+    ecs.create_entity(Position(201, 30), Tree(wood=5))
 
     npc_ai = NpcAiProcessor(game_map, wall_clock=_no_background_pump())
     fish_ai = FishAiProcessor(game_map, clock=_no_background_pump())
-    esper.add_processor(npc_ai, priority=0)
-    esper.add_processor(fish_ai, priority=0)
+    ecs.add_processor(npc_ai, priority=0)
+    ecs.add_processor(fish_ai, priority=0)
 
     # The player stays in region A for ten turns; region B (the NPC's) racks
     # up ten turns of debt.
@@ -274,14 +274,14 @@ def test_sleep_catches_up_every_region_not_just_the_players() -> None:
 
     far_region = npc_ai.scheduler.region_at(200, 30)
     assert npc_ai.scheduler.region_turn[far_region] == 0
-    needs = esper.component_for_entity(npc, Needs)
+    needs = ecs.component_for_entity(npc, Needs)
     assert needs.hunger == 90.0  # not simulated yet
 
-    for processor in (esper.get_processor(NpcAiProcessor), esper.get_processor(FishAiProcessor)):
+    for processor in (ecs.get_processor(NpcAiProcessor), ecs.get_processor(FishAiProcessor)):
         processor.scheduler.catch_up_all(clock.turn)
 
     assert npc_ai.scheduler.region_turn[far_region] == 10
-    needs = esper.component_for_entity(npc, Needs)
+    needs = ecs.component_for_entity(npc, Needs)
     assert needs.hunger < 90.0  # grazed once its region was actually simulated
 
 
@@ -295,19 +295,19 @@ def test_a_replayed_turn_is_dated_to_when_it_happened_not_when_it_is_replayed() 
     background pump got, so the same seed and the same inputs give different
     results on a faster machine.
     """
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     game_map = GameMap(240, 60)
     clock = WorldClock(turn=0)
-    esper.create_entity(clock)
-    esper.create_entity(Position(2, 30), Player())
+    ecs.create_entity(clock)
+    ecs.create_entity(Position(2, 30), Player())
 
     def tiredness_after_replaying_turn(cursor: int, now_turn: int) -> float:
         """One region-turn's tiredness for a region sitting at ``cursor`` while the
         true clock reads ``now_turn``."""
-        for ent, _comps in list(esper.get_components(Needs)):
-            esper.delete_entity(ent, immediate=True)
-        npc = esper.create_entity(
+        for ent, _comps in list(ecs.get_components(Needs)):
+            ecs.delete_entity(ent, immediate=True)
+        npc = ecs.create_entity(
             Position(200, 30), NPC(),
             Needs(hunger=0.0, thirst=0.0, tiredness=0.0,
                   hunger_rate=0.0, thirst_rate=0.0, tiredness_rate=1.0),
@@ -319,7 +319,7 @@ def test_a_replayed_turn_is_dated_to_when_it_happened_not_when_it_is_replayed() 
         scheduler.region_turn[region] = cursor
         clock.turn = now_turn
         scheduler.advance_region(region)
-        return esper.component_for_entity(npc, Needs).tiredness
+        return ecs.component_for_entity(npc, Needs).tiredness
 
     night_cursor = int(0.85 * clock.day_length) // BASE_ACTION_COST   # 0.85 -> Night
     daytime_cursor = int(0.30 * clock.day_length) // BASE_ACTION_COST  # 0.30 -> Day
@@ -364,11 +364,11 @@ def test_a_step_with_no_fast_path_pins_the_region_to_one_turn() -> None:
 def test_a_region_where_nothing_can_act_jumps_the_whole_gap() -> None:
     """The point of the whole mechanism: an empty region is brought current in one
     visit instead of one visit per turn of debt."""
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     game_map = GameMap(240, 60)
-    esper.create_entity(WorldClock(turn=0))
-    esper.create_entity(Position(2, 30), Player())
+    ecs.create_entity(WorldClock(turn=0))
+    ecs.create_entity(Position(2, 30), Player())
     npc_ai = NpcAiProcessor(game_map, wall_clock=_no_background_pump())
     empty = region_at(game_map, 200, 30)
     assert not list(npc_ai._index().of_kind(empty, NPC))
@@ -382,12 +382,12 @@ def test_a_region_where_nothing_can_act_jumps_the_whole_gap() -> None:
 
 
 def test_a_region_with_someone_able_to_act_does_not_jump() -> None:
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     game_map = GameMap(240, 60)
-    esper.create_entity(WorldClock(turn=0))
-    esper.create_entity(Position(2, 30), Player())
-    esper.create_entity(Position(200, 30), NPC(), Needs(hunger=50.0, thirst=50.0))
+    ecs.create_entity(WorldClock(turn=0))
+    ecs.create_entity(Position(2, 30), Player())
+    ecs.create_entity(Position(200, 30), NPC(), Needs(hunger=50.0, thirst=50.0))
     npc_ai = NpcAiProcessor(game_map, wall_clock=_no_background_pump())
 
     assert npc_ai.scheduler.jump_limit(region_at(game_map, 200, 30)) == 1
@@ -396,12 +396,12 @@ def test_a_region_with_someone_able_to_act_does_not_jump() -> None:
 def test_a_creature_in_arrears_makes_its_region_skippable() -> None:
     """Compacted travel and hauling leave an NPC unable to act for N turns. That
     is exactly the state the scheduler can skip over."""
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     game_map = GameMap(240, 60)
-    esper.create_entity(WorldClock(turn=0))
-    esper.create_entity(Position(2, 30), Player())
-    npc = esper.create_entity(
+    ecs.create_entity(WorldClock(turn=0))
+    ecs.create_entity(Position(2, 30), Player())
+    npc = ecs.create_entity(
         Position(200, 30), NPC(), Needs(hunger=50.0, thirst=50.0),
         Actor(energy=-7 * BASE_ACTION_COST),
     )
@@ -413,7 +413,7 @@ def test_a_creature_in_arrears_makes_its_region_skippable() -> None:
     # And skipping those turns leaves it able to act on exactly the turn it would
     # have: the jump credits the same energy the turns would have granted.
     npc_ai.scheduler.advance_region_by(region, 7)
-    assert esper.component_for_entity(npc, Actor).energy == 0.0
+    assert ecs.component_for_entity(npc, Actor).energy == 0.0
     assert npc_ai.scheduler.jump_limit(region) == 1
 
 
@@ -422,13 +422,13 @@ def test_skipping_turns_ages_a_creature_exactly_as_living_them_would() -> None:
     after N single turns, or the world would change with the frame rate."""
 
     def run(jump: bool, turns: int = 60) -> tuple[float, float, float]:
-        esper.clear_database()
+        ecs.clear_database()
         spatial.detach()
         game_map = GameMap(240, 60)
-        esper.create_entity(WorldClock(turn=0))
-        esper.create_entity(Position(2, 30), Player())
+        ecs.create_entity(WorldClock(turn=0))
+        ecs.create_entity(Position(2, 30), Player())
         # A creature with no AI attached, so only its needs move.
-        esper.create_entity(
+        ecs.create_entity(
             Position(200, 30),
             Needs(hunger=0.0, thirst=0.0, tiredness=0.0,
                   hunger_rate=0.3, thirst_rate=0.2, tiredness_rate=0.5),
@@ -442,7 +442,7 @@ def test_skipping_turns_ages_a_creature_exactly_as_living_them_would() -> None:
         else:
             for _ in range(turns):
                 scheduler.advance_region(region)
-        needs = next(n for _e, (n,) in esper.get_components(Needs))
+        needs = next(n for _e, (n,) in ecs.get_components(Needs))
         return (needs.hunger, needs.thirst, needs.tiredness)
 
     jumped = run(jump=True)

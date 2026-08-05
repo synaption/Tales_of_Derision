@@ -10,8 +10,8 @@ python3 rogue_juice.py                      # the bench, on the CPU
 python3 rogue_juice_gl.py                   # the same bench, on the card
 python3 rogue_juice.py --headless a.png     # one scripted swing, no window
 python3 rogue_juice_gl.py --headless b.png  # the same, through the shaders
-python3 juicetest.py                        # 143 headless tests
-python3 gltest.py                           # 31 more, on a windowless context
+python3 juicetest.py                        # 148 headless tests
+python3 gltest.py                           # 59 more, on a windowless context
 python3 -m pytest juicetest.py gltest.py -q # all of them
 ```
 
@@ -28,7 +28,8 @@ about hit-stop is nothing like turning it off and hitting a dummy.
 | `tiles.py` | slicing and tinting the sheet | yes | no |
 | `rogue_juice.py` | the sim, the panel, software compositing | yes | no |
 | `glfx.py` | shaders, batching, post chain, normals | only to upload | yes |
-| `rogue_juice_gl.py` | the same bench, drawn on the card, plus corpse physics | yes | yes |
+| `juicesettings.py` | the settings file, and the merge rules | **no** | **no** |
+| `rogue_juice_gl.py` | the same bench on the card, plus physics, menu, options | yes | yes |
 
 That split is the point rather than tidiness. An effect you cannot test without
 opening a window is an effect you will never tune, so the maths runs, and is
@@ -115,14 +116,14 @@ other and stack into a seizure. Rumble is driven from that same number, so the
 motors and the picture can never disagree about how hard something hit.
 
 **world** — particles, damage numbers, shockwaves, floor ripple, blood decals,
-ambient sway.
+ambient sway, and how many enemies a reset puts on the floor.
 
 Decals are the only thing here that is *evidence* rather than an event. The
 ambient sway is given to tufts and torches rather than to the floor tiles,
 because the arena is baked into one surface and wobbling it would undo that.
 
-**screen** — screen flash, vignette, RGB split, bloom, lighting, sprite
-outlines, heat haze, pixel snapping.
+**screen** — screen flash, vignette, RGB split, bloom, lighting with cast
+shadows, lit sprites, outlines, heat haze, pixel snapping.
 
 Pygame has no shaders, so this group is the software cousins. Bloom is a
 downscale, a threshold, an upscale and an add -- the downscale *is* the blur.
@@ -130,6 +131,49 @@ Lighting is a half-resolution light map, multiplied *and* added: a multiply can
 only take brightness away, so on a floor this dark a torch would light nothing.
 Heat haze is rows re-blitted at sine offsets, which is the same trick the slime
 uses, pointed at the background.
+
+The light map is not flat. Four sliders shape it, and they are the same four
+numbers the GL bench uses, doing the same arithmetic:
+
+| slider | what it decides |
+|---|---|
+| `light height` | how far the lights float above the floor. Low is a hot spot a tile wide; high is a lamp on the ceiling. Shape, not reach. |
+| `light / dark contrast` | ambient down and direct light up together. Ten is a torch-only dungeon; below one the shadows fade out with everything else. |
+| `wall shadow amount` | masonry as a real occluder. |
+| `NPC shadow amount` | the soft shadows bodies throw. |
+
+What the card answers per fragment -- march towards the light, see what you
+crossed -- is answered here per *occluder* instead. A wall's shadow is the quad
+between its two silhouette corners and those corners projected away from the
+light, which is one polygon fill for a shape a ray march pays four hundred
+thousand samples for; a body's is three nested trapezoids, because a smudge two
+tiles long reads as soft at three steps and a real blur would cost more than
+every light in the room.
+
+The bodies go into a layer of their own and are *multiplied* into the walls'
+rather than drawn on top of them. This is the one place the software version
+had to learn something the shader gets for nothing: `draw.polygon` replaces the
+pixels it covers, so a monster standing between you and a pillar used to stamp
+its 55%-dark trapezoid across the pillar's fully-dark wedge and cut a lighter,
+body-shaped hole through it. Visibility terms multiply -- the shader says
+`wall_shadow * npc_shadow` -- and within the body layer the three penumbra
+steps are drawn widest-first across every caster before the next step starts,
+so one body's soft edge can never land on another's core.
+
+Both layers are drawn in the light's *own* space, so the
+torches -- which never move -- are built once and cached for the session and
+only the light the player carries is rebuilt as they walk.
+
+Wall tiles are painted back in afterwards: a wall the light can see is lit
+whatever is behind it, and without that rule the far side of a pillar goes to a
+flat silhouette and reads as a hole in the room.
+
+**lit sprites** is the software reading of the GL bench's normal-mapped
+creatures. There are no per-texel normals here, but what those normals actually
+produce at 32 pixels is a warm band down the side facing the light and a cool
+one opposite, so that is what this draws: two blits a body, both masked by the
+sprite's own alpha, both *after* the light map has been multiplied through --
+in the other order the highlight would only be dimmed again.
 
 Pixel mode has three answers and no free one:
 
@@ -175,8 +219,8 @@ Tab    A/B the whole lot        F1 / F2  all on / all off
 F3     sliders back to defaults
 [ ]    move easing              - =  master intensity
 p      pixel mode (software)    m    music
-b      drop a bomb (GL only)
-esc    quit
+b      throw a bomb (GL only)
+esc    quit (software) / menu, options and save (GL)
 ```
 
 ## Notes
@@ -197,7 +241,7 @@ esc    quit
 
 `rogue_juice_gl.py` is the identical bench with the presentation moved to
 ModernGL. Everything above still applies -- same sim, same panel, same sliders,
-same sounds -- and four things stop being compromises.
+same sounds -- and a handful of things stop being compromises.
 
 **The slime deforms continuously.** `Jelly` is drawn on the CPU as ten bands
 with a surface-tension clamp holding them together, and that entire design
@@ -209,9 +253,11 @@ same springs drive it.
 **Creatures are lit rather than tinted.** Each sprite carries a normal map
 generated from its own silhouette -- a blurred alpha mask's gradient *is* the
 normal of an inflated shape -- so a torch rakes across a body and a hit flash
-shades the room. No new art. The software bench multiplies a flat frame by a
-light map, which is why it needs a compensating additive pass; here there is
-nothing to compensate for.
+shades the room. No new art, and it is per texel: the light crosses a body
+continuously and picks out every bump in the silhouette on the way. The
+software bench answers the same question with two gradient-masked blits a body
+and a light map that has to be added back as well as multiplied, because a
+multiply on a floor this dark can only ever take brightness away.
 
 **Pixel art is crisp *and* moves smoothly.** The three-way `pixel mode` choice
 is a `blit` artefact, not a property of pixel art. A textured quad sampled flat
@@ -248,7 +294,7 @@ the moment `leave_corpse` drops one, a body is a circle with a velocity:
   `world.fx.shockwaves` rather than the code that raises them, so every
   explosion in the bench throws corpses without knowing corpses can be thrown,
   and the ring on screen and the force in the physics are the same event by
-  construction. **B** drops a bomb;
+  construction. **B** throws one;
 * bodies **collide with each other** and settle into a heap, and a body that
   has stopped rolls the last few degrees flat -- a corpse frozen at twenty
   degrees reads as one still falling.
@@ -263,6 +309,53 @@ straight through a wall without ever overlapping it. Nine bodies cost 0.02ms.
 `RagdollField` imports no GL, needs no frame and is stepped by the loop rather
 than by `render`, so `gltest.py` drives all of it -- adoption, walls, shoving,
 blasts, settling, determinism -- on a machine that cannot open a window.
+
+**B throws a bomb.** It leaves the hand on an arc with a shadow under it,
+bounces off walls through the corpses' own wall pass -- `_walls` never asks what
+shape it is holding, so there is exactly one place a circle can be wrong about
+masonry -- rolls to a stop, and goes off on a fuse wherever it ended up. Thrown
+rather than dropped because *where* an explosion happens is the interesting
+decision, and a bomb at your feet takes that decision away. Two sliders, `bomb
+throw speed` and `bomb fuse`; a short enough fuse goes off in the air, which is
+a different weapon.
+
+**A menu, on escape.** Resume, options, *save current settings as defaults*, and
+quit. It pauses the sim -- a settings screen with a fight going on behind it is
+one you cannot use -- and swallows every key while it is up, because a modal
+that lets movement through is how you walk into a wall while picking a
+resolution. It is drawn by the same software renderer that draws the panel,
+into the same surface, and so costs nothing extra and shares its fonts.
+
+**Display options, and a settings file.** Resolution, fullscreen and a frame
+cap, all live; vsync, which is a property of the window and so honestly labelled
+"on restart". Resizing goes through SDL rather than `pygame.display.set_mode`,
+which would build a new window and take the GL context with it -- SDL simply
+resizes the one that exists, so only the size-dependent buffers are rebuilt and
+every shader, texture and atlas survives. The window is also resizable by drag.
+
+The file is `juice_settings.json`, beside the checkout and gitignored, and the
+rule it is built on is that **the file and the build never have to agree**:
+
+* a key the file has and the build does not know is kept and written back, so
+  opening an old build and saving does not delete a newer one's settings;
+* a key the build has and the file does not keeps its code default, so adding a
+  slider tomorrow needs no migration and no version bump;
+* a value that is present but wrong -- a string where a number goes, a slider
+  past its own maximum, a choice whose options have changed -- is ignored on its
+  own, and everything around it still loads. A stray comma must not be a bench
+  that will not start.
+
+`juicesettings.py` holds all of that and imports neither pygame nor moderngl, so
+the merge rules are tested as what they are: a dictionary and some arithmetic.
+Saving also makes the saved values what F3 returns to, since "save as my
+defaults" that F3 then undoes is not a save.
+
+**An enemy count slider** (`world` group). Up to nine it is the hand-placed
+roster, unchanged and in order; past that the cast repeats onto free tiles
+picked by the same seeded hash everything else here uses, so forty bodies in the
+room is one drag and still the same forty every run. It takes effect on the next
+reset, because respawning the room under a fight in progress is not a thing a
+slider should do.
 
 The panel is the deliberate exception: it is drawn by the *software* renderer
 into an offscreen surface and uploaded as a texture. Text layout is the one
@@ -302,8 +395,15 @@ GL is a D3D12/WSL context on an RTX 4080.
 The second row is the interesting one. On the CPU, switching everything on
 costs 60% more frame; on the card it costs nothing measurable, because the
 entire `screen` group is one fragment shader either way. Software lighting is
-~3.8ms and the RGB split is most of a frame on its own; in GL neither is worth
+~3.7ms and the RGB split is most of a frame on its own; in GL neither is worth
 a toggle except to see what it does.
+
+The shadows are the cheap part of that 3.7ms, not the expensive one: wall
+shadows, body shadows and lit sprites together add under half a millisecond,
+because the occluder count is a few dozen polygons and the torches' masks are
+cached across the whole session. What
+costs is what always cost -- the two full-frame blends and the upscale of the
+map itself, which is why it is built at half resolution.
 
 What is left in the GL frame is mostly *not* graphics: the sim is 0.25ms and a
 panel redraw is about 1.2ms of pygame text layout, which is why the panel is

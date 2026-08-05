@@ -232,12 +232,15 @@ def fake_ollama(models: list[str], content: str = "Hello!", token_delay: float =
 
 def fake_letta(reply: str = "Good to see you again!", version: str = "0.16.8",
                handles: list[str] | None = None,
-               embeddings: list[str] | None = None):
+               embeddings: list[str] | None = None, remembers: bool = True):
     """A stand-in Letta: agents that persist for the life of the server.
 
     Mirrors the v1 routes the backend actually calls -- health, model listing,
     find-by-name, create, streamed messages, core-memory blocks, delete -- so
     the agent-per-villager plumbing is exercised without installing Letta.
+
+    ``remembers=False`` plays a model like qwen2.5 that never calls a memory
+    tool: the conversation is still kept, the blocks never change.
     """
     agents: dict[str, dict] = {}          # id -> agent record, i.e. Letta's database
     seen: list[dict] = []                 # every message body that arrived
@@ -272,6 +275,10 @@ def fake_letta(reply: str = "Good to see you again!", version: str = "0.16.8",
                 agent = agents.get(self._agent_id(), {})
                 label = path.rsplit("/", 1)[1]
                 return self._send(agent.get("blocks", {}).get(label, {"label": label, "value": ""}))
+            if "/messages" in path:
+                agent = agents.get(self._agent_id(), {})
+                return self._send([{"message_type": "user_message", "content": line}
+                                   for line in agent.get("heard", [])])
             if path.startswith("/v1/agents"):
                 query = path.split("?", 1)[1] if "?" in path else ""
                 params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
@@ -298,9 +305,13 @@ def fake_letta(reply: str = "Good to see you again!", version: str = "0.16.8",
                 if agent_id not in agents:
                     return self._send({"detail": "no such agent"}, 404)
                 seen.append({"agent": agents[agent_id]["name"], "body": body})
-                # The agent learns something, the way a real one edits core memory.
-                human = agents[agent_id]["blocks"].setdefault("human", {"label": "human", "value": ""})
-                human["value"] = f"{human['value']} They said: {body['messages'][-1]['content']}".strip()
+                agents[agent_id].setdefault("heard", []).append(body["messages"][-1]["content"])
+                if remembers:
+                    # The agent learns something, the way a tool-calling model does.
+                    human = agents[agent_id]["blocks"].setdefault(
+                        "human", {"label": "human", "value": ""})
+                    human["value"] = (f"{human['value']} They said: "
+                                      f"{body['messages'][-1]['content']}").strip()
                 if not self.path.endswith("/stream"):
                     return self._send({"messages": [
                         {"message_type": "reasoning_message", "content": "thinking"},
@@ -436,6 +447,27 @@ def test_letta_memory_reaches_the_panel(game: fruitbrains.Game) -> None:
         game.end_chat()
         game.chat.shutdown()
         assert letta.agents, "the agent vanished"
+
+
+def test_a_quiet_model_still_shows_it_remembers(game: fruitbrains.Game) -> None:
+    """qwen2.5 never writes a memory block, but the past chats are still there.
+
+    The panel line must say something true in that case -- reading "nothing
+    about you yet" forever makes a working feature look broken.
+    """
+    with letta_town(remembers=False) as letta:
+        service = ChatService()
+        for said in ("hello there", "lovely morning", "see you soon"):
+            service.ask("Melon", "happy", "Bob", said)
+            _await_reply(service)
+        for _ in range(400):
+            if service.memory("Melon"):
+                break
+            time.sleep(0.005)
+        assert service.memory("Melon") == "3 things you have said before", service.memory("Melon")
+        blocks = list(letta.agents.values())[0]["blocks"]
+        assert "hello there" not in blocks["human"]["value"], "the block was edited after all"
+        service.shutdown()
 
 
 def test_a_villager_never_speaks_a_tool_call(game: fruitbrains.Game) -> None:
@@ -1099,7 +1131,8 @@ def main() -> int:
               test_model_is_sized_to_the_machine, test_reply_tidying,
               test_letta_gives_each_villager_one_agent,
               test_letta_is_sent_the_line_not_the_history,
-              test_letta_memory_reaches_the_panel, test_a_villager_never_speaks_a_tool_call,
+              test_letta_memory_reaches_the_panel, test_a_quiet_model_still_shows_it_remembers,
+              test_a_villager_never_speaks_a_tool_call,
               test_letta_errors_are_not_silence, test_forget_deletes_only_our_agents,
               test_letta_handles_are_resolved_to_full_tags,
               test_letta_needs_a_model_it_can_reach,

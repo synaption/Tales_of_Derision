@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import itertools
 
-import esper
+import ecs
 import pytest
 
 from components import (
@@ -40,14 +40,14 @@ def _no_background_pump() -> Callable[[], float]:
 def _open_world(width: int = 360, height: int = 60) -> GameMap:
     """Open floor across more than one region, with the player parked far to the
     west so the eastern end of the map is unwatched."""
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     game_map = GameMap(width, height)
     for y in range(1, height - 1):
         for x in range(1, width - 1):
             game_map.tiles[y][x] = game_map.FLOOR
-    esper.create_entity(WorldClock(turn=0))
-    esper.create_entity(Position(2, 30), Player())
+    ecs.create_entity(WorldClock(turn=0))
+    ecs.create_entity(Position(2, 30), Player())
     return game_map
 
 
@@ -59,7 +59,7 @@ def _processor(game_map: GameMap) -> NpcAiProcessor:
 
 def _deer(x: int, y: int, hunger: float = 90.0) -> tuple[int, Position]:
     pos = Position(x, y)
-    ent = esper.create_entity(
+    ent = ecs.create_entity(
         pos, NPC(), Deer(), Diet("herbivore"), Needs(hunger=hunger, thirst=10.0)
     )
     return ent, pos
@@ -121,14 +121,14 @@ def test_unreachable_sources_simply_are_not_in_the_field() -> None:
 def test_a_whole_crowd_shares_one_flood() -> None:
     game_map = _open_world()
     for x in range(40, 60, 2):
-        esper.create_entity(Position(x, 40), Tree(wood=5), BlocksMovement())
+        ecs.create_entity(Position(x, 40), Tree(wood=5), BlocksMovement())
     herd = [_deer(x, 20) for x in range(20, 32, 2)]
     proc = _processor(game_map)
     region = region_at(game_map, 20, 20)
     floods, restore = _count_floods(game_map)
     try:
         for ent, pos in herd:
-            proc._graze(ent, pos, esper.component_for_entity(ent, Needs), _trees(), {}, region)
+            proc._graze(ent, pos, ecs.component_for_entity(ent, Needs), _trees(), {}, region)
     finally:
         restore()
 
@@ -139,9 +139,9 @@ def test_a_whole_crowd_shares_one_flood() -> None:
 def test_the_flood_is_reused_across_turns() -> None:
     game_map = _open_world()
     for x in (40, 44, 48):
-        esper.create_entity(Position(x, 40), Tree(wood=99), BlocksMovement())
+        ecs.create_entity(Position(x, 40), Tree(wood=99), BlocksMovement())
     ent, pos = _deer(20, 20)
-    needs = esper.component_for_entity(ent, Needs)
+    needs = ecs.component_for_entity(ent, Needs)
     proc = _processor(game_map)
     region = region_at(game_map, 20, 20)
     floods, restore = _count_floods(game_map)
@@ -156,7 +156,7 @@ def test_the_flood_is_reused_across_turns() -> None:
 
 def _trees() -> list[tuple[tuple[int, int], int]]:
     return [
-        ((p.x, p.y), ent) for ent, (p, _t) in esper.get_components(Position, Tree)
+        ((p.x, p.y), ent) for ent, (p, _t) in ecs.get_components(Position, Tree)
     ]
 
 
@@ -173,23 +173,23 @@ def test_the_nearest_source_is_the_nearest_to_walk_to() -> None:
     for x in range(30, 46):
         game_map.tiles[10][x] = game_map.WALL
         game_map.tiles[20][x] = game_map.WALL
-    esper.create_entity(Position(32, 15), Tree(wood=5), BlocksMovement())  # 4 tiles away
-    esper.create_entity(Position(20, 30), Tree(wood=5), BlocksMovement())  # 15 tiles away
+    ecs.create_entity(Position(32, 15), Tree(wood=5), BlocksMovement())  # 4 tiles away
+    ecs.create_entity(Position(20, 30), Tree(wood=5), BlocksMovement())  # 15 tiles away
     ent, pos = _deer(28, 15)
     proc = _processor(game_map)
 
-    proc._graze(ent, pos, esper.component_for_entity(ent, Needs), _trees(), {})
+    proc._graze(ent, pos, ecs.component_for_entity(ent, Needs), _trees(), {})
 
     assert pos.x <= 28, "it set off for the open tree, not the one behind the wall"
 
 
 def test_an_equal_distance_tie_prefers_the_straight_step() -> None:
     game_map = _open_world(60, 30)
-    esper.create_entity(Position(40, 15), Tree(wood=5), BlocksMovement())
+    ecs.create_entity(Position(40, 15), Tree(wood=5), BlocksMovement())
     ent, pos = _deer(20, 15)
     proc = _processor(game_map)
 
-    proc._graze(ent, pos, esper.component_for_entity(ent, Needs), _trees(), {})
+    proc._graze(ent, pos, ecs.component_for_entity(ent, Needs), _trees(), {})
 
     assert (pos.x, pos.y) == (21, 15), "straight east, not an equal-cost diagonal"
 
@@ -201,9 +201,9 @@ def test_a_passing_creature_does_not_cost_a_re_flood() -> None:
     """The per-kind index version is the whole reason goal maps are affordable:
     the map of where the trees are must not die because a deer crossed a seam."""
     game_map = _open_world()
-    esper.create_entity(Position(40, 40), Tree(wood=99), BlocksMovement())
+    ecs.create_entity(Position(40, 40), Tree(wood=99), BlocksMovement())
     ent, pos = _deer(20, 20)
-    needs = esper.component_for_entity(ent, Needs)
+    needs = ecs.component_for_entity(ent, Needs)
     wanderer, wander_pos = _deer(118, 20)
     proc = _processor(game_map)
     region = region_at(game_map, 20, 20)
@@ -223,18 +223,18 @@ def test_a_passing_creature_does_not_cost_a_re_flood() -> None:
 
 def test_felling_a_tree_does_rebuild_the_map() -> None:
     game_map = _open_world()
-    doomed = esper.create_entity(Position(40, 40), Tree(wood=99), BlocksMovement())
+    doomed = ecs.create_entity(Position(40, 40), Tree(wood=99), BlocksMovement())
     for x in (44, 48):
-        esper.create_entity(Position(x, 40), Tree(wood=99), BlocksMovement())
+        ecs.create_entity(Position(x, 40), Tree(wood=99), BlocksMovement())
     ent, pos = _deer(20, 20)
-    needs = esper.component_for_entity(ent, Needs)
+    needs = ecs.component_for_entity(ent, Needs)
     proc = _processor(game_map)
     region = region_at(game_map, 20, 20)
     proc._graze(ent, pos, needs, _trees(), {}, region)
 
     floods, restore = _count_floods(game_map)
     try:
-        esper.delete_entity(doomed, immediate=True)
+        ecs.delete_entity(doomed, immediate=True)
         proc._graze(ent, pos, needs, _trees(), {}, region)
     finally:
         restore()
@@ -249,14 +249,14 @@ def test_an_unwatched_creature_does_not_build_a_goal_map() -> None:
     """Out in the lagging world a flood is bought over and over for a handful of
     uses, so those creatures keep the cheap scan-and-walk instead."""
     game_map = _open_world()
-    esper.create_entity(Position(300, 40), Tree(wood=99), BlocksMovement())
+    ecs.create_entity(Position(300, 40), Tree(wood=99), BlocksMovement())
     ent, pos = _deer(280, 20)
     proc = _processor(game_map)
     assert proc._compactable((280, 20)), "the test creature must be out of sight"
 
     floods, restore = _count_floods(game_map)
     try:
-        proc._graze(ent, pos, esper.component_for_entity(ent, Needs), _trees(), {})
+        proc._graze(ent, pos, ecs.component_for_entity(ent, Needs), _trees(), {})
     finally:
         restore()
 
@@ -278,15 +278,15 @@ def test_both_paths_agree_on_which_tree_a_creature_picks() -> None:
 
     def run(player_at: tuple[int, int]) -> tuple[int, int]:
         game_map = _open_world()
-        for _e, (p, _pl) in esper.get_components(Position, Player):
+        for _e, (p, _pl) in ecs.get_components(Position, Player):
             p.x, p.y = player_at
         for tx, ty in trees:
-            esper.create_entity(Position(tx, ty), Tree(wood=99), BlocksMovement())
+            ecs.create_entity(Position(tx, ty), Tree(wood=99), BlocksMovement())
         ent, pos = _deer(20, 20)
         proc = NpcAiProcessor(game_map, wall_clock=_no_background_pump())
         proc._player_xy = player_at
         for _ in range(6):
-            proc._graze(ent, pos, esper.component_for_entity(ent, Needs), _trees(), {})
+            proc._graze(ent, pos, ecs.component_for_entity(ent, Needs), _trees(), {})
         return (pos.x, pos.y)
 
     watched = run((20, 20))

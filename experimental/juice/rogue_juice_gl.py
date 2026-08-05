@@ -28,13 +28,21 @@ What is different to look at, in the order it is worth looking at it:
   anything that walks through them, and cartwheel away from an explosion.
   `RagdollField` is the only thing here that is not a renderer, and it is here
   because a corpse takes no turn and blocks no tile, so nothing is left that
-  needs it on a grid at all. Press **B** to drop a bomb;
+  needs it on a grid at all. Press **B** to throw a bomb -- which arcs, bounces
+  off walls through the corpses' own wall pass, and goes off on a fuse;
 * **one draw call** for every sprite, spark, shadow, decal, ring, arc and cut.
 
 The panel is drawn by the software renderer into an offscreen surface and
 uploaded as a texture, which keeps every slider, blurb and scroll behaviour
 identical and costs one upload a frame. Text layout is the one thing pygame
-does better than a weekend of shader work.
+does better than a weekend of shader work, and the escape menu is drawn into
+the same surface for the same reason.
+
+**Escape** opens that menu: resume, display options, save the current settings
+as your defaults, quit. The window's size, fullscreen and frame cap are live;
+the settings land in `juice_settings.json` next to the checkout, under merge
+rules (`juicesettings.py`) that let the file and the build disagree in either
+direction, because this bench grows a slider most times anybody opens it.
 
     python3 rogue_juice_gl.py
     python3 rogue_juice_gl.py --headless out.png
@@ -60,6 +68,7 @@ import pygame
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import glfx  # noqa: E402
+import juicesettings  # noqa: E402
 import rogue_juice as rj  # noqa: E402
 import tiles  # noqa: E402
 from juicefx import ambient_offset, clamp, hash01, shadow_of  # noqa: E402
@@ -118,7 +127,7 @@ GL_TOGGLES = [
      "nothing is left that needs it on a tile -- it becomes a circle with a "
      "velocity that slides, bounces off walls, is shoved aside in real time by "
      "anything that walks through it, and goes end over end when something "
-     "detonates next to it. Press B to drop a bomb and watch. Off, bodies lie "
+     "detonates next to it. Press B to throw a bomb and watch. Off, bodies lie "
      "exactly where they fell, which is what `leave_corpse` does on its own."),
 ]
 
@@ -186,6 +195,30 @@ GL_PARAMS = [
      "How much of a body's sideways speed turns into rotation on a bounce. "
      "Zero slides them around flat; high numbers make everything cartwheel.",
      "{:.2f}"),
+    ("bomb_throw", "bomb throw speed", "attack", 460.0, 60.0, 1400.0,
+     "How hard B lobs a bomb, in pixels a second. It leaves the hand on an "
+     "arc, bounces off walls, rolls, and goes off where it stops -- so this "
+     "slider is really 'how far away can you put an explosion'.", "{:.0f}"),
+    ("bomb_fuse", "bomb fuse", "attack", 0.95, 0.05, 4.0,
+     "Seconds between the throw and the bang. Short enough and it goes off in "
+     "the air, which is a different weapon; long enough and you have time to "
+     "walk into your own blast.", "{:.2f}s"),
+]
+
+#: The GL bench's own key list, shown in the panel footer. The software
+#: bench's `HELP_LINES` is left alone: `p` does nothing here, `esc` opens a
+#: menu instead of quitting, and `b` throws a bomb, none of which is true over
+#: there. `rj.Renderer.help_lines` is the seam.
+GL_HELP_LINES = [
+    "click a row to toggle   drag a slider",
+    "right-click a slider to reset it",
+    "wheel scrolls this panel",
+    "",
+    "wasd / arrows  move, walk into a thing",
+    "space swing   x get hit   K kill   r reset",
+    "b throw a bomb   Tab A/B   F1/F2 on/off",
+    "F3 defaults   [ ] easing   m music   - = amount",
+    "esc  menu, options, save and quit",
 ]
 
 #: Software-only controls that the hardware makes meaningless.
@@ -218,6 +251,308 @@ def gl_juice() -> rj.Juice:
     juice.params["light_radius"].value = 7.5
     juice.params["light_radius"].default = 7.5
     return juice
+
+
+# ---------------------------------------------------------------------------
+# Display settings and the escape menu
+# ---------------------------------------------------------------------------
+#
+# Two things that only exist once a bench is something you *open* rather than
+# something you run: a window whose size is your decision, and somewhere to
+# say so. Both are deliberately outside the panel -- the panel is the subject
+# of the experiment and every row on it is an effect being argued about, while
+# a resolution is a fact about your monitor.
+
+
+#: Offered in the options list, smallest first. The desktop's own size is
+#: appended at runtime if it is not already here, because that is the one
+#: everybody actually wants and it is the one that cannot be hard-coded.
+RESOLUTIONS = [
+    (1180, 600),      # the original: an 800x600 view and a 380px panel
+    (1280, 720),
+    (1440, 810),
+    (1600, 900),
+    (1920, 1080),
+]
+
+#: 0 means "as fast as it will go", which is the honest way to read the ms
+#: counter -- a capped frame time tells you what the cap is, not what the
+#: frame costs.
+FRAME_CAPS = [30, 60, 120, 144, 240, 0]
+
+#: The view cannot get so small that the panel is the window. Below this the
+#: camera clamp starts fighting the arena and the HUD runs off the bottom.
+MIN_VIEW = (480, 360)
+
+
+@dataclass
+class Display:
+    """Everything about the window, in one place that can be saved.
+
+    Separate from `Juice` on purpose. A juice parameter is a claim about what
+    looks good and belongs in the file the bench argues about; a resolution is
+    a fact about the machine, and mixing the two means copying a settings file
+    to another computer breaks the window.
+    """
+
+    width: int = rj.WIN_W
+    height: int = rj.WIN_H
+    fullscreen: bool = False
+    frame_cap: int = FPS
+    #: Applied when the window is created, so a change here is a note for the
+    #: next launch. Honest labelling in the menu beats pretending otherwise.
+    vsync: bool = True
+
+    @property
+    def size(self):
+        return self.width, self.height
+
+    def clamped(self):
+        """The size actually usable, with the panel and the minimum view."""
+        w = max(MIN_VIEW[0] + rj.PANEL_W, int(self.width))
+        h = max(MIN_VIEW[1], int(self.height))
+        return w, h
+
+    def load(self, settings: juicesettings.Settings):
+        self.width = settings.get("display", "width", self.width)
+        self.height = settings.get("display", "height", self.height)
+        self.fullscreen = settings.get("display", "fullscreen", self.fullscreen)
+        self.frame_cap = settings.get("display", "frame_cap", self.frame_cap)
+        self.vsync = settings.get("display", "vsync", self.vsync)
+        return self
+
+    def store(self, settings: juicesettings.Settings):
+        settings.set("display", "width", int(self.width))
+        settings.set("display", "height", int(self.height))
+        settings.set("display", "fullscreen", bool(self.fullscreen))
+        settings.set("display", "frame_cap", int(self.frame_cap))
+        settings.set("display", "vsync", bool(self.vsync))
+
+
+def _set_layout(width: int, height: int):
+    """Point both modules' layout globals at a new window size.
+
+    The only mutable global state the bench has, and it is here rather than
+    spread over two files because getting one of the four out of step is a
+    frame that draws the panel over the arena. `rogue_juice.py` computes its
+    own geometry from `VIEW_W`/`WIN_W` at call time, and so does everything in
+    this file, so this is the whole of a resolution change.
+    """
+    global VIEW_W, VIEW_H, WIN_W, WIN_H
+    rj.WIN_W, rj.WIN_H = int(width), int(height)
+    rj.VIEW_W, rj.VIEW_H = int(width) - rj.PANEL_W, int(height)
+    VIEW_W, VIEW_H = rj.VIEW_W, rj.VIEW_H
+    WIN_W, WIN_H = rj.WIN_W, rj.WIN_H
+
+
+def apply_window(display: Display) -> bool:
+    """Resize (or fullscreen) the real window, keeping the GL context alive.
+
+    `pygame.display.set_mode` would build a new window and take the context
+    with it, which means rebuilding every texture, shader and buffer in the
+    bench. SDL can simply resize the window it already has, and moderngl never
+    notices -- so this goes through `pygame._sdl2` and falls back to reporting
+    failure rather than doing anything drastic.
+    """
+    try:
+        from pygame._sdl2.video import Window
+        window = Window.from_display_module()
+        if display.fullscreen:
+            window.set_fullscreen(desktop=True)
+        else:
+            window.set_windowed()
+            window.size = display.clamped()
+        return True
+    except Exception:                                # pragma: no cover
+        return False
+
+
+def resolution_choices():
+    """The offered sizes, with the desktop's own folded in and duplicates gone."""
+    sizes = list(RESOLUTIONS)
+    try:
+        for size in pygame.display.get_desktop_sizes():
+            if tuple(size) not in sizes:
+                sizes.append(tuple(size))
+    except Exception:                                # pragma: no cover
+        pass                                         # no display module yet
+    return sorted(set(sizes))
+
+
+class Menu:
+    """The escape menu: resume, options, save, quit.
+
+    Drawn with pygame into the same offscreen surface the panel uses and
+    uploaded as part of the same texture, which is why it costs nothing extra
+    and why every font here is the panel's font. A menu drawn in GL would be a
+    text layout engine, and the panel already settled that argument.
+
+    Holds no state that is not the menu's own: which page is showing, which row
+    is under the cursor, and nothing else. What a row *does* is the bench's
+    business -- `activate` returns a string and the caller decides.
+    """
+
+    WIDTH = 380
+    ROW_H = 30
+
+    #: (key, label) for the plain pages. Value rows are built per frame,
+    #: because their right-hand side is a live reading of `Display`.
+    MAIN = [("resume", "Resume"),
+            ("options", "Options"),
+            ("save", "Save current settings as defaults"),
+            ("quit", "Quit")]
+
+    def __init__(self):
+        self.open = False
+        self.page = "main"
+        self.index = 0
+        #: (key, rect) for everything drawn this frame, registered from the
+        #: same loop that draws it -- so a row can never be clickable where it
+        #: is not shown, which is the bug every hand-rolled menu has.
+        self.hits: list = []
+        self.status = ""
+        self.status_age = 0.0
+
+    # -- state --------------------------------------------------------------
+    def show(self, page: str = "main"):
+        self.open = True
+        self.page = page
+        self.index = 0
+
+    def close(self):
+        self.open = False
+        self.page = "main"
+
+    def back(self) -> bool:
+        """Escape: out of a sub-page, or out of the menu. True if still open."""
+        if self.page != "main":
+            self.page = "main"
+            self.index = 1                            # back onto "Options"
+            return True
+        self.close()
+        return False
+
+    def say(self, text: str):
+        self.status = text
+        self.status_age = 0.0
+
+    def rows(self, display: Display):
+        """The current page as (key, label, value) triples.
+
+        Built fresh every frame rather than cached, so a value row cannot show
+        a stale reading -- which is the only kind of bug an options screen
+        really has.
+        """
+        if self.page == "main":
+            return [(key, label, None) for key, label in self.MAIN]
+        w, h = display.clamped()
+        cap = display.frame_cap
+        return [
+            ("resolution", "Resolution", f"{w} x {h}"),
+            ("fullscreen", "Fullscreen", "on" if display.fullscreen else "off"),
+            ("frame_cap", "Frame cap", f"{cap} fps" if cap else "uncapped"),
+            ("vsync", "VSync", ("on" if display.vsync else "off") + "  (on restart)"),
+            ("back", "Back", None),
+        ]
+
+    # -- input --------------------------------------------------------------
+    def key(self, event, display: Display):
+        """One key press. Returns an action for the bench, or None.
+
+        Arrow keys move and adjust, enter activates, escape steps back. The
+        left/right split matters: on a value row they cycle the value and on an
+        action row they do nothing, so there is never a keypress that both
+        changes a setting and leaves the menu.
+        """
+        rows = self.rows(display)
+        if event.key in (pygame.K_ESCAPE,):
+            return "back"
+        if event.key in (pygame.K_UP, pygame.K_w, pygame.K_k):
+            self.index = (self.index - 1) % len(rows)
+            return None
+        if event.key in (pygame.K_DOWN, pygame.K_s, pygame.K_j):
+            self.index = (self.index + 1) % len(rows)
+            return None
+        key = rows[self.index][0]
+        if event.key in (pygame.K_LEFT, pygame.K_a, pygame.K_h):
+            return f"{key}:-1" if rows[self.index][2] is not None else None
+        if event.key in (pygame.K_RIGHT, pygame.K_d, pygame.K_l):
+            return f"{key}:+1" if rows[self.index][2] is not None else None
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+            return f"{key}:+1" if rows[self.index][2] is not None else key
+        return None
+
+    def point(self, pos, display: Display):
+        """Hover. Returns True if the cursor is over the card at all."""
+        for i, (_key, rect) in enumerate(self.hits):
+            if rect.collidepoint(pos):
+                self.index = i
+                return True
+        return False
+
+    def click(self, pos, button: int, display: Display):
+        """A click on a row. Right-click steps a value backwards."""
+        for i, (key, rect) in enumerate(self.hits):
+            if not rect.collidepoint(pos):
+                continue
+            self.index = i
+            rows = self.rows(display)
+            if i < len(rows) and rows[i][2] is not None:
+                return f"{key}:{'-1' if button == 3 else '+1'}"
+            return key
+        return None
+
+    # -- drawing ------------------------------------------------------------
+    def draw(self, surface, ui: rj.Renderer, display: Display, dt: float):
+        """Dim the frame, then a card in the middle of it."""
+        self.status_age += dt
+        rows = self.rows(display)
+        self.index = min(self.index, len(rows) - 1)
+        self.hits.clear()
+
+        win_w, win_h = surface.get_size()
+        veil = pygame.Surface((win_w, win_h), pygame.SRCALPHA)
+        veil.fill((6, 7, 10, 208))
+        surface.blit(veil, (0, 0))
+
+        title = "OPTIONS -- DISPLAY" if self.page != "main" else "JUICE WORKBENCH"
+        body_h = len(rows) * self.ROW_H
+        card = pygame.Rect(0, 0, self.WIDTH, body_h + 104)
+        card.center = (win_w // 2, win_h // 2)
+        pygame.draw.rect(surface, rj.PANEL_BG, card)
+        pygame.draw.rect(surface, rj.PANEL_LINE, card, 1)
+
+        surface.blit(ui.font_big.render(title, True, rj.INK),
+                     (card.left + 18, card.top + 14))
+        pygame.draw.line(surface, rj.PANEL_LINE,
+                         (card.left + 14, card.top + 40),
+                         (card.right - 14, card.top + 40))
+
+        y = card.top + 52
+        for i, (key, label, value) in enumerate(rows):
+            rect = pygame.Rect(card.left + 8, y, card.width - 16, self.ROW_H - 4)
+            self.hits.append((key, rect))
+            picked = i == self.index
+            if picked:
+                pygame.draw.rect(surface, rj.TRACK_FILL, rect)
+            colour = rj.INK if picked else rj.DIM
+            surface.blit(ui.font_ui_b.render(label, True, colour),
+                         (rect.left + 10, rect.top + 5))
+            if value is not None:
+                text = f"< {value} >" if picked else value
+                surf = ui.font_ui.render(text, True, rj.GOLD if picked else rj.DIM)
+                surface.blit(surf, (rect.right - 10 - surf.get_width(),
+                                    rect.top + 6))
+            y += self.ROW_H
+
+        hint = ("arrows move and change   enter picks   esc backs out"
+                if self.page != "main" else
+                "arrows move   enter picks   esc resumes")
+        surface.blit(ui.font_ui.render(hint, True, rj.DIM),
+                     (card.left + 18, card.bottom - 40))
+        if self.status and self.status_age < 6.0:
+            surface.blit(ui.font_ui.render(self.status, True, rj.ACCENT),
+                         (card.left + 18, card.bottom - 24))
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +624,43 @@ class Ragdoll:
         return 1.0 + q, 1.0 - q
 
 
+@dataclass
+class Bomb:
+    """A thrown bomb, in the air and then on the floor.
+
+    Carries the same `x, y, vx, vy, radius, spin, squash_vel` block a `Ragdoll`
+    does, on purpose: `_walls` never asks what it is holding, so a bomb bounces
+    off masonry through exactly the code the corpses use and there is only one
+    place where a circle can be wrong about a wall.
+
+    `z` is the only thing it has that a body does not -- height above the
+    floor, which a corpse never needed because a corpse is always on it.
+    """
+
+    x: float
+    y: float
+    vx: float = 0.0
+    vy: float = 0.0
+    z: float = 0.0                 # pixels above the floor
+    vz: float = 0.0
+    radius: float = TILE * 0.22
+    spin: float = 0.0
+    angle: float = 0.0
+    mass: float = 1.0
+    fuse: float = 1.0
+    max_fuse: float = 1.0
+    squash: float = 0.0            # unused, and here so `_walls` can write it
+    squash_vel: float = 0.0
+
+    @property
+    def speed(self) -> float:
+        return math.hypot(self.vx, self.vy)
+
+    @property
+    def t(self) -> float:
+        return 1.0 - clamp(self.fuse / self.max_fuse) if self.max_fuse else 1.0
+
+
 class RagdollField:
     """The bodies on the floor, and the physics that moves them.
 
@@ -319,8 +691,15 @@ class RagdollField:
     #: outside the visible edge still gets shifted.
     BLAST_REACH = 1.6
 
+    #: Gravity for anything with a height, in pixels a second squared.
+    GRAVITY = 1500.0 * PX
+
     def __init__(self, seed: int = 0x1D0D):
         self.bodies: list[Ragdoll] = []
+        #: Bombs in flight. Kept beside the corpses rather than in with them
+        #: because they are the one thing here that is not dead: they have a
+        #: height, a fuse, and an ending.
+        self.thrown: list[Bomb] = []
         self._by_corpse: dict[int, Ragdoll] = {}
         #: id(entity) -> [entity, x, y, vx, vy], last frame. The strong
         #: reference is the point: it keeps `id()` from being recycled under
@@ -350,6 +729,7 @@ class RagdollField:
 
     def clear(self):
         self.bodies.clear()
+        self.thrown.clear()
         self._by_corpse.clear()
         self._tracked.clear()
         self._owed.clear()
@@ -365,10 +745,17 @@ class RagdollField:
         self._watch_explosions(world)
 
         j = world.juice
-        if not j.on("ragdoll") or dt <= 0.0:
-            # Left exactly where they are, including any velocity they had
-            # when the toggle went off, so switching it back on resumes rather
-            # than teleporting. This is the A/B the panel is for.
+        if dt <= 0.0:
+            return
+        # A bomb in the air is not a corpse and does not stop being a bomb
+        # because the ragdoll toggle is off -- the explosion is still worth
+        # having with the bodies nailed down, which is exactly the comparison
+        # the toggle is for.
+        self._fly(world, dt)
+        if not j.on("ragdoll"):
+            # Bodies left exactly where they are, including any velocity they
+            # had when the toggle went off, so switching it back on resumes
+            # rather than teleporting.
             return
 
         # Sub-stepping is priced off the fastest body in the room, so the
@@ -754,6 +1141,77 @@ class RagdollField:
             self._seen_waves = {k: v for k, v in self._seen_waves.items()
                                 if k in ids}
 
+    # -- thrown bombs ---------------------------------------------------------
+    def throw(self, world: rj.World, thrower=None):
+        """Lob a bomb out of an entity's hand along the way it is facing.
+
+        Thrown rather than placed, because where an explosion happens is the
+        interesting decision and dropping one at your feet takes that decision
+        away. It leaves on an arc, so it clears a body standing in front of
+        you; it bounces off walls, so a corridor can be banked; and it goes off
+        on a fuse wherever it has ended up, so a bad throw is a bad throw.
+        """
+        j = world.juice
+        e = thrower if thrower is not None else world.player
+        x, y = e.world_pos()
+        dx, dy = e.body.facing
+        d = math.hypot(dx, dy) or 1.0
+        speed = j.p("bomb_throw") * PX
+        fuse = j.p("bomb_fuse")
+        self.thrown.append(Bomb(
+            x=x + dx / d * TILE * 0.35, y=y + dy / d * TILE * 0.35,
+            vx=dx / d * speed, vy=dy / d * speed,
+            z=TILE * 0.45, vz=speed * 0.42,
+            spin=(self._rand() - 0.5) * 900.0,
+            fuse=fuse, max_fuse=fuse))
+        world.sfx("swipe", gain=0.6, wx=x, pitch=4.0)
+        del self.thrown[:-12]
+
+    def _fly(self, world: rj.World, dt: float):
+        """Move the bombs, and set off the ones whose fuse has run out.
+
+        Height is integrated separately from the ground plane and drawn as an
+        offset, which is the same trick the hop uses: there is no third axis
+        here, only a number that lifts a sprite off its own shadow.
+        """
+        if not self.thrown:
+            return
+        drag = world.juice.p("rag_drag")
+        for bomb in list(self.thrown):
+            bomb.fuse -= dt
+            if bomb.z > 0.0 or bomb.vz > 0.0:
+                bomb.vz -= self.GRAVITY * dt
+                bomb.z += bomb.vz * dt
+                if bomb.z <= 0.0:
+                    # Lands, keeps a little of the drop as a hop, and loses a
+                    # chunk of its ground speed to the impact.
+                    bomb.z = 0.0
+                    if bomb.vz < -60.0 * PX:
+                        bomb.vz = -bomb.vz * 0.34
+                        # Most of the ground speed goes into the floor on the
+                        # first touch. A bomb that keeps it skitters away like
+                        # a hockey puck and you can never put one where you
+                        # meant to -- which is the only thing a throw is for.
+                        bomb.vx *= 0.55
+                        bomb.vy *= 0.55
+                        world.sfx("bump", gain=0.35, wx=bomb.x, pitch=6.0)
+                    else:
+                        bomb.vz = 0.0
+            else:
+                # Rolling. Only touches the floor's drag once it is on it, and
+                # more of it than a body gets: this thing is a cast-iron ball.
+                keep = math.exp(-drag * 1.4 * dt)
+                bomb.vx *= keep
+                bomb.vy *= keep
+            bomb.x += bomb.vx * dt
+            bomb.y += bomb.vy * dt
+            bomb.angle += bomb.spin * dt
+            bomb.spin *= math.exp(-1.6 * dt)
+            self._walls(world, bomb)
+            if bomb.fuse <= 0.0:
+                self.thrown.remove(bomb)
+                self.detonate(world, bomb.x, bomb.y)
+
     def _wave_force(self, world: rj.World, ring_radius: float) -> float:
         """How hard a ring of that size throws things, in pixels a second.
 
@@ -907,11 +1365,15 @@ class GLRenderer:
         # it, and a stack of sparks reads as a glow rather than as paint.
         ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
 
-        # Not a rendering concern, and it knows nothing about GL -- but the
-        # bench has nowhere else to keep per-world state without editing the
-        # sim, and everything that builds a renderer wants one. Stepped by the
-        # loop (`run`, `run_headless`), never from `render`.
+        # Not rendering concerns, and none of them know anything about GL --
+        # but the bench has nowhere else to keep per-window state without
+        # editing the sim, and everything that builds a renderer wants all
+        # three. The field is stepped by the loop (`run`, `run_headless`) and
+        # never from `render`, because a draw must not advance time.
         self.ragdolls = RagdollField()
+        self.settings = juicesettings.Settings()
+        self.display = Display()
+        self.menu = Menu()
 
         self.sheet = tiles.SpriteSheet(TILE)
         self.atlas = self._build_atlas()
@@ -936,6 +1398,7 @@ class GLRenderer:
         # costs a few surfaces we never use; what it buys is that every row,
         # blurb, slider and scroll behaviour is literally the same code.
         self.ui = rj.Renderer()
+        self.ui.help_lines = GL_HELP_LINES
         self.ui_surface = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
         self.ui_tex = ctx.texture((WIN_W, WIN_H), 4)
         self.ui_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)  # already 1:1
@@ -1196,6 +1659,8 @@ class GLRenderer:
             self._add_tail(b, world, e)
             self._add_body(b, world, e)
 
+        self._add_bombs(b, world)
+
         if j.on("shockwave"):
             for s in world.fx.shockwaves:
                 r = s.radius
@@ -1235,6 +1700,38 @@ class GLRenderer:
 
     def _tint(self, e):
         return [c / 255.0 for c in e.color] if e.tint else (1.0, 1.0, 1.0)
+
+    def _add_bombs(self, b, world):
+        """A bomb in the air, its shadow on the floor, and a fuse that hurries.
+
+        The shadow is the whole reason a thrown thing reads as thrown: without
+        one, a sprite rising up the screen is indistinguishable from a sprite
+        moving away, and the throw looks like a slide. It also has to stay on
+        the ground while the bomb does not, which is why the height is an
+        offset on the draw rather than anything the physics knows about.
+        """
+        white = self.atlas.white
+        for bomb in self.ragdolls.thrown:
+            lift = clamp(bomb.z / (TILE * 1.2), 0.0, 1.0)
+            b.add(bomb.x, bomb.y + TILE * 0.12,
+                  TILE * (0.56 - 0.18 * lift), TILE * (0.23 - 0.08 * lift),
+                  uv=white, color=(0.0, 0.0, 0.0),
+                  alpha=(0.5 - 0.24 * lift) * world.juice.p("shadow_alpha") * 2.0,
+                  shape=glfx.SHAPE_DISC, params=(0.62, 0, 0, 0))
+            # The fuse spends its last third flashing, faster as it goes: a
+            # constant blink says "a bomb", an accelerating one says "now".
+            urgency = bomb.t ** 3
+            blink = 0.5 + 0.5 * math.sin(world.elapsed * (18.0 + 60.0 * urgency))
+            hot = 0.25 + 0.75 * urgency * blink
+            b.add(bomb.x, bomb.y - bomb.z, TILE * 0.52, TILE * 0.52,
+                  rot=math.radians(bomb.angle), uv=white,
+                  color=(0.16 + hot * 1.9, 0.15 + hot * 0.7, 0.17 + hot * 0.2),
+                  alpha=1.0, shape=glfx.SHAPE_DISC, params=(0.8, 0, 0, 0))
+            b.add(bomb.x + math.cos(math.radians(bomb.angle)) * TILE * 0.2,
+                  bomb.y - bomb.z - math.sin(math.radians(bomb.angle)) * TILE * 0.2,
+                  TILE * 0.16, TILE * 0.16, uv=white,
+                  color=(2.6 * (0.4 + hot), 1.9 * (0.3 + hot), 0.7),
+                  alpha=0.95, shape=glfx.SHAPE_DISC, params=(0.5, 0, 0, 0))
 
     def _add_trail(self, b, e):
         uv = self.atlas.uv.get(e.sprite)
@@ -1333,6 +1830,44 @@ class GLRenderer:
                           alpha=clamp(f.alpha), params=(1.0, 0, 0, 0))
                 x += size * 0.56
 
+    # -- resolution ---------------------------------------------------------
+    def resize(self, world: rj.World, width: int, height: int):
+        """Re-lay the bench out at a new window size, on the same GL context.
+
+        Everything that is sized in pixels is rebuilt: the scene and bloom
+        buffers, the panel surface and its texture, and the software renderer
+        whose own scratch surfaces are view-sized. The context, the atlas and
+        the baked floor survive, because none of them ever knew how big the
+        window was.
+
+        `VIEW_W` and friends are module globals read at call time in both
+        `rogue_juice.py` and here, which is what makes this possible at all: no
+        function captured the old size, so setting the globals is the layout
+        change and the rebuild below is only the buffers catching up.
+        """
+        width = max(MIN_VIEW[0] + rj.PANEL_W, int(width))
+        height = max(MIN_VIEW[1], int(height))
+        if (width, height) == (WIN_W, WIN_H):
+            return False
+        _set_layout(width, height)
+
+        self.post.release()
+        self.post = glfx.PostChain(self.ctx, (VIEW_W, VIEW_H))
+        self.ui_tex.release()
+        self.ui_surface = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        self.ui_tex = self.ctx.texture((WIN_W, WIN_H), 4)
+        self.ui_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.ui_tex.repeat_x = self.ui_tex.repeat_y = False
+        # Its buffers, not the whole renderer: the GL bench only ever asks it
+        # for the panel and the HUD, neither of which touches a view-sized
+        # surface, but leaving stale ones behind is a trap for whoever next
+        # asks it for something else -- and rebuilding it outright would reload
+        # five fonts on every frame of a window drag.
+        self.ui.resize()
+        self.ui_dirty = True
+        world.clamp_camera()
+        return True
+
     # -- UI ---------------------------------------------------------------
     def draw_ui(self, world: rj.World, mouse, force: bool = False):
         """Redraw the panel and the log, and upload them.
@@ -1347,9 +1882,13 @@ class GLRenderer:
         """
         now = time.perf_counter()
         moved = mouse != self._ui_mouse
-        if not (force or moved or self.ui_dirty
+        # The menu is a paused state: nothing is competing for the frame, and a
+        # throttled highlight under a moving cursor is the one place the 30Hz
+        # panel would be felt.
+        if not (force or moved or self.ui_dirty or self.menu.open
                 or now - self._ui_drawn >= 1.0 / self.UI_HZ):
             return
+        elapsed = min(0.25, now - self._ui_drawn)
         self._ui_drawn = now
         self.ui_dirty = False
         self._ui_mouse = mouse
@@ -1357,6 +1896,8 @@ class GLRenderer:
         self.ui.frame_ms = self.frame_ms
         self.ui.draw_hud(self.ui_surface, world)
         self.ui.draw_panel(self.ui_surface, world, mouse)
+        if self.menu.open:
+            self.menu.draw(self.ui_surface, self.ui, self.display, elapsed)
         self.ui_tex.write(pygame.image.tobytes(self.ui_surface, "RGBA", True))
         self.upload_ms += ((time.perf_counter() - now) * 1000.0 - self.upload_ms) * 0.08
 
@@ -1440,28 +1981,126 @@ class GLRenderer:
 # ---------------------------------------------------------------------------
 
 
+def menu_action(action: str, world: rj.World, renderer: GLRenderer) -> bool:
+    """Carry out one thing the menu asked for. False means quit.
+
+    Split out from the event handler because the actions are the interesting
+    part and the key mapping is not: everything here can be driven by name
+    from a test, with no window, no click and no keyboard.
+    """
+    menu, display, settings = renderer.menu, renderer.display, renderer.settings
+    key, _, step = action.partition(":")
+    delta = -1 if step == "-1" else 1
+
+    if key == "resume":
+        menu.close()
+    elif key == "back":
+        menu.back()
+    elif key == "options":
+        menu.show("options")
+    elif key == "quit":
+        return False
+    elif key == "save":
+        settings.capture_juice(world.juice)
+        display.store(settings)
+        settings.save()
+        menu.say(settings.note)
+        world.say(settings.note, rj.ACCENT)
+    elif key == "resolution":
+        sizes = resolution_choices()
+        now = display.clamped()
+        try:
+            i = sizes.index(now)
+        except ValueError:
+            i = 0
+        width, height = sizes[(i + delta) % len(sizes)]
+        display.width, display.height = width, height
+        _apply_display(world, renderer, resized=True)
+    elif key == "fullscreen":
+        display.fullscreen = not display.fullscreen
+        _apply_display(world, renderer, resized=True)
+    elif key == "frame_cap":
+        caps = FRAME_CAPS
+        i = caps.index(display.frame_cap) if display.frame_cap in caps else 1
+        display.frame_cap = caps[(i + delta) % len(caps)]
+    elif key == "vsync":
+        display.vsync = not display.vsync
+        menu.say("vsync applies on the next restart")
+    renderer.ui_dirty = True
+    return True
+
+
+def _apply_display(world: rj.World, renderer: GLRenderer, resized: bool):
+    """Push a `Display` at the real window, then re-lay the bench out.
+
+    The window is asked first and *measured* afterwards rather than assumed: a
+    window manager is free to refuse a size, and going fullscreen gives you the
+    desktop's size, not the one in the settings.
+    """
+    if not resized:
+        return
+    if not apply_window(renderer.display):
+        renderer.menu.say("this build cannot resize the window -- saved anyway")
+        return
+    try:
+        width, height = pygame.display.get_window_size()
+    except Exception:                                # pragma: no cover
+        width, height = renderer.display.clamped()
+    renderer.resize(world, width, height)
+
+
 def handle_event(event, world: rj.World, renderer: GLRenderer) -> bool:
     """The software handler, with the panel pointed at the UI renderer.
 
     The panel is the software renderer's, so its own hit testing, scrolling and
     drag handling apply unchanged -- the only difference is that the surface it
     drew onto is now a texture.
+
+    The menu, when it is up, gets everything: a modal that lets keys through to
+    the thing behind it is how you end up walking into a wall while picking a
+    resolution.
     """
     renderer.ui_dirty = True                     # any input can change the panel
-    if event.type == pygame.KEYDOWN and event.key == pygame.K_p:
-        return True                              # pixel mode has no meaning here
-    if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
-        # Thrown a tile and a half ahead rather than dropped underfoot, so the
-        # player is outside their own blast and can watch it from the side.
-        px, py = world.player.world_pos()
-        dx, dy = world.player.body.facing
-        renderer.ragdolls.detonate(world, px + dx * TILE * 1.5,
-                                   py + dy * TILE * 1.5)
+    if event.type == pygame.QUIT:
+        return False
+
+    if renderer.menu.open:
+        if event.type == pygame.KEYDOWN:
+            action = renderer.menu.key(event, renderer.display)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+            action = renderer.menu.click(event.pos, event.button,
+                                         renderer.display)
+        elif event.type == pygame.MOUSEMOTION:
+            renderer.menu.point(event.pos, renderer.display)
+            return True
+        else:
+            return True
+        return menu_action(action, world, renderer) if action else True
+
+    if event.type == pygame.KEYDOWN:
+        if event.key == pygame.K_ESCAPE:
+            renderer.menu.show()                 # escape opens it, not quits
+            return True
+        if event.key == pygame.K_p:
+            return True                          # pixel mode has no meaning here
+        if event.key == pygame.K_b:
+            renderer.ragdolls.throw(world)
+            return True
+        if event.key == pygame.K_F3:
+            # "Back to defaults" has to mean the saved ones once there are
+            # saved ones, or the menu's save button is a button that undoes
+            # itself the next time anybody presses F3.
+            renderer.settings.restore_defaults(world.juice)
+            world.say("sliders back to defaults", rj.ACCENT)
+            return True
+        if event.key == pygame.K_r:
+            # The sim's reset empties `world.corpses`; the field has to let go
+            # of the bodies that were pointing at them in the same breath.
+            renderer.ragdolls.clear()
+    if event.type == pygame.VIDEORESIZE:         # pragma: no cover -- user drag
+        renderer.resize(world, event.w, event.h)
+        renderer.display.width, renderer.display.height = event.w, event.h
         return True
-    if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-        # The sim's reset empties `world.corpses`; the field has to let go of
-        # the bodies that were pointing at them in the same breath.
-        renderer.ragdolls.clear()
     return rj.handle_event(event, world, renderer.ui)
 
 
@@ -1521,40 +2160,61 @@ def run():
         pygame.init()
         pygame.font.init()
         pygame.joystick.init()
-        glfx.open_gl_window((WIN_W, WIN_H))
+
+        # Read before the window exists, because two of the things in it --
+        # the size and the swap interval -- can only be chosen while it is
+        # being made. The juice half is applied further down, once there is a
+        # registry to apply it to.
+        settings = juicesettings.Settings()
+        settings.load()
+        display = Display().load(settings)
+        _set_layout(*display.clamped())
+        glfx.open_gl_window((WIN_W, WIN_H), vsync=display.vsync, resizable=True)
         ctx = glfx.create_context()
         glfx.restart_on_the_card(ctx.info["GL_RENDERER"])
+        # A window manager may have had opinions. Believe the window.
+        _set_layout(*pygame.display.get_window_size())
 
         target = ctx.screen
         target.viewport = (0, 0, WIN_W, WIN_H)
-        world = rj.World(gl_juice(), bank)
+        juice = gl_juice()
+        settings.apply_juice(juice)
+        world = rj.World(juice, bank)
         if pygame.joystick.get_count():           # pragma: no cover
             world.pad = pygame.joystick.Joystick(0)
             world.pad.init()
         renderer = GLRenderer(ctx, target, world)
+        renderer.settings = settings
+        renderer.display = display
+        if display.fullscreen:
+            _apply_display(world, renderer, resized=True)
         print(f"rendering on {ctx.info['GL_RENDERER']}")
-        # The one control that is not on the panel and not in `HELP_LINES`,
-        # which belongs to the software bench and does not know about it.
-        world.say("K kills, B drops a bomb -- the dead are off the grid",
-                  rj.ACCENT)
+        world.say(settings.note, rj.DIM)
+        world.say("K kills, B throws a bomb, esc opens the menu", rj.ACCENT)
 
         pygame.key.set_repeat(180, 70)
         clock = pygame.time.Clock()
         while running:
-            dt = min(clock.tick(FPS) / 1000.0, 1.0 / 20.0)
+            # A frame cap of zero means "do not wait", which is what makes the
+            # ms readout worth reading.
+            raw = clock.tick(display.frame_cap) if display.frame_cap else clock.tick()
+            dt = min(raw / 1000.0, 1.0 / 20.0)
             for event in pygame.event.get():
                 if not handle_event(event, world, renderer):
                     running = False
                     break
-            # Do not submit another expensive frame after Escape/window-close.
+            # Do not submit another expensive frame after quit/window-close.
             if not running:
                 break
 
             t0 = time.perf_counter()
-            world.update(dt)
-            # After the sim, because it adopts the corpses the sim just laid
-            # down; before the render, because the render reads what it wrote.
-            renderer.ragdolls.update(world, dt)
+            if not renderer.menu.open:
+                # The menu pauses. A settings screen that lets the fight carry
+                # on behind it is a settings screen you cannot use.
+                world.update(dt)
+                # After the sim, because it adopts the corpses the sim just
+                # laid down; before the render, which reads what it wrote.
+                renderer.ragdolls.update(world, dt)
             ctx.screen.viewport = (0, 0, WIN_W, WIN_H)
             renderer.render(world, pygame.mouse.get_pos())
             ms = (time.perf_counter() - t0) * 1000.0

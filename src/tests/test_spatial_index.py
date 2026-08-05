@@ -7,7 +7,7 @@ move between regions, are born, and die throughout.
 """
 from __future__ import annotations
 
-import esper
+import ecs
 import pytest
 
 from components import BlocksMovement, NPC, Position, Sapling, Seaweed, Tree
@@ -25,20 +25,20 @@ pytestmark = pytest.mark.headless_renderer
 
 
 def _world(grid: int = 2):
-    esper.clear_database()
+    ecs.clear_database()
     spatial.detach()
     set_world_rng(0x7A1E5)
     width, height = archipelago_size(grid)
     game_map = GameMap(width, height, layout="islands")
     _setup_world(game_map, Position(width // 2, height // 2))
-    esper.add_processor(TimeProcessor(), priority=2)
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
-    esper.add_processor(NpcAiProcessor(game_map, max_entry_catchup_advances=1), priority=0)
-    esper.add_processor(FishAiProcessor(game_map, max_entry_catchup_advances=1), priority=0)
-    esper.add_processor(NeedsProcessor(game_map), priority=0)
-    esper.add_processor(TreeGrowthProcessor(game_map), priority=0)
-    esper.add_processor(ReproductionProcessor(), priority=0)
+    ecs.add_processor(TimeProcessor(), priority=2)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(HousingProcessor(game_map, live_region_only=True), priority=0)
+    ecs.add_processor(NpcAiProcessor(game_map, max_entry_catchup_advances=1), priority=0)
+    ecs.add_processor(FishAiProcessor(game_map, max_entry_catchup_advances=1), priority=0)
+    ecs.add_processor(NeedsProcessor(game_map), priority=0)
+    ecs.add_processor(TreeGrowthProcessor(game_map), priority=0)
+    ecs.add_processor(ReproductionProcessor(), priority=0)
     return game_map
 
 
@@ -53,7 +53,7 @@ def test_index_stays_true_while_the_world_simulates() -> None:
 
     moves = ["move_right", "move_right", "move_down", "move_down"]
     for i in range(120):
-        esper.process(moves[i % len(moves)])
+        ecs.process(moves[i % len(moves)])
 
     assert index.audit() == []
 
@@ -61,11 +61,11 @@ def test_index_stays_true_while_the_world_simulates() -> None:
 def test_a_walking_entity_changes_region_bucket() -> None:
     game_map = _world()
     index = spatial.index_for(game_map)
-    ent = esper.create_entity(Position(5, 5), NPC(), BlocksMovement())
+    ent = ecs.create_entity(Position(5, 5), NPC(), BlocksMovement())
     index.sync()  # creation is noticed by the population check
 
     assert ent in index.entities_in(region_at(game_map, 5, 5))
-    pos = esper.component_for_entity(ent, Position)
+    pos = ecs.component_for_entity(ent, Position)
     far = (game_map.width - 5, game_map.height - 5)
     spatial.moved(ent, (pos.x, pos.y), far)
     pos.x, pos.y = far
@@ -80,14 +80,14 @@ def test_static_blockers_are_indexed_by_tile_not_scanned() -> None:
     index = spatial.index_for(game_map)
 
     trees = [
-        (ent, esper.component_for_entity(ent, Position))
-        for ent, (_t,) in esper.get_components(Tree)
+        (ent, ecs.component_for_entity(ent, Position))
+        for ent, (_t,) in ecs.get_components(Tree)
     ]
     assert trees, "the world should have trees to check"
     for ent, pos in trees[:20]:
         assert index.blocker_at(pos.x, pos.y) == ent
     # Creatures move every turn and are deliberately NOT in the tile map.
-    for ent, (pos, _npc) in esper.get_components(Position, NPC):
+    for ent, (pos, _npc) in ecs.get_components(Position, NPC):
         assert index.blocker_at(pos.x, pos.y) != ent
         break
 
@@ -99,16 +99,16 @@ def test_plants_are_indexed_by_tile_whether_or_not_they_block() -> None:
     game_map = _world()
     index = spatial.index_for(game_map)
 
-    for ent, (_s,) in list(esper.get_components(Seaweed))[:20]:
-        pos = esper.component_for_entity(ent, Position)
+    for ent, (_s,) in list(ecs.get_components(Seaweed))[:20]:
+        pos = ecs.component_for_entity(ent, Position)
         assert index.rooted_at(pos.x, pos.y) == ent
         assert index.blocker_at(pos.x, pos.y) is None  # a frond blocks nothing
 
-    for ent, (_t,) in list(esper.get_components(Tree))[:20]:
-        pos = esper.component_for_entity(ent, Position)
+    for ent, (_t,) in list(ecs.get_components(Tree))[:20]:
+        pos = ecs.component_for_entity(ent, Position)
         assert index.rooted_at(pos.x, pos.y) == ent  # trees are in both maps
 
-    for ent, (pos, _npc) in esper.get_components(Position, NPC):
+    for ent, (pos, _npc) in ecs.get_components(Position, NPC):
         assert index.rooted_at(pos.x, pos.y) != ent  # people are not plants
         break
 
@@ -119,19 +119,19 @@ def test_a_sapling_maturing_into_a_tree_stays_rooted_to_its_tile() -> None:
     game_map = _world()
     index = spatial.index_for(game_map)
     x, y = 7, 7
-    ent = esper.create_entity(Position(x, y), Sapling(planted_turn=0))
+    ent = ecs.create_entity(Position(x, y), Sapling(planted_turn=0))
     assert index.rooted_at(x, y) == ent
 
-    esper.remove_component(ent, Sapling)
-    esper.add_component(ent, Tree())
-    esper.add_component(ent, BlocksMovement())
+    ecs.remove_component(ent, Sapling)
+    ecs.add_component(ent, Tree())
+    ecs.add_component(ent, BlocksMovement())
     spatial.reclassify(ent)
 
     assert index.rooted_at(x, y) == ent
     assert index.blocker_at(x, y) == ent  # and now it blocks, too
     assert index.audit() == []
 
-    esper.delete_entity(ent, immediate=True)
+    ecs.delete_entity(ent, immediate=True)
     assert index.rooted_at(x, y) is None
     assert index.audit() == []
 
@@ -141,7 +141,7 @@ def test_entities_created_without_a_hook_are_picked_up() -> None:
     index = spatial.index_for(game_map)
     rebuilds_before = index.rebuilds
 
-    ent = esper.create_entity(Position(7, 7), Tree(), BlocksMovement())
+    ent = ecs.create_entity(Position(7, 7), Tree(), BlocksMovement())
 
     assert ent in index.entities_in(region_at(game_map, 7, 7))
     assert index.blocker_at(7, 7) == ent
@@ -153,10 +153,10 @@ def test_entities_created_without_a_hook_are_picked_up() -> None:
 def test_a_dead_entity_leaves_the_index() -> None:
     game_map = _world()
     index = spatial.index_for(game_map)
-    ent = esper.create_entity(Position(9, 9), Tree(), BlocksMovement())
+    ent = ecs.create_entity(Position(9, 9), Tree(), BlocksMovement())
     assert index.blocker_at(9, 9) == ent
 
-    esper.delete_entity(ent, immediate=True)
+    ecs.delete_entity(ent, immediate=True)
 
     assert index.blocker_at(9, 9) is None
     assert index.audit() == []
@@ -180,12 +180,12 @@ def test_audit_reflects_the_index_as_callers_see_it() -> None:
     """
     game_map = _world()
     index = spatial.index_for(game_map)
-    doomed = [ent for ent, (_t,) in list(esper.get_components(Tree))[:5]]
+    doomed = [ent for ent, (_t,) in list(ecs.get_components(Tree))[:5]]
     assert doomed
     index.sync()
 
     for ent in doomed:
-        esper.delete_entity(ent, immediate=True)
+        ecs.delete_entity(ent, immediate=True)
     # No read in between: the buckets still hold them, by design.
     assert index.audit() == [], "audit must fold in the deletions before judging"
     for ent in doomed:
@@ -204,10 +204,10 @@ def test_a_death_does_not_cost_a_pass_over_the_whole_index() -> None:
     game_map = _world()
     index = spatial.index_for(game_map)
     for x in range(20, 40):
-        esper.create_entity(Position(x, 5), Tree(), BlocksMovement())
+        ecs.create_entity(Position(x, 5), Tree(), BlocksMovement())
     index.sync()
     held = len(index._region_of)
-    doomed = esper.create_entity(Position(11, 11), Tree(), BlocksMovement())
+    doomed = ecs.create_entity(Position(11, 11), Tree(), BlocksMovement())
     index.sync()
 
     reads = 0
@@ -220,7 +220,7 @@ def test_a_death_does_not_cost_a_pass_over_the_whole_index() -> None:
 
     spatial.SpatialIndex._forget = counting_forget
     try:
-        esper.delete_entity(doomed, immediate=True)
+        ecs.delete_entity(doomed, immediate=True)
         index.sync()
     finally:
         spatial.SpatialIndex._forget = original
@@ -248,17 +248,17 @@ def test_many_deaths_and_births_leave_the_index_exact() -> None:
     for round_ in range(30):
         for _ in range(20):
             x, y = next(tiles)
-            living.append(esper.create_entity(Position(x, y), Tree()))
+            living.append(ecs.create_entity(Position(x, y), Tree()))
         index.sync()
         for ent in living[: len(living) // 2]:
-            esper.delete_entity(ent, immediate=True)
+            ecs.delete_entity(ent, immediate=True)
         living = living[len(living) // 2:]
         assert index.audit() == [], f"drifted after round {round_}"
     assert index.rebuilds == 1, "churn must never force a full rebuild"
 
 
 def test_a_deferred_delete_is_folded_in_once_it_really_goes() -> None:
-    """``delete_entity`` without ``immediate`` only queues the entity; esper keeps
+    """``delete_entity`` without ``immediate`` only queues the entity; ECS keeps
     it in the component tables until the next ``process``.
 
     The deletion is logged at the call, which is *before* the entity actually
@@ -267,14 +267,14 @@ def test_a_deferred_delete_is_folded_in_once_it_really_goes() -> None:
     """
     game_map = _world()
     index = spatial.index_for(game_map)
-    ent = esper.create_entity(Position(13, 13), Tree(), BlocksMovement())
+    ent = ecs.create_entity(Position(13, 13), Tree(), BlocksMovement())
     assert index.blocker_at(13, 13) == ent
 
-    esper.delete_entity(ent)  # deferred
+    ecs.delete_entity(ent)  # deferred
     index.sync()              # logged, but the entity is still in the world
     assert index._pending_deletes, "held pending, not consumed and dropped"
 
-    esper.process()
+    ecs.process()
 
     assert index.blocker_at(13, 13) is None
     assert index.audit() == []

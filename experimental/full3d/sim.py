@@ -365,21 +365,27 @@ class FlightProcessor(esper.Processor):
 
     Four coupled rules, in the order they are applied:
 
-    1. **Dash.** A flat energy charge buys a fixed-speed horizontal burst that
-       ignores gravity for its duration. It is an impulse, not a state, so the
-       speed it leaves behind is yours to keep or waste.
-    2. **Thrust.** Held, it drains continuously and adds upward *acceleration*
+    1. **Thrust.** Held, it drains continuously and adds upward *acceleration*
        -- not an upward velocity -- capped at ``rise_max``. Because it is an
        acceleration, tapping it gives a hop and holding it gives a climb, and
        falling momentum has to be paid off before you rise.
+    2. **Glide.** Held, and only in the air, the wings come out: the descent
+       eases back to ``glide_fall`` and the horizontal drag drops by most of an
+       order of magnitude, so the speed you arrived with is speed you keep.
+       It never adds height. A glide cannot lift you a millimetre -- that is
+       the whole difference between a glide and a hop -- it only makes the
+       ground come up slowly enough that you get somewhere first. At 7 energy
+       a second against the thrust's 26, distance is cheap and altitude is not.
     3. **Air control.** Airborne horizontal acceleration is high but the speed
-       cap is soft: you may exceed it (a dash does), you just cannot thrust
-       past it. Let go and drag bleeds you back down, which is the glide.
-    4. **Recharge and overheat.** Energy only refills while not thrusting, and
-       four times faster with feet on the ground. Touch exactly zero and the
-       meter latches ``empty``: no flight, no dash, and a recharge at 55% rate
-       that does not release until the bar is *completely* full. Nearly all
-       the skill in the class is in never letting that latch close.
+       cap is soft: you may exceed it and keep what you have, you just cannot
+       accelerate past it. Gliding trades some of that control away, because
+       committing to a line is what gliding is.
+    4. **Recharge and overheat.** Energy only refills while neither thrusting
+       nor gliding, and four times faster with feet on the ground. Touch
+       exactly zero and the meter latches ``empty``: no flight, no glide, and
+       a recharge at 55% rate that does not release until the bar is
+       *completely* full. Nearly all the skill in the class is in never
+       letting that latch close.
     """
 
     def __init__(self, sim: Sim) -> None:
@@ -389,11 +395,9 @@ class FlightProcessor(esper.Processor):
         for ent, (transform, vel, body, energy, flight, intent) in esper.get_components(
             Transform, Velocity, Body, Energy, Flight, Intent
         ):
-            dead = esper.has_component(ent, Dead)
-            flight.dash_cd = max(0.0, flight.dash_cd - dt)
-            flight.dash_timer = max(0.0, flight.dash_timer - dt)
             flight.thrusting = False
-            if dead:
+            flight.gliding = False
+            if esper.has_component(ent, Dead):
                 continue
 
             fwd_x, fwd_y, right_x, right_y = heading_vectors(intent.aim_yaw)
@@ -405,30 +409,7 @@ class FlightProcessor(esper.Processor):
                 wish_y /= wish_len
                 wish_len = 1.0
 
-            # 1. dash
-            if intent.dash and flight.dash_cd <= 0.0 and not energy.empty:
-                if wish_len < 1e-3:  # no stick input: dash where you are looking
-                    wish_x, wish_y, wish_len = fwd_x, fwd_y, 1.0
-                if energy.spend(energy.cost_dash):
-                    flight.dash_dir = Vec3(wish_x / wish_len, wish_y / wish_len, 0.0)
-                    flight.dash_timer = flight.dash_time
-                    flight.dash_cd = flight.dash_cooldown
-                    vel.vec.x = flight.dash_dir.x * flight.dash_speed
-                    vel.vec.y = flight.dash_dir.y * flight.dash_speed
-                    # A ground dash skims rather than scrapes.
-                    vel.vec.z = max(vel.vec.z, 2.5)
-                    body.grounded = False
-
-            if flight.dash_timer > 0.0:
-                # Hold the burst. Gravity is suspended for the duration by
-                # PhysicsProcessor, which reads dash_timer.
-                vel.vec.x = flight.dash_dir.x * flight.dash_speed
-                vel.vec.y = flight.dash_dir.y * flight.dash_speed
-                transform.heading = intent.aim_yaw
-                transform.roll = -clamp(intent.move_x, -1.0, 1.0) * 24.0
-                continue
-
-            # 2. thrust -- pay first, and take the last drop if that is all
+            # 1. thrust -- pay first, and take the last drop if that is all
             # that is left, which is what arms the overheat.
             if intent.thrust and not energy.empty and energy.current > 0.0:
                 cost = min(energy.drain_thrust * dt, energy.current)
@@ -438,6 +419,26 @@ class FlightProcessor(esper.Processor):
                     if body.grounded:
                         body.grounded = False
                         vel.vec.z = max(vel.vec.z, 2.0)
+
+            # 2. glide -- airborne only, and never while the jets are lit.
+            # Note there is no `max(vel.z, ...)` anywhere in here: the wings
+            # can only ever slow a descent, never reverse one.
+            if (
+                intent.glide
+                and not flight.thrusting
+                and not body.grounded
+                and not energy.empty
+                and energy.current > 0.0
+            ):
+                cost = min(energy.drain_glide * dt, energy.current)
+                if energy.spend(cost):
+                    flight.gliding = True
+                    if vel.vec.z < -flight.glide_fall:
+                        # The wings bite: a hard fall is eased back to the
+                        # glide terminal over a few tenths, not snapped to it.
+                        vel.vec.z += (-flight.glide_fall - vel.vec.z) * clamp(
+                            flight.glide_bite * dt, 0.0, 1.0
+                        )
 
             # 3. air / ground control
             if body.grounded and not flight.thrusting:
@@ -449,24 +450,26 @@ class FlightProcessor(esper.Processor):
                 vel.vec.y += (target_y - vel.vec.y) * rate
             else:
                 speed = horizontal_speed(vel.vec)
+                accel = flight.glide_accel if flight.gliding else flight.air_accel
                 if wish_len > 1e-3:
-                    nvx = vel.vec.x + wish_x * flight.air_accel * dt
-                    nvy = vel.vec.y + wish_y * flight.air_accel * dt
+                    nvx = vel.vec.x + wish_x * accel * dt
+                    nvy = vel.vec.y + wish_y * accel * dt
                     nspeed = math.hypot(nvx, nvy)
-                    # Soft cap: thrusting cannot push past air_max, but a dash
-                    # that already did is allowed to keep what it earned.
+                    # Soft cap: you cannot accelerate past air_max, but speed
+                    # you already have is yours to keep.
                     ceiling = max(flight.air_max, speed)
                     if nspeed > ceiling:
                         nvx *= ceiling / nspeed
                         nvy *= ceiling / nspeed
                     vel.vec.x, vel.vec.y = nvx, nvy
                 else:
-                    decay = math.exp(-flight.glide_drag * dt)
+                    drag = flight.glide_drag if flight.gliding else flight.air_drag
+                    decay = math.exp(-drag * dt)
                     vel.vec.x *= decay
                     vel.vec.y *= decay
 
             # 4. recharge
-            if not flight.thrusting:
+            if not flight.thrusting and not flight.gliding:
                 rate = energy.regen_ground if body.grounded else energy.regen_air
                 if energy.empty:
                     rate *= energy.empty_penalty
@@ -477,7 +480,9 @@ class FlightProcessor(esper.Processor):
 
             transform.heading = intent.aim_yaw
             # Cosmetic bank, eased so it does not snap when the stick centres.
-            want_roll = -clamp(intent.move_x, -1.0, 1.0) * (14.0 if not body.grounded else 0.0)
+            # A gliding diver leans into the turn harder; she is on her wings.
+            lean = 26.0 if flight.gliding else 14.0
+            want_roll = -clamp(intent.move_x, -1.0, 1.0) * (0.0 if body.grounded else lean)
             transform.roll += (want_roll - transform.roll) * clamp(8.0 * dt, 0.0, 1.0)
             transform.pitch = clamp(-vel.vec.z * 0.6, -18.0, 18.0)
 
@@ -562,15 +567,25 @@ class PhysicsProcessor(esper.Processor):
         grid = self.sim.grid
         for ent, (transform, vel, body) in esper.get_components(Transform, Velocity, Body):
             flight = esper.try_component(ent, Flight)
-            dashing = flight is not None and flight.dash_timer > 0.0
 
-            if not dashing and not body.grounded:
-                vel.vec.z -= body.gravity * dt
+            if not body.grounded:
+                # Gravity is scaled down rather than switched off while the
+                # wings are out: the terminal descent then falls out of the
+                # balance between this and FlightProcessor's easing, instead
+                # of being a hard clamp that reads as an invisible floor.
+                #
+                # Gated on already descending, which matters more than it
+                # looks. Wings that soften gravity on the way *up* stretch out
+                # a climb -- press glide at the top of a thrust and you float
+                # higher than you would have. That is a hop, which is the one
+                # thing a glide must never be, so an ascent gets full gravity
+                # and the apex is identical whether or not shift was held.
+                gliding = flight is not None and flight.gliding
+                scale = flight.glide_gravity if (gliding and vel.vec.z <= 0.0) else 1.0
+                vel.vec.z -= body.gravity * scale * dt
                 fall_max = flight.fall_max if flight else 55.0
                 if vel.vec.z < -fall_max:
                     vel.vec.z = -fall_max
-            elif dashing:
-                vel.vec.z = max(vel.vec.z - body.gravity * 0.15 * dt, -2.0)
 
             pos = transform.pos
             new_x = pos.x + vel.vec.x * dt

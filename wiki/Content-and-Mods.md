@@ -25,7 +25,7 @@ The existing ECS already does the hard part. A creature is a carnivore because i
 So **most new content needs no new system and no new component** — it's a new
 *combination* of existing components. The content layer's job is to make assembling
 those combinations declarative and reusable instead of hand-written
-`esper.create_entity(...)` calls scattered across `main.py`.
+`ecs.create_entity(...)` calls scattered across `main.py`.
 
 ## The pieces (`src/content/`)
 
@@ -44,7 +44,7 @@ class PrefabDef:
 
 register_prefab(defn, prefab_id=None)  # a PrefabDef (data) OR a factory callable (Python)
 build_components(id, x, y, **overrides) -> list      # pure, headless-testable
-spawn(id, x, y, **overrides) -> int                  # esper.create_entity(...)
+spawn(id, x, y, **overrides) -> int                  # ecs.create_entity(...)
 ```
 `register_prefab` accepts **either** a `PrefabDef` (data path) **or** a factory
 `Callable[[int, int, dict], list]` (Python path, needs an explicit `prefab_id`) —
@@ -140,6 +140,6 @@ prefab attaches — the Python path, identical to how the core game adds feature
 ## Testing
 
 Everything here is renderer-agnostic and headless-testable: `build_components(...)`
-returns a plain list to assert on (no esper side effects), and `spawn`/`apply_effect`
+returns a plain list to assert on (no ECS side effects), and `spawn`/`apply_effect`
 drive the ECS directly. New tests cover prefab build/spawn, kit composition, effect
 apply/tick, item lookups, and the JSON side-loader.

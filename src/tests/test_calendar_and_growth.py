@@ -4,7 +4,7 @@ after their season, bearing and rotting. Trees, bushes and seaweed all live the
 same life -- see ``TreeGrowthProcessor``."""
 from __future__ import annotations
 
-import esper
+import ecs
 import pytest
 
 from components import BerryBush, BlocksMovement, Inventory, Name, Player, Position, Renderable, Sapling, Tree, WorldClock
@@ -71,15 +71,15 @@ def _advance_a_day(processor, clock, *, from_turn: int) -> None:
 def test_saplings_sprout_on_open_outdoor_ground() -> None:
     game_map = GameMap(24, 14)  # too small to carve houses -> all floor is outdoor
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     processor = TreeGrowthProcessor(game_map, rng=lambda: 0.0)  # every roll sprouts
 
     _advance_a_day(processor, clock, from_turn=0)
 
-    saplings = list(esper.get_components(Sapling))
+    saplings = list(ecs.get_components(Sapling))
     assert saplings, "expected saplings to sprout on open ground"
     for ent, (sapling,) in saplings:
-        pos = esper.component_for_entity(ent, Position)
+        pos = ecs.component_for_entity(ent, Position)
         assert game_map.tile_at(pos.x, pos.y) == game_map.FLOOR
         assert sapling.planted_turn == clock.turn
 
@@ -91,14 +91,14 @@ def test_saplings_do_not_sprout_indoors() -> None:
     interiors = set().union(*game_map.find_enclosed_rooms())
     assert interiors  # sanity: the map really has enclosed houses
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     processor = TreeGrowthProcessor(game_map, rng=lambda: 0.0)
 
     _advance_a_day(processor, clock, from_turn=0)
 
     sapling_tiles = {
-        (esper.component_for_entity(e, Position).x, esper.component_for_entity(e, Position).y)
-        for e, _c in esper.get_components(Sapling)
+        (ecs.component_for_entity(e, Position).x, ecs.component_for_entity(e, Position).y)
+        for e, _c in ecs.get_components(Sapling)
     }
     assert sapling_tiles.isdisjoint(interiors)
 
@@ -106,78 +106,78 @@ def test_saplings_do_not_sprout_indoors() -> None:
 def test_no_saplings_when_the_daily_roll_never_fires() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     processor = TreeGrowthProcessor(game_map, rng=lambda: 1.0)  # never below the chance
 
     _advance_a_day(processor, clock, from_turn=0)
-    assert list(esper.get_components(Sapling)) == []
+    assert list(ecs.get_components(Sapling)) == []
 
 
 def test_growth_only_happens_on_a_new_day() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     processor = TreeGrowthProcessor(game_map, rng=lambda: 0.0)
 
     processor.process("wait")  # first call just sets the baseline day
     clock.turn = _DAY_LEN - 1  # still day 0
     processor.process("wait")
-    assert list(esper.get_components(Sapling)) == []  # no new day yet -> nothing
+    assert list(ecs.get_components(Sapling)) == []  # no new day yet -> nothing
 
 
 def test_trees_can_die() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
-    t1 = esper.create_entity(Position(6, 6), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
-    t2 = esper.create_entity(Position(9, 9), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
+    ecs.create_entity(clock)
+    t1 = ecs.create_entity(Position(6, 6), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
+    t2 = ecs.create_entity(Position(9, 9), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
     # rng = 0 is below the death chance, so every tree dies on the daily pass.
     processor = TreeGrowthProcessor(game_map, rng=lambda: 0.0)
 
     _advance_a_day(processor, clock, from_turn=0)
-    assert not esper.entity_exists(t1)
-    assert not esper.entity_exists(t2)
+    assert not ecs.entity_exists(t1)
+    assert not ecs.entity_exists(t2)
 
 
 def test_sapling_matures_into_a_tree_after_a_year() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
-    sapling = esper.create_entity(
+    ecs.create_entity(clock)
+    sapling = ecs.create_entity(
         Position(8, 8), Renderable("t"), Name("Sapling"), Sapling(planted_turn=0)
     )
     processor = TreeGrowthProcessor(game_map, rng=lambda: 1.0)  # suppress sprouts/deaths
 
     # A daily pass before it is a year old: still a sapling.
     _advance_a_day(processor, clock, from_turn=100 * _DAY_LEN)
-    assert esper.has_component(sapling, Sapling)
-    assert not esper.has_component(sapling, Tree)
+    assert ecs.has_component(sapling, Sapling)
+    assert not ecs.has_component(sapling, Tree)
 
     # A daily pass after a full year (112 days) has elapsed: it becomes a tree.
     clock.turn = _DAYS_PER_YEAR * _DAY_LEN
     processor.process("wait")
-    assert not esper.has_component(sapling, Sapling)
-    assert esper.has_component(sapling, Tree)
-    assert esper.has_component(sapling, BlocksMovement)
-    assert esper.component_for_entity(sapling, Renderable).glyph == "T"
-    assert esper.component_for_entity(sapling, Name).value == "Tree"
+    assert not ecs.has_component(sapling, Sapling)
+    assert ecs.has_component(sapling, Tree)
+    assert ecs.has_component(sapling, BlocksMovement)
+    assert ecs.component_for_entity(sapling, Renderable).glyph == "T"
+    assert ecs.component_for_entity(sapling, Name).value == "Tree"
 
 
 def test_sapling_maturation_waits_while_its_tile_is_occupied() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
-    sapling = esper.create_entity(
+    ecs.create_entity(clock)
+    sapling = ecs.create_entity(
         Position(8, 8), Renderable("t"), Name("Sapling"), Sapling(planted_turn=0)
     )
     # The player stands on the sapling tile -- it must not turn into a tree under
     # them (that would trap them in a wall of wood).
-    esper.create_entity(Position(8, 8), Player(), BlocksMovement())
+    ecs.create_entity(Position(8, 8), Player(), BlocksMovement())
     processor = TreeGrowthProcessor(game_map, rng=lambda: 1.0)
 
     _advance_a_day(processor, clock, from_turn=_DAYS_PER_YEAR * _DAY_LEN)
-    assert esper.has_component(sapling, Sapling)  # deferred
-    assert not esper.has_component(sapling, Tree)
+    assert ecs.has_component(sapling, Sapling)  # deferred
+    assert not ecs.has_component(sapling, Tree)
 
 
 # --- Berry bushes ----------------------------------------------------------
@@ -186,27 +186,27 @@ def test_sapling_maturation_waits_while_its_tile_is_occupied() -> None:
 def test_bush_sapling_matures_into_a_berry_bush() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
-    seedling = esper.create_entity(
+    ecs.create_entity(clock)
+    seedling = ecs.create_entity(
         Position(8, 8), Renderable(","), Name("Bush Seedling"), Sapling(planted_turn=0, kind="bush")
     )
     processor = TreeGrowthProcessor(game_map, rng=lambda: 1.0)  # suppress sprouts/deaths
 
     _advance_a_day(processor, clock, from_turn=_DAYS_PER_YEAR * _DAY_LEN)
-    assert not esper.has_component(seedling, Sapling)
-    assert esper.has_component(seedling, BerryBush)
-    assert esper.has_component(seedling, BlocksMovement)
-    assert esper.component_for_entity(seedling, BerryBush).has_berries is True
-    assert esper.component_for_entity(seedling, Name).value == "Berry Bush"
+    assert not ecs.has_component(seedling, Sapling)
+    assert ecs.has_component(seedling, BerryBush)
+    assert ecs.has_component(seedling, BlocksMovement)
+    assert ecs.component_for_entity(seedling, BerryBush).has_berries is True
+    assert ecs.component_for_entity(seedling, Name).value == "Berry Bush"
 
 
 def test_picking_berries_marks_the_bush_bare_and_stamps_the_time() -> None:
     clock = WorldClock(turn=500, day_length=_DAY_LEN)
-    esper.create_entity(clock)
-    bush = esper.create_entity(Position(8, 8), Renderable("%"), Name("Berry Bush"), BerryBush())
+    ecs.create_entity(clock)
+    bush = ecs.create_entity(Position(8, 8), Renderable("%"), Name("Berry Bush"), BerryBush())
 
     assert pick_berries(bush, clock) is True
-    b = esper.component_for_entity(bush, BerryBush)
+    b = ecs.component_for_entity(bush, BerryBush)
     assert b.has_berries is False
     assert b.harvested_turn == 500
     # A bare bush yields nothing until it regrows.
@@ -216,19 +216,19 @@ def test_picking_berries_marks_the_bush_bare_and_stamps_the_time() -> None:
 def test_bush_regrows_berries_after_seven_days() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
-    bush = esper.create_entity(Position(8, 8), Renderable("%"), Name("Berry Bush"), BerryBush())
+    ecs.create_entity(clock)
+    bush = ecs.create_entity(Position(8, 8), Renderable("%"), Name("Berry Bush"), BerryBush())
     pick_berries(bush, clock)  # harvested at turn 0
     processor = TreeGrowthProcessor(game_map, rng=lambda: 1.0)
 
     # A daily pass on day 6 (only six days after harvest): not ripe yet.
     _advance_a_day(processor, clock, from_turn=5 * _DAY_LEN)
-    assert esper.component_for_entity(bush, BerryBush).has_berries is False
+    assert ecs.component_for_entity(bush, BerryBush).has_berries is False
 
     # Seven days after harvest: a fresh crop.
     clock.turn = _BERRY_REGROW_DAYS * _DAY_LEN
     processor.process("wait")
-    assert esper.component_for_entity(bush, BerryBush).has_berries is True
+    assert ecs.component_for_entity(bush, BerryBush).has_berries is True
 
 
 def test_bush_picked_midway_through_a_day_still_regrows_on_the_seventh_day() -> None:
@@ -238,8 +238,8 @@ def test_bush_picked_midway_through_a_day_still_regrows_on_the_seventh_day() -> 
     the case that would drift if the rounding were wrong."""
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
-    bush = esper.create_entity(Position(8, 8), Renderable("%"), Name("Berry Bush"), BerryBush())
+    ecs.create_entity(clock)
+    bush = ecs.create_entity(Position(8, 8), Renderable("%"), Name("Berry Bush"), BerryBush())
     processor = TreeGrowthProcessor(game_map, rng=lambda: 1.0)
     processor.process("wait")  # baseline day 0
     clock.turn = _DAY_LEN // 2  # picked halfway through day 0
@@ -248,17 +248,17 @@ def test_bush_picked_midway_through_a_day_still_regrows_on_the_seventh_day() -> 
     for day in range(1, _BERRY_REGROW_DAYS):
         clock.turn = day * _DAY_LEN
         processor.process("wait")
-        assert esper.component_for_entity(bush, BerryBush).has_berries is False
+        assert ecs.component_for_entity(bush, BerryBush).has_berries is False
 
     clock.turn = _BERRY_REGROW_DAYS * _DAY_LEN
     processor.process("wait")
-    assert esper.component_for_entity(bush, BerryBush).has_berries is True
+    assert ecs.component_for_entity(bush, BerryBush).has_berries is True
 
 
 def test_bush_saplings_can_sprout() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     # Sprouting draws twice per sapling: first the gap to the next sprouting
     # tile (0.0 -> the very next one), then what kind it is. A kind roll above
     # the tree's share of the combined chance makes every sprout a bush.
@@ -268,7 +268,7 @@ def test_bush_saplings_can_sprout() -> None:
     processor = TreeGrowthProcessor(game_map, rng=lambda: next(rolls))
 
     _advance_a_day(processor, clock, from_turn=0)
-    kinds = {esper.component_for_entity(e, Sapling).kind for e, _c in esper.get_components(Sapling)}
+    kinds = {ecs.component_for_entity(e, Sapling).kind for e, _c in ecs.get_components(Sapling)}
     assert kinds == {"bush"}
 
 
@@ -282,9 +282,9 @@ def test_bush_saplings_can_sprout() -> None:
 def test_a_quiet_day_costs_a_handful_of_rolls_not_one_per_tile() -> None:
     game_map = GameMap(24, 14)  # ~250 outdoor ground tiles
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     for x in range(4, 12):
-        esper.create_entity(Position(x, 3), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
+        ecs.create_entity(Position(x, 3), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
     calls = 0
 
     def counting_rng() -> float:
@@ -298,7 +298,7 @@ def test_a_quiet_day_costs_a_handful_of_rolls_not_one_per_tile() -> None:
     # One draw for tree deaths, one for bush deaths, one for sprouting: the day
     # asks each distribution "how many?" once and is told "none".
     assert calls <= 4, f"a quiet day should not roll per tile or per plant (rolled {calls})"
-    assert list(esper.get_components(Sapling)) == []
+    assert list(ecs.get_components(Sapling)) == []
 
 
 def test_sprouting_costs_two_rolls_per_sapling_regardless_of_map_size() -> None:
@@ -307,10 +307,10 @@ def test_sprouting_costs_two_rolls_per_sapling_regardless_of_map_size() -> None:
     kind draw. A per-tile scan would scale with the tiles instead."""
     counts = {}
     for width, height in ((24, 14), (48, 28)):
-        esper.clear_database()
+        ecs.clear_database()
         game_map = GameMap(width, height)
         clock = WorldClock(turn=0, day_length=_DAY_LEN)
-        esper.create_entity(clock)
+        ecs.create_entity(clock)
         calls = 0
 
         def counting_rng() -> float:
@@ -321,7 +321,7 @@ def test_sprouting_costs_two_rolls_per_sapling_regardless_of_map_size() -> None:
         processor = TreeGrowthProcessor(game_map, rng=counting_rng)
         processor._cap = 10  # stop well short of the map, so tiles aren't the limit
         _advance_a_day(processor, clock, from_turn=0)
-        counts[(width, height)] = (calls, len(list(esper.get_components(Sapling))))
+        counts[(width, height)] = (calls, len(list(ecs.get_components(Sapling))))
 
     for _size, (calls, saplings) in counts.items():
         assert saplings == 10  # the cap, on both maps
@@ -332,9 +332,9 @@ def test_sprouting_costs_two_rolls_per_sapling_regardless_of_map_size() -> None:
 def test_death_count_tracks_the_population_not_a_per_plant_roll() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     trees = [
-        esper.create_entity(Position(x, 3), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
+        ecs.create_entity(Position(x, 3), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
         for x in range(4, 12)
     ]
     # A gap roll worth exactly two failures, so the deaths land two trees apart:
@@ -347,22 +347,22 @@ def test_death_count_tracks_the_population_not_a_per_plant_roll() -> None:
 
     _advance_a_day(processor, clock, from_turn=0)
 
-    dead = [i for i, e in enumerate(sorted(trees)) if not esper.entity_exists(e)]
+    dead = [i for i, e in enumerate(sorted(trees)) if not ecs.entity_exists(e)]
     assert dead == [2, 5]  # skip 2, hit; skip 2, hit; the next gap runs off the end
 
 
 def test_growth_respects_the_soft_cap() -> None:
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
-    esper.create_entity(Position(10, 6), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
+    ecs.create_entity(clock)
+    ecs.create_entity(Position(10, 6), Renderable("T"), Name("Tree"), Tree(), BlocksMovement())
     # rng between the death chance and the sprout chance: the tree survives, and
     # sprouting *would* fire -- but the cap (already met by the tree) blocks it.
     processor = TreeGrowthProcessor(game_map, rng=lambda: 0.00007)
     processor._cap = 1
 
     _advance_a_day(processor, clock, from_turn=0)
-    assert list(esper.get_components(Sapling)) == []
+    assert list(ecs.get_components(Sapling)) == []
 
 
 # --- Spreading, and seaweed's life cycle ------------------------------------
@@ -418,25 +418,25 @@ def test_seaweed_sprouts_as_a_seedling_and_matures_into_food() -> None:
     game_map = GameMap(24, 14)
     game_map.has_ocean = True
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
-    sprout = esper.create_entity(
+    ecs.create_entity(clock)
+    sprout = ecs.create_entity(
         Position(8, 8), Renderable("'"), Name("Seaweed Sprout"), SeaSprout(planted_turn=0)
     )
     processor = TreeGrowthProcessor(game_map, rng=lambda: 1.0)  # nothing else happens
 
     _advance_a_day(processor, clock, from_turn=0)
-    assert esper.has_component(sprout, SeaSprout), "still young the next day"
-    assert not esper.has_component(sprout, Seaweed)
+    assert ecs.has_component(sprout, SeaSprout), "still young the next day"
+    assert not ecs.has_component(sprout, Seaweed)
 
     clock.turn = _SEAWEED_MATURE_DAYS * _DAY_LEN
     processor.process("wait")
 
-    assert not esper.has_component(sprout, SeaSprout)
-    assert esper.has_component(sprout, Seaweed)
+    assert not ecs.has_component(sprout, SeaSprout)
+    assert ecs.has_component(sprout, Seaweed)
     # ...and unlike a tree it does not block the water it grows in: fish swim
     # over seaweed, which is how they graze it.
-    assert not esper.has_component(sprout, BlocksMovement)
-    assert esper.component_for_entity(sprout, Name).value == "Seaweed"
+    assert not ecs.has_component(sprout, BlocksMovement)
+    assert ecs.component_for_entity(sprout, Name).value == "Seaweed"
 
 
 def test_grown_seaweed_can_rot() -> None:
@@ -446,16 +446,16 @@ def test_grown_seaweed_can_rot() -> None:
     game_map = GameMap(24, 14)
     game_map.has_ocean = True
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     fronds = [
-        esper.create_entity(Position(4 + i, 5), Renderable('"'), Name("Seaweed"), Seaweed())
+        ecs.create_entity(Position(4 + i, 5), Renderable('"'), Name("Seaweed"), Seaweed())
         for i in range(6)
     ]
     processor = TreeGrowthProcessor(game_map, rng=lambda: 0.0)  # every roll kills
 
     _advance_a_day(processor, clock, from_turn=0)
 
-    assert all(not esper.entity_exists(e) for e in fronds)
+    assert all(not ecs.entity_exists(e) for e in fronds)
 
 
 def test_young_seaweed_is_not_counted_against_the_land_flora_cap() -> None:
@@ -466,12 +466,12 @@ def test_young_seaweed_is_not_counted_against_the_land_flora_cap() -> None:
 
     game_map = GameMap(24, 14)
     clock = WorldClock(turn=0, day_length=_DAY_LEN)
-    esper.create_entity(clock)
+    ecs.create_entity(clock)
     for i in range(50):
-        esper.create_entity(Position(2 + i % 20, 2 + i // 20), SeaSprout(planted_turn=0))
+        ecs.create_entity(Position(2 + i % 20, 2 + i // 20), SeaSprout(planted_turn=0))
     processor = TreeGrowthProcessor(game_map, rng=lambda: 0.0)  # every roll sprouts
     processor._cap = 40  # fewer than the 50 sea sprouts standing
 
     _advance_a_day(processor, clock, from_turn=0)
 
-    assert list(esper.get_components(Sapling)), "land growth must ignore sea sprouts"
+    assert list(ecs.get_components(Sapling)), "land growth must ignore sea sprouts"

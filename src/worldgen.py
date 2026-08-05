@@ -10,7 +10,7 @@ the RNG draw order stable when editing -- worldgen reproducibility is tested
 """
 from __future__ import annotations
 
-import esper
+import ecs
 
 from components import (
     Age, Attributes, Bed, BlocksMovement, Equipment, Family, Gender, Inventory,
@@ -70,7 +70,7 @@ def _spawn_cave_rat(x: int, y: int, *, include_loot: bool) -> None:
                 Equipment(slots=default_equipment_slots()),
             ]
         )
-    esper.create_entity(*components)
+    ecs.create_entity(*components)
 
 
 def _nearest_walkable(game_map: GameMap, x: int, y: int) -> Position:
@@ -115,7 +115,7 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     # The game opens mid-morning so the player starts a fresh day in daylight.
     start_clock = WorldClock()
     start_clock.turn = int(start_clock.day_length * 0.2)
-    esper.create_entity(start_clock)
+    ecs.create_entity(start_clock)
 
     player_name = "You"
     player_skin = _human_skin_tone(player_name)
@@ -123,7 +123,7 @@ def _setup_world(game_map: GameMap, player_position: Position, rat_flood: bool =
     player_equipment = default_equipment_slots()
     player_equipment["main hand"] = "Rusty Sword"
     player_equipment["chest"] = "Traveler Tunic"
-    esper.create_entity(
+    ecs.create_entity(
         player_position,
         Renderable("@", fg=player_skin),
         Name(player_name),
@@ -277,7 +277,7 @@ def _populate_island(
         # age (which needs the clock) are added here. Family links wired below.
         _given, _surname, full = onymancer.full_name(gender, surname)
         occupied.add((pos.x, pos.y))
-        return esper.create_entity(
+        return ecs.create_entity(
             pos,
             Renderable("v", fg=_human_skin_tone(full, offset=7)),
             Name(full),
@@ -291,13 +291,13 @@ def _populate_island(
         mg, mtraits, moff, mage = mother_spec
         father = spawn_villager(place(foff), fg, ftraits, surname, fage)
         mother = spawn_villager(place(moff), mg, mtraits, surname, mage)
-        father_fam = esper.component_for_entity(father, Family)
-        mother_fam = esper.component_for_entity(mother, Family)
+        father_fam = ecs.component_for_entity(father, Family)
+        mother_fam = ecs.component_for_entity(mother, Family)
         father_fam.spouse = mother
         mother_fam.spouse = father
         for cg, ctraits, coff, cage in child_specs:
             child = spawn_villager(place(coff), cg, ctraits, surname, cage)
-            child_fam = esper.component_for_entity(child, Family)
+            child_fam = ecs.component_for_entity(child, Family)
             child_fam.parents = [father, mother]
             father_fam.children.append(child)
             mother_fam.children.append(child)
@@ -371,7 +371,7 @@ def _spawn_ocean_life(game_map: GameMap) -> None:
     Fish graze the seaweed (see ``FishAiProcessor``). Placement draws from the
     world seed so the ocean is reproducible for a given seed."""
     rng = world_rng().stream("worldgen_ocean")
-    occupied = {(pos.x, pos.y) for _ent, (pos,) in esper.get_components(Position)}
+    occupied = {(pos.x, pos.y) for _ent, (pos,) in ecs.get_components(Position)}
 
     for y in range(1, game_map.height - 1):
         for x in range(1, game_map.width - 1):
@@ -428,7 +428,7 @@ def _place_player_kit(
         player_ent = first_player_entity()
         bed_xy = (player_position.x + 3, player_position.y + 2)
         if player_ent is not None:
-            for bed_ent, (bpos, _bed) in esper.get_components(Position, Bed):
+            for bed_ent, (bpos, _bed) in ecs.get_components(Position, Bed):
                 if (bpos.x, bpos.y) == bed_xy:
                     set_bed_owner(bed_ent, player_ent)
                     break

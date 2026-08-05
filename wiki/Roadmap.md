@@ -2,7 +2,7 @@
 
 ## Done
 
-- [x] esper ECS (3.x); `Renderer` interface + pygame backend; headless fake-renderer tests
+- [x] Small built-in ECS; `Renderer` interface + pygame backend; headless fake-renderer tests
 - [x] Time-based **action economy** + deterministic completion-time scheduler
 - [x] **Region scheduler**: background world simulation, nearest-first catch-up, idle pumping
 - [x] Seed-deterministic worldgen; ocean/island map; A* + flow-field pathfinding; connected regions

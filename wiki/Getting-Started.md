@@ -3,13 +3,13 @@
 ## Requirements
 
 - **Python 3.12+** (uses `str | None` syntax in annotations)
-- **[esper](https://github.com/benmoran56/esper) 3.x** — the ECS library
-- **pygame** — window/input/audio runtime used by the game
+- **pygame-ce** — window, input, rendering, and audio
+- The ECS is included in the repository; no ECS package is required
 
 ## Install
 
 ```bash
-python3 -m pip install --user esper pygame
+python3 -m pip install --user pygame-ce
 ```
 
 ## Run
@@ -79,5 +79,5 @@ Keybinds live under `keybinds` in `options.json` using action names (for example
 
 Because the renderer is decoupled, you can drive the whole game headless with a
 fake renderer that records `draw_glyph` calls and feeds actions to
-`esper.process(...)`. This is how movement and collision are tested. See
+`ecs.process(...)`. This is how movement and collision are tested. See
 [Architecture](Architecture.md#testing-headless).

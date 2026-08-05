@@ -5,7 +5,7 @@ Why this exists
 ---------------
 The region scheduler (``regions.py``) decides *when* a region simulates. It
 never solved *what to iterate*: every system still reached for
-``esper.get_components(...)``, which walks every entity in the world no matter
+``ecs.get_components(...)``, which walks every entity in the world no matter
 where the player is. At one island that is a few hundred entities and invisible;
 at a hundred islands it is ~85k, and those scans -- not pathfinding -- are what
 make a keypress cost more on a big world than a small one.
@@ -31,9 +31,9 @@ Three things can invalidate a bucket, and each has a hook:
 * an entity's **kind changes** (a sapling matures into a tree, someone falls
   asleep)                   -> ``reclassify(ent)``
 * an entity is **created or destroyed** -> nothing to call: creation and deletion
-  both change esper's own entity population, which the index checks (an O(1)
+  both change ECS's own entity population, which the index checks (an O(1)
   ``len``) on every read and repairs by rebuilding. So a missed hook can only
-  ever cost one rebuild, never a wrong answer. Direct ``esper.create_entity``
+  ever cost one rebuild, never a wrong answer. Direct ``ecs.create_entity``
   calls -- including every one in the tests -- stay correct for free.
 
 Indexes are per map and built on demand (``ensure``), so every caller can count on
@@ -46,7 +46,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 import weakref
 
-import esper
+import ecs
 
 from components import (
     Bed, BerryBush, BlocksMovement, Blueprint, Camp, Corpse, Deer, Fish, Needs, NPC,
@@ -72,12 +72,12 @@ _ROOTED: tuple[type, ...] = (Tree, BerryBush, Sapling, SeaSprout, Seaweed)
 
 
 class _CreationCounter:
-    """Remembers the last entity id esper handed out.
+    """Remembers the last entity id ECS handed out.
 
-    esper has no "something was created" signal, and no cheap one can be derived
+    ECS has no "something was created" signal, and no cheap one can be derived
     from its tables (a create plus a delete leaves every length unchanged). So the
     id source itself is wrapped, once -- the whole of the hook, and the thing that
-    lets every ``esper.create_entity`` in the game and in the tests stay untouched
+    lets every ``ecs.create_entity`` in the game and in the tests stay untouched
     while the index still notices them. Ids are issued in order, so "the last id"
     also names exactly which entities are new since any earlier look.
     """
@@ -95,19 +95,19 @@ class _CreationCounter:
 
 
 def _last_entity_id() -> int:
-    """The highest entity id esper has issued. Installs the counter on first ask,
+    """The highest entity id ECS has issued. Installs the counter on first ask,
     seeding it from the ids already out there (this may be a world that was built
     before anything asked)."""
-    counter = esper._entity_count
+    counter = ecs._entity_count
     if not isinstance(counter, _CreationCounter):
-        counter = _CreationCounter(counter, max(esper._entities, default=0))
-        esper._entity_count = counter
+        counter = _CreationCounter(counter, max(ecs._entities, default=0))
+        ecs._entity_count = counter
     return counter.last_id
 
 
-# Ids passed to ``esper.delete_entity`` since the log was last trimmed, in order.
+# Ids passed to ``ecs.delete_entity`` since the log was last trimmed, in order.
 # The deletion half of the ``_CreationCounter`` trick, and for the same reason:
-# esper has no "something died" signal, so without this the only way to find out
+# ECS has no "something died" signal, so without this the only way to find out
 # what an index still holds that the world no longer has is to compare the whole
 # index against the world. That comparison is O(everything alive) and it fires
 # whenever *anything* dies -- which during a world catch-up is every region,
@@ -118,9 +118,9 @@ _deleted_log: list[int] = []
 
 
 def _install_deletion_log() -> None:
-    """Wrap ``esper.delete_entity`` once so deletions are recorded. Idempotent,
+    """Wrap ``ecs.delete_entity`` once so deletions are recorded. Idempotent,
     and like the creation counter it needs no call-site changes anywhere."""
-    original = esper.delete_entity
+    original = ecs.delete_entity
     if getattr(original, "_records_deletions", False):
         return
 
@@ -129,7 +129,7 @@ def _install_deletion_log() -> None:
         return original(entity, immediate=immediate)
 
     delete_entity._records_deletions = True  # type: ignore[attr-defined]
-    esper.delete_entity = delete_entity
+    ecs.delete_entity = delete_entity
 
 
 def _trim_deletion_log() -> None:
@@ -189,12 +189,12 @@ class SpatialIndex:
         # would do. Trees change when a tree grows or is felled, and that is all
         # this moves for.
         self._kind_version: dict[tuple[RegionId, type], int] = {}
-        # esper's population as of the last sync. Creation/deletion anywhere moves
+        # ECS's population as of the last sync. Creation/deletion anywhere moves
         # this, which is how the index notices work it wasn't told about.
         self._population: tuple[int, int, int] = (-1, -1, -1)
         # How far this index has read the shared deletion log, and the ids it has
         # seen there but not yet been able to drop (a deferred delete is still
-        # alive until the next ``esper.process``).
+        # alive until the next ``ecs.process``).
         self._deleted_cursor = 0
         self._pending_deletes: set[int] = set()
         self.rebuilds = 0  # diagnostics; a healthy live game leaves this alone
@@ -212,15 +212,15 @@ class SpatialIndex:
         exactly as it was, and an index that only watched the total would keep
         handing out the dead deer. ``_dead_entities`` matters too -- a deferred
         delete lands there first and only leaves ``_entities`` at the next
-        ``esper.process``.
+        ``ecs.process``.
         """
-        return (_last_entity_id(), len(esper._entities), len(esper._dead_entities))
+        return (_last_entity_id(), len(ecs._entities), len(ecs._dead_entities))
 
     def sync(self) -> None:
         """Fold in the entities created or destroyed since the last look.
 
         Almost always a single tuple comparison. When something did change, the
-        work is proportional to *what changed*, not to the world: esper hands out
+        work is proportional to *what changed*, not to the world: ECS hands out
         entity ids in order, so the ids created since last time are exactly the
         next run of integers, and only a death forces a pass over what we hold.
         A full rebuild is the last resort (a new or cleared world).
@@ -234,14 +234,14 @@ class SpatialIndex:
             self.rebuild()  # the world was cleared or replaced underneath us
             return
 
-        positioned = esper._components.get(Position, set())
+        positioned = ecs._components.get(Position, set())
         for ent in range(prev_last_id + 1, last_id + 1):
             if ent in positioned:
-                self._insert(ent, esper.component_for_entity(ent, Position))
+                self._insert(ent, ecs.component_for_entity(ent, Position))
         if (alive - prev_alive) != (last_id - prev_last_id) or dead != prev_dead:
             # Something died. The deletion log says exactly what, so the repair
             # costs what died rather than what lives. A deferred delete is still
-            # in ``positioned`` until the next ``esper.process``, so ids that
+            # in ``positioned`` until the next ``ecs.process``, so ids that
             # haven't actually gone yet stay pending and are re-checked next time
             # -- that set only ever holds the handful in flight.
             self._pending_deletes.update(_deleted_log[self._deleted_cursor:])
@@ -267,7 +267,7 @@ class SpatialIndex:
         self.rooted = {}
         self._rooted_tile = {}
         _install_deletion_log()
-        for ent, (pos,) in esper.get_components(Position):
+        for ent, (pos,) in ecs.get_components(Position):
             self._insert(ent, pos)
         # A rebuild has just read the world directly, so nothing already in the
         # log can still be owed -- start from its end.
@@ -278,7 +278,7 @@ class SpatialIndex:
     # --- maintenance ------------------------------------------------------
 
     def _kinds_for(self, ent: int) -> tuple[type, ...]:
-        return tuple(kind for kind in _KINDS if esper.has_component(ent, kind))
+        return tuple(kind for kind in _KINDS if ecs.has_component(ent, kind))
 
     def _is_static_blocker(self, ent: int) -> bool:
         """Static blockers are the furniture of the world -- trees, walls-in-a-box,
@@ -286,9 +286,9 @@ class SpatialIndex:
         AI deliberately ignores creature-on-creature collision, so they are left
         out (see ``NpcAiProcessor._advance_region``)."""
         return (
-            esper.has_component(ent, BlocksMovement)
-            and not esper.has_component(ent, NPC)
-            and not esper.has_component(ent, Player)
+            ecs.has_component(ent, BlocksMovement)
+            and not ecs.has_component(ent, NPC)
+            and not ecs.has_component(ent, Player)
         )
 
     @staticmethod
@@ -376,7 +376,7 @@ class SpatialIndex:
         self._bump(region, was)
         for kind in was:
             self._by_kind.get((region, kind), set()).discard(ent)
-        if not esper.entity_exists(ent) or not esper.has_component(ent, Position):
+        if not ecs.entity_exists(ent) or not ecs.has_component(ent, Position):
             self._kinds_of.pop(ent, None)
             self._forget(ent)
             return
@@ -386,7 +386,7 @@ class SpatialIndex:
         self._kinds_of[ent] = kinds
         for kind in kinds:
             self._by_kind.setdefault((region, kind), set()).add(ent)
-        pos = esper.component_for_entity(ent, Position)
+        pos = ecs.component_for_entity(ent, Position)
         if self._is_static_blocker(ent):
             self.blockers[(pos.x, pos.y)] = ent
             self._blocker_tile[ent] = (pos.x, pos.y)
@@ -459,11 +459,11 @@ class SpatialIndex:
         return self.rooted.get((x, y))
 
     def components(self, region_id: RegionId, *kinds: type) -> Iterator[tuple[int, tuple]]:
-        """``esper.get_components``, scoped to one region.
+        """``ecs.get_components``, scoped to one region.
 
         Yields ``(entity, (component, ...))`` for the region's entities that have
         every requested component, in ascending entity order so iteration is as
-        deterministic as esper's own.
+        deterministic as ECS's own.
         """
         self.sync()
         if not kinds:
@@ -478,10 +478,10 @@ class SpatialIndex:
         else:
             candidates = set(self._by_region.get(region_id, set()))
         for ent in sorted(candidates):
-            if not esper.entity_exists(ent):
+            if not ecs.entity_exists(ent):
                 continue
-            if all(esper.has_component(ent, kind) for kind in kinds):
-                yield ent, tuple(esper.component_for_entity(ent, kind) for kind in kinds)
+            if all(ecs.has_component(ent, kind) for kind in kinds):
+                yield ent, tuple(ecs.component_for_entity(ent, kind) for kind in kinds)
 
     # --- diagnostics ------------------------------------------------------
 
@@ -503,7 +503,7 @@ class SpatialIndex:
         truth_region: dict[int, RegionId] = {}
         truth_blockers: dict[tuple[int, int], int] = {}
         truth_rooted: dict[tuple[int, int], int] = {}
-        for ent, (pos,) in esper.get_components(Position):
+        for ent, (pos,) in ecs.get_components(Position):
             truth_region[ent] = region_at(self.game_map, pos.x, pos.y)
             if self._is_static_blocker(ent):
                 truth_blockers[(pos.x, pos.y)] = ent
@@ -530,10 +530,10 @@ class SpatialIndex:
             )
         for (region, kind), bucket in self._by_kind.items():
             for ent in bucket:
-                if not esper.entity_exists(ent):
+                if not ecs.entity_exists(ent):
                     problems.append(f"{kind.__name__} bucket {region} holds dead entity {ent}")
                     break
-                if not esper.has_component(ent, kind):
+                if not ecs.has_component(ent, kind):
                     problems.append(f"{kind.__name__} bucket {region} holds unrelated {ent}")
                     break
                 if truth_region.get(ent) != region:
@@ -599,6 +599,6 @@ def component_population(component_type: type) -> int:
     is the point: it turns "rescan the world in case something changed" into
     "rebuild only when something did".
     """
-    return len(esper._components.get(component_type, ()))
+    return len(ecs._components.get(component_type, ()))
 
 

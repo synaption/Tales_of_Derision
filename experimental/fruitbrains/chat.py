@@ -167,6 +167,10 @@ class Backend:
         """What the backend remembers about the player. Stateless: nothing."""
         return ""
 
+    def remembers(self, villager: str) -> str:
+        """One player-facing line about what has stuck. Stateless: nothing."""
+        return ""
+
 
 class CannedBackend(Backend):
     """Scripted lines -- a deliberate mode, never a stand-in for the model.
@@ -597,7 +601,7 @@ class ChatService:
 
         def work() -> None:
             try:
-                text = self.backend.memory(villager)
+                text = self.backend.remembers(villager)
             except Exception:
                 text = ""                 # a missing memory line is not worth an error
             if text:

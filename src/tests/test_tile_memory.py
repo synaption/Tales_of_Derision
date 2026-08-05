@@ -8,7 +8,7 @@ we can read exactly which glyph/colour landed on each remembered cell.
 """
 from __future__ import annotations
 
-import esper
+import ecs
 import pytest
 
 from components import (
@@ -44,23 +44,23 @@ def _setup() -> tuple[GameMap, FakeRenderer, Position, int, int]:
     game_map = GameMap(25, 5)
     renderer = FakeRenderer()
 
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(RenderProcessor(renderer, game_map), priority=0)
 
     player_pos = Position(3, 2)
-    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(2), BlocksMovement())
-    tree = esper.create_entity(Position(4, 2), Renderable(_TREE_GLYPH, fg=_TREE_FG), Name("Tree"), Tree())
-    npc = esper.create_entity(
+    ecs.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(2), BlocksMovement())
+    tree = ecs.create_entity(Position(4, 2), Renderable(_TREE_GLYPH, fg=_TREE_FG), Name("Tree"), Tree())
+    npc = ecs.create_entity(
         Position(5, 2), Renderable("r", fg=(200, 60, 60)), Name("Rat"), NPC(), Enemy(), BlocksMovement()
     )
     return game_map, renderer, player_pos, tree, npc
 
 
 def test_is_memorable_scenery_whitelists_static_objects_only() -> None:
-    tree = esper.create_entity(Position(0, 0), Renderable("T"), Tree())
-    table = esper.create_entity(Position(1, 0), Renderable("T"), Furniture("table"))
-    rat = esper.create_entity(Position(2, 0), Renderable("r"), NPC(), Enemy())
-    corpse = esper.create_entity(Position(3, 0), Renderable("x"), Corpse(), Name("Corpse"))
+    tree = ecs.create_entity(Position(0, 0), Renderable("T"), Tree())
+    table = ecs.create_entity(Position(1, 0), Renderable("T"), Furniture("table"))
+    rat = ecs.create_entity(Position(2, 0), Renderable("r"), NPC(), Enemy())
+    corpse = ecs.create_entity(Position(3, 0), Renderable("x"), Corpse(), Name("Corpse"))
 
     assert is_memorable_scenery(tree)
     assert is_memorable_scenery(table)
@@ -72,13 +72,13 @@ def test_tree_is_seen_lit_then_remembered_desaturated_when_out_of_sight() -> Non
     _game_map, renderer, _player_pos, _tree, _npc = _setup()
 
     # In view: the tree is drawn at its true (lit) colour.
-    esper.process(None)
+    ecs.process(None)
     assert renderer.glyphs[(4, 2)] == _TREE_GLYPH
     assert renderer.glyph_colors[(4, 2)][0] == _TREE_FG
 
     # Walk out of the tree's line of sight (radius 2): (3,2) -> (2,2) -> (1,2).
-    esper.process("move_left")
-    esper.process("move_left")
+    ecs.process("move_left")
+    ecs.process("move_left")
 
     # The tree tile is no longer visible but is remembered: same glyph, but the
     # colour has been toned down to its desaturated "memory" tone.
@@ -92,11 +92,11 @@ def test_tree_is_seen_lit_then_remembered_desaturated_when_out_of_sight() -> Non
 def test_npc_is_not_remembered_when_it_leaves_view() -> None:
     game_map, renderer, _player_pos, _tree, _npc = _setup()
 
-    esper.process(None)
+    ecs.process(None)
     assert renderer.glyphs[(5, 2)] == "r"  # the NPC is visible to start
 
-    esper.process("move_left")
-    esper.process("move_left")
+    ecs.process("move_left")
+    ecs.process("move_left")
 
     # The NPC's tile was explored, so its terrain is remembered -- but the NPC
     # itself is gone from the frame, leaving only the (desaturated) floor.
@@ -106,9 +106,9 @@ def test_npc_is_not_remembered_when_it_leaves_view() -> None:
 def test_remembered_terrain_is_dimmed_but_present() -> None:
     game_map, renderer, _player_pos, _tree, _npc = _setup()
 
-    esper.process(None)
-    esper.process("move_left")
-    esper.process("move_left")
+    ecs.process(None)
+    ecs.process("move_left")
+    ecs.process("move_left")
 
     # A remembered plain-floor tile (the tree's neighbour) still draws its floor
     # glyph, tinted to the memory tone rather than left uncoloured (None).
@@ -121,14 +121,14 @@ def test_remembered_terrain_is_dimmed_but_present() -> None:
 def test_felled_tree_clears_its_memory_while_still_in_view() -> None:
     _game_map, renderer, _player_pos, tree, _npc = _setup()
 
-    esper.process(None)  # see and remember the tree
+    ecs.process(None)  # see and remember the tree
 
     # The tree is chopped down while the player still has it in sight.
-    esper.delete_entity(tree, immediate=True)
-    esper.process(None)  # re-observe the now-empty tile: memory should clear
+    ecs.delete_entity(tree, immediate=True)
+    ecs.process(None)  # re-observe the now-empty tile: memory should clear
 
-    esper.process("move_left")
-    esper.process("move_left")
+    ecs.process("move_left")
+    ecs.process("move_left")
 
     # With the tree gone before the tile left view, nothing scenery-like is
     # recalled there -- just remembered floor.
@@ -141,25 +141,25 @@ def _setup_open_room() -> tuple[GameMap, FakeRenderer, Position]:
     """Just a player (short vision) in an open room -- no NPC on the test tile."""
     game_map = GameMap(25, 5)
     renderer = FakeRenderer()
-    esper.add_processor(MovementProcessor(game_map), priority=1)
-    esper.add_processor(RenderProcessor(renderer, game_map), priority=0)
+    ecs.add_processor(MovementProcessor(game_map), priority=1)
+    ecs.add_processor(RenderProcessor(renderer, game_map), priority=0)
     player_pos = Position(3, 2)
-    esper.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(2), BlocksMovement())
+    ecs.create_entity(player_pos, Renderable("@"), Name("You"), Player(), Vision(2), BlocksMovement())
     return game_map, renderer, player_pos
 
 
 def test_wall_built_out_of_sight_is_not_remembered() -> None:
     game_map, renderer, _player_pos = _setup_open_room()
 
-    esper.process(None)  # see the floor at (5, 2)
+    ecs.process(None)  # see the floor at (5, 2)
     assert renderer.glyphs[(5, 2)] == game_map.FLOOR
 
-    esper.process("move_left")
-    esper.process("move_left")  # (5, 2) is now remembered floor, out of sight
+    ecs.process("move_left")
+    ecs.process("move_left")  # (5, 2) is now remembered floor, out of sight
 
     # A villager raises a wall on that tile while the player can't see it.
     assert game_map.set_tile(5, 2, game_map.WALL)
-    esper.process(None)
+    ecs.process(None)
 
     proc = _render_processor()
     assert (5, 2) not in proc._visible_tiles
@@ -171,16 +171,16 @@ def test_wall_built_out_of_sight_is_not_remembered() -> None:
 def test_remembered_terrain_updates_once_the_change_is_seen() -> None:
     game_map, renderer, _player_pos = _setup_open_room()
 
-    esper.process(None)
-    esper.process("move_left")
-    esper.process("move_left")
+    ecs.process(None)
+    ecs.process("move_left")
+    ecs.process("move_left")
     game_map.set_tile(5, 2, game_map.WALL)  # built out of sight
-    esper.process(None)
+    ecs.process(None)
     assert renderer.glyphs[(5, 2)] == game_map.FLOOR  # still remembered as floor
 
     # Walk back until the wall is actually in view again.
-    esper.process("move_right")
-    esper.process("move_right")
+    ecs.process("move_right")
+    ecs.process("move_right")
 
     proc = _render_processor()
     assert (5, 2) in proc._visible_tiles
@@ -190,6 +190,6 @@ def test_remembered_terrain_updates_once_the_change_is_seen() -> None:
 
 
 def _render_processor() -> RenderProcessor:
-    proc = esper.get_processor(RenderProcessor)
+    proc = ecs.get_processor(RenderProcessor)
     assert proc is not None, "no RenderProcessor registered"
     return proc

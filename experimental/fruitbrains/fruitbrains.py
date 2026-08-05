@@ -408,7 +408,7 @@ class Game:
         elif self.chat.stateful:
             # What the villager has actually written down about you -- the whole
             # reason for the agent layer, so it belongs on screen, not in a log.
-            note = " ".join(self.chat.memory(other.name).split()) or "nothing about you yet"
+            note = " ".join(self.chat.memory(other.name).split()) or "this is our first chat"
             self.fit_text(f"remembers: {note}", (panel.x + 232, panel.y + 15), 19,
                           (128, 150, 170), panel.right - 232 - 226)
 
