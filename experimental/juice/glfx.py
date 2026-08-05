@@ -173,6 +173,13 @@ MAX_LIGHTS = 24
 MAX_WAVES = 8
 MAX_SHADOW_CASTERS = 32
 
+#: How many tile rows in front of a fragment the floor shader looks for the
+#: surface that is actually visible there. Raised ground is drawn shifted up
+#: the screen, so a fragment can be showing the top of a tile that lies this
+#: many rows nearer the camera -- see `resolve_surface`. Three rows covers a
+#: hill of any height the bench's slider can ask for; more would only cost.
+TERRAIN_ROWS = 3
+
 QUAD_VS = """
 #version 330
 
@@ -189,7 +196,8 @@ in vec4 in_color;       // tint, alpha in .a
 in float in_flash;      // 0..1 towards white
 in vec2 in_lag;         // soft-body displacement of the trailing edge, px
 in float in_shape;      // 0 sprite, 1 disc, 2 ring, 3 arc, 4 cut
-in vec4 in_params;      // shape-specific
+in vec4 in_params;      // shape-specific in xyz; .w is the terrain lift, px
+in float in_depth;      // world y it stands at; 0 means "the foot of the quad"
 
 // Camera. Roll and zoom are applied to the *geometry* rather than by
 // resampling the finished frame, which is the one place the GL path is not
@@ -210,6 +218,7 @@ flat out float v_flash;
 flat out vec2 v_lag;        // in quad-space units
 flat out float v_shape;
 flat out vec4 v_params;
+flat out float v_ground;    // world y it stands at, for the occlusion test
 
 mat2 rot(float a) {
     float c = cos(a), s = sin(a);
@@ -227,7 +236,15 @@ void main() {
 
     vec2 local = rot(in_rot) * (in_corner * half_size * 2.0);
     vec2 world = in_center + local;
+    // Standing on high ground is a pure upward shift of where the thing is
+    // *drawn*, and emphatically not of where it *is*: `v_world` stays on the
+    // flat plane the lights, the shadows and the wall grid all live on, so a
+    // torch three tiles away lights a body on a plateau from three tiles away
+    // rather than from the extra half tile the picture moved it. Applied here
+    // in world space rather than to the finished screen position so that the
+    // camera's roll takes the hill with it.
     v_world = world;
+    world.y -= in_params.w;
 
     vec2 rel = (world - u_camera) * u_zoom;
     vec2 screen = rot(u_roll) * rel + u_half + u_shake;
@@ -241,6 +258,22 @@ void main() {
     v_lag = in_lag / max(in_size, vec2(1.0));
     v_shape = in_shape;
     v_params = in_params;
+
+    /* Where this thing is *standing*, which is not where it is drawn.
+
+       Every quad in this batch is a picture of something that occupies one
+       spot on the floor, and that spot -- not the picture -- is what a hill in
+       front has to be compared against. The default is the bottom edge of the
+       quad, which is the right answer for nearly everything here and costs
+       nothing: an upright sprite's feet are its lower edge, and a shadow or a
+       decal lying flat wants its *nearest* pixel, or rising ground would start
+       eating the near half of it.
+
+       An explicit value overrides that, for the cases where the picture and
+       the position genuinely differ: a bomb in the air is drawn well above the
+       spot it is going to land on, and a damage number is not in the room at
+       all and is handed a value far enough forward that nothing can cover it. */
+    v_ground = in_depth > 0.0 ? in_depth : in_center.y + in_size.y * 0.5;
 }
 """
 
@@ -256,6 +289,7 @@ flat in float v_flash;
 flat in vec2 v_lag;
 flat in float v_shape;
 flat in vec4 v_params;
+flat in float v_ground;
 
 uniform sampler2D u_albedo;
 uniform sampler2D u_normal;
@@ -283,6 +317,13 @@ uniform float u_sharpness;              // 0 = bilinear, 1 = sharp bilinear
 out vec4 frag_color;
 
 const float PI = 3.14159265;
+
+TERRAIN_LIB
+
+//: Slack on the occlusion test, in world pixels. Something standing *on* a
+//: ledge is at the same y as that ledge's own front edge to within a rounding
+//: error, and with no slack at all it would clip its own feet off.
+const float GROUND_SLACK = 2.5;
 
 /* Sharp bilinear.
 
@@ -353,7 +394,7 @@ float shadow_visibility(vec2 world, vec2 light_pos) {
     return wall_shadow * npc_shadow;
 }
 
-vec3 light_at(vec2 world, vec3 n) {
+vec3 light_at(vec2 world, vec3 n, float height) {
     float contrast = max(u_light_contrast, 0.01);
     // From the authored value at contrast 1 to literally no ambient at 10.
     // This is linear so the last part of the slider remains useful instead of
@@ -369,7 +410,7 @@ vec3 light_at(vec2 world, vec3 n) {
         // and the loop can be cut short.
         float atten = 1.0 - dist / L.z;
         atten *= atten;
-        vec3 dir = normalize(vec3(d, u_light_height));
+        vec3 dir = normalize(vec3(d, height));
         // Half-lambert: a creature's unlit side goes dim, not black. Fully
         // black silhouettes read as holes at this sprite size.
         float ndl = 0.35 + 0.65 * max(dot(n, dir), 0.0);
@@ -382,6 +423,35 @@ vec3 light_at(vec2 world, vec3 n) {
 }
 
 void main() {
+    /* Behind a hill?
+
+       There is no depth buffer and no sorting here, and that is not an
+       oversight: the batch is one draw call in painter's order, which is what
+       lets four thousand additive sparks stack into a glow instead of into
+       paint. Depth writes from translucent quads would take that away, and
+       depth *without* writes is not something this GL binding exposes.
+
+       So the question is asked from the other end. The fragment walks the
+       terrain itself and finds which piece of ground is visible where it is
+       about to draw -- the same `resolve_surface` the floor shader runs, from
+       the same injected source -- and stands down if that ground is further
+       forward than the thing it belongs to. Sorting solves the general
+       problem; this solves the one the room actually has, which is that a
+       creature can be behind a hill.
+
+       Cheap where it counts: three iterations of a couple of texel fetches,
+       over the pixels sprites cover rather than the whole screen, and skipped
+       outright on a flat arena. */
+    if (u_rise > 0.0) {
+        // The spot on the flat plane this fragment is drawn over. The quad was
+        // lifted up the screen by the ground under it, so putting the lift
+        // back is what turns "where it is drawn" into "where that is on the
+        // floor" -- and the floor is the only thing `resolve_surface` knows.
+        vec2 plane = vec2(v_world.x, v_world.y - v_params.w);
+        if (surface_depth(resolve_surface(plane)) > v_ground + GROUND_SLACK)
+            discard;
+    }
+
     vec2 q = v_local;
     float alpha = 1.0;
     vec3 rgb = v_color.rgb;
@@ -451,7 +521,12 @@ void main() {
             vec3 n = v_params.y > 0.5
                 ? vec3(0.0, 0.0, 1.0)
                 : normalize(texture(u_normal, suv).xyz * 2.0 - 1.0);
-            rgb *= light_at(v_world, n);
+            // Climbing a hill closes the gap to the lights, which is the one
+            // part of standing higher up that is not merely a shift of the
+            // picture: the pool a torch throws tightens and brightens under a
+            // creature on a plateau the same way it would if the torch had
+            // been lowered towards it.
+            rgb *= light_at(v_world, n, max(u_light_height - v_params.w, 4.0));
         }
     } else if (v_shape < 1.5) {
         // A soft disc: particles, shadows, decals, dust.
@@ -552,8 +627,12 @@ uniform float u_light_contrast;
 uniform float u_wall_shadow_amount;
 uniform float u_npc_shadow_amount;
 
+uniform float u_cliff_shade;
+
 out vec4 frag_color;
 const float PI = 3.14159265;
+
+TERRAIN_LIB
 
 vec2 sharp_uv(vec2 uv, vec2 tex_size) {
     vec2 p = uv * tex_size;
@@ -631,6 +710,13 @@ void main() {
                  * u_ambient_sway;
     }
 
+    // Elevation, before anything is sampled: from here on `world` is where the
+    // *ground* being shown is, which is not where the fragment is any more.
+    vec4 surface = resolve_surface(world);
+    world = surface.xy;
+    bool is_cliff = surface.z >= 0.0;
+    float height = surface.w * u_rise;      // pixels above the flat plane
+
     vec2 uv = world / u_extent;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         frag_color = vec4(0.0);
@@ -638,8 +724,26 @@ void main() {
     }
     vec2 suv = sharp_uv(uv, u_floor_size);
     vec3 rgb = texture(u_floor, suv).rgb;
+    if (is_cliff) {
+        // The exposed side of the ground: the same floor, seen edge on. Darker
+        // because it faces the viewer rather than the sky, and the darkening is
+        // a slider because how much of a cliff you want to read as rock rather
+        // than as shadow is exactly the kind of question this bench is for.
+        // Darker still towards the foot, which is the cheapest thing that
+        // stops a flat band of colour reading as a painted skirting board.
+        rgb *= u_cliff_shade * (1.0 - 0.3 * surface.z);
+    } else {
+        // A little brighter the higher it is, which is what stops two terraces
+        // of identical floor reading as one floor with a line drawn on it.
+        rgb *= 1.0 + 0.05 * surface.w;
+    }
     if (u_lit > 0.5) {
         vec3 n = normalize(texture(u_floor_normal, suv).xyz * 2.0 - 1.0);
+        // A cliff face is vertical and pointed at the camera, so it takes its
+        // normal from the geometry instead of from the floor's bump map --
+        // which is a map of a surface lying flat and says nothing useful about
+        // one standing on its edge. Light from the south rakes across it.
+        if (is_cliff) n = normalize(vec3(0.0, 1.0, 0.55));
         float contrast = max(u_light_contrast, 0.01);
         float ambient_scale = 1.0 - clamp((contrast - 1.0) / 9.0, 0.0, 1.0);
         vec3 sum = u_ambient * ambient_scale;
@@ -650,7 +754,9 @@ void main() {
             if (dist > L.z) continue;
             float atten = 1.0 - dist / L.z;
             atten *= atten;
-            vec3 dir = normalize(vec3(d, u_light_height));
+            // Raised ground is that much closer to the lights, which is what
+            // makes a plateau catch a torch the flat floor beside it misses.
+            vec3 dir = normalize(vec3(d, max(u_light_height - height, 4.0)));
             // A wider wrap than the sprites get. A floor is nearly flat, so a
             // strict N.L makes the whole pool depend on the light's height and
             // a low light lands as a coin-sized dot; the wrap keeps the pool
@@ -806,11 +912,152 @@ void main() {
 """
 
 
+# ---------------------------------------------------------------------------
+# The terrain, as GLSL both programs get a copy of
+# ---------------------------------------------------------------------------
+#
+# Injected into the floor shader *and* the quad shader, because both of them
+# have to agree about where the ground is while asking opposite questions of
+# the same answer. The floor asks "which piece of ground do I draw here"; a
+# sprite asks "is a piece of ground in front of me covering this pixel". One
+# copy of the maths, substituted in the same pass that substitutes the array
+# sizes, so the two cannot drift apart -- which they would, silently, and the
+# tell would be creatures standing inside hills.
+
+TERRAIN_GLSL = """
+// Elevation. `u_terrain` is one texel a tile: red is the level, green is the
+// stair code -- see `terrain.Terrain.pack`. `u_rise` is how many pixels a
+// level is worth, and zero switches the whole thing off, which is what the
+// bench's toggle does.
+uniform sampler2D u_terrain;
+uniform float u_tile;
+uniform float u_rise;
+
+/* Ground height under a world point, in levels.
+
+   The exact companion of `terrain.Terrain.lift_at`, and a test renders one
+   against the other rather than trusting that they were written on the same
+   afternoon: the sprites are lifted by the Python one and the floor they stand
+   on by this one, so any disagreement is a creature hovering over its own
+   hill. Flat within a tile, linear across a stair. */
+vec2 terrain_at(vec2 world) {
+    ivec2 cell = clamp(ivec2(floor(world / u_tile)), ivec2(0), u_grid_size - 1);
+    vec2 t = texelFetch(u_terrain, cell, 0).rg;
+    // Both channels are a small integer times 32, which every byte in the
+    // range holds exactly -- so the rounding here is a decode, not a guess.
+    return vec2(floor(t.r * 255.0 / 32.0 + 0.5), floor(t.g * 255.0 / 32.0 + 0.5));
+}
+
+/* The height a tile's ground stands at, under a point inside that tile.
+
+   Split from the fetch because `resolve_surface` wants two heights out of the
+   same tile -- one at each of its horizontal edges -- and the fetch is the
+   expensive half. */
+float lift_of(vec2 t, vec2 world) {
+    if (t.y < 0.5) return t.x;
+    vec2 f = fract(world / u_tile);
+    // Codes, from `terrain.STAIR_CODES`: 1 uphill +x, 2 -x, 3 +y, 4 -y.
+    float along = t.y < 1.5 ? f.x
+                : (t.y < 2.5 ? 1.0 - f.x
+                : (t.y < 3.5 ? f.y : 1.0 - f.y));
+    return t.x + clamp(along, 0.0, 1.0);
+}
+
+float lift_levels(vec2 world) {
+    return lift_of(terrain_at(world), world);
+}
+
+/* Which piece of ground is actually visible at this fragment.
+
+   Raised ground is drawn shifted up the screen, so the pixel under the cursor
+   is showing one of three things: the floor that is genuinely here, the *top*
+   of a tile that lies some rows nearer the camera and has been lifted over
+   this spot, or the *cliff face* hanging under such a tile's near edge. The
+   nearer tile wins, so the scan runs front to back and stops at the first hit.
+
+   Returns the world point to sample in .xy and the height of that surface in
+   levels in .w. `.z` is -1 for a top face and 0..1 for a cliff face, saying
+   how far down the face the fragment is -- one component carrying both "is
+   this a face" and "where on it", because a vec4 is what a function returns
+   and the two are never wanted apart. */
+vec4 resolve_surface(vec2 world) {
+    if (u_rise <= 0.0) return vec4(world, -1.0, 0.0);
+    float row = floor(world.y / u_tile);
+    /* The ground just in front of the row about to be looked at, carried from
+       one iteration to the next. The scan walks *backwards* up the column, so
+       each tile's near neighbour is the tile the previous iteration was
+       standing on -- which turns three texture fetches an iteration into one,
+       and this loop runs over every fragment of the floor and of every sprite
+       in the batch. */
+    float l_front = lift_levels(vec2(world.x,
+                                     (row + float(TERRAIN_ROWS) + 1.0) * u_tile + 0.01));
+    for (int r = TERRAIN_ROWS; r >= 0; --r) {
+        float y_far = (row + float(r)) * u_tile;      // the tile's north edge
+        float y_near = y_far + u_tile;                // and its south edge
+        // One fetch, two heights: the two horizontal edges of the same tile,
+        // which differ only where that tile is a stair climbing north-south.
+        vec2 t = terrain_at(vec2(world.x, y_far + 0.01));
+        float l_far = lift_of(t, vec2(world.x, y_far + 0.01));
+        float l_near = lift_of(t, vec2(world.x, y_near - 0.01));
+
+        /* The top face. A fragment shows source row `ys` when
+               ys - rise * lift(ys) == world.y,
+           and lift is linear in ys across one tile -- flat on plain ground, a
+           constant slope on a stair -- so the whole search is one division.
+           Marching down the column instead would cost tens of texture fetches
+           a fragment to answer a question with a closed form. */
+        float slope = (l_near - l_far) / u_tile;      // levels per world pixel
+        float denom = max(1.0 - u_rise * slope, 1e-3);
+        float ys = (world.y + u_rise * (l_far - slope * y_far)) / denom;
+        if (ys >= y_far && ys < y_near) {
+            return vec4(world.x, ys, -1.0, l_far + slope * (ys - y_far));
+        }
+
+        /* The cliff face, hanging under the near edge and as tall as the drop
+           to whatever is in front. Its span begins exactly where the top face
+           above it ended, so the two can never both claim a fragment. */
+        if (l_near > l_front + 1e-3) {
+            float top = y_near - u_rise * l_near;
+            float bottom = y_near - u_rise * l_front;
+            if (world.y >= top && world.y < bottom) {
+                float down = (world.y - top) / max(bottom - top, 1e-4);
+                // Sampled from the *middle* of the tile it hangs off, not from
+                // its near edge. The baked floor draws each tile two pixels
+                // short so the grid reads as grout, and the near edge is that
+                // grout -- a face sampled there is a strip of background and
+                // comes out solid black.
+                return vec4(world.x, y_far + u_tile * 0.5, down,
+                            mix(l_near, l_front, down));
+            }
+        }
+        // This tile is the next one's near neighbour.
+        l_front = l_far;
+    }
+    return vec4(world, -1.0, 0.0);
+}
+
+/* How far forward the ground visible at a fragment stands, in world y.
+
+   The one number the occlusion test needs. A top face is as far forward as
+   the strip of ground it is showing; a cliff face belongs to the tile it
+   hangs off and is as far forward as that tile's near edge, because the face
+   *is* that edge, seen from the front. */
+float surface_depth(vec4 surface) {
+    if (surface.z < 0.0) return surface.y;
+    return (floor(surface.y / u_tile) + 1.0) * u_tile;
+}
+"""
+
+
 def _inject(src: str) -> str:
     """Substitute the array sizes the shaders share with Python."""
-    return (src.replace("MAX_LIGHTS", str(MAX_LIGHTS))
+    # The terrain chunk goes in first: it has a `TERRAIN_ROWS` of its own in
+    # it, and the substitutions below are what turn that into a number.
+    return (src.replace("TERRAIN_LIB", TERRAIN_GLSL)
+               .replace("MAX_LIGHTS", str(MAX_LIGHTS))
                .replace("MAX_WAVES", str(MAX_WAVES))
-               .replace("MAX_SHADOW_CASTERS", str(MAX_SHADOW_CASTERS)))
+               .replace("MAX_SHADOW_CASTERS", str(MAX_SHADOW_CASTERS))
+               .replace("TERRAIN_ROWS", str(TERRAIN_ROWS)))
 
 
 # ---------------------------------------------------------------------------
@@ -982,10 +1229,11 @@ class Atlas:
 #: One instance, in floats. Kept as a module constant because the numpy view,
 #: the buffer format string and the shader inputs all have to agree and there
 #: is no way to make the compiler check that for you.
-INSTANCE_FLOATS = 21
-INSTANCE_FORMAT = "2f 2f 1f 2f 2f 4f 1f 2f 1f 4f"
+INSTANCE_FLOATS = 22
+INSTANCE_FORMAT = "2f 2f 1f 2f 2f 4f 1f 2f 1f 4f 1f"
 INSTANCE_ATTRS = ["in_center", "in_size", "in_rot", "in_uv0", "in_uv1",
-                  "in_color", "in_flash", "in_lag", "in_shape", "in_params"]
+                  "in_color", "in_flash", "in_lag", "in_shape", "in_params",
+                  "in_depth"]
 
 SHAPE_SPRITE, SHAPE_DISC, SHAPE_RING, SHAPE_ARC, SHAPE_CUT = 0.0, 1.0, 2.0, 3.0, 4.0
 
@@ -1034,7 +1282,21 @@ class QuadBatch:
 
     def add(self, cx, cy, w, h, *, rot=0.0, uv=None, color=(1.0, 1.0, 1.0),
             alpha=1.0, flash=0.0, lag=(0.0, 0.0), shape=SHAPE_SPRITE,
-            params=(0.0, 0.0, 0.0, 0.0)):
+            params=(0.0, 0.0, 0.0, 0.0), lift=0.0, depth=0.0):
+        """One instance.
+
+        `lift` is how far above the flat plane this thing's ground is, in
+        pixels. It travels in the fourth slot of `params` rather than as an
+        attribute of its own because the buffer layout, the format string and
+        the shader inputs all have to agree by hand, and every shape already
+        had a spare component there. The named argument is what keeps that from
+        being something anyone has to remember: no caller writes `params[3]`.
+
+        `depth` is the world y this thing *stands* at, which decides whether a
+        hill in front of it hides it. Zero -- the usual answer -- means "the
+        foot of the quad", and only the handful of things whose picture is not
+        where they are need to say otherwise. See `v_ground` in the shader.
+        """
         if self.count >= self.capacity:
             self._grow()
         row = self.data[self.count]
@@ -1048,7 +1310,9 @@ class QuadBatch:
         row[13] = flash
         row[14], row[15] = lag
         row[16] = shape
-        row[17], row[18], row[19], row[20] = params
+        row[17], row[18], row[19] = params[0], params[1], params[2]
+        row[20] = lift
+        row[21] = depth
         self.count += 1
 
     def render(self):

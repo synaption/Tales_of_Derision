@@ -1112,6 +1112,515 @@ def test_the_bomb_flies_with_the_ragdolls_switched_off():
 
 
 # ---------------------------------------------------------------------------
+# Hills and stairs
+# ---------------------------------------------------------------------------
+#
+# `terrain.py` is the second thing in this bench that is not a renderer, and it
+# is tested the same way `RagdollField` is: everything except the last three
+# tests here runs with no context, no window and no pixel, because "can you
+# walk from this tile to that one" is a question about a data structure.
+#
+# The three that do render are there for the one claim that cannot be checked
+# any other way. The height of the ground is computed *twice* -- once in Python
+# to lift the sprites, once in GLSL to lift the floor under them -- and if the
+# two ever disagree, every creature in the room hovers. There is no way to ask
+# a shader what it thinks, so the last test measures it: it renders the same
+# hill twice with the terrain on and off and finds how far the picture moved.
+
+
+def _hilly(kills=0):
+    """A world with the arena's real terrain composed in. No GL involved.
+
+    Built the way the GL bench builds it -- `build_hills` over the sim's own
+    map -- rather than with a toy grid, because the layout is the thing most
+    likely to be wrong and a test on a two-tile fixture would never say so.
+    """
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    import terrain as tf
+    world = rj.World(gl.gl_juice(), None)
+    world.terrain = tf.build_hills(world.grid, tile=rj.TILE)
+    field = gl.RagdollField()
+    for _ in range(kills):
+        victim = world.nearest_enemy(killable=True)
+        if victim is not None:
+            world.kill(victim)
+    if kills:
+        _run(world, field, 90)
+    return world, world.terrain, field
+
+
+def _stand(world, tile):
+    """Put the player on a tile with no animation owing and a turn available."""
+    world.player.body.tx, world.player.body.ty = tile
+    world.player.anim.clear()
+    world.player.body.reset_juice()
+    world.turn_cooldown = 0.0
+    world.hitstop.remaining = 0.0
+    world.rebuild_goal_map()
+
+
+#: A level-1 tile on the eastern plateau, the level-0 tile north of it across
+#: the cliff, and the stair that is the legal way between the two. Named rather
+#: than searched for, because a test that finds its own fixture in the layout
+#: passes just as happily when the layout has become something else.
+PLATEAU = (21, 12)
+BELOW_CLIFF = (21, 11)
+STAIR_FOOT = (20, 11)
+STAIR_TOP = (20, 12)
+
+#: A level-1 tile with nothing higher *south* of it, for the drawing tests.
+#: `PLATEAU` will not do: the level-2 shelf is immediately in front of it, so
+#: something standing there correctly has its legs hidden by the shelf -- which
+#: is the behaviour under test everywhere else and noise here.
+OPEN_PLATEAU = (19, 13)
+
+
+def test_the_arena_layout_describes_a_room_you_can_walk_around():
+    """`build_hills` refuses to hand back a room with a stranded corner in it,
+    so this is really a test that the check is still doing something."""
+    import rogue_juice as rj
+    import terrain as tf
+    world, terrain, _ = _hilly()
+    floor = {(x, y) for y, row in enumerate(world.grid)
+             for x, cell in enumerate(row) if not cell}
+    assert floor - terrain.reachable(world.grid, world.player.tile) == set()
+    assert terrain.max_level >= 2, "a one-level room is a kerb, not a hill"
+    for (tx, ty) in terrain.stairs:
+        assert not world.blocked(tx, ty)
+    assert len(tf.ARENA) == rj.GRID_H
+    assert all(len(row) == rj.GRID_W for row in tf.ARENA)
+
+
+def test_the_level_height_cannot_outgrow_what_the_shader_can_find():
+    """The floor shader searches a fixed number of tile rows ahead, so a level
+    tall enough to lift a plateau over its own cliff face would draw holes in
+    the room. The slider is capped rather than trusted."""
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    import glfx
+    if not gl_available():
+        return
+    _ctx, _target, _world, renderer = bench()
+    world = rj.World(gl.gl_juice(), None)
+    world.juice.params["hill_rise"].value = 10_000.0
+    reach = renderer.rise(world) * renderer.terrain.max_level
+    assert reach <= glfx.TERRAIN_ROWS * rj.TILE + 1e-6, \
+        f"{reach:.0f}px of hill against a {glfx.TERRAIN_ROWS}-row search"
+    # And the cap is not so tight that the honest end of the slider is clipped.
+    world.juice.params["hill_rise"].reset()
+    assert renderer.rise(world) == world.juice.p("hill_rise") * rj.PX
+
+
+def test_a_level_change_needs_a_stair():
+    _, terrain, _ = _hilly()
+    assert not terrain.passable(*BELOW_CLIFF, *PLATEAU), \
+        "walked straight up a cliff"
+    assert not terrain.passable(*PLATEAU, *BELOW_CLIFF), \
+        "walked straight down a cliff"
+    assert terrain.passable(*STAIR_FOOT, *STAIR_TOP), "the stair is blocked"
+    assert terrain.passable(*STAIR_TOP, *STAIR_FOOT), "the stair is one-way"
+
+
+def test_you_cannot_walk_onto_the_side_of_a_staircase():
+    """The half-level edge in the model exists for exactly this: a staircase
+    seen from the side is a wall, or it is a ramp you can arrive at halfway up."""
+    _, terrain, _ = _hilly()
+    sx, sy = STAIR_FOOT
+    for dx, dy in ((1, 0), (-1, 0)):        # this stair climbs on the y axis
+        if terrain.level(sx + dx, sy + dy) == terrain.level(sx, sy):
+            assert not terrain.passable(sx + dx, sy + dy, sx, sy), \
+                f"stepped onto the side of the stair from ({sx + dx}, {sy + dy})"
+
+
+def test_the_ground_is_continuous_across_a_stair():
+    """The ramp has to meet the floor at one end and the plateau at the other,
+    or walking up it is a smooth rise followed by a jump."""
+    import rogue_juice as rj
+    _, terrain, _ = _hilly()
+    tile = rj.TILE
+    sx, sy = STAIR_FOOT
+    low = terrain.lift_at((sx + 0.5) * tile, (sy + 0.02) * tile)
+    high = terrain.lift_at((sx + 0.5) * tile, (sy + 0.98) * tile)
+    assert abs(low - terrain.level(sx, sy - 1)) < 0.05, \
+        f"the foot of the stair is at {low}, the floor at {terrain.level(sx, sy - 1)}"
+    assert abs(high - terrain.level(*STAIR_TOP)) < 0.05, \
+        f"the head of the stair is at {high}, the plateau at " \
+        f"{terrain.level(*STAIR_TOP)}"
+    # And monotonic in between, which is what makes it a ramp rather than a
+    # step drawn diagonally.
+    heights = [terrain.lift_at((sx + 0.5) * tile, (sy + f / 20.0) * tile)
+               for f in range(1, 20)]
+    assert all(b >= a - 1e-6 for a, b in zip(heights, heights[1:])), heights
+
+
+def test_switching_the_hills_off_gives_back_a_flat_arena():
+    """The toggle cannot strand anybody, because a level never blocks a tile --
+    only the edge between two. So off is the old arena exactly."""
+    import rogue_juice as rj
+    world, terrain, _ = _hilly()
+    terrain.enabled = False
+    assert terrain.passable(*BELOW_CLIFF, *PLATEAU)
+    assert terrain.lift_at(21.5 * rj.TILE, 12.5 * rj.TILE) == 0.0
+    assert terrain.downhill(21.5 * rj.TILE, 15.9 * rj.TILE) == (0.0, 0.0)
+    floor = {(x, y) for y, row in enumerate(world.grid)
+             for x, cell in enumerate(row) if not cell}
+    assert floor - terrain.reachable(world.grid, world.player.tile) == set()
+
+
+def test_a_layout_that_does_not_describe_a_room_is_rejected():
+    """Every one of these is a mistake somebody will make in `ARENA`, and the
+    only cheap moment to catch them is the moment it is read."""
+    import terrain as tf
+    grid = [[0] * 4 for _ in range(3)]
+    grid[1][3] = 1
+    bad = {
+        "wrong shape": ["....", "...."],
+        "unknown character": ["....", "..x.", "...."],
+        "a stair that climbs two levels": ["....", ".<2.", "...."],
+        "a stair that climbs nothing": ["....", ".<..", "...."],
+        "a stair inside a wall": ["....", "..2<", "...."],
+        "raised masonry": ["....", "...1", "...."],
+    }
+    for why, rows in bad.items():
+        try:
+            tf.Terrain.parse(rows, grid)
+        except tf.TerrainError:
+            continue
+        raise AssertionError(f"{why} was accepted")
+
+
+def test_a_world_with_no_terrain_is_the_arena_it_always_was():
+    """The seam in the sim has to be inert, or the software bench is a
+    different game to the one it was before hills existed."""
+    import rogue_juice as rj
+    world = rj.World(rj.Juice(), None)
+    assert world.terrain is None
+    assert world.step_allowed(*PLATEAU, *BELOW_CLIFF)
+    assert world.step_allowed(0, 0, 39, 19)          # not even adjacent
+
+
+def test_walking_into_a_cliff_bumps_and_costs_no_turn():
+    world, _, _ = _hilly()
+    _stand(world, PLATEAU)
+    turn = world.turn
+    world.try_move(world.player, 0, -1)
+    assert world.player.tile == PLATEAU, "walked off the edge of the plateau"
+    assert world.turn == turn, "a refused move took a turn"
+    assert world.player.anim.busy, "no bump animation -- that reads as a dropped key"
+
+
+def test_walking_up_a_stair_works():
+    world, _, _ = _hilly()
+    _stand(world, STAIR_FOOT)
+    turn = world.turn
+    world.try_move(world.player, 0, 1)
+    assert world.player.tile == STAIR_TOP, \
+        f"the stair refused a climb ({world.player.tile})"
+    assert world.turn == turn + 1
+
+
+def test_the_enemies_path_around_a_cliff_rather_than_into_it():
+    """The goal map is the enemies' whole idea of where the player is, so the
+    heights have to be in it -- otherwise every monster walks to the foot of
+    the cliff and stands there jittering at the wall it cannot see."""
+    world, _, _ = _hilly()
+    _stand(world, PLATEAU)
+    bx, by = BELOW_CLIFF
+    direct = world.goal_map[by][bx]
+    assert direct is not None, "the tile below the cliff is unreachable"
+    assert direct > 1, \
+        f"the flood fill walked up the cliff ({direct} steps from one tile away)"
+    # Round by the stair, which is the only way: down to the foot, up, along.
+    assert direct <= 6, f"the route round the cliff is {direct} steps"
+
+
+def test_you_can_hit_across_a_cliff_you_cannot_walk_across():
+    """Deliberate, and symmetric. A monster on a ledge that could neither be
+    reached nor reach back would be scenery, so the height rule stops a *step*
+    and never a swing -- at either end."""
+    world, _, _ = _hilly()
+    _stand(world, PLATEAU)
+    victim = world.entity_at(*BELOW_CLIFF)
+    if victim is None:
+        import rogue_juice as rj
+        victim = rj.Entity("goblin", *BELOW_CLIFF, (150, 200, 130), "goblin",
+                           hp=14, weight=1.0)
+        world.entities.append(victim)
+    hp = victim.hp
+    world.try_move(world.player, 0, -1)
+    step(world, 40)
+    assert world.player.tile == PLATEAU, "the swing moved the player"
+    assert victim.hp < hp, "the blow did not land across the drop"
+
+
+def test_a_corpse_slides_off_a_ledge_and_lands_at_the_bottom():
+    """The point of the whole exercise. A body left on a ledge is a body
+    balanced on a ledge, which nothing dead does."""
+    import rogue_juice as rj
+    world, terrain, field = _hilly(kills=1)
+    assert field.bodies, "nothing died"
+    b = field.bodies[0]
+    # On the southernmost row of the plateau, a few pixels from the drop.
+    b.x, b.y = 21.5 * rj.TILE, 15.8 * rj.TILE
+    b.vx = b.vy = b.spin = 0.0
+    b.ground = terrain.lift_at(b.x, b.y) * field._rise(world)
+    assert b.ground > 0.0, "the fixture is not on the hill"
+    _run(world, field, 240)
+    assert terrain.lift_at(b.x, b.y) == 0.0, \
+        f"the body is still up on the hill at ({b.x:.0f}, {b.y:.0f})"
+    assert b.y > 16 * rj.TILE, f"it did not go over the south edge (y={b.y:.0f})"
+    assert b.z == 0.0 and b.ground == 0.0, "it never landed"
+
+
+def test_a_corpse_thrown_at_a_cliff_does_not_climb_it():
+    """A cliff stops a sliding body for the same reason a wall does, and the
+    body has to end up outside it rather than inside it."""
+    import rogue_juice as rj
+    world, terrain, field = _hilly(kills=1)
+    b = field.bodies[0]
+    b.x, b.y = 21.5 * rj.TILE, 17.0 * rj.TILE      # on the flat, south of it
+    b.ground = b.z = 0.0
+    b.vx, b.vy = 0.0, -900.0 * rj.PX               # fired north at the face
+    _run(world, field, 180)
+    assert terrain.lift_at(b.x, b.y) == 0.0, \
+        f"it climbed the cliff to ({b.x:.0f}, {b.y:.0f})"
+    assert not _in_a_wall(world, b)
+
+
+def test_a_falling_body_leaves_its_shadow_on_the_ground_it_fell_from():
+    """`ground` and `z` are separate for one reason: while a body is in the air
+    the picture needs both -- the body at ground + z and the shadow at ground.
+    A single height would put the shadow under the falling sprite, and a shadow
+    that falls with the body is not a shadow."""
+    import rogue_juice as rj
+    world, terrain, field = _hilly(kills=1)
+    b = field.bodies[0]
+    b.x, b.y = 21.5 * rj.TILE, 15.9 * rj.TILE
+    b.vx, b.vy, b.spin = 0.0, 260.0 * rj.PX, 0.0
+    b.ground = terrain.lift_at(b.x, b.y) * field._rise(world)
+    #: Frames on which the shadow had arrived at the lower ground and the body
+    #: had not -- which is the state the two numbers exist to represent, and
+    #: the one a single height could not have described.
+    apart = 0
+    for _ in range(90):
+        _run(world, field, 1)
+        if b.z > 0.0 and b.ground == 0.0:
+            apart += 1
+    assert apart >= 2, f"the body teleported down instead of falling ({apart})"
+
+
+def test_a_bomb_rolls_off_a_hill():
+    """A cast-iron ball is the thing on this floor least likely to stay where
+    you put it on a slope, and it goes over the edge through the same three
+    methods a corpse does."""
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    world, terrain, field = _hilly()
+    x, y = 21.5 * rj.TILE, 15.6 * rj.TILE
+    ground = terrain.lift_at(x, y) * field._rise(world)
+    assert ground > 0.0, "the fixture is not on the hill"
+    # A fuse long enough that rolling is what ends the test, not the bang.
+    bomb = gl.Bomb(x=x, y=y, ground=ground, fuse=99.0, max_fuse=99.0)
+    field.thrown.append(bomb)
+    _run(world, field, 200)
+    assert bomb.ground == 0.0, "the bomb sat on the ledge until it went off"
+    assert bomb.y > 16 * rj.TILE, f"it did not go over the edge (y={bomb.y:.0f})"
+
+
+def test_the_hills_change_the_picture_and_switching_them_off_puts_it_back():
+    if not gl_available():
+        return
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    juice = gl.gl_juice()
+    world = rj.World(juice, None)
+    world.camera.snap(21.5 * rj.TILE, 13.5 * rj.TILE)
+    world.clamp_camera()
+    hilly = frame(world).astype(int)
+    juice.toggles["hills"].on = False
+    flat = frame(world).astype(int)
+    juice.toggles["hills"].on = True
+    again = frame(world).astype(int)
+    moved = (np.abs(hilly - flat).max(axis=2) > 8).sum()
+    assert moved > 4000, f"the terrain barely showed ({moved} pixels)"
+    assert np.array_equal(hilly, again), "the toggle is not reversible"
+
+
+def test_the_shader_and_the_model_agree_about_how_high_the_ground_is():
+    """The one test that could not have been written any other way.
+
+    The lift is computed twice -- `Terrain.lift_at` in Python for the sprites,
+    `lift_levels` in GLSL for the floor -- and nothing but a rendered pixel can
+    say whether the two agree. A level of ground is a pure vertical shift of
+    the picture, so the measurement is: how far up did the floor move? If that
+    is not `hill_rise` pixels, one of the two implementations has drifted.
+    """
+    if not gl_available():
+        return
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    juice = gl.gl_juice()
+    # Lighting off, because a raised surface is genuinely lit differently --
+    # it is closer to the lights -- and this test is about geometry.
+    juice.toggles["light"].on = False
+    juice.toggles["ambient"].on = False
+    juice.toggles["bloom"].on = False
+    world = rj.World(juice, None)
+    world.camera.snap(21.5 * rj.TILE, 13.5 * rj.TILE)
+    world.clamp_camera()
+    hilly = frame(world).astype(float)
+    juice.toggles["hills"].on = False
+    flat = frame(world).astype(float)
+    juice.toggles["hills"].on = True
+
+    # A column down the western edge of the plateau, where every row from 12 to
+    # 15 is level 1 -- the shelf in the middle of it is level 2 and would be
+    # two different answers in one strip.
+    view_x = 19.5 * rj.TILE - world.camera.x + rj.VIEW_W * 0.5
+    column = int(view_x * gl.WIN_W / rj.VIEW_W)
+    rows = slice(360, 455)
+
+    def mismatch(shift):
+        a = hilly[rows, column]
+        b = flat[rows.start + shift:rows.stop + shift, column]
+        return float(np.abs(a - b).mean())
+
+    rise = int(round(juice.p("hill_rise") * rj.PX))
+    best = min(range(0, 2 * rise + 4), key=mismatch)
+    assert abs(best - rise) <= 1, \
+        f"the floor moved {best}px, the model says {rise}px"
+    assert mismatch(best) < mismatch(0) * 0.5, \
+        f"nothing actually moved (aligned {mismatch(best):.1f} vs " \
+        f"unshifted {mismatch(0):.1f})"
+
+
+def _visible_pixels(world, renderer_world_tile, away=(2, 2)):
+    """How many pixels the player is worth on screen, standing on a tile.
+
+    Measured by difference rather than by looking for a colour: render the
+    frame with the player where it is being asked about, render it again with
+    the player parked in a far corner, and count what changed. Everything else
+    in the room is in both frames and cancels, which is what makes this robust
+    to the arena's own contents.
+    """
+    import rogue_juice as rj
+
+    def place(tile):
+        world.player.body.tx, world.player.body.ty = tile
+        world.player.anim.clear()
+        world.player.body.reset_juice()
+        world.player.trail.clear()
+        return frame(world).astype(int)
+
+    here = place(renderer_world_tile)
+    gone = place(away)
+    return int((np.abs(here - gone).max(axis=2) > 8).sum())
+
+
+def _occlusion_bench():
+    """A world stripped to the sprite and the ground, with the camera parked.
+
+    Every effect off: a trail, a shadow or a light following the player around
+    would be counted as part of the player by `_visible_pixels`, and the light
+    especially would repaint half the room when the player moves away.
+    """
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    juice = gl.gl_juice()
+    juice.set_all(False)
+    juice.toggles["hills"].on = True
+    world = rj.World(juice, None)
+    world.camera.snap(21.5 * rj.TILE, 12.0 * rj.TILE)
+    world.clamp_camera()
+    return world, juice
+
+
+def test_a_hill_hides_what_is_standing_behind_it():
+    """The bug this was written to fix. A creature one tile behind a plateau
+    is behind a wall of ground as tall as the level, and has to be cut off by
+    it rather than drawn over the top of it."""
+    if not gl_available():
+        return
+    world, juice = _occlusion_bench()
+    behind = _visible_pixels(world, BELOW_CLIFF)
+    juice.toggles["hills"].on = False
+    flat = _visible_pixels(world, BELOW_CLIFF)
+    juice.toggles["hills"].on = True
+    assert flat > 200, f"the fixture never drew a sprite at all ({flat}px)"
+    assert behind < flat * 0.85, \
+        f"the hill hid nothing: {behind}px behind it against {flat}px on the flat"
+    assert behind > flat * 0.2, \
+        f"the hill swallowed the whole creature ({behind}px of {flat}px)"
+
+
+def test_standing_on_a_hill_does_not_clip_you_against_your_own_ground():
+    """The other half, and the easier one to get wrong: the ground a creature
+    is standing on is at exactly its own depth, so a rounding error either way
+    is a sprite with its feet cut off on every plateau in the room."""
+    if not gl_available():
+        return
+    world, juice = _occlusion_bench()
+    on_top = _visible_pixels(world, OPEN_PLATEAU)
+    juice.toggles["hills"].on = False
+    flat = _visible_pixels(world, OPEN_PLATEAU)
+    juice.toggles["hills"].on = True
+    assert on_top >= flat * 0.95, \
+        f"standing on the hill cost {flat - on_top}px of the sprite"
+
+
+def test_the_occlusion_leaves_a_flat_arena_alone():
+    """Nothing anywhere near the hills should notice they exist."""
+    if not gl_available():
+        return
+    world, juice = _occlusion_bench()
+    far = (6, 17)                       # open floor, nowhere near either hill
+    hilly = _visible_pixels(world, far)
+    juice.toggles["hills"].on = False
+    flat = _visible_pixels(world, far)
+    juice.toggles["hills"].on = True
+    assert hilly == flat, f"{flat - hilly}px of the sprite went missing"
+
+
+def test_a_cliff_face_is_drawn_under_the_edge_it_hangs_off():
+    """Without the face, a plateau is a floor that has slid up the screen and
+    left a hole. The face is the only part of this that is new *pixels* rather
+    than moved ones, so it is worth one test of its own."""
+    if not gl_available():
+        return
+    import rogue_juice as rj
+    import rogue_juice_gl as gl
+    juice = gl.gl_juice()
+    juice.toggles["light"].on = False
+    juice.toggles["ambient"].on = False
+    world = rj.World(juice, None)
+    world.camera.snap(21.5 * rj.TILE, 13.5 * rj.TILE)
+    world.clamp_camera()
+
+    rise = juice.p("hill_rise") * rj.PX
+    # The strip the plateau's southern edge hangs over, in view pixels.
+    edge = 16 * rj.TILE - world.camera.y + rj.VIEW_H * 0.5
+    band = slice(int(edge - rise) + 2, int(edge) - 1)
+    left = int((19.2 * rj.TILE - world.camera.x + rj.VIEW_W * 0.5)
+               * gl.WIN_W / rj.VIEW_W)
+    right = int((24.8 * rj.TILE - world.camera.x + rj.VIEW_W * 0.5)
+                * gl.WIN_W / rj.VIEW_W)
+
+    bright = frame(world).astype(float)
+    juice.params["hill_shade"].value = 1.0
+    plain = frame(world).astype(float)
+    juice.params["hill_shade"].reset()
+
+    face = bright[band, left:right].mean()
+    unshaded = plain[band, left:right].mean()
+    assert face < unshaded * 0.75, \
+        f"the cliff face is not shaded ({face:.1f} against {unshaded:.1f})"
+    # And it is darker than the ground on top of it, which is the whole read.
+    top = bright[band.start - 24:band.start - 4, left:right].mean()
+    assert face < top * 0.8, f"the face ({face:.1f}) is as bright as the top ({top:.1f})"
+
+
+# ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 #

@@ -826,6 +826,11 @@ class World:
         self.juice = juice
         self.audio = audio
         self.grid = build_map()
+        #: Optional elevation, composed in from outside -- see `step_allowed`
+        #: and `terrain.py`. `None` is a flat arena and is what this bench
+        #: draws, because a software blitter has no way to show a cliff face;
+        #: the GL bench hands one in. Nothing below cares which it got.
+        self.terrain = None
         self.props = build_props(self.grid)
         self.fx = EffectField()
         self.decals = DecalField()
@@ -975,6 +980,21 @@ class World:
             return True
         return self.grid[y][x] == 1
 
+    def step_allowed(self, fx: int, fy: int, tx: int, ty: int) -> bool:
+        """Whether a step between two adjacent, unblocked tiles is legal.
+
+        `blocked` answers "is there a wall *there*", which is a property of one
+        tile. Height is a property of the *edge* between two -- a cliff is
+        perfectly good ground on both sides and impassable in the middle -- so
+        it needs a question of its own, and every path in the sim asks it:
+        the player's step, the enemies' step, and the flood fill that tells the
+        enemies which way the player is.
+
+        With no terrain composed in there is nothing an edge can object to, so
+        this is `True` and the arena is the flat one it always was.
+        """
+        return self.terrain is None or self.terrain.passable(fx, fy, tx, ty)
+
     def entity_at(self, x: int, y: int):
         for e in self.entities:
             if not e.dying and e.tile == (x, y):
@@ -1007,6 +1027,13 @@ class World:
                 nx, ny = x + dx, y + dy
                 if self.blocked(nx, ny) or self.goal_map[ny][nx] is not None:
                     continue
+                # Floods *backwards* from the player, so the edge being tested
+                # is the one an enemy would walk forwards over. Both directions
+                # of a legal step agree, so the distinction only matters if a
+                # one-way drop is ever added -- but getting it right here costs
+                # the argument order and nothing else.
+                if not self.step_allowed(nx, ny, x, y):
+                    continue
                 self.goal_map[ny][nx] = d
                 frontier.append((nx, ny))
 
@@ -1030,6 +1057,13 @@ class World:
                 return True
             if occupant is not None:
                 continue          # another monster has the tile; wait a turn
+            # Tested *after* the attack, which is the deliberate half of the
+            # rule: you can hit what is beside you across a drop, from either
+            # end, and you cannot walk there. `try_move` reads the same way
+            # round, and it has to -- a monster on a ledge that could not be
+            # reached and could not reach back would be scenery.
+            if not self.step_allowed(x, y, nx, ny):
+                continue          # a cliff between here and there
             if best is None or d < best[0]:
                 best = (d, dx, dy)
 
@@ -1155,7 +1189,11 @@ class World:
         if target is not None and target is not e:
             self.face(e, dx, dy)
             self.attack(e, target, dx, dy)
-        elif self.blocked(nx, ny):
+        elif self.blocked(nx, ny) or not self.step_allowed(*e.tile, nx, ny):
+            # A cliff answers exactly like masonry does, and deliberately so:
+            # the bump animation is what tells you the input was heard, and a
+            # player who has just walked into a drop needs that as much as one
+            # who has walked into a wall. Neither costs a turn.
             e.body.facing = (dx, dy)
             self.bump_wall(e, dx, dy)
             return                       # a move into a wall costs no turn

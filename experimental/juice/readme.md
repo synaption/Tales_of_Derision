@@ -10,8 +10,8 @@ python3 rogue_juice.py                      # the bench, on the CPU
 python3 rogue_juice_gl.py                   # the same bench, on the card
 python3 rogue_juice.py --headless a.png     # one scripted swing, no window
 python3 rogue_juice_gl.py --headless b.png  # the same, through the shaders
-python3 juicetest.py                        # 148 headless tests
-python3 gltest.py                           # 59 more, on a windowless context
+python3 juicetest.py                        # 157 headless tests
+python3 gltest.py                           # 81 more, on a windowless context
 python3 -m pytest juicetest.py gltest.py -q # all of them
 ```
 
@@ -29,6 +29,7 @@ about hit-stop is nothing like turning it off and hitting a dummy.
 | `rogue_juice.py` | the sim, the panel, software compositing | yes | no |
 | `glfx.py` | shaders, batching, post chain, normals | only to upload | yes |
 | `juicesettings.py` | the settings file, and the merge rules | **no** | **no** |
+| `terrain.py` | levels, cliffs and stairs, as data | **no** | **no** |
 | `rogue_juice_gl.py` | the same bench on the card, plus physics, menu, options | yes | yes |
 
 That split is the point rather than tidiness. An effect you cannot test without
@@ -40,11 +41,15 @@ contact" is an assertion rather than something you listen for.
 
 It also means the GL version is not a fork. `rogue_juice_gl.py` imports `World`,
 `Juice`, `Entity` and every toggle and slider from `rogue_juice.py` and replaces
-only the drawing; `juicefx.py` does not know it exists. Its one non-drawing
-addition, `RagdollField`, follows the same rule from the other side: it reads
-the wall grid, the entity list and the shockwave pool through the sim's own
-public surface and writes back onto the `Corpse` objects, so it too is a layer
-on top of `rogue_juice.py` rather than an edit to it.
+only the drawing; `juicefx.py` does not know it exists. Its two non-drawing
+additions follow the same rule from the other side. `RagdollField` reads the
+wall grid, the entity list and the shockwave pool through the sim's own public
+surface and writes back onto the `Corpse` objects, so it is a layer on top of
+`rogue_juice.py` rather than an edit to it. `terrain.py` could not quite manage
+that -- whether a step is legal is a question only the sim can be asked -- so it
+is composed *into* `World` through one empty slot and one method that returns
+`True` while the slot is empty, which is the smallest seam that could work and
+leaves the software bench exactly as flat as it was.
 
 ## The governing idea
 
@@ -318,6 +323,86 @@ rather than dropped because *where* an explosion happens is the interesting
 decision, and a bomb at your feet takes that decision away. Two sliders, `bomb
 throw speed` and `bomb fuse`; a short enough fuse goes off in the air, which is
 a different weapon.
+
+**The floor has hills in it.** The other addition that is not purely a
+rendering argument, and the shape of it is the interesting part: almost all of
+verticality turns out to be a picture, and the small remainder that is not has
+to go in the sim.
+
+The model, in `terrain.py`, is the smallest one that reads as terrain. Every
+tile has an integer **level**; tiles at the same level are one continuous floor;
+the boundary between two is a **cliff**; and a **stair** is a single tile that
+ramps from its low neighbour to its high one and is the only legal way between
+levels. Passability is decided at the *edge* rather than by comparing levels,
+which is one rule doing three jobs -- a cliff is impassable, a staircase is
+climbable end to end, and the *side* of a staircase is a wall, because its side
+edges sit at a half level and half levels never match anything.
+
+That rule is the whole of what the sim knows. `World` grew a `terrain` slot and
+`World.step_allowed`, which returns `True` when the slot is empty, and three
+call sites ask it: the player's step, the enemies' step, and the flood fill that
+tells the enemies where the player is. Walking into a cliff bumps and costs no
+turn, exactly as walking into masonry does, because the animation is what tells
+you the key was heard. Monsters route round to the stairs, because the goal map
+has the heights in it. A *swing* is never stopped by an edge, at either end -- a
+monster on a ledge that could not be reached and could not reach back would be
+scenery.
+
+Everything else is drawn:
+
+* a level is **a number of pixels a thing is drawn further up the screen** --
+  applied in the vertex shader in world space, so the camera's roll takes the
+  hill with it, and applied to the *drawn* position rather than the tile, so
+  walking up a stair rises smoothly across the step tween the sim already had;
+* **the shadow is not lifted with the body**, which is the entire height cue,
+  and is the same trick the hop and the thrown bomb already use;
+* the floor shader **works out which terrace is visible** at each fragment.
+  Raised ground is drawn shifted up, so a pixel can be showing the floor that
+  is really there, the top of a tile some rows nearer the camera, or the cliff
+  face hanging under that tile's near edge -- resolved front to back over three
+  rows, in closed form rather than by marching down the column;
+* lights stay on the flat plane, so a torch three tiles away lights a body on a
+  plateau from three tiles away -- but raised ground is genuinely closer to
+  them, so a plateau catches a torch the floor beside it misses;
+* **corpses go over the edge.** Gravity along the ground is one force, and the
+  moment the floor under a body is lower than it was, the difference becomes
+  *height* and is spent falling. Written that way, a body that slides, is
+  shoved, or is blown over a ledge falls off it without any of those three
+  knowing ledges exist -- and a bomb rolls off a hill before its fuse runs out.
+
+One toggle and three sliders (`level height`, `cliff shade`, `downhill slide`)
+in the **world** group. The arena's own hills are hand-drawn as a 40x20 picture
+in `terrain.ARENA` and checked at load: a stair that climbs two levels, a
+plateau on top of a pillar or a corner of the room nobody can reach is an error
+rather than a bad afternoon. The one thing no test can assert about a shader is
+checked by measurement instead -- the ground height is computed twice, in Python
+for the sprites and in GLSL for the floor, so `gltest.py` renders the same hill
+with the terrain on and off and asserts the picture moved by exactly the number
+of pixels the model claims.
+
+**A hill hides what is behind it**, and the way that is done is the one place
+the terrain pushed back on the renderer's design. The obvious answer is a depth
+buffer -- and it is the wrong one here, because this batch is a single draw call
+in painter's order and that is exactly what lets four thousand additive sparks
+stack into a glow instead of into paint. Depth *writes* from translucent quads
+would take that away, and depth without writes is not something this GL binding
+exposes.
+
+So the question is asked from the other end. Each fragment of each sprite walks
+the terrain itself, finds which piece of ground is visible where it is about to
+draw -- the same `resolve_surface` the floor runs, injected into both programs
+from one source so the two cannot drift -- and stands down if that ground is
+further forward than the thing it belongs to. Sorting solves the general
+problem; this solves the one the room has. It costs three iterations of one
+texture fetch over the pixels sprites actually cover, it is skipped outright on
+a flat arena, and the whole terrain feature measures at about 0.05ms a frame.
+
+What each quad is compared against is *where it stands*, which is not where it
+is drawn: the foot of the quad by default, which is right for feet and right for
+a shadow lying flat, and an explicit value for the two things whose picture and
+position genuinely differ -- a bomb in the air, drawn well above the spot it is
+over, and a damage number, which is a reading rather than an object and is put
+in front of every hill in the room.
 
 **A menu, on escape.** Resume, options, *save current settings as defaults*, and
 quit. It pauses the sim -- a settings screen with a fight going on behind it is

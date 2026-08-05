@@ -4,8 +4,19 @@ Same bench, same sim, same panel. The renderer is the only thing that changed,
 and the import list is the argument for why the split was worth having:
 
     from juicefx import ...        # every effect, as maths. Unchanged.
-    from rogue_juice import World  # the sim, the toggles, the sliders. Unchanged.
+    from rogue_juice import World  # the sim, the toggles, the sliders.
     from audiofx import SoundBank  # unchanged.
+    from terrain import build_hills  # the hills, as data. No pygame, no GL.
+
+The sim has exactly one thing in it that this file put there, and it is worth
+naming because the rest of the split depends on nobody adding a second: hills
+need the sim to have an opinion about whether a step is legal, which is not a
+rendering question and cannot be answered from out here. So `World` grew
+`terrain` (a slot, empty by default) and `step_allowed` (a method that returns
+`True` when the slot is empty). The software bench never fills it and is the
+arena it always was; this one fills it with a `terrain.Terrain` and everything
+else about verticality -- how high a level looks, which sprites are lifted,
+what the cliff face is made of, whether corpses roll off it -- stays here.
 
 Not one line of `juicefx.py` knows this file exists. `Body` already carried
 `ox, oy, sx, sy, angle, alpha, flash` and a lag vector, which turns out to be a
@@ -30,6 +41,20 @@ What is different to look at, in the order it is worth looking at it:
   because a corpse takes no turn and blocks no tile, so nothing is left that
   needs it on a grid at all. Press **B** to throw a bomb -- which arcs, bounces
   off walls through the corpses' own wall pass, and goes off on a fuse;
+* **the floor has hills in it**, which is the one thing here that is not
+  purely a picture. Ground comes in whole levels: same level is one floor, the
+  boundary between two is a cliff nobody walks up, and a stair is the single
+  tile that ramps between them -- so the sim has a new answer to "can I go
+  that way", and it is one method (`World.step_allowed`) with a flat default.
+  Everything else about it *is* a picture: a level is a number of pixels a
+  thing is drawn further up the screen, its shadow is not moved with it, and
+  the floor shader works out which terrace is visible at each fragment and
+  draws the cliff face hanging under it. A creature behind a hill is hidden by
+  it without a depth buffer or a sort -- its fragments ask the terrain the same
+  question the floor does and stand down -- which is what keeps the batch to
+  one draw call in painter's order and the sparks additive. `terrain.py` holds
+  the model and has no pygame and no GL in it, so which tiles are walkable is a
+  question with a headless answer;
 * **one draw call** for every sprite, spark, shadow, decal, ring, arc and cut.
 
 The panel is drawn by the software renderer into an offscreen surface and
@@ -70,6 +95,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glfx  # noqa: E402
 import juicesettings  # noqa: E402
 import rogue_juice as rj  # noqa: E402
+import terrain as terrainfx  # noqa: E402
 import tiles  # noqa: E402
 from juicefx import ambient_offset, clamp, hash01, shadow_of  # noqa: E402
 
@@ -122,6 +148,17 @@ GL_TOGGLES = [
     ("refract", "heat refraction", "screen",
      "Bend the frame around each torch. The software bench re-blits ninety rows "
      "per torch to fake this; here every fragment simply asks where to sample."),
+    ("hills", "hills and stairs", "world",
+     "Give the floor a third dimension. Ground comes in whole levels: tiles at "
+     "the same level are one continuous floor, the boundary between two is a "
+     "cliff you cannot walk up or down, and a stair is the one tile that ramps "
+     "between them. Everything standing on high ground is drawn lifted -- and "
+     "its shadow is not, which is the entire height cue -- while the lights, "
+     "the wall shadows and the sim's own idea of where anybody is stay on the "
+     "flat plane, because a grid with a genuine third axis in it is a "
+     "different game. Off, the same arena is flat and every step is legal, "
+     "which is the comparison: watch how much of 'terrain' is one number and a "
+     "shadow that refuses to move."),
     ("ragdoll", "corpse ragdolls", "attack",
      "Take the dead off the grid. A corpse has no turn and blocks nothing, so "
      "nothing is left that needs it on a tile -- it becomes a circle with a "
@@ -164,6 +201,25 @@ GL_PARAMS = [
      "How far the frame is pushed warm on impact.", "{:.2f}"),
     ("scanline_amt", "scanline depth", "screen", 0.14, 0.0, 0.6,
      "", "{:.2f}"),
+
+    ("hill_rise", "level height", "world", 14.0, 0.0, 34.0,
+     "How far one level of ground lifts what is standing on it, in pixels. "
+     "This is the only number that decides whether the terrain reads as a kerb "
+     "or as a plateau, and it is worth dragging to both ends: at two pixels "
+     "the cliff faces are a drawn line and the hill is a floor pattern, and "
+     "somewhere around ten the same geometry starts being a place you climb "
+     "onto. Nothing about the sim changes as it moves -- the stairs are in the "
+     "same tiles at either end.", "{:.0f}"),
+    ("hill_shade", "cliff shade", "world", 0.42, 0.05, 1.0,
+     "How dark the exposed side of the ground is against its top. One is no "
+     "difference at all, which makes a plateau look like a floor that has slid "
+     "upwards; around a half reads as rock in its own shadow.", "{:.2f}"),
+    ("hill_slide", "downhill slide", "world", 34.0, 0.0, 120.0,
+     "How hard gravity pulls a corpse along sloping ground. This is what a "
+     "cliff is *for*: bodies do not settle on a ledge, they go over it, fall "
+     "the height of the level and pile up at the bottom -- and a bomb thrown "
+     "onto a hill rolls off it before the fuse runs out. Zero leaves the dead "
+     "lying wherever the blast put them, on a slope or not.", "{:.0f}"),
 
     ("rag_size", "corpse radius", "attack", 0.34, 0.12, 0.70,
      "Collision radius of a body, in tiles. This is the one number that "
@@ -215,6 +271,7 @@ GL_HELP_LINES = [
     "wheel scrolls this panel",
     "",
     "wasd / arrows  move, walk into a thing",
+    "cliffs bump -- stairs are the way up",
     "space swing   x get hit   K kill   r reset",
     "b throw a bomb   Tab A/B   F1/F2 on/off",
     "F3 defaults   [ ] easing   m music   - = amount",
@@ -605,6 +662,15 @@ class Ragdoll:
     spin: float = 0.0              # degrees a second
     radius: float = TILE * 0.34
     mass: float = 1.0
+    #: Height of the ground under it, in pixels, and its own height above that
+    #: ground. Both are zero on a flat arena and neither is a third axis: `z`
+    #: exists so that sliding off a ledge is a fall rather than a teleport, and
+    #: `ground` so the body knows the moment the floor went away. A `Bomb`
+    #: carries the same two under the same names, which is what lets one wall
+    #: solver serve both.
+    z: float = 0.0
+    vz: float = 0.0
+    ground: float = 0.0
     #: An impact wobble, as a signed fraction: +ve is squat and wide. Sprung
     #: rather than decayed, so a body that lands hard overshoots once.
     squash: float = 0.0
@@ -643,6 +709,7 @@ class Bomb:
     vy: float = 0.0
     z: float = 0.0                 # pixels above the floor
     vz: float = 0.0
+    ground: float = 0.0            # height of that floor, if the arena has hills
     radius: float = TILE * 0.22
     spin: float = 0.0
     angle: float = 0.0
@@ -870,6 +937,11 @@ class RagdollField:
             spin += (self._rand() - 0.5) * 2.0 * launch * j.p("rag_spin")
             b = Ragdoll(corpse=c, x=c.x, y=c.y, vx=vx, vy=vy, angle=c.angle,
                         spin=spin, radius=TILE * j.p("rag_size"), mass=mass)
+            # Seated on whatever it died standing on, so its first step is not
+            # a body discovering that the hill it has been on all along is a
+            # drop it has yet to fall down.
+            rise = self._rise(world)
+            b.ground = world.terrain.lift_at(b.x, b.y) * rise if rise > 0.0 else 0.0
             self.bodies.append(b)
             self._by_corpse[id(c)] = b
 
@@ -889,6 +961,75 @@ class RagdollField:
                 best, best_d = rec, d
         return best
 
+    # -- the ground ---------------------------------------------------------
+    #
+    # Three small methods, and between them they are all the corpse physics
+    # knows about hills. Everything else in this class was written for a flat
+    # room and did not have to change: a body still slides, still bounces off
+    # masonry and still gets shoved by whoever walks through it, and the ground
+    # under it is a number it consults rather than a case it handles.
+
+    def _rise(self, world: rj.World) -> float:
+        """Pixels per level of ground, or zero if the arena is flat.
+
+        Reads the switch off the terrain rather than off the juice registry, so
+        a field driven with a world that has no terrain in it -- the software
+        bench's, or a test's -- never asks for a parameter that only the GL
+        build defines.
+        """
+        t = world.terrain
+        if t is None or not t.enabled:
+            return 0.0
+        return world.juice.p("hill_rise") * PX
+
+    def _fall(self, world: rj.World, b, h: float) -> float:
+        """Keep a thing on the ground, and drop it when the ground goes away.
+
+        The whole of falling off a cliff is the second line: when the floor
+        under a body is lower than it was, the difference is not a new position
+        but a new *height*, and gravity spends it over the next few frames.
+        Written that way, a body that slides over a ledge falls off it, a body
+        that is shoved over one falls off it, and a body blown over one falls
+        off it, without any of those three knowing that ledges exist.
+
+        Returns the speed it landed at, or zero if it did not land this step.
+        """
+        rise = self._rise(world)
+        ground = world.terrain.lift_at(b.x, b.y) * rise if rise > 0.0 else 0.0
+        b.z += b.ground - ground
+        b.ground = ground
+        if b.z < 0.0:
+            # Walked, slid or was shoved *up* a ramp. The ground came to meet
+            # it, which is not a bounce.
+            b.z, b.vz = 0.0, max(b.vz, 0.0)
+        if b.z <= 0.0 and b.vz <= 0.0:
+            b.z = 0.0
+            return 0.0
+        b.vz -= self.GRAVITY * h
+        b.z += b.vz * h
+        if b.z > 0.0:
+            return 0.0
+        landed = -b.vz
+        b.z, b.vz = 0.0, 0.0
+        return landed
+
+    def _slope(self, world: rj.World, b, h: float):
+        """Gravity along the ground, which is what makes a slope a slope.
+
+        Only while the thing is actually touching it: something in the air is
+        already being pulled the other way by `_fall`, and pushing it sideways
+        as well would make a body arc as it fell.
+        """
+        rise = self._rise(world)
+        if rise <= 0.0 or b.z > 1.0:
+            return
+        gx, gy = world.terrain.downhill(b.x, b.y)
+        if gx == 0.0 and gy == 0.0:
+            return
+        push = world.juice.p("hill_slide") * rise * h
+        b.vx += gx * push
+        b.vy += gy * push
+
     # -- integration --------------------------------------------------------
     def _integrate(self, world: rj.World, b: Ragdoll, h: float):
         j = world.juice
@@ -900,6 +1041,10 @@ class RagdollField:
         b.vx *= keep
         b.vy *= keep
         b.spin *= math.exp(-drag * 0.85 * h)
+        # After the drag and before the sleep test, so a body on a slope is
+        # re-accelerated every step and creeps down it rather than being
+        # stopped dead halfway by the speed floor.
+        self._slope(world, b, h)
 
         if b.speed < self.SLEEP_SPEED:
             b.vx = b.vy = 0.0
@@ -910,12 +1055,21 @@ class RagdollField:
         b.angle += b.spin * h
         self._walls(world, b)
 
+        landed = self._fall(world, b, h)
+        if landed > 90.0 * PX:
+            b.squash_vel += landed * 0.006
+            self._thud(world, b, landed)
+
         # The squash is a spring, not a decay: a body that lands hard flattens,
         # overshoots on the way back and settles. A decay only ever flattens.
         b.squash_vel += (-b.squash * 340.0 - b.squash_vel * 13.0) * h
         b.squash += b.squash_vel * h
 
-        b.resting = b.speed <= 0.0 and abs(b.spin) < self.SLEEP_SPIN
+        # In the air is not at rest, however still the body looks from above --
+        # without this a corpse halfway down a cliff face settles flat and
+        # stops taking the tumble the fall was going to give it.
+        b.resting = (b.speed <= 0.0 and abs(b.spin) < self.SLEEP_SPIN
+                     and b.z <= 0.0)
         if b.resting:
             b.spin = 0.0
             # Settle flat. `leave_corpse`'s convention is that +-90 is a body
@@ -925,6 +1079,24 @@ class RagdollField:
             flat = round((b.angle - 90.0) / 180.0) * 180.0 + 90.0
             b.angle += (flat - b.angle) * min(1.0, 5.0 * h)
 
+    def _solid(self, world: rj.World, b, tx: int, ty: int) -> bool:
+        """Whether this tile stops the thing at `b`, at the height it is at.
+
+        Masonry always. A step *up* in the ground only while the thing is low
+        enough to hit it -- which is one condition doing two jobs: a corpse
+        cannot slide up a cliff it could not have walked up, and a bomb thrown
+        over one sails across instead of bouncing off thin air. A step *down*
+        is never solid, because the difference between a cliff and a wall is
+        precisely that you can go over the edge of it.
+        """
+        if world.blocked(tx, ty):
+            return True
+        rise = self._rise(world)
+        if rise <= 0.0:
+            return False
+        step = world.terrain.step_up(b.x, b.y, tx, ty) * rise
+        return step > 2.0 and b.z < step
+
     def _walls(self, world: rj.World, b: Ragdoll):
         """Push the circle out of every solid tile it overlaps, and bounce it.
 
@@ -932,6 +1104,11 @@ class RagdollField:
         nearest point on a box is what gives a body sliding along a wall a
         clean tangent, and what stops it catching on the seam between two
         tiles of the same wall.
+
+        "Solid" is `_solid` rather than `world.blocked`, so the same code
+        bounces a body off the side of a hill -- masonry and a cliff face are
+        the same problem and there is still only one place a circle can be
+        wrong about one.
         """
         j = world.juice
         bounce = j.p("rag_bounce")
@@ -942,7 +1119,7 @@ class RagdollField:
         ty0, ty1 = int((b.y - r) // TILE), int((b.y + r) // TILE)
         for ty in range(ty0, ty1 + 1):
             for tx in range(tx0, tx1 + 1):
-                if not world.blocked(tx, ty):
+                if not self._solid(world, b, tx, ty):
                     continue
                 left, top = tx * TILE, ty * TILE
                 nearest_x = clamp(b.x, left, left + TILE)
@@ -1179,6 +1356,15 @@ class RagdollField:
         drag = world.juice.p("rag_drag")
         for bomb in list(self.thrown):
             bomb.fuse -= dt
+            # The ground first, so a bomb that has just rolled over a ledge is
+            # airborne again by the time the arc below looks at it -- and then
+            # bounces when it arrives, which is the same landing it gets off a
+            # throw. A bomb thrown *onto* a hill is handled by the same line
+            # from the other side: the ground rises, the height is spent.
+            rise = self._rise(world)
+            ground = world.terrain.lift_at(bomb.x, bomb.y) * rise if rise > 0.0 else 0.0
+            bomb.z = max(0.0, bomb.z + bomb.ground - ground)
+            bomb.ground = ground
             if bomb.z > 0.0 or bomb.vz > 0.0:
                 bomb.vz -= self.GRAVITY * dt
                 bomb.z += bomb.vz * dt
@@ -1203,6 +1389,9 @@ class RagdollField:
                 keep = math.exp(-drag * 1.4 * dt)
                 bomb.vx *= keep
                 bomb.vy *= keep
+                # Which is also why it is the thing on this floor least likely
+                # to stay where you put it on a slope.
+                self._slope(world, bomb, dt)
             bomb.x += bomb.vx * dt
             bomb.y += bomb.vy * dt
             bomb.angle += bomb.spin * dt
@@ -1375,6 +1564,20 @@ class GLRenderer:
         self.display = Display()
         self.menu = Menu()
 
+        # The hills, composed into the world rather than built into it. The sim
+        # asks it one question (`World.step_allowed`) and otherwise does not
+        # know it is there; this file asks it how high the ground is under
+        # every sprite; the corpse physics asks it which way is downhill. The
+        # software bench never gets one, which is why that bench is flat.
+        self.terrain = terrainfx.build_hills(world.grid, tile=TILE)
+        world.terrain = self.terrain
+        self.sync_terrain(world)
+        #: The tallest a level may be drawn -- see `rise`. Worked out once,
+        #: because `max_level` walks the whole grid and `rise` is asked per
+        #: quad: leaving it as a property call cost a millisecond a frame, all
+        #: of it on the processor, for an answer that cannot change.
+        self.rise_ceiling = glfx.TERRAIN_ROWS * TILE / max(1, self.terrain.max_level)
+
         self.sheet = tiles.SpriteSheet(TILE)
         self.atlas = self._build_atlas()
         self.digit_uv = {ch: self.atlas.uv[f"digit_{ch}"] for ch in self.DIGITS
@@ -1415,6 +1618,15 @@ class GLRenderer:
         self.wall_grid = ctx.texture((GRID_W, GRID_H), 1, wall_bytes, dtype="f1")
         self.wall_grid.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.wall_grid.repeat_x = self.wall_grid.repeat_y = False
+
+        # One texel a tile, two channels: the level and the stair code. Nearest
+        # filtering because a level is a whole number and an interpolated one
+        # is a height nothing stands at -- the ramp across a stair is computed
+        # from the code, not blended out of the neighbours.
+        self.terrain_tex = ctx.texture((GRID_W, GRID_H), 2, self.terrain.pack(),
+                                       dtype="f1")
+        self.terrain_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.terrain_tex.repeat_x = self.terrain_tex.repeat_y = False
 
     # -- setup ------------------------------------------------------------
     def _build_atlas(self):
@@ -1472,6 +1684,60 @@ class GLRenderer:
         self.floor_normal = self.ctx.texture(surf.get_size(), 3, normals.tobytes())
         self.floor_normal.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.floor_size = surf.get_size()
+
+    # -- elevation ----------------------------------------------------------
+    #
+    # Three lines of arithmetic, and the reason they are worth naming is that
+    # *everything* about verticality here is one of them. There is no third
+    # axis: a level of ground is a number of pixels a thing is drawn further up
+    # the screen, and the whole of the effect is which things get the offset
+    # (bodies, corpses, bombs, the numbers over their heads) and which pointedly
+    # do not (shadows, the lights, the sim).
+
+    def sync_terrain(self, world: rj.World):
+        """Point the terrain at whatever the panel currently says.
+
+        Called from the step *and* from the draw. `render` must be safe to run
+        twice on the same world with no time passing -- the headless path does
+        exactly that -- and copying a flag out of the toggle registry is not
+        time passing; it is the draw reading the same switch as everything
+        else. Leaving it to the step alone would mean a frame rendered without
+        one (a test, a screenshot) drawing hills the sim had switched off.
+        """
+        self.terrain.enabled = world.juice.on("hills")
+
+    def rise(self, world: rj.World) -> float:
+        """Pixels of lift per level of ground. Zero when hills are switched off.
+
+        Capped so the tallest ground in the room stays inside the handful of
+        tile rows the floor shader searches for a visible surface. Past that
+        cap a plateau would be lifted clean over its own cliff face and the
+        room would show holes -- and it is a cap rather than an assertion
+        because the alternative is a slider with a range that silently depends
+        on how many levels somebody drew into `terrain.ARENA`.
+        """
+        if not self.terrain.enabled:
+            return 0.0
+        return min(world.juice.p("hill_rise") * PX, self.rise_ceiling)
+
+    def lift(self, world: rj.World, wx: float, wy: float) -> float:
+        """How far above the flat plane the ground under a world point is.
+
+        Convenient rather than fast, and used where a handful of calls happen.
+        The batch fill asks `lifter` for a closure instead, because it asks
+        this question a few hundred times a frame and the two lookups behind
+        `rise` are then a few hundred lookups that never change their answer.
+        """
+        rise = self.rise(world)
+        return self.terrain.lift_at(wx, wy) * rise if rise > 0.0 else 0.0
+
+    def lifter(self, world: rj.World):
+        """A `lift(x, y)` for this frame, with the constants already read."""
+        rise = self.rise(world)
+        if rise <= 0.0:
+            return lambda wx, wy: 0.0
+        lift_at = self.terrain.lift_at
+        return lambda wx, wy: lift_at(wx, wy) * rise
 
     # -- per frame --------------------------------------------------------
     def camera_uniforms(self, world: rj.World):
@@ -1585,13 +1851,53 @@ class GLRenderer:
         self.floor_normal.use(1)
         p["u_floor"] = 0
         p["u_floor_normal"] = 1
+        p["u_cliff_shade"] = j.p("hill_shade")
+        self._set_terrain(p, world)
         self.floor_vao.render(mode=moderngl.TRIANGLE_STRIP)
+
+    def _set_terrain(self, program, world: rj.World):
+        """The elevation uniforms, for either program that was injected with it.
+
+        Both the floor shader and the quad shader carry a copy of the terrain
+        code -- one to draw the ground, one to ask whether the ground is in the
+        way -- so both want the same three uniforms and there is one place they
+        are written.
+        """
+        if "u_terrain" not in program:
+            # A driver is free to strip a uniform whose result never reaches an
+            # output, so a program that stops *using* the terrain stops
+            # declaring it. Guarded the same way `_set_lighting` guards its
+            # own, because the alternative is a KeyError from a shader edit
+            # rather than a picture that has quietly lost a feature.
+            return
+        self.terrain_tex.use(3)
+        program["u_terrain"] = 3
+        program["u_tile"] = float(TILE)
+        # The one uniform that turns the terrain on. At zero the floor shader
+        # takes the flat path in a single branch and the quad shader skips its
+        # occlusion test outright, so switching hills off costs nothing rather
+        # than costing a disabled feature.
+        program["u_rise"] = self.rise(world)
 
     # -- the batch --------------------------------------------------------
     def fill_batch(self, world: rj.World):
-        """Everything else, in painter's order, into one instance buffer."""
+        """Everything else, in painter's order, into one instance buffer.
+
+        The `lift=` on a good half of these calls is the terrain, and what is
+        interesting about it is the calls that do *not* have one. A shadow
+        stays on the ground the body is standing on, so it is lifted with the
+        ground and not with the body -- which is the entire reason a creature
+        on a plateau reads as being up there rather than as being drawn wrong.
+        Particles are left flat on purpose: there are thousands of them, they
+        are in the air anyway, and half a level of error on a spark that lives
+        a third of a second is not worth a terrain lookup per particle per
+        frame. Rings and ripples are flat because they are events on the floor
+        plane, and lifting one would mean deciding which of the four terraces
+        it crosses it belongs to.
+        """
         b = self.batch
         j = world.juice
+        lift = self.lifter(world)
         b.clear()
         white = self.atlas.white
 
@@ -1600,7 +1906,7 @@ class GLRenderer:
                 b.add(d.x, d.y, d.radius * 2.4, d.radius * 2.4 * d.squash,
                       uv=white, color=[c / 255.0 for c in d.color],
                       alpha=0.85 * d.alpha, shape=glfx.SHAPE_DISC,
-                      params=(0.55, 0, 0, 0))
+                      params=(0.55, 0, 0, 0), lift=lift(d.x, d.y))
 
         # Torch flames. The tufts are baked into the floor because the floor
         # itself sways now; a flame has to be drawn because it also flickers.
@@ -1613,12 +1919,13 @@ class GLRenderer:
                 ox, oy = ambient_offset(wx, wy, world.elapsed + phase,
                                         j.p("ambient_amt") * j.intensity)
                 wob += ox
+            flame = lift(wx, wy)
             b.add(wx + wob, wy - 8.0, 9.0, 15.0, uv=white,
                   color=(1.6, 0.8, 0.25), alpha=0.9, shape=glfx.SHAPE_DISC,
-                  params=(0.85, 0, 0, 0))
+                  params=(0.85, 0, 0, 0), lift=flame)
             b.add(wx + wob * 0.6, wy - 9.0, 4.5, 9.0, uv=white,
                   color=(2.4, 2.0, 1.2), alpha=1.0, shape=glfx.SHAPE_DISC,
-                  params=(0.7, 0, 0, 0))
+                  params=(0.7, 0, 0, 0), lift=flame)
 
         if j.on("shadow"):
             for e in world.entities:
@@ -1628,11 +1935,14 @@ class GLRenderer:
                 alpha *= j.p("shadow_alpha") * j.intensity
                 if alpha <= 0.02:
                     continue
-                b.add((e.body.tx + 0.5 + ox) * TILE,
-                      (e.body.ty + 0.5) * TILE + TILE * 0.36,
-                      TILE * size * 1.3, TILE * size * 0.55, uv=white,
+                sx = (e.body.tx + 0.5 + ox) * TILE
+                sy = (e.body.ty + 0.5) * TILE + TILE * 0.36
+                # Lifted by the *tile* rather than by the body: a shadow
+                # belongs to the ground, and the ground does not hop.
+                b.add(sx, sy, TILE * size * 1.3, TILE * size * 0.55, uv=white,
                       color=(0.0, 0.0, 0.0), alpha=alpha,
-                      shape=glfx.SHAPE_DISC, params=(0.7, 0, 0, 0))
+                      shape=glfx.SHAPE_DISC, params=(0.7, 0, 0, 0),
+                      lift=lift(*e.tile_center()))
             # A corpse that slides needs a shadow for the same reason a hop
             # does: without one it reads as a decal painted on the floor
             # rather than as an object being moved across it.
@@ -1640,9 +1950,12 @@ class GLRenderer:
                 a = c.alpha * j.p("shadow_alpha") * j.intensity * 1.1
                 if a <= 0.02:
                     continue
+                rag = self.ragdolls.of(c)
                 b.add(c.x, c.y + TILE * 0.16, TILE * 0.92, TILE * 0.34,
                       uv=white, color=(0.0, 0.0, 0.0), alpha=a,
-                      shape=glfx.SHAPE_DISC, params=(0.62, 0, 0, 0))
+                      shape=glfx.SHAPE_DISC, params=(0.62, 0, 0, 0),
+                      lift=rag.ground if rag is not None
+                      else lift(c.x, c.y))
 
         for c in world.corpses:
             uv = self.atlas.uv.get(c.sprite)
@@ -1650,14 +1963,17 @@ class GLRenderer:
                 continue
             rag = self.ragdolls.of(c)
             sx, sy = rag.scale if rag is not None else (1.0, 1.0)
+            # A tracked body carries its own height, because it may be halfway
+            # down a cliff and the ground under it says nothing about that.
+            high = (rag.ground + rag.z) if rag is not None else lift(c.x, c.y)
             b.add(c.x, c.y, TILE * sx, TILE * sy, rot=math.radians(c.angle),
-                  uv=uv, color=self._tint(c), alpha=c.alpha)
+                  uv=uv, color=self._tint(c), alpha=c.alpha, lift=high)
 
         for e in world.entities:
-            self._add_trail(b, e)
+            self._add_trail(b, lift, e)
         for e in world.entities:
-            self._add_tail(b, world, e)
-            self._add_body(b, world, e)
+            self._add_tail(b, world, lift, e)
+            self._add_body(b, world, lift, e)
 
         self._add_bombs(b, world)
 
@@ -1678,13 +1994,15 @@ class GLRenderer:
                   color=(1.7, 1.7, 1.7), alpha=0.95 * s.alpha,
                   shape=glfx.SHAPE_ARC,
                   params=(reach / (reach + 8), math.radians(s.sweep),
-                          0.10 + 0.25 * (1.0 - s.t), 0.0))
+                          0.10 + 0.25 * (1.0 - s.t), 0.0),
+                  lift=lift(s.x, s.y))
 
         for c in world.fx.cuts:
             b.add(c.x, c.y, c.length, c.thickness * 2.4,
                   rot=-math.radians(c.angle), uv=white,
                   color=[v / 255.0 for v in c.color], alpha=c.alpha,
-                  shape=glfx.SHAPE_CUT, params=(c.progress, 0, 0, 0))
+                  shape=glfx.SHAPE_CUT, params=(c.progress, 0, 0, 0),
+                  lift=lift(c.x, c.y))
 
         for p in world.fx.particles.particles:
             size = p.size * (1.0 - p.t) * 2.2
@@ -1696,7 +2014,7 @@ class GLRenderer:
                   params=(0.85, 0, 0, 0))
 
         if j.on("numbers"):
-            self._add_numbers(b, world)
+            self._add_numbers(b, world, lift)
 
     def _tint(self, e):
         return [c / 255.0 for c in e.color] if e.tint else (1.0, 1.0, 1.0)
@@ -1712,42 +2030,61 @@ class GLRenderer:
         """
         white = self.atlas.white
         for bomb in self.ragdolls.thrown:
-            lift = clamp(bomb.z / (TILE * 1.2), 0.0, 1.0)
+            # `air` is how high the bomb is above its own ground and shrinks its
+            # shadow; `bomb.ground` is how high that ground is and moves both,
+            # which is what keeps a bomb rolling along a plateau looking like it
+            # is on the plateau rather than hovering over the room.
+            air = clamp(bomb.z / (TILE * 1.2), 0.0, 1.0)
             b.add(bomb.x, bomb.y + TILE * 0.12,
-                  TILE * (0.56 - 0.18 * lift), TILE * (0.23 - 0.08 * lift),
+                  TILE * (0.56 - 0.18 * air), TILE * (0.23 - 0.08 * air),
                   uv=white, color=(0.0, 0.0, 0.0),
-                  alpha=(0.5 - 0.24 * lift) * world.juice.p("shadow_alpha") * 2.0,
-                  shape=glfx.SHAPE_DISC, params=(0.62, 0, 0, 0))
+                  alpha=(0.5 - 0.24 * air) * world.juice.p("shadow_alpha") * 2.0,
+                  shape=glfx.SHAPE_DISC, params=(0.62, 0, 0, 0),
+                  lift=bomb.ground)
             # The fuse spends its last third flashing, faster as it goes: a
             # constant blink says "a bomb", an accelerating one says "now".
             urgency = bomb.t ** 3
             blink = 0.5 + 0.5 * math.sin(world.elapsed * (18.0 + 60.0 * urgency))
             hot = 0.25 + 0.75 * urgency * blink
+            # A bomb in the air is drawn well above the spot it is over, so the
+            # foot of its quad is no guide to whether a hill is in front of it.
+            # It stands where its shadow is.
+            stands = bomb.y + TILE * 0.26
             b.add(bomb.x, bomb.y - bomb.z, TILE * 0.52, TILE * 0.52,
                   rot=math.radians(bomb.angle), uv=white,
                   color=(0.16 + hot * 1.9, 0.15 + hot * 0.7, 0.17 + hot * 0.2),
-                  alpha=1.0, shape=glfx.SHAPE_DISC, params=(0.8, 0, 0, 0))
+                  alpha=1.0, shape=glfx.SHAPE_DISC, params=(0.8, 0, 0, 0),
+                  lift=bomb.ground, depth=stands)
             b.add(bomb.x + math.cos(math.radians(bomb.angle)) * TILE * 0.2,
                   bomb.y - bomb.z - math.sin(math.radians(bomb.angle)) * TILE * 0.2,
                   TILE * 0.16, TILE * 0.16, uv=white,
                   color=(2.6 * (0.4 + hot), 1.9 * (0.3 + hot), 0.7),
-                  alpha=0.95, shape=glfx.SHAPE_DISC, params=(0.5, 0, 0, 0))
+                  alpha=0.95, shape=glfx.SHAPE_DISC, params=(0.5, 0, 0, 0),
+                  lift=bomb.ground, depth=stands)
 
-    def _add_trail(self, b, e):
+    def _add_trail(self, b, lift, e):
         uv = self.atlas.uv.get(e.sprite)
         if uv is None:
             return
         for g in e.trail.ghosts:
+            # Each ghost takes the height of the ground it was left on, so an
+            # afterimage of a run up a staircase climbs the staircase.
             b.add(g.x, g.y, TILE * g.sx, TILE * g.sy, rot=-math.radians(g.angle),
                   uv=uv, color=self._tint(e), alpha=0.42 * g.alpha,
-                  params=(1.0, 0, 0, 0))       # unlit: an echo is not a body
+                  params=(1.0, 0, 0, 0),       # unlit: an echo is not a body
+                  lift=lift(g.x, g.y))
 
-    def _add_tail(self, b, world, e):
+    def _add_tail(self, b, world, lift, e):
         if e.tail is None or not world.juice.on("tail"):
             return
         pts = e.tail.points(e.body)
         white = self.atlas.white
         col = [c / 255.0 for c in e.tail_color]
+        # One sample for the whole chain, at the body it hangs off. A cape is
+        # attached to a creature and not to the floor, so a tail trailing back
+        # over a ledge should stay level with its owner rather than pour down
+        # the cliff behind them.
+        high = lift(*e.world_pos())
         for i in range(len(pts) - 1):
             (x0, y0), (x1, y1) = pts[i], pts[i + 1]
             x0, y0, x1, y1 = x0 * TILE, y0 * TILE, x1 * TILE, y1 * TILE
@@ -1762,9 +2099,10 @@ class GLRenderer:
             b.add((x0 + x1) * 0.5, (y0 + y1) * 0.5, length * 2.0,
                   max(2.0, (1.0 - t) ** 0.8 * TILE * 0.42),
                   rot=math.atan2(dy, dx), uv=white, color=col,
-                  alpha=1.0, shape=glfx.SHAPE_DISC, params=(0.35, 0, 0, 0))
+                  alpha=1.0, shape=glfx.SHAPE_DISC, params=(0.35, 0, 0, 0),
+                  lift=high)
 
-    def _add_body(self, b, world, e):
+    def _add_body(self, b, world, lift, e):
         uv = self.atlas.uv.get(e.sprite)
         if uv is None:
             return
@@ -1804,12 +2142,17 @@ class GLRenderer:
         # bug this line will ever have.
         (u0, v0), (u1, v1) = uv
         cell = ((u1, v0), (u0, v1)) if e.flip else uv
+        # Sampled at the drawn position rather than at the logical tile, so the
+        # rise happens across the step animation: walking up a stair, the body
+        # is lifted a fraction of a level per frame by the ramp it is standing
+        # on, and the climb is the tween the sim already had.
         b.add(wx, wy, TILE * body.sx, TILE * body.sy,
               rot=-math.radians(body.angle), uv=cell,
               color=self._tint(e), alpha=body.alpha, flash=body.flash,
-              lag=lag, params=(0.0, 0.0 if j.on("normals") else 1.0, 0, 0))
+              lag=lag, params=(0.0, 0.0 if j.on("normals") else 1.0, 0, 0),
+              lift=lift(wx, wy))
 
-    def _add_numbers(self, b, world):
+    def _add_numbers(self, b, world, lift):
         """Damage numbers as instanced digit quads, so they live in the world.
 
         Drawn into the UI overlay instead, they would hold perfectly still
@@ -1818,16 +2161,24 @@ class GLRenderer:
         """
         if not self.digit_uv:
             return
+        #: Damage numbers are the one thing in the batch that is not *in* the
+        #: room -- they are a reading, drawn in world space only so they shake
+        #: with it. A hill hiding the number that says how hard you just hit
+        #: something would be the terrain eating a piece of the interface, so
+        #: they stand further forward than any ground in the arena can.
+        in_front = (GRID_H + 1) * TILE
         for f in world.fx.floaters.floaters:
             size = TILE * 0.8 * f.scale
             text = f.text
             x = f.x - (len(text) - 1) * size * 0.28
+            high = lift(f.x, f.y)
             for ch in text:
                 uv = self.digit_uv.get(ch)
                 if uv is not None:
                     b.add(x, f.y, size, size, uv=uv,
                           color=[c / 255.0 * 1.35 for c in f.color],
-                          alpha=clamp(f.alpha), params=(1.0, 0, 0, 0))
+                          alpha=clamp(f.alpha), params=(1.0, 0, 0, 0),
+                          lift=high, depth=in_front)
                 x += size * 0.56
 
     # -- resolution ---------------------------------------------------------
@@ -1902,8 +2253,20 @@ class GLRenderer:
         self.upload_ms += ((time.perf_counter() - now) * 1000.0 - self.upload_ms) * 0.08
 
     # -- the frame --------------------------------------------------------
+    def step(self, world: rj.World, dt: float):
+        """Advance everything the renderer owns that is not drawing.
+
+        Called after `world.update` and before `render`, which is the order the
+        two things here need: the corpse field adopts the bodies the sim has
+        just laid down, and the terrain switch has to agree with the panel
+        before either the physics or the picture reads it.
+        """
+        self.sync_terrain(world)
+        self.ragdolls.update(world, dt)
+
     def render(self, world: rj.World, mouse=(0, 0)):
         j = world.juice
+        self.sync_terrain(world)
         lights = self.lights_of(world)
 
         self.post.scene.use()
@@ -1917,6 +2280,7 @@ class GLRenderer:
         p["u_soft_power"] = j.p("soft_power")
         p["u_soft_pinch"] = j.p("jelly_stretch") * j.intensity
         self._set_lighting(p, world, lights)
+        self._set_terrain(p, world)
         self.atlas.albedo.use(0)
         self.atlas.normal.use(1)
         p["u_albedo"] = 0
@@ -1969,6 +2333,7 @@ class GLRenderer:
         self.floor_tex.release()
         self.floor_normal.release()
         self.wall_grid.release()
+        self.terrain_tex.release()
         self.floor_vao.release()
         self.floor_vbo.release()
         self.ui_tex.release()
@@ -2214,7 +2579,7 @@ def run():
                 world.update(dt)
                 # After the sim, because it adopts the corpses the sim just
                 # laid down; before the render, which reads what it wrote.
-                renderer.ragdolls.update(world, dt)
+                renderer.step(world, dt)
             ctx.screen.viewport = (0, 0, WIN_W, WIN_H)
             renderer.render(world, pygame.mouse.get_pos())
             ms = (time.perf_counter() - t0) * 1000.0
@@ -2256,7 +2621,7 @@ def run_headless(path: str):
     def step(n):
         for _ in range(n):
             world.update(dt)
-            renderer.ragdolls.update(world, dt)
+            renderer.step(world, dt)
 
     px, py = world.player.tile
     tx, ty = rj.DUMMY_POS
